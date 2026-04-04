@@ -93,6 +93,7 @@ export class MoviElement extends HTMLElement {
   private _title: string | null = null; // Video title to display
   private _showTitle: boolean = false; // Show title at top if true
   private _resume: boolean = false; // Resume playback from last position (opt-in)
+  private _stableVolume: boolean = false; // Stable volume / loudness normalization (opt-in)
   private _resumeSaveInterval: number | null = null; // Interval to save position
   private _titleAutoLoaded: boolean = false; // Track if title was auto-loaded from metadata
   private _lastDuration: number = 0; // Track duration changes for title auto-load
@@ -152,6 +153,7 @@ export class MoviElement extends HTMLElement {
       "title",
       "showtitle",
       "resume",
+      "stablevolume",
     ];
   }
 
@@ -463,8 +465,8 @@ export class MoviElement extends HTMLElement {
         <span class="movi-context-menu-label">Loop</span>
         <span class="movi-context-menu-status movi-loop-status">Off</span>
       </div>
-      <div class="movi-context-menu-item movi-context-menu-active" data-action="stable-audio-toggle">
-        <svg class="movi-context-menu-icon movi-context-menu-stable-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
+      <div class="movi-context-menu-item" data-action="stable-audio-toggle">
+        <svg class="movi-context-menu-icon movi-context-menu-stable-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <rect x="2" y="4" width="20" height="16" rx="2"></rect>
           <path d="M6 15v-2"></path>
           <path d="M9 15v-4"></path>
@@ -472,11 +474,11 @@ export class MoviElement extends HTMLElement {
           <path d="M15 15v-4"></path>
           <path d="M18 15v-2"></path>
         </svg>
-        <svg class="movi-context-menu-icon movi-context-menu-stable-filled" viewBox="0 0 24 24" fill="currentColor">
+        <svg class="movi-context-menu-icon movi-context-menu-stable-filled" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
           <path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm1 9v2h2v-2H5zm3-2v4h2v-4H8zm3-2v6h2V9h-2zm3 2v4h2v-4h-2zm3 2v2h2v-2h-2z"></path>
         </svg>
         <span class="movi-context-menu-label">Stable Volume</span>
-        <span class="movi-context-menu-status movi-stable-audio-status">On</span>
+        <span class="movi-context-menu-status movi-stable-audio-status">Off</span>
       </div>
       <div class="movi-context-menu-divider"></div>
       <div class="movi-context-menu-item" data-action="snapshot">
@@ -670,7 +672,7 @@ export class MoviElement extends HTMLElement {
               </div>
 
               <div class="movi-stable-audio-container">
-                <button class="movi-btn movi-stable-audio-btn active" aria-label="Toggle Stable Audio">
+                <button class="movi-btn movi-stable-audio-btn" aria-label="Toggle Stable Audio">
                   <svg class="movi-icon-stable-audio-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                     <rect x="2" y="4" width="20" height="16" rx="2"></rect>
                     <path d="M6 15v-2"></path>
@@ -7392,6 +7394,13 @@ export class MoviElement extends HTMLElement {
       case "resume":
         this._resume = newValue !== null;
         break;
+      case "stablevolume":
+        this._stableVolume = newValue !== null;
+        if (this.player) {
+          this.player.setStableAudio(this._stableVolume);
+          this.updateStableAudioUI();
+        }
+        break;
       case "src":
         // Only handle string src attributes, File objects are handled via setter
         if (!(this._src instanceof File)) {
@@ -7783,6 +7792,8 @@ export class MoviElement extends HTMLElement {
       this.updateFitMode();
       if (this.player) {
         this.player.setHDREnabled(this._hdr);
+        this.player.setStableAudio(this._stableVolume);
+        this.updateStableAudioUI();
       }
       this.updateHDRVisibility();
       this.updateControlsVisibility();

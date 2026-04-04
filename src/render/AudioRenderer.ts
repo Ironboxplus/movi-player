@@ -37,8 +37,8 @@ export class AudioRenderer {
   private preservePitch: boolean = true;
   private soundTouch: SoundTouch | null = null;
 
-  // Stable audio: master toggle
-  private _stableAudio: boolean = true;
+  // Stable audio: master toggle (off by default, opt-in via element attribute)
+  private _stableAudio: boolean = false;
 
   // Stable audio: gain ramp duration for smooth transitions (prevents clicks/pops)
   private static readonly GAIN_RAMP_TIME = 0.015; // 15ms ramp
