@@ -947,7 +947,7 @@ export class MoviElement extends HTMLElement {
       e.stopPropagation(); // Prevent triggering overlay click
       if (this.player) {
         const state = this.player.getState();
-        if (state === "playing") {
+        if (state === "playing" || state === "buffering") {
           this.pause();
         } else {
           // Play if in ready, paused, ended, or any other non-playing state
@@ -1070,7 +1070,7 @@ export class MoviElement extends HTMLElement {
       e.stopPropagation(); // Prevent triggering overlay click
       if (this.player) {
         const state = this.player.getState();
-        if (state === "playing") {
+        if (state === "playing" || state === "buffering") {
           this.pause();
         } else {
           // Play if in ready, paused, ended, or any other non-playing state
@@ -1817,7 +1817,7 @@ export class MoviElement extends HTMLElement {
         // This means the click is on the video area (canvas/overlay), not on controls
         this.focus(); // Make sure it gets focus for keyboard shortcuts
         const state = this.player?.getState();
-        if (state === "playing") {
+        if (state === "playing" || state === "buffering") {
           this.pause();
         } else {
           this.play();
@@ -2110,7 +2110,7 @@ export class MoviElement extends HTMLElement {
           this.showControls();
         } else {
           const state = this.player?.getState();
-          if (state === "playing") {
+          if (state === "playing" || state === "buffering") {
             this.pause();
           } else {
             this.play();
@@ -2195,7 +2195,7 @@ export class MoviElement extends HTMLElement {
             this.showControls();
           } else {
             const state = this.player?.getState();
-            if (state === "playing") {
+            if (state === "playing" || state === "buffering") {
               this.pause();
             } else {
               this.play();
@@ -2503,7 +2503,7 @@ export class MoviElement extends HTMLElement {
           // Space or K: Play/Pause
           e.preventDefault();
           const state = this.player?.getState();
-          if (state === "playing") {
+          if (state === "playing" || state === "buffering") {
             this.pause();
           } else {
             this.play();
@@ -3298,7 +3298,7 @@ export class MoviElement extends HTMLElement {
       if (action === "play-pause") {
         if (this.player) {
           const state = this.player.getState();
-          if (state === "playing") {
+          if (state === "playing" || state === "buffering") {
             this.pause();
           } else {
             this.play();
@@ -4087,7 +4087,8 @@ export class MoviElement extends HTMLElement {
 
       playPauseBtn.addEventListener("click", () => {
         if (!this.player) return;
-        if (this.player.getState() === "playing") this.pause();
+        const pipPlayState = this.player.getState();
+        if (pipPlayState === "playing" || pipPlayState === "buffering") this.pause();
         else this.play();
       });
 
@@ -4148,7 +4149,8 @@ export class MoviElement extends HTMLElement {
         if (!this.player) return;
         if (e.key === " " || e.key === "k") {
           e.preventDefault();
-          if (this.player.getState() === "playing") this.pause();
+          const pipState = this.player.getState();
+          if (pipState === "playing" || pipState === "buffering") this.pause();
           else this.play();
         } else if (e.key === "ArrowLeft") {
           this.currentTime = Math.max(0, this.currentTime - 10);

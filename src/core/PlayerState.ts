@@ -20,7 +20,7 @@ const VALID_TRANSITIONS: Record<PlayerState, PlayerState[]> = {
   playing: ['paused', 'seeking', 'buffering', 'ended', 'error'],
   paused: ['playing', 'seeking', 'error'],
   seeking: ['ready', 'playing', 'paused', 'buffering', 'error', 'seeking'],
-  buffering: ['playing', 'paused', 'error', 'seeking'],
+  buffering: ['playing', 'paused', 'ended', 'error', 'seeking'],
   ended: ['seeking', 'idle'],
   error: ['idle'],
 };

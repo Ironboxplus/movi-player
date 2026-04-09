@@ -86,6 +86,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private muted: boolean = false; // Mute state
   private wasPlayingBeforeRebuffer: boolean = false; // Track if we were playing before entering rebuffering state
   private _stallStartTime: number = 0; // When stall was first detected
+  private _bufferingEntryTime: number = 0; // When we entered buffering state
 
   // Playback Loop
   private animationFrameId: number | null = null;
@@ -992,16 +993,27 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const currentState = this.stateManager.getState();
       if (currentState === "playing") {
         this.wasPlayingBeforeRebuffer = true;
+        this._bufferingEntryTime = performance.now();
         this.stateManager.setState("buffering");
         this.clock.pause();
+        if (this.videoRenderer) this.videoRenderer.stopPresentationLoop();
         Logger.debug(TAG, "Entered buffering state for playback rate change");
       }
       // Continue processing to allow new audio to be decoded and scheduled
     } else if (this.stateManager.getState() === "buffering" && this.wasPlayingBeforeRebuffer) {
-      // Resume as soon as we have any data available
-      const videoReady = this.videoRenderer ? this.videoRenderer.getQueueSize() > 0 : true;
-      const audioReady = this.disableAudio || this.audioRenderer.getBufferedDuration() > 0.05;
-      if (videoReady || audioReady) {
+      // Resume after minimum dwell time to accumulate enough data
+      const hasAudioTrack = !!this.trackManager.getActiveAudioTrack();
+      const audioReady = this.disableAudio || !hasAudioTrack || this.audioRenderer.getBufferedDuration() > 0.1;
+      const videoReady = !this.videoRenderer || this.videoRenderer.getQueueSize() > 0;
+      const dwellMs = performance.now() - this._bufferingEntryTime;
+      const minDwell = 1500; // Wait at least 1.5s to accumulate buffer
+      // Resume if: (1) both ready after minDwell, or (2) audio ready after longer wait
+      // Video decoder output is async — don't block forever if frames are delayed
+      const canResume = dwellMs >= minDwell && (
+        (audioReady && videoReady) ||
+        (audioReady && dwellMs >= 3000)
+      );
+      if (canResume) {
         this.stateManager.setState("paused");
         this.wasPlayingBeforeRebuffer = false;
         Logger.info(TAG, "Buffers refilled, resuming playback");
@@ -1028,7 +1040,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const nearEnd = this.mediaInfo && this.clock.getTime() >= (this.mediaInfo.duration + this.startTime) - 3;
     if (this.stateManager.getState() === "playing" && !this.eofReached && !this.waitingForVideoSync && !nearEnd) {
       const videoEmpty = this.videoRenderer ? this.videoRenderer.getQueueSize() === 0 : false;
-      const audioLow = this.disableAudio || this.audioRenderer.getBufferedDuration() < 0.05;
+      const hasAudio = !!this.trackManager.getActiveAudioTrack() && !this.disableAudio;
+      const audioLow = !hasAudio || this.audioRenderer.getBufferedDuration() < 0.05;
       if (videoEmpty && audioLow) {
         if (!this._stallStartTime) {
           this._stallStartTime = performance.now();
@@ -1036,8 +1049,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           // Only enter buffering after 500ms of continuous stall
           Logger.warn(TAG, "Stall detected: buffers empty for 500ms, entering buffering state");
           this.wasPlayingBeforeRebuffer = true;
+          this._bufferingEntryTime = performance.now();
           this.stateManager.setState("buffering");
           this.clock.pause();
+          // Stop presentation loop so decoded frames accumulate in queue
+          // (otherwise it keeps consuming them and videoReady never becomes true)
+          if (this.videoRenderer) this.videoRenderer.stopPresentationLoop();
           this._stallStartTime = 0;
         }
       } else {
@@ -3032,9 +3049,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * Handle network recovery — re-seek to current position to restart cleanly
    */
   private handleNetworkOnline = (): void => {
-    // Network recovery is handled by processLoop's buffering exit condition.
-    // HttpSource resumes fetching on online event, buffers refill,
-    // then processLoop detects videoReady || audioReady and auto-resumes.
+    const state = this.stateManager.getState();
+    if (state === "buffering" || state === "playing") {
+      const currentTime = this.getCurrentTime();
+      Logger.info(TAG, `Network online — re-seeking to ${currentTime.toFixed(2)}s for clean recovery`);
+      this.seek(currentTime).catch((err) => {
+        Logger.error(TAG, "Network recovery seek failed", err);
+      });
+    }
   };
 
   /**

@@ -221,7 +221,7 @@ export class WasmBindings {
         }
 
         const data = await self.dataSource.read(offsetNum, size);
-        self.fulfillRead(data, data.byteLength);
+        self.fulfillRead(new Uint8Array(data), data.byteLength);
       } catch (error) {
         // Store error message for better error reporting
         self.lastError = (error as any).message || String(error);
@@ -661,12 +661,13 @@ export class WasmBindings {
       const info = parsePacketInfo(this.module, infoPtr);
 
       // Validate packet size to prevent corrupted state from creating invalid arrays
+      // Near EOF, FFmpeg's demuxer may produce corrupted packets from stale internal buffer data — treat as EOF
       if (info.size < 0 || info.size > this.packetBufferSize) {
-        Logger.error(
+        Logger.warn(
           TAG,
-          `Invalid packet size: ${info.size} (buffer size: ${this.packetBufferSize}). State may be corrupted.`,
+          `Invalid packet size: ${info.size} (buffer size: ${this.packetBufferSize}), treating as EOF`,
         );
-        throw new Error(`Invalid packet size: ${info.size}`);
+        return null;
       }
 
       // Copy packet data
@@ -1166,8 +1167,6 @@ export class ThumbnailBindings {
       if (self.dataSource) {
         const offsetNum = typeof offset === "bigint" ? Number(offset) : offset;
         self.dataSource.read(offsetNum, size).then((data) => {
-          // dataSource.read returns ArrayBuffer for ThumbnailHttpSource
-          // but we need Uint8Array for subarray operation
           const view = data instanceof Uint8Array ? data : new Uint8Array(data);
           self.fulfillRead(view, view.byteLength);
         });
