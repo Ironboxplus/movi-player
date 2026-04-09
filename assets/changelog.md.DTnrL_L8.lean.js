@@ -1,1 +1,0 @@
-import{_ as i,o,c as t,ag as a}from"./chunks/framework.DfsMvb5-.js";const p=JSON.parse('{"title":"Changelog","description":"","frontmatter":{},"headers":[],"relativePath":"changelog.md","filePath":"changelog.md"}'),r={name:"changelog.md"};function l(n,e,s,d,c,u){return o(),t("div",null,[...e[0]||(e[0]=[a("",48)])])}const g=i(r,[["render",l]]);export{p as __pageData,g as default};
