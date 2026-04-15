@@ -573,6 +573,14 @@ export class MoviElement extends HTMLElement {
         <span class="movi-context-menu-label">Stats for nerds</span>
         <span class="movi-context-menu-shortcut">I</span>
       </div>
+      <div class="movi-context-menu-item" data-action="keyboard-shortcuts">
+        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="6" width="20" height="12" rx="2"></rect>
+          <path d="M6 10h0M10 10h0M14 10h0M18 10h0M6 14h12"></path>
+        </svg>
+        <span class="movi-context-menu-label">Keyboard Shortcuts</span>
+        <span class="movi-context-menu-shortcut">?</span>
+      </div>
     `;
     shadowRoot.appendChild(contextMenu);
     Logger.debug(
@@ -3514,6 +3522,14 @@ export class MoviElement extends HTMLElement {
         hideContextMenu();
       } else if (action === "nerd-stats") {
         this.toggleNerdStats(shadowRoot);
+        hideContextMenu();
+      } else if (action === "keyboard-shortcuts") {
+        const panel = shadowRoot.querySelector(
+          ".movi-shortcuts-panel",
+        ) as HTMLElement;
+        if (panel) {
+          panel.style.display = panel.style.display === "none" ? "flex" : "none";
+        }
         hideContextMenu();
       } else if (action === "timeline") {
         this.toggleTimeline();

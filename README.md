@@ -231,6 +231,8 @@ Use cases: video validators, asset management, HDR detection pipelines, search i
 
 ## Keyboard Shortcuts
 
+Press `?` during playback to toggle the shortcuts panel (also available from the right-click context menu).
+
 | Key | Action | Key | Action |
 |---|---|---|---|
 | `Space` / `K` | Play / Pause | `B` | Cycle audio track |
