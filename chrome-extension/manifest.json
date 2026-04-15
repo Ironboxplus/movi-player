@@ -19,15 +19,16 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["<all_urls>", "file:///*"],
       "js": ["content.js"],
-      "css": ["content.css"]
+      "css": ["content.css"],
+      "run_at": "document_end"
     }
   ],
   "web_accessible_resources": [
     {
       "resources": ["player.html", "player.js", "popup.js", "dist/*"],
-      "matches": ["<all_urls>"]
+      "matches": ["<all_urls>", "file:///*"]
     }
   ],
   "action": {
