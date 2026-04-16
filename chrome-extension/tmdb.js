@@ -313,7 +313,11 @@ function parseMusicTitle(title) {
           if (name.length > 1) people.push(name);
         });
       } else if (!movie && part.length > 1) {
+        // First non-comma part = movie name
         movie = part;
+      } else if (part.length > 1) {
+        // Remaining non-comma parts = people (e.g. "Sharvari & Abhay Verma")
+        splitArtists(part).forEach(a => people.push(a));
       }
     }
     if (people.length > 0 || movie) return { song: songPart, movie, people };
@@ -462,7 +466,7 @@ function renderPanel(data, type) {
       <div class="tmdb-section-title">Cast</div>
       <div class="tmdb-cast">
         ${cast.map(c => `
-          <div class="tmdb-cast-item">
+          <div class="tmdb-cast-item" data-person-id="${c.id}" style="cursor:pointer">
             ${c.profile_path
               ? `<img src="${IMG("w92", c.profile_path)}" alt="${c.name}">`
               : `<div class="no-avatar">${c.name[0]}</div>`}
@@ -475,6 +479,14 @@ function renderPanel(data, type) {
   `;
 
   document.getElementById("tmdbClose").addEventListener("click", closePanel);
+
+  // Click cast member → show person detail
+  tmdbContent.querySelectorAll(".tmdb-cast-item[data-person-id]").forEach(card => {
+    card.addEventListener("click", () => {
+      const id = card.dataset.personId;
+      if (id) showCastPersonDetail(id, data, type);
+    });
+  });
 }
 
 // ─── Render: Music/People panel ─────────────────────────
@@ -601,6 +613,65 @@ async function showPersonDetail(id, musicInfo, people, movieData) {
   });
 }
 
+// ─── Cast person detail (from movie/TV panel) ──────────
+async function showCastPersonDetail(id, data, type) {
+  renderLoading();
+  const person = await getPersonDetails(id);
+  if (!person) { renderError("Could not load person info"); return; }
+
+  const photo = IMG("w342", person.profile_path);
+  const credits = (person.combined_credits?.cast || [])
+    .sort((a, b) => (b.vote_count || 0) - (a.vote_count || 0))
+    .slice(0, 12);
+
+  tmdbContent.innerHTML = `
+    <button class="tmdb-close" id="tmdbClose">&times;</button>
+    <div class="tmdb-person-detail">
+      <button class="tmdb-back-btn" id="tmdbBackBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+        Back
+      </button>
+
+      <div class="tmdb-person-hero">
+        ${photo
+          ? `<img src="${photo}" alt="${person.name}">`
+          : `<div class="no-avatar">${person.name[0]}</div>`}
+        <h2>${person.name}</h2>
+        <div class="dept">${person.known_for_department || ""}</div>
+      </div>
+
+      <div class="tmdb-stats">
+        ${person.birthday ? `<div class="tmdb-stat"><div class="label">Born</div><div class="value">${person.birthday}</div></div>` : ""}
+        ${person.place_of_birth ? `<div class="tmdb-stat"><div class="label">Place</div><div class="value">${person.place_of_birth}</div></div>` : ""}
+      </div>
+
+      ${person.biography ? `<div class="tmdb-person-bio">${person.biography}</div>` : ""}
+
+      ${credits.length ? `
+      <div class="tmdb-section-title">Known For</div>
+      <div class="tmdb-filmography">
+        ${credits.map(c => `
+          <div class="tmdb-film-item">
+            ${c.poster_path
+              ? `<img src="${IMG("w92", c.poster_path)}" alt="${c.title || c.name}">`
+              : `<div style="width:34px;height:50px;background:#111;border-radius:6px;flex-shrink:0"></div>`}
+            <div class="film-info">
+              <div class="film-title">${c.title || c.name}</div>
+              <div class="film-meta">${c.character ? `as ${c.character}` : ""} ${c.release_date?.split("-")[0] || c.first_air_date?.split("-")[0] || ""}</div>
+            </div>
+            ${c.vote_average ? `<div class="film-rating">${c.vote_average.toFixed(1)} &#9733;</div>` : ""}
+          </div>
+        `).join("")}
+      </div>` : ""}
+    </div>
+  `;
+
+  document.getElementById("tmdbClose").addEventListener("click", closePanel);
+  document.getElementById("tmdbBackBtn").addEventListener("click", () => {
+    renderPanel(data, type);
+  });
+}
+
 // ─── Panel toggle ────────────────────────────────────────
 function openPanel() {
   panelOpen = true;
@@ -641,16 +712,8 @@ async function fetchAndRender() {
     const musicInfo = parseMusicTitle(title);
 
     if (musicInfo && musicInfo.people.length > 0) {
-      // Music video mode: search for people
-      const peopleResults = await Promise.all(
-        musicInfo.people.slice(0, 6).map(name => searchPerson(name))
-      );
-
-      const people = peopleResults
-        .filter(r => r?.results?.length > 0)
-        .map(r => r.results[0]);
-
-      // Also search for the movie if mentioned
+      // Also search for the movie if mentioned — do this first so we can
+      // cross-reference credits to find people embedded in the song name.
       let movieData = null;
       if (musicInfo.movie) {
         const movieSearch = await searchTMDb(musicInfo.movie);
@@ -658,6 +721,66 @@ async function fetchAndRender() {
           movieData = await getMovieDetails(movieSearch.results[0].id);
         }
       }
+
+      // Try to extract people names that got merged into the song title.
+      // e.g. "Laal Peeli Akhiyaan Shahid Kapoor" → song: "Laal Peeli Akhiyaan", extra person: "Shahid Kapoor"
+      // Check against movie credits if available, or try TMDb person search on trailing word pairs.
+      if (musicInfo.song) {
+        const words = musicInfo.song.split(/\s+/);
+        // Try progressively larger trailing word groups (2 words, 3 words)
+        for (let len = 2; len <= Math.min(3, words.length - 1); len++) {
+          const candidate = words.slice(-len).join(" ");
+          // Check movie credits first (fast, no API call)
+          if (movieData?.credits?.cast?.some(c => c.name.toLowerCase() === candidate.toLowerCase())) {
+            musicInfo.people.unshift(candidate);
+            musicInfo.song = words.slice(0, -len).join(" ");
+            break;
+          }
+          // Fallback: quick TMDb person search
+          const personResult = await searchPerson(candidate);
+          if (personResult?.results?.length > 0 && personResult.results[0].popularity > 5) {
+            musicInfo.people.unshift(candidate);
+            musicInfo.song = words.slice(0, -len).join(" ");
+            break;
+          }
+        }
+      }
+
+      // Music video mode: search for people.
+      // When movie data is available, match partial names against cast/crew first
+      // (e.g. "Kriti" → "Kriti Sanon" from movie credits) before falling back to
+      // blind TMDb person search which returns wrong results for short/first names.
+      const movieCredits = [
+        ...(movieData?.credits?.cast || []),
+        ...(movieData?.credits?.crew || []),
+      ];
+
+      const peopleResults = await Promise.all(
+        musicInfo.people.slice(0, 6).map(async (name) => {
+          // Try exact match in movie credits first
+          const exactMatch = movieCredits.find(
+            c => c.name.toLowerCase() === name.toLowerCase()
+          );
+          if (exactMatch) return { results: [exactMatch] };
+
+          // Try partial match: "Kriti" matches "Kriti Sanon"
+          const partialMatch = movieCredits.find(
+            c => c.name.toLowerCase().startsWith(name.toLowerCase() + " ") ||
+                 c.name.toLowerCase() === name.toLowerCase()
+          );
+          if (partialMatch) return { results: [partialMatch] };
+
+          // No match in credits — skip (don't show wrong random people)
+          if (movieCredits.length > 0) return { results: [] };
+
+          // No movie data available — fallback to TMDb search
+          return searchPerson(name);
+        })
+      );
+
+      const people = peopleResults
+        .filter(r => r?.results?.length > 0)
+        .map(r => r.results[0]);
 
       if (people.length > 0) {
         tmdbData = { musicInfo, people, movieData };
@@ -700,20 +823,13 @@ async function fetchAndRender() {
   }
 }
 
-// ─── Auto-init: show toggle once video loads ─────────────
+// ─── Auto-init: show toggle only when title is detected ──
+function showToggleIfTitle() {
+  const title = getVideoTitle();
+  if (title) tmdbToggle.classList.add("visible");
+}
+
 customElements.whenDefined("movi-player").then(() => {
   const player = document.getElementById("player");
-  player.addEventListener("loadeddata", () => {
-    tmdbToggle.classList.add("visible");
-  });
-
-  // Also show if video is already loaded (URL mode)
-  if (player.src) {
-    tmdbToggle.classList.add("visible");
-  }
+  player.addEventListener("loadeddata", showToggleIfTitle);
 });
-
-// Show toggle immediately if URL param present
-if (new URLSearchParams(window.location.search).get("url")) {
-  tmdbToggle.classList.add("visible");
-}

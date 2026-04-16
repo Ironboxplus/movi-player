@@ -138,8 +138,8 @@
     .tmdb-panel {
       position: fixed;
       top: 0;
-      right: -380px;
-      width: 360px;
+      right: -420px;
+      width: 400px;
       height: 100%;
       z-index: 9991;
       background: #0a0a10;
@@ -298,9 +298,9 @@
 
     .tmdb-cast {
       display: flex;
-      gap: 8px;
+      gap: 12px;
       overflow-x: auto;
-      padding-bottom: 6px;
+      padding-bottom: 8px;
       margin-bottom: 18px;
     }
     .tmdb-cast::-webkit-scrollbar { height: 3px; }
@@ -308,18 +308,18 @@
     .tmdb-cast-item {
       flex-shrink: 0;
       text-align: center;
-      width: 56px;
+      width: 72px;
     }
     .tmdb-cast-item img {
-      width: 46px;
-      height: 46px;
+      width: 56px;
+      height: 56px;
       border-radius: 50%;
       object-fit: cover;
       background: #111;
     }
     .tmdb-cast-item .no-avatar {
-      width: 46px;
-      height: 46px;
+      width: 56px;
+      height: 56px;
       border-radius: 50%;
       background: #111;
       display: flex;
@@ -329,16 +329,22 @@
       margin: 0 auto;
     }
     .tmdb-cast-item .name {
+      font-size: 10px;
+      color: #999;
+      margin-top: 5px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      line-height: 1.3;
+    }
+    .tmdb-cast-item .role {
       font-size: 8.5px;
-      color: #666;
-      margin-top: 4px;
+      color: #555;
+      margin-top: 1px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-    }
-    .tmdb-cast-item .role {
-      font-size: 7.5px;
-      color: #333;
     }
 
     /* ─── Music/Person cards ────────── */
