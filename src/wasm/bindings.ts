@@ -192,6 +192,46 @@ export class WasmBindings {
   }
 
   /**
+   * Map FFmpeg AVERROR codes to user-friendly messages
+   */
+  private getHumanReadableError(code: number): string {
+    // FFmpeg FFERRTAG: negate and read as 4-char ASCII
+    const tag = (-code >>> 0);
+    const a = String.fromCharCode(tag & 0xFF);
+    const b = String.fromCharCode((tag >> 8) & 0xFF);
+    const c = String.fromCharCode((tag >> 16) & 0xFF);
+    const d = String.fromCharCode((tag >> 24) & 0xFF);
+    const fftag = `${a}${b}${c}${d}`;
+
+    const messages: Record<string, string> = {
+      "INDA": ": File is corrupted or in an unsupported format",
+      "FEND": ": Unexpected end of file",
+      "NDPA": ": Cannot detect file format — file may be corrupted or incomplete",
+      "NFED": ": Could not find a suitable decoder for this file",
+      "NFMX": ": Could not find a suitable demuxer for this file",
+      "EXIT": ": Operation was interrupted",
+    };
+
+    if (messages[fftag]) {
+      return messages[fftag];
+    }
+
+    // POSIX errno (small negative numbers)
+    if (code > -100) {
+      const posix: Record<number, string> = {
+        [-2]: ": File not found",
+        [-13]: ": Permission denied",
+        [-12]: ": Not enough memory to process this file",
+        [-5]: ": Read error — file may be incomplete or inaccessible",
+      };
+      if (posix[code]) return posix[code];
+    }
+
+    Logger.debug(TAG, `Unknown FFmpeg error: code=${code}, tag=${fftag}`);
+    return ": Unable to open this file";
+  }
+
+  /**
    * Setup async I/O handlers for Asyncify callbacks
    */
   private setupAsyncHandlers(): void {
@@ -415,9 +455,12 @@ export class WasmBindings {
 
     if (ret < 0) {
       // Include last I/O error if available (e.g., CORS, network errors)
-      const errorDetail = this.lastError
-        ? `: ${this.lastError}`
-        : ` (FFmpeg error code: ${ret})`;
+      let errorDetail: string;
+      if (this.lastError) {
+        errorDetail = `: ${this.lastError}`;
+      } else {
+        errorDetail = this.getHumanReadableError(ret);
+      }
       throw new Error(`Failed to open media${errorDetail}`);
     }
 
