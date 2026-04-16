@@ -108,8 +108,8 @@ static enum AVPixelFormat get_format(AVCodecContext *s, const enum AVPixelFormat
     for (p = fmt; *p != -1; p++) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
         
-        av_log(NULL, AV_LOG_DEBUG, "[THUMB] get_format checking: %s (hwaccel: %d)\n", 
-               desc->name, (desc->flags & AV_PIX_FMT_FLAG_HWACCEL));
+        av_log(NULL, AV_LOG_DEBUG, "[THUMB] get_format checking: %s (hwaccel: %llu)\n",
+               desc->name, (unsigned long long)(desc->flags & AV_PIX_FMT_FLAG_HWACCEL));
 
         if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
             // Found a software format
