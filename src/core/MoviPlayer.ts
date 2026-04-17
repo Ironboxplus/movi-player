@@ -89,6 +89,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private _stallStartTime: number = 0; // When stall was first detected
   private _bufferingEntryTime: number = 0; // When we entered buffering state
   private _decoderStuckSince: number = 0; // When video decoder was first detected stuck
+  private _prevPlaybackRate: number = 1.0; // Previous playback rate for slow→1x recovery
 
   // Playback Loop
   private animationFrameId: number | null = null;
@@ -2800,6 +2801,34 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (this.nativeAudioEl) {
       this.nativeAudioEl.playbackRate = rate;
     }
+
+    // When returning to 1x on high-FPS (≥50fps) content from any non-1x rate,
+    // seek to current position to flush stale decoder/queue state.
+    const fps = (this.mediaInfo as any)?.videoFrameRate ?? 30;
+    const wasNon1x = Math.abs(this._prevPlaybackRate - 1.0) > 0.01;
+    if (Math.abs(rate - 1.0) < 0.01 && wasNon1x && fps >= 50) {
+      // Flush stale video state from non-1x playback on high-FPS content.
+      // Full seek is too heavy and causes hangs — just flush decoder + clear queue.
+      setTimeout(async () => {
+        try {
+          if (this.animationFrameId !== null) {
+            cancelAnimationFrame(this.animationFrameId);
+            this.animationFrameId = null;
+          }
+          if (this.videoDecoder) await this.videoDecoder.flush();
+          if (this.videoRenderer) this.videoRenderer.clearQueue();
+          await this.audioDecoder.flush();
+          this.audioRenderer.reset();
+          if (!this.disableAudio) await this.audioRenderer.play();
+          if (this.videoRenderer) this.videoRenderer.startPresentationLoop();
+          this.processLoop();
+          Logger.debug(TAG, "Flushed video pipeline after returning to 1x on high-FPS content");
+        } catch (err) {
+          Logger.error(TAG, "1x recovery flush failed", err);
+        }
+      }, 100);
+    }
+    this._prevPlaybackRate = rate;
   }
 
   /**
