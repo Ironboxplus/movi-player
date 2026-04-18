@@ -24,7 +24,6 @@ export class FileSource implements SourceAdapter {
   private currentTime: number = 0;
   private duration: number = 0;
   private preloadOffset: number = 0; // Current byte offset being preloaded around
-  private playbackActive: boolean = false; // Whether playback is currently active
   private preloadAbort: boolean = false; // Signal to abort current preload cycle
 
   // Disk read stats
@@ -64,8 +63,6 @@ export class FileSource implements SourceAdapter {
 
     this.currentTime = currentTime;
     this.duration = duration;
-    this.playbackActive = true;
-
     // Let the initial preload finish — it's caching the file for smooth playback.
     // Don't restart or trigger new preloads during playback; demux reads via
     // readFromFile() already cache every chunk they touch as a fallback.
