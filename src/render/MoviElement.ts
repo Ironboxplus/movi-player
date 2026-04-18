@@ -863,7 +863,7 @@ export class MoviElement extends HTMLElement {
       <div class="movi-resume-text">Resume from <span class="movi-resume-time">0:00</span>?</div>
       <div class="movi-resume-buttons">
         <button class="movi-resume-btn movi-resume-yes">Resume</button>
-        <button class="movi-resume-btn movi-resume-no">Start Over</button>
+        <button class="movi-resume-btn movi-resume-no">Cancel</button>
       </div>
     `;
     shadowRoot.appendChild(resumeDialog);
@@ -882,9 +882,6 @@ export class MoviElement extends HTMLElement {
       e.stopPropagation();
       resumeDialog.style.display = "none";
       this.clearResumePosition();
-      if (this.player) {
-        this.player.seek(0).catch(() => {});
-      }
       this.focus();
     });
 
@@ -2458,7 +2455,7 @@ export class MoviElement extends HTMLElement {
         const noBtn = resumeDialog.querySelector(".movi-resume-no") as HTMLElement;
         if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
           e.preventDefault();
-          // Toggle focus between Resume and Start Over
+          // Toggle focus between Resume and Cancel
           // Toggle visual selection
           const yesSelected = yesBtn?.classList.contains("movi-resume-focused");
           yesBtn?.classList.toggle("movi-resume-focused", !yesSelected);
@@ -5158,9 +5155,9 @@ export class MoviElement extends HTMLElement {
         background: linear-gradient(to top, rgba(255, 255, 255, 0.4) 0%, transparent 30%) !important;
       }
 
-      /* Light Theme Title Bar */
+      /* Light Theme Title Bar — keep dark like dark theme for readability */
       :host([theme="light"]) .movi-title-bar {
-        background: linear-gradient(to bottom, rgba(255, 255, 255, 0.7) 0%, transparent 100%) !important;
+        background: linear-gradient(to bottom, rgba(0, 0, 0, 0.7) 0%, transparent 100%) !important;
       }
 
       /* Light Theme Progress Bar */
@@ -6786,23 +6783,23 @@ export class MoviElement extends HTMLElement {
         }
 
         .movi-btn {
-          padding: 6px;
-          width: 34px;
-          height: 34px;
+          padding: 8px;
+          width: 44px;
+          height: 44px;
         }
 
         .movi-btn svg {
-          width: 18px;
-          height: 18px;
-        }
-        
-        /* Show volume slider on mobile - user request */
-        .movi-volume-slider-container {
-          /* display: none !important; REMOVED */
+          width: 22px;
+          height: 22px;
         }
         
         .movi-volume-slider-container {
-          max-width: 50px;
+          display: none !important;
+        }
+
+        .movi-seek-backward,
+        .movi-seek-forward {
+          display: none !important;
         }
 
         .movi-progress-container {
@@ -8011,31 +8008,29 @@ export class MoviElement extends HTMLElement {
         }
       }
 
-      /* Narrow viewports (≤ iPhone 12 Pro ≈ 390px) — prevent controls bar overflow
-         and stop the center play button from overlapping the controls bar on
-         short 16:9 players. */
+      /* Narrow viewports (≤ 480px) — keep touch-friendly sizes */
       @media (max-width: 480px) {
         .movi-btn {
-          width: 30px !important;
-          height: 30px !important;
-          padding: 4px !important;
+          width: 40px !important;
+          height: 40px !important;
+          padding: 6px !important;
         }
         .movi-btn svg {
-          width: 16px !important;
-          height: 16px !important;
+          width: 20px !important;
+          height: 20px !important;
         }
         .movi-controls-left,
         .movi-controls-right {
-          gap: 1px !important;
-        }
-        .movi-buttons-row {
           gap: 2px !important;
         }
+        .movi-buttons-row {
+          gap: 4px !important;
+        }
         .movi-controls-bar {
-          padding: 4px 6px 6px !important;
+          padding: 4px 8px 6px !important;
         }
         .movi-time {
-          font-size: 9px !important;
+          font-size: 10px !important;
         }
 
         /* Center play button sized so it doesn't clip into controls bar
@@ -9214,8 +9209,9 @@ export class MoviElement extends HTMLElement {
       this.player = null;
     }
 
-    // Reset unsupported state on source change so new source can load
+    // Reset unsupported and loading state on source change so new source can load
     this._isUnsupported = false;
+    this.isLoading = false;
     if (this.brokenIndicator) this.brokenIndicator.style.display = "none";
 
     // Show empty state if no src after player cleanup

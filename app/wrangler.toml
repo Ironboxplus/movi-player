@@ -13,4 +13,4 @@ bucket_name = "movi-assets"
 
 [[rules]]
 type = "Text"
-globs = ["**/*.html"]
+globs = ["**/*.html", "**/*.xml", "**/*.txt"]

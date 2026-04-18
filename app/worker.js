@@ -1,7 +1,9 @@
 import HTML_RAW from "./index.html";
+import SITEMAP from "./sitemap.xml";
+import ROBOTS from "./robots.txt";
 
-const BUILD_VERSION = "1776507281";
-const HTML = HTML_RAW.replace(/1776507281/g, BUILD_VERSION);
+const BUILD_VERSION = "1776527774";
+const HTML = HTML_RAW.replace(/1776527774/g, BUILD_VERSION);
 
 const SECURITY_HEADERS = {
   "Cross-Origin-Opener-Policy": "same-origin",
@@ -49,9 +51,11 @@ export default {
       });
     }
 
-    // --- Serve dist files from R2 (strip query params for key lookup) ---
+    // --- Serve dist files from R2 (strip version prefix for key lookup) ---
     if (path.startsWith("/dist/")) {
-      const key = path.slice(6).split("?")[0];
+      const parts = path.slice(6).split("/");
+      // /dist/<version>/element.js → key = "element.js"
+      const key = parts.length > 1 ? parts.slice(1).join("/") : parts[0];
       return handleR2(env, key, request);
     }
 
@@ -63,6 +67,14 @@ export default {
     // --- Video proxy ---
     if (path === "/proxy") {
       return handleProxy(request, url);
+    }
+
+    // --- Sitemap & Robots ---
+    if (path === "/sitemap.xml") {
+      return new Response(SITEMAP, { headers: { "Content-Type": "application/xml", "Cache-Control": "public, max-age=86400" } });
+    }
+    if (path === "/robots.txt") {
+      return new Response(ROBOTS, { headers: { "Content-Type": "text/plain", "Cache-Control": "public, max-age=86400" } });
     }
 
     // --- Serve static assets from R2 (favicons, etc.) ---
@@ -94,7 +106,7 @@ movi-player{width:100%;height:100%;display:block}
 <body>
 <movi-player id="p" renderer="canvas" controls objectfit="control" gesturefs fastseek stablevolume${autoplay ? " autoplay" : ""}></movi-player>
 <script type="module">
-import "/dist/element.js?v=${BUILD_VERSION}";
+import "/dist/${BUILD_VERSION}/element.js";
 const p=document.getElementById("p");
 const url="${videoUrl.replace(/"/g, "&quot;")}";
 if(url) p.src="/proxy?url="+encodeURIComponent(url);

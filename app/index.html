@@ -288,6 +288,16 @@
         padding-bottom: 3rem;
         overflow: hidden;
         text-align: center;
+        z-index: 1;
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(to bottom, var(--bg-base) 80%, transparent 100%);
+        z-index: 1;
+        pointer-events: none;
       }
 
       .hero-bg {
@@ -517,7 +527,7 @@
       .url-bar {
         display: flex;
         align-items: center;
-        background: rgba(15, 15, 20, 0.9);
+        background: var(--input-bg);
         border: 1px solid rgba(124, 108, 240, 0.15);
         border-radius: 8px;
         overflow: hidden;
@@ -633,8 +643,13 @@
         margin-top: 0;
       }
 
+      .player-section::before {
+        display: none;
+      }
+
       .player-wrapper {
         position: relative;
+        z-index: 2;
         max-width: 1200px;
         margin: 0 auto;
         border-radius: 16px;
@@ -708,6 +723,10 @@
         opacity: 0.5;
         filter: blur(100px);
         transition: opacity 1s ease;
+      }
+
+      [data-theme="light"] #ambient-wrapper {
+        opacity: 0.15;
       }
 
       /* ===== FEATURES SECTION ===== */
@@ -1186,7 +1205,7 @@
 
     <!-- Movi Player from CDN -->
     <script type="module">
-      import "/dist/element.js?v=__BUILD_VERSION__";
+      import "/dist/__BUILD_VERSION__/element.js";
 
       const urlInput = document.getElementById("url-input");
       const loadBtn = document.getElementById("load-btn");
@@ -1353,6 +1372,22 @@
       });
 
       applyTheme(currentMode);
+
+      // Forward document keyboard events to player
+      document.addEventListener("keydown", (e) => {
+        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) return;
+        if (!player || !player.shadowRoot) return;
+        // Skip if player or its shadow DOM already has focus
+        if (document.activeElement === player || player.contains(e.target)) return;
+        player.dispatchEvent(new KeyboardEvent("keydown", {
+          key: e.key, code: e.code, keyCode: e.keyCode,
+          shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey,
+          bubbles: true, cancelable: true
+        }));
+        if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) {
+          e.preventDefault();
+        }
+      });
     </script>
   </body>
 </html>
