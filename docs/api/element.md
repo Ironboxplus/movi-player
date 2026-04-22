@@ -479,17 +479,22 @@ Sets a custom primary color for the player UI (progress bar, buttons, accents).
 
 #### `buffersize`
 
-Sets custom buffer size in seconds.
+Target prefetch window in **megabytes** — how far ahead of playback the source should try to keep buffered.
 
 ```html
-<movi-player src="video.mp4" buffersize="30"></movi-player>
+<movi-player src="video.mp4" buffersize="200"></movi-player>
 ```
 
-**Value:** Number of seconds to buffer ahead.
+**Value:** Target buffer depth in MB.
 
-**Default:** Auto (based on connection quality).
+**Default:** `250` for plain HTTP (sliding window at 8% of file size, capped at 250 MB); `~192` for encrypted mode (prefetch high-water × 2 MB block size).
 
-**Use Case:** Increase for unstable connections, decrease to reduce memory usage.
+**Behavior:**
+- **HTTP source** — overrides the sliding-window cap. Files smaller than this value are cached entirely; larger files use a sliding window.
+- **Encrypted source** — scales the prefetch depth (`PREFETCH_HIGH_WATER`), refill threshold (`LOW_WATER` ≈ half), and block cache cap (≈ 1.5× target).
+- **File source** — no-op (entire file already in memory).
+
+**Use Case:** Raise for deep-scrub UX on large files; lower for memory-constrained embeds.
 
 ---
 
@@ -836,11 +841,11 @@ player.themecolor = null; // Reset to default
 
 #### `buffersize: number`
 
-Gets/sets custom buffer size in seconds.
+Gets/sets the target prefetch window in **megabytes**. Applies to both HTTP and encrypted sources; file sources ignore it.
 
 ```typescript
-player.buffersize = 30; // Buffer 30 seconds ahead
-player.buffersize = 0; // Auto buffer size
+player.buffersize = 400; // Keep ~400 MB buffered ahead
+player.buffersize = 0;   // Restore library default
 ```
 
 ---

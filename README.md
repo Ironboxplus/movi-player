@@ -215,7 +215,7 @@ Use cases: video validators, asset management, HDR detection pipelines, search i
   startat="30"              <!-- Start at time (seconds) -->
   resume                    <!-- Resume from last position -->
   stablevolume              <!-- Loudness normalization -->
-  buffersize="30"           <!-- Custom buffer size (seconds) -->
+  buffersize="200"          <!-- Max prefetch window in MB (HTTP + encrypted) -->
   renderer="canvas"         <!-- canvas | mse -->
   sw                        <!-- Force software decoding -->
   fps="60"                  <!-- Override frame rate -->

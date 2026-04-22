@@ -517,10 +517,23 @@
 
       .hero-actions {
         display: flex;
+        flex-wrap: wrap;
         gap: 0.75rem;
         align-items: center;
         justify-content: center;
         width: 100%;
+      }
+
+      /* URL bar always occupies its own full-width row so the input
+         stays readable regardless of how many ghost buttons (Open File,
+         Open Folder, Embed) are visible underneath it. Scoped to the
+         desktop layout — the ≤ 768px media query already turns
+         .hero-actions into a column and stretches every child. */
+      @media (min-width: 769px) {
+        .hero-actions > .url-bar {
+          flex: 1 1 100%;
+          max-width: 100%;
+        }
       }
 
       /* URL Input Bar - Netflix style search */
@@ -543,7 +556,8 @@
       }
 
       .url-bar input {
-        flex: 1;
+        flex: 1 1 0;
+        min-width: 0;
         background: transparent;
         border: none;
         padding: 0.875rem 1rem;
@@ -557,13 +571,31 @@
         color: var(--input-placeholder);
       }
 
+      /* Chrome/Safari autofill otherwise paints its own yellow/white
+         background over the input and there's no plain `background`
+         override for it — the only lever is a massive inset box-shadow
+         that drowns out the UA color, plus -webkit-text-fill-color to
+         keep the filled text legible on our dark theme. */
+      .url-bar input:-webkit-autofill,
+      .url-bar input:-webkit-autofill:hover,
+      .url-bar input:-webkit-autofill:focus,
+      .url-bar input:-webkit-autofill:active {
+        -webkit-box-shadow: 0 0 0 1000px var(--input-bg) inset;
+        -webkit-text-fill-color: var(--input-text);
+        caret-color: var(--input-text);
+        transition: background-color 9999s ease-in-out 0s;
+      }
+      .url-bar:focus-within input:-webkit-autofill {
+        -webkit-box-shadow: 0 0 0 1000px var(--input-focus-bg) inset;
+      }
+
       .url-bar-btn {
         background: var(--accent);
         border: none;
         color: #fff;
-        padding: 0 1.5rem;
-        height: 100%;
+        padding: 0 1.25rem;
         min-height: 48px;
+        flex-shrink: 0;
         cursor: pointer;
         display: flex;
         align-items: center;
@@ -578,6 +610,56 @@
       .url-bar-btn:hover {
         background: var(--accent-hover);
         box-shadow: inset 0 0 20px rgba(255, 255, 255, 0.1);
+      }
+
+      .url-bar-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        margin: 0 0.5rem 0 0.25rem;
+        padding: 0.35rem 0.7rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+        color: var(--text-muted);
+        background: rgba(124, 108, 240, 0.06);
+        border: 1px solid rgba(124, 108, 240, 0.14);
+        cursor: pointer;
+        user-select: none;
+        white-space: nowrap;
+        flex-shrink: 0;
+        transition: color 0.15s, background 0.15s, border-color 0.15s;
+      }
+
+      .url-bar-toggle input {
+        appearance: none;
+        -webkit-appearance: none;
+        margin: 0;
+        width: 0;
+        height: 0;
+        opacity: 0;
+        position: absolute;
+      }
+
+      .url-bar-toggle svg {
+        opacity: 0.7;
+        transition: opacity 0.15s, color 0.15s;
+      }
+
+      .url-bar-toggle:hover {
+        color: var(--text-secondary);
+        background: rgba(124, 108, 240, 0.1);
+        border-color: rgba(124, 108, 240, 0.2);
+      }
+
+      .url-bar-toggle:has(input:checked) {
+        color: var(--accent);
+        background: rgba(124, 108, 240, 0.16);
+        border-color: rgba(124, 108, 240, 0.4);
+      }
+
+      .url-bar-toggle:has(input:checked) svg {
+        opacity: 1;
       }
 
       /* Primary CTA button */
@@ -941,6 +1023,25 @@
         letter-spacing: 0.6px;
       }
 
+      /* High-frame-rate badge (≥ 50 fps). Mirrors the HDR badge style
+         in the opposite corner so the two can coexist without
+         overlapping — HDR stays top-left, FPS sits top-right. Cyan
+         picked to read as "smooth motion" without clashing with the
+         red HDR accent. */
+      .playlist-thumb-fps {
+        position: absolute;
+        right: 5px;
+        top: 5px;
+        padding: 2px 6px;
+        font-size: 0.58rem;
+        line-height: 1;
+        color: #fff;
+        background: #0ea5e9;
+        border-radius: 999px;
+        font-weight: 700;
+        letter-spacing: 0.6px;
+      }
+
       .playlist-thumb-progress {
         position: absolute;
         left: 0;
@@ -1080,16 +1181,34 @@
         background: #fff;
       }
 
+      /* Switch to stacked (player-on-top, playlist-below) once the
+         side-by-side layout runs out of comfortable width — 900 px is
+         the minimum where 380 px playlist + ~500 px player + gaps still
+         feel balanced. Below that we stack. */
       @media (max-width: 900px) {
         .player-layout,
         .player-layout.has-playlist {
           flex-direction: column;
+          align-items: center;
           max-width: 1200px;
+        }
+
+        /* Cap both player and playlist at a comfortable reading width
+           in stacked mode — the container can still grow to 1200 px,
+           but the video shouldn't stretch that wide on a tablet and
+           the playlist shouldn't either. `align-items: center` above
+           defeats the usual stretch, so the explicit width:100% plus
+           max-width gives us centered, capped panels. */
+        .player-layout .player-wrapper,
+        .player-layout.has-playlist .player-wrapper {
+          width: 100%;
+          max-width: 960px;
         }
 
         .playlist-panel {
           width: 100%;
-          max-height: 360px;
+          max-width: 960px;
+          max-height: 420px;
         }
       }
 
@@ -1488,6 +1607,14 @@
               placeholder="Paste a video URL..."
               aria-label="Video URL"
             />
+            <label class="url-bar-toggle" id="encrypt-toggle-label" title="Route the URL through a signed token proxy — hides the source URL and requires auth per request.">
+              <input type="checkbox" id="encrypt-toggle" />
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+              </svg>
+              <span>Protected</span>
+            </label>
             <button class="url-bar-btn" id="load-btn">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <polygon points="5 3 19 12 5 21 5 3"></polygon>
@@ -1669,6 +1796,7 @@
 
       const urlInput = document.getElementById("url-input");
       const loadBtn = document.getElementById("load-btn");
+      const encryptToggle = document.getElementById("encrypt-toggle");
       const fileInput = document.getElementById("file-input");
       const folderBtn = document.getElementById("folder-btn");
       const folderInputFallback = document.getElementById("folder-input-fallback");
@@ -1684,6 +1812,32 @@
       const playlistAutoplayEl = document.getElementById("playlist-autoplay");
       let currentVideoUrl = "";
       const defaultTitle = document.title;
+
+      // Safari-only autoplay primer. See the playlist click handler for
+      // the full explanation — short version: Safari binds AudioContext
+      // resume permission to the live user-gesture call stack, but
+      // MoviPlayer's init chain is async, so its own AudioContext gets
+      // created long after the gesture window has closed. Creating and
+      // resuming a throwaway AudioContext while the click is still live
+      // flips the tab's audio permission to granted, which carries over
+      // to MoviPlayer's context (newly-created contexts inherit the
+      // "running" default once the tab has been unlocked once).
+      //
+      // Chrome doesn't gate on this, so running the primer there is a
+      // no-op at worst. The primer is kept alive (not close()'d) so a
+      // single call unlocks the tab for the whole session — subsequent
+      // playlist clicks just resume() the same instance.
+      let _audioPrimer = null;
+      const primeAudioForSafari = () => {
+        try {
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (!Ctx) return;
+          if (!_audioPrimer) _audioPrimer = new Ctx();
+          if (_audioPrimer.state !== "running") {
+            _audioPrimer.resume().catch(() => {});
+          }
+        } catch { /* noop */ }
+      };
 
       const updateTitle = (name) => {
         document.title = name ? `${name} - MoviPlayer` : defaultTitle;
@@ -1701,20 +1855,143 @@
       // --- URL Loading (via proxy for CORS bypass) ---
       const proxyUrl = (url) => `/proxy?url=${encodeURIComponent(url)}`;
 
+      // ── Turnstile session gate (optional) ──────────────────────────
+      // Injected from env.TURNSTILE_SITE_KEY at request time. If empty
+      // Turnstile is disabled (dev mode) — ensureEncSession() becomes a
+      // no-op and the server /api/token endpoint falls open.
+      const TURNSTILE_SITE_KEY = "__TURNSTILE_SITE_KEY__";
+      const turnstileEnabled = !!TURNSTILE_SITE_KEY;
+      let encSessionJwt = null;
+      let encSessionExpiresAt = 0;
+
+      const loadTurnstileScript = () => new Promise((resolve, reject) => {
+        if (window.turnstile) return resolve();
+        const s = document.createElement("script");
+        s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+        s.async = true;
+        s.defer = true;
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("Failed to load Turnstile"));
+        document.head.appendChild(s);
+      });
+
+      const getTurnstileToken = async () => {
+        await loadTurnstileScript();
+        // Lazily create a hidden container on first use.
+        let host = document.getElementById("turnstile-host");
+        if (!host) {
+          host = document.createElement("div");
+          host.id = "turnstile-host";
+          host.style.cssText = "position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden";
+          document.body.appendChild(host);
+        }
+        return new Promise((resolve, reject) => {
+          try {
+            const widgetId = window.turnstile.render(host, {
+              sitekey: TURNSTILE_SITE_KEY,
+              size: "invisible",
+              callback: (token) => {
+                try { window.turnstile.remove(widgetId); } catch {}
+                resolve(token);
+              },
+              "error-callback": () => {
+                try { window.turnstile.remove(widgetId); } catch {}
+                reject(new Error("Turnstile error"));
+              },
+              "timeout-callback": () => {
+                try { window.turnstile.remove(widgetId); } catch {}
+                reject(new Error("Turnstile timeout"));
+              },
+            });
+            window.turnstile.execute(widgetId);
+          } catch (err) {
+            reject(err);
+          }
+        });
+      };
+
+      const ensureEncSession = async () => {
+        if (!turnstileEnabled) return null;
+        // Refresh 60s before expiry so in-flight /api/token calls don't
+        // race the JWT expiring.
+        if (encSessionJwt && Date.now() + 60_000 < encSessionExpiresAt) {
+          return encSessionJwt;
+        }
+        const turnstileToken = await getTurnstileToken();
+        const res = await fetch("/api/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ turnstileToken }),
+        });
+        if (!res.ok) {
+          throw new Error("Session minting failed: " + res.status);
+        }
+        const data = await res.json();
+        encSessionJwt = data.sessionJwt;
+        encSessionExpiresAt = data.expiresAt;
+        return encSessionJwt;
+      };
+
+      // Remember the "Protected" toggle across reloads.
+      try {
+        if (localStorage.getItem("enc-toggle") === "1") {
+          encryptToggle.checked = true;
+        }
+      } catch { /* noop */ }
+      encryptToggle.addEventListener("change", () => {
+        try {
+          localStorage.setItem("enc-toggle", encryptToggle.checked ? "1" : "0");
+        } catch { /* noop */ }
+      });
+
+      const loadUrlEncrypted = async (url) => {
+        clearPlaylist();
+        player.removeAttribute("poster");
+        player.removeAttribute("postertime");
+        // Get/refresh a Turnstile-backed session JWT before starting the
+        // encrypted pipeline. If Turnstile isn't configured this resolves
+        // to null and sessionToken stays empty (server falls open too).
+        try {
+          const jwt = await ensureEncSession();
+          if (jwt) player.setAttribute("sessiontoken", jwt);
+          else player.removeAttribute("sessiontoken");
+        } catch (err) {
+          console.error("Session challenge failed:", err);
+          return;
+        }
+        player.setAttribute("tokenurl", "/api/token");
+        player.setAttribute("videourl", "/api/video");
+        // MoviElement sends `videoid` as the `videoId` field in the token
+        // request body. Worker accepts it as the upstream URL.
+        player.setAttribute("videoid", url);
+        player.setAttribute("encrypted", "");
+        player.load?.().catch((err) => console.error("Encrypted load failed:", err));
+        currentVideoUrl = url;
+        embedBtn.classList.add("visible");
+        scrollToPlayer();
+      };
+
       const loadUrl = () => {
         const url = urlInput.value.trim();
         if (!url) {
           urlInput.focus();
           return;
         }
-        if (player) {
-          clearPlaylist();
-          currentVideoUrl = url;
-          player.src = proxyUrl(url);
-          embedBtn.classList.add("visible");
-          // Scroll to player
-          scrollToPlayer();
+        if (!player) return;
+
+        if (encryptToggle?.checked) {
+          loadUrlEncrypted(url);
+          return;
         }
+
+        clearPlaylist();
+        // Leaving encrypted mode: strip any leftover attributes so the
+        // next initializePlayer takes the plain /proxy path.
+        player.removeAttribute("encrypted");
+        currentVideoUrl = url;
+        player.src = proxyUrl(url);
+        embedBtn.classList.add("visible");
+        scrollToPlayer();
       };
 
       loadBtn.addEventListener("click", loadUrl);
@@ -1838,7 +2115,20 @@
           hdrOverlay.remove();
         }
 
+        let fpsOverlay = thumbEl.querySelector(".playlist-thumb-fps");
+        if (meta?.isHighFps && meta?.frameRate) {
+          if (!fpsOverlay) {
+            fpsOverlay = document.createElement("span");
+            fpsOverlay.className = "playlist-thumb-fps";
+            thumbEl.appendChild(fpsOverlay);
+          }
+          fpsOverlay.textContent = `${Math.round(meta.frameRate)} FPS`;
+        } else if (fpsOverlay) {
+          fpsOverlay.remove();
+        }
+
         li.classList.toggle("is-hdr", !!meta?.isHDR);
+        li.classList.toggle("is-highfps", !!meta?.isHighFps);
 
         applyItemProgress(li, file);
 
@@ -1928,6 +2218,7 @@
           // "loading", "seeking" etc., which would incorrectly autoplay the
           // new item the first time the user clicks into the playlist.
           const wasPlaying = !!player?.playing;
+          if (wasPlaying) primeAudioForSafari();
           playPlaylistItem(i, { autoplay: wasPlaying });
         });
         applyItemMeta(li, file);
@@ -2074,6 +2365,14 @@
             streamInfo.colorTransfer === "smpte2084" ||
             streamInfo.colorTransfer === "arib-std-b67" ||
             streamInfo.colorPrimaries === "bt2020";
+          // High-frame-rate detection — standard/cinematic content is
+          // 24/25/30 fps, so anything at 50+ is worth surfacing with a
+          // badge the same way HDR is. Round to the nearest integer
+          // for display because most sources report fractional rates
+          // (29.97, 59.94 etc.) and users don't care about the
+          // fraction.
+          const frameRate = streamInfo.frameRate || 0;
+          const isHighFps = frameRate >= 50;
 
           // Displayed dimensions after rotation — use these for the UI badge
           // (a portrait video stored as landscape with rotation=90 is shown to
@@ -2085,6 +2384,7 @@
           fileMeta.set(file, {
             ...(fileMeta.get(file) || {}),
             duration, width: displayW, height: displayH, codec, isHDR,
+            frameRate, isHighFps,
           });
           const idx = playlist.indexOf(file);
           if (idx >= 0 && playlistItemEls[idx]) applyItemMeta(playlistItemEls[idx], file);
@@ -2368,7 +2668,68 @@
       // --- Auto-play from URL params ---
       const params = new URLSearchParams(window.location.search);
       const videoUrl = params.get("url");
-      if (videoUrl && player) {
+
+      // Encrypted playback via EncryptedHttpSource.
+      //
+      // Simple mode (same-origin — recommended):
+      //   ?encrypted=1&videoid=<ID>
+      //   Worker serves /api/token + /api/video from the ENC R2 bucket.
+      //
+      // BYO-server mode (point at an external encrypted backend):
+      //   ?encrypted=1
+      //   &tokenurl=<TOKEN_ENDPOINT>
+      //   &videourl=<VIDEO_ENDPOINT>
+      //   &videoid=<ID>
+      //   &encproxy=0                ← optional; default on
+      //
+      // Cross-origin token/video URLs are routed through /eproxy by default
+      // so the upstream doesn't need to set CORS + CORP headers for this
+      // origin specifically. Pass encproxy=0 to hit the upstream directly.
+      const encFlag = params.get("encrypted");
+      const encVideoId = params.get("videoid");
+      const encTokenUrl = params.get("tokenurl") || "/api/token";
+      const encVideoUrl = params.get("videourl") || "/api/video";
+      const encProxyFlag = params.get("encproxy");
+      const useEncProxy = encProxyFlag !== "0" && encProxyFlag !== "false";
+      const isEncrypted = (encFlag === "1" || encFlag === "true") && encVideoId;
+
+      const wrapEncUrl = (u) => {
+        try {
+          const parsed = new URL(u, window.location.href);
+          // Same-origin: no need to proxy (hits the worker directly)
+          if (parsed.origin === window.location.origin) return u;
+          if (!useEncProxy) return u;
+          return `/eproxy?url=${encodeURIComponent(u)}`;
+        } catch {
+          return u;
+        }
+      };
+
+      if (isEncrypted && player) {
+        clearPlaylist();
+        // Same session-JWT flow as the manual Load button so Turnstile
+        // gates the auto-start path too.
+        (async () => {
+          try {
+            const jwt = await ensureEncSession();
+            if (jwt) player.setAttribute("sessiontoken", jwt);
+          } catch (err) {
+            console.error("Session challenge failed:", err);
+            return;
+          }
+          player.setAttribute("tokenurl", wrapEncUrl(encTokenUrl));
+          player.setAttribute("videourl", wrapEncUrl(encVideoUrl));
+          player.setAttribute("videoid", encVideoId);
+          player.setAttribute("encrypted", "");
+          // MoviElement's attributeChangedCallback just stores these values —
+          // it doesn't auto-kick off the encrypted pipeline. Call load() to
+          // trigger initializePlayer() which routes to loadEncrypted when
+          // the encrypted flag + token/video URLs are all set.
+          player.load?.().catch((err) => console.error("Encrypted load failed:", err));
+          urlInput.value = `[encrypted: ${encVideoId}]`;
+          urlInput.disabled = true;
+        })();
+      } else if (videoUrl && player) {
         currentVideoUrl = videoUrl;
         urlInput.value = videoUrl;
         player.src = proxyUrl(videoUrl);

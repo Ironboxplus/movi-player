@@ -106,6 +106,26 @@ export class HttpSource implements SourceAdapter {
   }
 
   /**
+   * Override the maximum buffer size cap at runtime. Takes effect on the
+   * next resizeBuffer() call (typically the post-resolveSize pass) — and
+   * immediately re-runs the buffer-sizing logic if a size is already
+   * known, so UI attribute changes reflect without needing a reload.
+   * Pass a number of megabytes. 0 or negative values are ignored.
+   */
+  setMaxBufferSize(megabytes: number): void {
+    if (!(megabytes > 0)) return;
+    this.maxBufferSizeMB = megabytes;
+    if (this.size > 0) {
+      const maxBufferBytes = megabytes * 1024 * 1024;
+      const canCacheEntireFile = this.size <= maxBufferBytes;
+      const calculatedBufferSize = canCacheEntireFile
+        ? this.size
+        : Math.floor(this.size * BUFFER_PERCENTAGE);
+      this.resizeBuffer(calculatedBufferSize);
+    }
+  }
+
+  /**
    * Resize buffer based on file size (3% of file, clamped to min/max)
    */
   private resizeBuffer(newSize: number): void {
@@ -240,64 +260,100 @@ export class HttpSource implements SourceAdapter {
     }
   }
 
+  // ─── Subclass extension points ─────────────────────────────────
+  //
+  // Subclasses (e.g. EncryptedHttpSource) override these to swap out the
+  // "how do we learn the size" and "what headers go on every request"
+  // policies while inheriting the rest of HttpSource's streaming engine —
+  // SharedArrayBuffer, sliding window, background prefetch, compaction,
+  // retry/backoff, stream error handling, etc.
+
+  /**
+   * Resolve the total file size. Default implementation issues a HEAD
+   * request and parses Content-Length + Content-Disposition. Override to
+   * source the size from elsewhere (auth token response, database, etc.);
+   * throw on failure.
+   */
+  protected async resolveSize(): Promise<number> {
+    const response = await fetch(this.url, {
+      method: "HEAD",
+      headers: await this.buildRequestHeaders(),
+    });
+
+    if (!response.ok) {
+      if (response.status === 403) throw new Error("Access denied. Check video permissions.");
+      if (response.status === 401) throw new Error("Authentication required.");
+      if (response.status === 404) throw new Error("Video not found.");
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const contentLength = response.headers.get("Content-Length");
+    if (!contentLength) throw new Error("Content-Length missing");
+
+    // Extract filename from Content-Disposition header (e.g., "attachment; filename=\"video.mp4\"")
+    const disposition = response.headers.get("Content-Disposition");
+    if (disposition) {
+      // Try filename*= (RFC 5987 encoded) first, then filename=
+      let filenameMatch = disposition.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)/i);
+      if (filenameMatch) {
+        try {
+          this._contentDispositionFilename = decodeURIComponent(filenameMatch[1]);
+        } catch { /* ignore decode error */ }
+      }
+      if (!this._contentDispositionFilename) {
+        // Try quoted filename first (allows spaces inside quotes)
+        filenameMatch = disposition.match(/filename\s*=\s*"([^"]+)"/i);
+        if (!filenameMatch) {
+          // Unquoted: capture everything until semicolon or end, then trim
+          filenameMatch = disposition.match(/filename\s*=\s*([^;]+)/i);
+        }
+        if (filenameMatch) {
+          const raw = filenameMatch[1].trim();
+          try {
+            this._contentDispositionFilename = decodeURIComponent(raw);
+          } catch {
+            this._contentDispositionFilename = raw;
+          }
+        }
+      }
+      if (this._contentDispositionFilename) {
+        Logger.debug(TAG, `Content-Disposition filename: ${this._contentDispositionFilename}`);
+      }
+    }
+
+    return parseInt(contentLength, 10);
+  }
+
+  /**
+   * Build the HTTP headers used for every outbound request (HEAD, range
+   * GET, stream GET). Default implementation just returns the static
+   * headers provided to the constructor. Override to inject per-request
+   * auth/signing headers (token, HMAC signature, nonce, timestamp, ...);
+   * note this is called many times across a playback session, so any
+   * expensive work should be cached/memoised by the subclass.
+   *
+   * @param range Optional byte range the caller will request. Subclasses
+   *              that sign the range (e.g. HMAC over `offset/length`) need
+   *              this; pass-through callers can ignore it.
+   */
+  protected async buildRequestHeaders(
+    range?: { offset: number; length: number },
+  ): Promise<Record<string, string>> {
+    if (range) {
+      return {
+        ...this.headers,
+        Range: `bytes=${range.offset}-${range.offset + range.length - 1}`,
+      };
+    }
+    return { ...this.headers };
+  }
+
   async getSize(): Promise<number> {
     if (this.size >= 0) return this.size;
 
     try {
-      const response = await fetch(this.url, {
-        method: "HEAD",
-        headers: this.headers,
-      });
-
-      if (!response.ok) {
-        // Provide specific error messages for common status codes
-        if (response.status === 403) {
-          throw new Error("Access denied. Check video permissions.");
-        } else if (response.status === 401) {
-          throw new Error("Authentication required.");
-        } else if (response.status === 404) {
-          throw new Error("Video not found.");
-        } else {
-          throw new Error(`HTTP ${response.status}`);
-        }
-      }
-
-      const contentLength = response.headers.get("Content-Length");
-      if (!contentLength) throw new Error("Content-Length missing");
-
-      this.size = parseInt(contentLength, 10);
+      this.size = await this.resolveSize();
       Logger.debug(TAG, `File size: ${this.size} bytes`);
-
-      // Extract filename from Content-Disposition header (e.g., "attachment; filename=\"video.mp4\"")
-      const disposition = response.headers.get("Content-Disposition");
-      if (disposition) {
-        // Try filename*= (RFC 5987 encoded) first, then filename=
-        let filenameMatch = disposition.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)/i);
-        if (filenameMatch) {
-          try {
-            this._contentDispositionFilename = decodeURIComponent(filenameMatch[1]);
-          } catch { /* ignore decode error */ }
-        }
-        if (!this._contentDispositionFilename) {
-          // Try quoted filename first (allows spaces inside quotes)
-          filenameMatch = disposition.match(/filename\s*=\s*"([^"]+)"/i);
-          if (!filenameMatch) {
-            // Unquoted: capture everything until semicolon or end, then trim
-            filenameMatch = disposition.match(/filename\s*=\s*([^;]+)/i);
-          }
-          if (filenameMatch) {
-            const raw = filenameMatch[1].trim();
-            try {
-              this._contentDispositionFilename = decodeURIComponent(raw);
-            } catch {
-              this._contentDispositionFilename = raw;
-            }
-          }
-        }
-        if (this._contentDispositionFilename) {
-          Logger.debug(TAG, `Content-Disposition filename: ${this._contentDispositionFilename}`);
-        }
-      }
 
       // Buffer sizing strategy (YouTube-like):
       // - Files <= 250MB: cache entire file (instant seek/replay, zero re-fetch)
@@ -312,9 +368,6 @@ export class HttpSource implements SourceAdapter {
         TAG,
         `Buffer: ${(this.bufferSize / 1024 / 1024).toFixed(1)}MB ${canCacheEntireFile ? '(full file cache)' : `(${(BUFFER_PERCENTAGE * 100)}% sliding window)`} for ${(this.size / 1024 / 1024).toFixed(1)}MB file`,
       );
-
-      // Start caching using the known file size to optimal calculation
-      // this.ensureHeadCache();
 
       return this.size;
     } catch (error) {
@@ -453,10 +506,10 @@ export class HttpSource implements SourceAdapter {
         // Fetch with bounded range
         Logger.debug(TAG, `Fetching range: ${resumeOffset}-${rangeEnd} (max ${(maxDownload / 1024 / 1024).toFixed(1)}MB)`);
         const response = await fetch(this.url, {
-          headers: {
-            ...this.headers,
-            Range: `bytes=${resumeOffset}-${rangeEnd}`,
-          },
+          headers: await this.buildRequestHeaders({
+            offset: resumeOffset,
+            length: rangeEnd - resumeOffset + 1,
+          }),
           cache: 'no-store', // Prevent cached 200 responses
           signal: this.abortController!.signal,
         });
@@ -1040,11 +1093,10 @@ export class HttpSource implements SourceAdapter {
       Logger.info(TAG, `Read: one-off range fetch for offset=${offset}, length=${length} (gap=${(gap / 1024).toFixed(0)}KB, main stream continues)`);
       try {
         const rangeEnd = Math.min(offset + length - 1, this.size - 1);
-        const headers: Record<string, string> = {
-          ...this.headers,
-          Range: `bytes=${offset}-${rangeEnd}`,
-        };
-        const response = await fetch(this.url, { headers });
+        const rangeLen = rangeEnd - offset + 1;
+        const response = await fetch(this.url, {
+          headers: await this.buildRequestHeaders({ offset, length: rangeLen }),
+        });
         if (response.ok || response.status === 206) {
           const arrayBuffer = await response.arrayBuffer();
           const data = new Uint8Array(arrayBuffer);

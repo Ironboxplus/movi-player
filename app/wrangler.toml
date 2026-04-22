@@ -11,6 +11,75 @@ routes = [
 binding = "ASSETS"
 bucket_name = "movi-assets"
 
+# Master HMAC secret for the URL-gated token proxy. Tokens embed the
+# client's chosen upstream URL in a signed payload, so the worker needs
+# this secret to verify incoming /api/video requests. Set with:
+#   wrangler secret put ENC_SERVER_SECRET
+# For local dev, add to .dev.vars instead (auto-loaded by wrangler dev).
+#
+# ─── Turnstile (OPTIONAL — skip entirely if you don't want bot protection) ─
+# Cloudflare Turnstile gates /api/token to keep bots from draining your
+# token quota. Completely optional for forks — leaving both vars unset
+# makes the worker fall open with a warning log, and everything else
+# works normally. Free tier covers unlimited requests, no plan upgrade
+# needed.
+#
+# If you DO want it, set BOTH vars (partial setup breaks the flow —
+# server enforces but client has no site key to solve the challenge):
+#
+#   wrangler secret put TURNSTILE_SECRET_KEY   # from Cloudflare dashboard
+#   # TURNSTILE_SITE_KEY goes in the [vars] block below or the dashboard
+#
+# Get keys: https://dash.cloudflare.com → Turnstile → Add site.
+# Test keys for local dev (always pass, no network call):
+#   site:   1x00000000000000000000AA
+#   secret: 1x0000000000000000000000000000000AA
+
+# Durable Object for nonce replay protection. Single global instance
+# ("global") tracks recently-seen request nonces so a captured signed
+# tuple can't be replayed within the skew window. Requires the paid
+# Workers plan; custom-domain routes already imply that.
+[[durable_objects.bindings]]
+name = "NONCE_TRACKER"
+class_name = "NonceTracker"
+
+# Rotating wrap-key store. Holds the current + previous epoch's 32-byte
+# random key used to AES-seal the ephemeral ECDH private key inside each
+# token. Rotates hourly — provides forward secrecy even if
+# ENC_SERVER_SECRET leaks later.
+[[durable_objects.bindings]]
+name = "WRAP_KEY_STORE"
+class_name = "WrapKeyStore"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["NonceTracker", "WrapKeyStore"]
+
 [[rules]]
 type = "Text"
 globs = ["**/*.html", "**/*.xml", "**/*.txt"]
+
+# ─── Rate limits (manual setup in Cloudflare dashboard) ────────────────
+# Workers doesn't expose per-route rate limiting in wrangler.toml — it
+# has to be configured via the "Security → WAF → Rate limiting rules"
+# dashboard on the moviplayer.com zone. Recommended rules:
+#
+#   1. Path: /api/session
+#      Period: 1 minute     Threshold: 5 requests    Action: block 10 min
+#      Characteristics: IP + User-Agent
+#      Purpose: cap Turnstile solve attempts (one solve per session per hour)
+#
+#   2. Path: /api/token
+#      Period: 1 minute     Threshold: 120 requests  Action: block 10 min
+#      Characteristics: IP
+#      Purpose: 30s token TTL × safety multiplier = ~2 refresh/min per tab
+#
+#   3. Path: /api/video
+#      Period: 1 minute     Threshold: 60 requests   Action: managed_challenge
+#      Characteristics: IP + token (URL arg)
+#      Purpose: streaming fetches are long-lived; 60/min is >10× normal
+#
+#   4. Path: /proxy or /eproxy
+#      Period: 1 minute     Threshold: 60 requests   Action: managed_challenge
+#      Characteristics: IP
+#      Purpose: general scraping cap

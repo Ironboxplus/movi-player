@@ -8462,7 +8462,9 @@ export class MoviElement extends HTMLElement {
         break;
       case "buffersize":
         this._bufferSize = newValue ? parseFloat(newValue) : 0;
-        // Propagate to player if possible
+        if (this._bufferSize > 0) {
+          this.player?.setMaxBufferSize(this._bufferSize);
+        }
         break;
       case "title":
         if (this._stripTitleAttr) {
@@ -8945,6 +8947,12 @@ export class MoviElement extends HTMLElement {
       // Load the video
       if (this.player) {
         await this.player.load();
+        // Apply any `buffersize` attribute set on the element before
+        // load() — the source only exists after load() resolves, so
+        // the attributeChangedCallback path couldn't have reached it.
+        if (this._bufferSize > 0) {
+          this.player.setMaxBufferSize(this._bufferSize);
+        }
       }
 
       // Check for software decoding fallback (only for MoviPlayer/Canvas mode)
@@ -10491,6 +10499,9 @@ export class MoviElement extends HTMLElement {
 
       this.setupEventHandlers();
       await this.player.load();
+      if (this._bufferSize > 0) {
+        this.player.setMaxBufferSize(this._bufferSize);
+      }
 
       // Apply all element properties (same as initializePlayer)
       this.updateVolume();
@@ -11805,8 +11816,13 @@ export class MoviElement extends HTMLElement {
       this.player &&
       this.duration > 0
     ) {
-      // Title priority: Metadata → Content-Disposition → URL filename
-      if (this._src) {
+      // Title priority: Metadata → Content-Disposition → URL filename.
+      // Encrypted mode doesn't set `_src` (URL lives in `videoid`), so
+      // allow the block to run there too.
+      const haveTitleSource =
+        !!this._src ||
+        (this._encrypted && !!this._videoId);
+      if (haveTitleSource) {
         let filename = "";
 
         // Priority 1: FFmpeg metadata title (skip if it's a watermark like "Downloaded From ...")
@@ -11830,11 +11846,23 @@ export class MoviElement extends HTMLElement {
 
         // Priority 3: File object name or URL filename
         if (!filename) {
-          if (this._src instanceof File) {
-            filename = this._src.name;
-          } else if (typeof this._src === "string") {
+          // In encrypted mode we never set `src` — the upstream URL lives
+          // in the `videoid` attribute instead. Fall back to that so the
+          // title overlay still works on /api/video-backed playback.
+          let srcForTitle: string | File | null = this._src;
+          if (
+            !srcForTitle &&
+            this._encrypted &&
+            this._videoId &&
+            /^https?:\/\//i.test(this._videoId)
+          ) {
+            srcForTitle = this._videoId;
+          }
+          if (srcForTitle instanceof File) {
+            filename = srcForTitle.name;
+          } else if (typeof srcForTitle === "string") {
             try {
-              let srcUrl = new URL(this._src, window.location.href);
+              let srcUrl = new URL(srcForTitle, window.location.href);
               if (srcUrl.pathname === "/proxy" && srcUrl.searchParams.get("url")) {
                 srcUrl = new URL(srcUrl.searchParams.get("url")!);
               }
@@ -11844,7 +11872,7 @@ export class MoviElement extends HTMLElement {
                 filename = decodeURIComponent(filename.split("?")[0]);
               }
             } catch {
-              filename = this._src;
+              filename = srcForTitle;
             }
           }
         }

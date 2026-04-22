@@ -8,6 +8,9 @@ old/
 docs/.vitepress/cache/
 docs/.vitepress/dist/
 .wrangler/
+.dev.vars
+.dev.vars.*
+
 chrome-extension/screenshots/
 test-media/
 *.zip

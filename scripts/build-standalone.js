@@ -23,7 +23,9 @@ const entries = [
 
 const terserConfig = {
   compress: {
-    drop_console: true,
+    // TEMPORARY: console.* kept in build for seek/prefetch debugging.
+    // Flip back to `true` before shipping a release.
+    drop_console: false,
     drop_debugger: false,
     passes: 5,
     unsafe: false,

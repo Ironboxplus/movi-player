@@ -3436,15 +3436,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (this.hlsWrapper) {
       return this.hlsWrapper.getNetworkSpeed();
     }
+    // EncryptedHttpSource extends HttpSource, so the HttpSource branch
+    // covers encrypted playback too.
     if (this.source instanceof HttpSource) {
       return this.source.getNetworkStats().currentSpeed;
     }
     if (this.source instanceof FileSource) {
       return this.source.getDiskStats().currentSpeed;
-    }
-    // EncryptedHttpSource (dynamic import, check duck-typed)
-    if (this.source && "getNetworkStats" in this.source && !(this.source instanceof HttpSource)) {
-      return (this.source as any).getNetworkStats().currentSpeed;
     }
     return 0;
   }
@@ -3815,14 +3813,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return duration;
     }
 
-    // For EncryptedHttpSource, use getBufferedEnd() like HttpSource
-    if (this.source && "getBufferedEnd" in this.source && !(this.source instanceof HttpSource) && this.fileSize > 0) {
-      const bufferedBytes = (this.source as any).getBufferedEnd();
-      if (bufferedBytes > 0) {
-        const ratio = Math.min(1, bufferedBytes / this.fileSize);
-        return Math.max(ratio * duration, this.getCurrentTime());
-      }
-    }
+    // EncryptedHttpSource now extends HttpSource, so the branch above
+    // handles its buffered-end reporting too.
 
     return 0;
   }
@@ -3832,6 +3824,26 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   isHttpSource(): boolean {
     return this.source instanceof HttpSource;
+  }
+
+  /**
+   * Tune the active source's prefetch window. Value is megabytes — the
+   * target "buffer ahead of playback" the source should try to maintain.
+   * Honored by HttpSource (adjusts its sliding-window cap) and by
+   * EncryptedHttpSource (scales PREFETCH_HIGH/LOW_WATER + cache cap).
+   * Other source types are silently ignored.
+   *
+   * Wired to the `buffersize` element attribute so consumers can tune
+   * memory vs. seek responsiveness at deploy time without forking.
+   */
+  setMaxBufferSize(megabytes: number): void {
+    if (!(megabytes > 0) || !this.source) return;
+    const src = this.source as SourceAdapter & {
+      setMaxBufferSize?: (mb: number) => void;
+    };
+    if (typeof src.setMaxBufferSize === "function") {
+      src.setMaxBufferSize(megabytes);
+    }
   }
 
   /**
