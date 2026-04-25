@@ -223,6 +223,37 @@ Displays an image before playback starts.
 
 ---
 
+#### `postertime`
+
+Generates a native-resolution poster frame from a timestamp instead of (or as a fallback for) `poster`. Useful when you don't have a pre-rendered thumbnail but want to show a representative frame.
+
+**Accepted formats:**
+
+- `"10%"` — percentage of total duration
+- `"5"` or `"5s"` — seconds
+- `"1:30"` — `mm:ss`
+- `"0:01:30"` — `hh:mm:ss`
+
+```html
+<!-- Show frame at 10% of duration -->
+<movi-player src="video.mp4" postertime="10%"></movi-player>
+
+<!-- Show frame at 1 minute 30 seconds -->
+<movi-player src="video.mp4" postertime="1:30"></movi-player>
+```
+
+**Behavior:**
+
+- Runs on an isolated thumbnail pipeline (separate WASM + `ThumbnailBindings`); does **not** disturb the main player's clock or decoder.
+- Respects the video's rotation metadata so portrait videos display correctly.
+- Race-guarded — a generation counter invalidates in-flight generators on every `src` change so a late frame from the old source can't paint over the new poster.
+- Skipped if an explicit `poster` URL is set, or if the source is encrypted/DRM (those pipelines have their own protected paths).
+- Only `File` and plain HTTP URL sources are supported.
+
+**Use Case:** Playlist UIs that don't want to ship pre-rendered thumbnails but still want a sharp, native-resolution preview before play.
+
+---
+
 #### `title`
 
 Sets the video title shown in the in-player overlay. Unlike the global HTML `title` attribute, this does **not** trigger a native browser tooltip on hover.
@@ -708,6 +739,25 @@ if (player.ended) {
 
 ---
 
+#### `playing: boolean` (read-only)
+
+True only while the player is actively playing — distinguishes `playing` from intermediate states like `ready`, `loading`, `seeking`, and `buffering`. Useful when deciding whether to carry play state across a source switch (e.g., a playlist).
+
+```typescript
+if (player.playing) {
+  console.log("Frame loop is running");
+}
+
+// Forward play state to the next playlist item
+const wasPlaying = player.playing;
+player.src = nextItem.url;
+if (wasPlaying) await player.play();
+```
+
+**Note:** `!paused` is true even during `ready`/`buffering`. Use `playing` when you want to mean "actively rendering frames right now."
+
+---
+
 ### Audio Properties
 
 #### `volume: number`
@@ -872,6 +922,18 @@ player.poster = "thumbnail.jpg";
 
 ---
 
+#### `postertime: string | null`
+
+Gets/sets the timestamp used to generate the poster frame. Setting to `null` removes the attribute. See the [`postertime` attribute](#postertime) for accepted formats.
+
+```typescript
+player.postertime = "10%";   // Generate poster at 10% of duration
+player.postertime = "1:30";  // Generate poster at 1m 30s
+player.postertime = null;    // Disable
+```
+
+---
+
 ## Methods
 
 ### Playback Control
@@ -907,6 +969,25 @@ Loads the media source (called automatically when `src` changes).
 player.src = "video.mp4";
 await player.load();
 ```
+
+**Note:** Calling `play()` while a source is still loading is now safe — the play intent is queued and flushed once the load completes (matches `HTMLMediaElement` semantics).
+
+---
+
+#### `dispose(): void`
+
+Tears down the internal player and resets transient UI (subtitles, timeline, time, title, generated poster) back to the no-source state. Called automatically on every `src` change so playlist-style flows never leak state between sources. Safe to call when nothing is loaded.
+
+```typescript
+// Manual cleanup before swapping content
+player.dispose();
+player.src = nextVideo;
+```
+
+**Notes:**
+- Does **not** touch the canvas or the native `<video>` element — the canvas keeps its WebGL2 context for the next renderer to reuse, and resetting `<video>` would interfere with the DRM/HLS path.
+- Releases any per-source software-decoder fallback so the next source gets a fresh hardware-decode attempt.
+- Revokes any `postertime`-generated poster URL.
 
 ---
 
@@ -1043,6 +1124,23 @@ Generates a thumbnail image.
 const thumbnail = await player.generatePreview(60, 320, 180);
 imgElement.src = URL.createObjectURL(thumbnail);
 ```
+
+---
+
+### Static Utilities
+
+#### `MoviElement.cleanVideoTitle(filename: string): string`
+
+Turns a raw filename or metadata string into a human-readable title by stripping separators, release-group tags, and quality/codec suffixes — the same logic the player uses internally for tab titles, the in-player overlay, and the resume localStorage key.
+
+```typescript
+import { MoviElement } from "movi-player/element";
+
+MoviElement.cleanVideoTitle("My.Series.S01E02.Episode.Title.1080p.WEB-DL.DDP5.1.x265-RELEASEGRP.mkv");
+// → "My Series S01E02 Episode Title"
+```
+
+**Use Case:** A playlist UI that wants to show identical titles to the player, or compute the resume key (`movi-resume:<cleanVideoTitle(name)>`) so the right resume position is shown next to each item.
 
 ---
 

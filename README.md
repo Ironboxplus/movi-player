@@ -185,6 +185,8 @@ Use cases: video validators, asset management, HDR detection pipelines, search i
 
 **Resume** -- `<movi-player resume>` saves position to localStorage, shows resume dialog on reload. Keyboard navigable.
 
+**Poster from Timestamp** -- `postertime="10%"` (or `"5"`, `"1:30"`, `"0:01:30"`) generates a native-resolution poster frame from any timestamp. Runs on an isolated thumbnail pipeline, respects rotation metadata, and never paints stale frames after a `src` change.
+
 **Encrypted** -- AES-256-GCM chunked encryption with HMAC-signed token auth. See encrypted-server/.
 
 **DRM** -- Optional Widevine/FairPlay for HLS streams via `drm` + `licenseurl` attributes. Uses native `<video>` + EME API.
@@ -213,6 +215,7 @@ Use cases: video validators, asset management, HDR detection pipelines, search i
   title="My Video"          <!-- Video title (in-player overlay only) -->
   showtitle                 <!-- Show title overlay at top -->
   startat="30"              <!-- Start at time (seconds) -->
+  postertime="10%"          <!-- Generate poster from timestamp ("5", "1:30", "10%") -->
   resume                    <!-- Resume from last position -->
   stablevolume              <!-- Loudness normalization -->
   buffersize="200"          <!-- Max prefetch window in MB (HTTP + encrypted) -->
