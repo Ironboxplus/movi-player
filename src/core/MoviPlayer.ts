@@ -534,7 +534,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   private async createSource(config: SourceConfig): Promise<SourceAdapter> {
     if (config.type === "file" && config.file) {
-      return new FileSource(config.file, this.cache);
+      const fs = new FileSource(config.file, this.cache);
+      fs.setOnRevoked((info) => {
+        Logger.error(TAG, `File handle revoked: ${info.reason}`);
+        this.emit("filerevoked", info);
+      });
+      return fs;
     }
 
     if (config.type === "encrypted" && config.encrypted) {

@@ -61,6 +61,7 @@ export class MoviElement extends HTMLElement {
   private controlsTimeout: number | null = null;
   private isOverControls: boolean = false;
   private isSeeking: boolean = false;
+  private pendingSeekTarget: number | null = null; // Coalesces rapid currentTime sets while a seek is in flight
   private isPosterSeek: boolean = false; // True during initial seek(0) to render first frame
   private isDragging: boolean = false;
   private isTouchDragging: boolean = false;
@@ -8843,8 +8844,10 @@ export class MoviElement extends HTMLElement {
     if (this.player) {
       // When muted, disable audio track processing (saves CPU)
       this.player.setMuted(this._muted);
-      this.updateVolumeIcon();
     }
+    // Update icon regardless of player presence so UI reflects state even
+    // before src is set / player is initialized.
+    this.updateVolumeIcon();
   }
 
   private updateVolume() {
@@ -9350,6 +9353,14 @@ export class MoviElement extends HTMLElement {
     this.player.on("timeUpdate", timeUpdateHandler);
     this.eventHandlers.set("timeUpdate", () =>
       this.player?.off("timeUpdate", timeUpdateHandler),
+    );
+
+    const fileRevokedHandler = (info: { offset: number; length: number; reason: string }) => {
+      this.dispatchEvent(new CustomEvent("filerevoked", { detail: info, bubbles: true, composed: true }));
+    };
+    this.player.on("filerevoked", fileRevokedHandler);
+    this.eventHandlers.set("filerevoked", () =>
+      this.player?.off("filerevoked", fileRevokedHandler),
     );
 
     const errorHandler = (error: unknown) => {
@@ -11551,33 +11562,46 @@ export class MoviElement extends HTMLElement {
   }
 
   set currentTime(value: number) {
-    if (this.player) {
-      const state = this.player.getState();
-      Logger.info(TAG, `currentTime setter: value=${value.toFixed(2)}, state=${state}, isSeeking=${this.isSeeking}`);
-      if (
-        state === "ready" ||
-        state === "playing" ||
-        state === "paused" ||
-        state === "ended" ||
-        state === "seeking" ||
-        state === "buffering"
-      ) {
-        this.isSeeking = true;
-        this.player
-          .seek(value)
-          .then(() => {
-            Logger.info(TAG, `Seek resolved: value=${value.toFixed(2)}, newState=${this.player?.getState()}`);
-          })
-          .catch((error) => {
-            Logger.error(TAG, `Seek error: value=${value.toFixed(2)}`, error);
-          })
-          .finally(() => {
-            this.isSeeking = false;
-          });
-      } else {
-        Logger.warn(TAG, `Seek blocked — state=${state} not allowed`);
-      }
+    if (!this.player) return;
+    const state = this.player.getState();
+    Logger.info(TAG, `currentTime setter: value=${value.toFixed(2)}, state=${state}, isSeeking=${this.isSeeking}`);
+    if (
+      state !== "ready" &&
+      state !== "playing" &&
+      state !== "paused" &&
+      state !== "ended" &&
+      state !== "seeking" &&
+      state !== "buffering"
+    ) {
+      Logger.warn(TAG, `Seek blocked — state=${state} not allowed`);
+      return;
     }
+
+    // Coalesce: a previous seek is still running. Stash the latest target and
+    // bail. The in-flight seek's finally() will pick up the latest target,
+    // collapsing any number of intermediate sets into one tail seek.
+    if (this.isSeeking) {
+      this.pendingSeekTarget = value;
+      return;
+    }
+
+    this.isSeeking = true;
+    this.player
+      .seek(value)
+      .then(() => {
+        Logger.info(TAG, `Seek resolved: value=${value.toFixed(2)}, newState=${this.player?.getState()}`);
+      })
+      .catch((error) => {
+        Logger.error(TAG, `Seek error: value=${value.toFixed(2)}`, error);
+      })
+      .finally(() => {
+        this.isSeeking = false;
+        if (this.pendingSeekTarget !== null) {
+          const next = this.pendingSeekTarget;
+          this.pendingSeekTarget = null;
+          this.currentTime = next;
+        }
+      });
   }
 
   get renderer(): RendererType {
