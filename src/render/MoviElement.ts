@@ -9050,6 +9050,15 @@ export class MoviElement extends HTMLElement {
    * Automatically create and initialize MoviPlayer
    */
   private async initializePlayer(): Promise<void> {
+    // Re-run the security-header check before any FFmpeg init. load() resets
+    // _isUnsupported on every source change, which would otherwise let a
+    // non-isolated context (e.g. embed iframe inside a third-party page that
+    // doesn't set COOP+COEP) reach FFmpeg and surface a cryptic
+    // "Failed to open media: Timeout at 0" instead of the proper
+    // "Security Headers Missing" diagnostic.
+    this.checkSecurityHeaders();
+    if (this._isUnsupported) return;
+
     // If encrypted mode, use loadEncrypted instead
     if (this._encrypted && this._tokenUrl && this._videoUrl && !this.isLoading && !this.player) {
       try {

@@ -265,11 +265,12 @@ Videos served over HTTP need:
 
 1. **Range requests** -- for seeking
 2. **CORS headers** -- if cross-origin
-3. **COOP/COEP headers** (optional) -- for SharedArrayBuffer zero-copy mode:
+3. **COOP/COEP headers** -- required for `SharedArrayBuffer` (FFmpeg WASM threading). Without these the player shows a "Security Headers Missing" screen and refuses to initialize:
    ```
    Cross-Origin-Opener-Policy: same-origin
    Cross-Origin-Embedder-Policy: require-corp
    ```
+   On static hosts where you can't set response headers (GitHub Pages, Netlify free tier, etc.), use [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) to inject these headers client-side via a service worker.
 
 ## Browser Support
 
