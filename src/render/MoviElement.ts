@@ -6322,7 +6322,8 @@ export class MoviElement extends HTMLElement {
     const browseBtn = this.shadowRoot?.querySelector(
       ".movi-subtitle-browse-btn",
     ) as HTMLElement | null;
-    const hasActiveSubtitle = this.getActiveSubtitleKind() !== null;
+    const activeSubtitleKind = this.getActiveSubtitleKind();
+    const hasActiveSubtitle = activeSubtitleKind !== null;
     if (gearBtn) {
       gearBtn.style.display = hasActiveSubtitle ? "" : "none";
       gearBtn.classList.toggle("is-active", this._showingSubtitleCustomize);
@@ -6332,9 +6333,13 @@ export class MoviElement extends HTMLElement {
       );
     }
     if (browseBtn) {
-      // Transcript browser is file-source only — getAllSubtitleCues()
-      // can't yield a complete cue list for streamed sources.
-      const canBrowse = hasActiveSubtitle && !!this.player?.isFileSource();
+      // Transcript browser needs text cues — image subtitles (PGS/VOBSUB)
+      // are bitmaps with no extractable text. Also file-source only, since
+      // getAllSubtitleCues() can't yield a complete list for streamed sources.
+      const canBrowse =
+        hasActiveSubtitle &&
+        activeSubtitleKind !== "image" &&
+        !!this.player?.isFileSource();
       browseBtn.style.display = canBrowse ? "" : "none";
     }
     // If the user had the customize panel open and then hit "Off",
@@ -9809,7 +9814,7 @@ export class MoviElement extends HTMLElement {
         /* Base size scales against the player width via --movi-player-width;
            the user's customize-panel choice is applied as a multiplier via
            --movi-sub-size-mult. Defaults to 1 (= 100%). */
-        font-size: calc(clamp(18px, calc(var(--movi-player-width, 100vw) * 0.028), 36px) * var(--movi-sub-size-mult, 1));
+        font-size: calc(clamp(20px, calc(var(--movi-player-width, 100vw) * 0.032), 40px) * var(--movi-sub-size-mult, 1));
         font-weight: 500;
         line-height: 1.35;
         letter-spacing: 0.01em;

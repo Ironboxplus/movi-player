@@ -1764,14 +1764,18 @@ export class CanvasRenderer {
       // Convert to data URL
       const dataUrl = tempCanvas.toDataURL("image/png");
 
-      // Get display dimensions (not buffer dimensions) for overlay
-      // If rotated 90/270, the buffer dimensions (this.width/height) are swapped relative to the screen
-      const isRotated90 = this.rotation % 180 !== 0;
-      const displayWidth = isRotated90 ? this.height : this.width;
-      const displayHeight = isRotated90 ? this.width : this.height;
-
-      const canvasWidth = displayWidth;
-      const canvasHeight = displayHeight;
+      // Use CSS-pixel dimensions of the visible canvas, not the dpr-scaled
+      // backbuffer. this.width/height live in buffer space (target × dpr) and
+      // sizing the overlay with those values blows it up to 2× on retina,
+      // pushing the bottom-anchored flex child off-screen below the canvas.
+      // Mirrors the rect-based sizing the text-subtitle path already uses.
+      const canvasEl =
+        this.canvas instanceof HTMLCanvasElement ? this.canvas : null;
+      const rect = canvasEl?.getBoundingClientRect();
+      const canvasWidth =
+        rect?.width || this.containerWidth || this.width;
+      const canvasHeight =
+        rect?.height || this.containerHeight || this.height;
 
       // Scale position based on video dimensions vs subtitle dimensions
       // PGS subtitle positions are typically relative to video resolution (1920x1080, etc.)
