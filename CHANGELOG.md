@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Custom `SourceAdapter` for `<movi-player>` and `MoviPlayer` (closes #7)**: Plug any custom byte protocol (WebSocket, WebRTC data channel, IndexedDB, custom encryption, etc.) directly into the element or programmatic player without touching the demuxer or rebuilding the UI. New `sourceAdapter` property on `<movi-player>` (`el.sourceAdapter = new MySource()`) plus a new `sourceAdapter` field in `PlayerConfig` for `new MoviPlayer({ sourceAdapter, canvas })`. `Demuxer` already accepted adapters via its constructor — same `SourceAdapter` contract is now usable across all three layers. `src` / `sourceAdapter` are mutually exclusive — setting one clears the other so the source-pipeline path stays unambiguous. Docs updated in `docs/api/sources.md`, `docs/api/player.md`, and `docs/api/element.md` (interface table, minimal-adapter pattern, plug-in examples).
+
 ## [0.2.4] - 2026-05-08
 
 ### Added

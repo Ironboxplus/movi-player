@@ -106,7 +106,8 @@ constructor(config: PlayerConfig)
 
 ```typescript
 interface PlayerConfig {
-  source: SourceConfig;                         // Required — { type, url } or { type, file }
+  source?: SourceConfig;                        // { type, url } or { type, file } — optional when sourceAdapter is set
+  sourceAdapter?: SourceAdapter;                // Pre-built adapter — overrides `source` (custom protocols)
   audioSource?: SourceConfig;                   // Separate audio for split video+audio sources
   audioTracks?: AudioSourceEntry[];             // Multi-language audio with metadata
   subtitleTracks?: SubtitleSourceEntry[];       // External subtitles (VTT/SRT) with metadata
@@ -135,6 +136,21 @@ const player = new MoviPlayer({
   renderer: "canvas",
 });
 ```
+
+**With a custom SourceAdapter** (any protocol — WebSocket, IndexedDB, custom encryption, etc.):
+
+```typescript
+import { MoviPlayer } from "movi-player/player";
+import type { SourceAdapter } from "movi-player";
+
+const player = new MoviPlayer({
+  sourceAdapter: myCustomAdapter,   // wins over `source` when present
+  canvas,
+});
+await player.load();
+```
+
+See [Sources → Creating Custom Sources](./sources.md#creating-custom-sources) for the adapter contract.
 
 ---
 

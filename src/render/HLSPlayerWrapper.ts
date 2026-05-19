@@ -193,7 +193,7 @@ export class HLSPlayerWrapper extends EventEmitter<PlayerEventMap> {
     }
 
     const source = this.config.source;
-    const url = source.type === "url" ? source.url : null;
+    const url = source && source.type === "url" ? source.url : null;
 
     if (!url) {
       throw new Error("HLS source must be a URL");
@@ -298,7 +298,7 @@ export class HLSPlayerWrapper extends EventEmitter<PlayerEventMap> {
   }
 
   private async loadNative(): Promise<void> {
-    const url = this.config.source.type === "url" ? this.config.source.url : "";
+    const url = this.config.source && this.config.source.type === "url" ? this.config.source.url : "";
     if (!url) throw new Error("Invalid URL");
 
     return new Promise((resolve, reject) => {

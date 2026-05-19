@@ -463,9 +463,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Clean up any existing preview pipeline
     this.destroyPreviewPipeline();
 
-    // Check for HLS
+    // Check for HLS — only when caller used SourceConfig. A custom
+    // SourceAdapter bypasses URL/HLS detection entirely.
     const src = this.config.source;
     if (
+      !this.config.sourceAdapter &&
+      src &&
       src.type === "url" &&
       src.url &&
       (src.url.includes(".m3u8") || src.url.toLowerCase().endsWith("m3u8"))
@@ -521,8 +524,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
 
     try {
-      // Create source
-      this.source = await this.createSource(this.config.source);
+      // Create source — honor a pre-built adapter if the caller supplied
+      // one (custom protocol, encrypted blob, IndexedDB-backed source, etc.)
+      // so the demuxer can read through it without going through SourceConfig.
+      if (this.config.sourceAdapter) {
+        this.source = this.config.sourceAdapter;
+      } else if (this.config.source) {
+        this.source = await this.createSource(this.config.source);
+      } else {
+        throw new Error("Either config.source or config.sourceAdapter is required");
+      }
 
       // Create demuxer (getSize will be called lazily in bindings.open())
       this.demuxer = new Demuxer(this.source, this.config.wasmBinary);
@@ -2693,7 +2704,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const isEncrypted = sourceConfig
       && typeof sourceConfig !== "string"
       && (sourceConfig as any).type === "encrypted";
-    if (isEncrypted && this.source) {
+    // Custom user-supplied adapter — we can't safely spin up a second reader
+    // (we don't know the underlying protocol), so reuse the main source.
+    // The user's read() must tolerate interleaved offsets in this case.
+    if (this.config.sourceAdapter && this.source) {
+      this.thumbnailSource = this.source;
+    } else if (isEncrypted && this.source) {
       this.thumbnailSource = this.source;
     } else {
       // Plain HTTP / URL sources: use a dedicated ThumbnailHttpSource that
@@ -2707,15 +2723,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           : null;
       if (typeof sourceConfig === "string") {
         this.thumbnailSource = new ThumbnailHttpSource(sourceConfig, {}, borrowSource);
-      } else if ("url" in sourceConfig && sourceConfig.url) {
+      } else if (sourceConfig && "url" in sourceConfig && sourceConfig.url) {
         this.thumbnailSource = new ThumbnailHttpSource(
           sourceConfig.url,
           sourceConfig.headers || {},
           borrowSource,
         );
-      } else {
+      } else if (sourceConfig) {
         // File source
         this.thumbnailSource = await this.createSource(sourceConfig);
+      } else if (this.source) {
+        // No SourceConfig (custom adapter path) — fall back to main source.
+        this.thumbnailSource = this.source;
+      } else {
+        throw new Error("No source available for thumbnail pipeline");
       }
     }
 

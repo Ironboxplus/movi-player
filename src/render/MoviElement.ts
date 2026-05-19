@@ -25,6 +25,7 @@ import { ThumbnailBindings } from "../wasm/bindings";
 import { loadWasmModuleNew } from "../wasm/FFmpegLoader";
 import { FileSource } from "../source/FileSource";
 import { ThumbnailHttpSource } from "../source/ThumbnailHttpSource";
+import type { SourceAdapter } from "../source/SourceAdapter";
 import { Demuxer } from "../demux/Demuxer";
 
 import { SettingsStorage } from "../utils/SettingsStorage";
@@ -107,6 +108,10 @@ export class MoviElement extends HTMLElement {
 
   // Internal state
   private _src: string | File | null = null;
+  // Caller-supplied SourceAdapter — wins over _src when present. Lets users
+  // wire any custom protocol (WebSocket, WebRTC data channel, IndexedDB,
+  // bespoke encryption, etc.) into the element without losing the UI.
+  private _sourceAdapter: SourceAdapter | null = null;
   private _audioSrc: string | null = null; // Separate audio source URL
   // Pre-muxed video qualities declared via multiple <source> tags with
   // data-height / data-label. Lets the player drive a YouTube-style quality
@@ -12219,7 +12224,7 @@ export class MoviElement extends HTMLElement {
       return;
     }
 
-    if (!this._src || this.isLoading || this.player || this._isUnsupported) {
+    if ((!this._src && !this._sourceAdapter) || this.isLoading || this.player || this._isUnsupported) {
       return;
     }
 
@@ -12231,9 +12236,12 @@ export class MoviElement extends HTMLElement {
     }
 
     try {
-      // Determine source type (URL or File)
-      let source: SourceConfig;
-      if (this._src instanceof File) {
+      // Determine source type (URL or File) — skipped entirely when the
+      // caller plugged in their own SourceAdapter.
+      let source: SourceConfig | undefined;
+      if (this._sourceAdapter) {
+        source = undefined;
+      } else if (this._src instanceof File) {
         // File object - use FileSource
         source = { type: "file", file: this._src };
       } else if (typeof this._src === "string") {
@@ -12264,6 +12272,7 @@ export class MoviElement extends HTMLElement {
         cache: { type: "lru", maxSizeMB: 520 },
         enablePreviews: this._thumb,
         ...(this._fps > 0 && { frameRate: this._fps }),
+        ...(this._sourceAdapter && { sourceAdapter: this._sourceAdapter }),
       };
 
       // Separate audio source — multi-language or single
@@ -13830,6 +13839,9 @@ export class MoviElement extends HTMLElement {
     // artifacts (last frame, subtitles, duration, title) leak across.
     this.dispose();
 
+    // Switching to a URL/File source supersedes any custom adapter.
+    this._sourceAdapter = null;
+
     this.dispatchEvent(new CustomEvent("loadstart", { detail: { src: value instanceof File ? value.name : value } }));
 
     if (value instanceof File) {
@@ -13870,6 +13882,59 @@ export class MoviElement extends HTMLElement {
    */
   setFile(file: File | null): void {
     this.src = file;
+  }
+
+  /**
+   * Custom SourceAdapter — feeds bytes from any protocol (WebSocket, WebRTC
+   * data channel, IndexedDB, custom encryption, etc.) without writing a
+   * SourceConfig branch. Set to `null` to clear and go back to `src`.
+   *
+   * Usage:
+   * ```ts
+   *   const element = document.querySelector('movi-player');
+   *   element.sourceAdapter = new MyWebSocketSource(url);
+   * ```
+   *
+   * Clearing src + setting adapter is mutually exclusive — the adapter wins.
+   */
+  get sourceAdapter(): SourceAdapter | null {
+    return this._sourceAdapter;
+  }
+
+  set sourceAdapter(adapter: SourceAdapter | null) {
+    if (this._resume) this.saveResumePosition();
+    this.stopResumeSaving();
+    this._resumeCheckedWithTitle = false;
+
+    // Mirror the src setter: full reset so the new adapter starts clean and
+    // no previous-video artifacts (last frame, subtitles, duration) leak.
+    this.dispose();
+
+    this.dispatchEvent(
+      new CustomEvent("loadstart", { detail: { src: adapter ? adapter.getKey() : null } }),
+    );
+
+    this._sourceAdapter = adapter;
+    // An adapter overrides any prior src — keep them mutually exclusive so
+    // initializePlayer's source-type branching isn't ambiguous.
+    if (adapter) {
+      this._src = null;
+      this.removeAttribute("src");
+      this.updatePoster();
+      if (this.isConnected) {
+        this.initializePlayer();
+      }
+    } else if (this.emptyStateIndicator && !this.player) {
+      this.emptyStateIndicator.style.display = "flex";
+    }
+  }
+
+  /**
+   * Convenience method mirroring `setFile()` — same effect as assigning to
+   * the `sourceAdapter` property.
+   */
+  setSourceAdapter(adapter: SourceAdapter | null): void {
+    this.sourceAdapter = adapter;
   }
 
   /**

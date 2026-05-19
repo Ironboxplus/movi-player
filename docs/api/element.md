@@ -131,6 +131,48 @@ Specifies the video source URL or File object.
 
 ---
 
+#### `sourceAdapter` (property)
+
+JavaScript-only property — bypasses `src` entirely and feeds bytes through a custom [`SourceAdapter`](./sources.md#creating-custom-sources). Use this when your media doesn't live behind an HTTP URL or a local `File` (WebSocket, WebRTC data channel, IndexedDB, custom encryption, etc.) — you keep the full `<movi-player>` UI without re-implementing controls.
+
+```html
+<movi-player id="player" controls></movi-player>
+<script type="module">
+  import { MyWebSocketSource } from "./my-source.js";
+
+  const player = document.getElementById("player");
+  player.sourceAdapter = new MyWebSocketSource("wss://media.example.com", 12_345_678);
+</script>
+```
+
+**Mutual exclusion with `src`:**
+
+| You set        | Result                                       |
+| -------------- | -------------------------------------------- |
+| `src`          | Clears `sourceAdapter`, loads via URL/File   |
+| `sourceAdapter`| Clears `src` + `src` attribute, loads via adapter |
+| Both           | Last assignment wins                         |
+| `null`         | Clears that source; both null → empty state  |
+
+Setting either re-runs the full source-switch flow: disposes the old player, fires `loadstart`, and re-initializes. There's no separate attribute — pass adapter instances through JavaScript.
+
+```javascript
+// Swap protocols on a live element
+player.sourceAdapter = new MyWebRTCSource(channel);
+
+// Later, switch back to a plain URL
+player.src = "https://example.com/video.mp4"; // sourceAdapter auto-clears
+
+// Clear everything
+player.src = null;
+```
+
+::: tip Programmatic-only
+There's no `sourceadapter` HTML attribute — adapter instances aren't serializable. Always assign via JS (or the `setSourceAdapter()` convenience method, identical to the property setter).
+:::
+
+---
+
 ### Playback Behavior
 
 #### `autoplay`

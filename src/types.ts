@@ -114,7 +114,18 @@ export type RendererType = "canvas";
 export type DecoderType = "auto" | "software";
 
 export interface PlayerConfig {
-  source: SourceConfig;
+  /**
+   * Standard source descriptor (url / file / encrypted). Optional when a
+   * pre-built `sourceAdapter` is supplied instead.
+   */
+  source?: SourceConfig;
+  /**
+   * Pre-built SourceAdapter — overrides `source` when present.
+   * Use this to feed media from a custom protocol (WebSocket, WebRTC data
+   * channel, IndexedDB, encrypted blob, etc.) without writing a SourceConfig
+   * branch. The adapter's `getSize()` and `read()` are called directly.
+   */
+  sourceAdapter?: import("./source/SourceAdapter").SourceAdapter;
   /** Separate audio source — single or multi-language */
   audioSource?: SourceConfig;
   /** Multiple audio tracks with language metadata */
