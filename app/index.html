@@ -3188,7 +3188,7 @@
             <strong>Pick a video to play</strong>
             <small>or just drop one anywhere on the page</small>
           </span>
-          <input type="file" id="file-input" accept="video/*,.mkv,.ts,.avi,.flv,.wmv,.mov" multiple />
+          <input type="file" id="file-input" accept="video/*,audio/*,.mkv,.ts,.m2ts,.mts,.evo,.avi,.flv,.wmv,.mov,.mka,.m4b,.opus,.oga,.dts,.ac3,.ec3,.eac3" multiple />
         </label>
 
         <!-- "or paste a link" divider -->
@@ -3907,9 +3907,10 @@
       });
 
       // --- Folder / Playlist ---
-      const VIDEO_EXT = /\.(mp4|m4v|mkv|webm|mov|avi|flv|wmv|ts|mts|m2ts|mpg|mpeg|3gp|ogv)$/i;
+      const VIDEO_EXT = /\.(mp4|m4v|mkv|webm|mov|avi|flv|wmv|ts|mts|m2ts|evo|mpg|mpeg|3gp|ogv|mp3|m4a|m4b|aac|flac|wav|wave|ogg|oga|opus|ac3|ec3|eac3|mka|dts)$/i;
       const isVideoFile = (file) =>
-        (file.type && file.type.startsWith("video/")) || VIDEO_EXT.test(file.name);
+        (file.type && (file.type.startsWith("video/") || file.type.startsWith("audio/"))) ||
+        VIDEO_EXT.test(file.name);
 
       const naturalCompare = (a, b) =>
         a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
