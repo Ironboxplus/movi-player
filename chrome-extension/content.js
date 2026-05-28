@@ -121,7 +121,7 @@ function drainProbeQueue() {
         probedUrls.set(url, "video");
         // Tag every matching link currently in the DOM (a URL may appear in
         // several <a> elements on link-heavy pages).
-        document.querySelectorAll(`a[target="_blank"][href="${CSS.escape(url)}"]`).forEach(createPlayButton);
+        document.querySelectorAll(`a[href="${CSS.escape(url)}"]`).forEach(createPlayButton);
       } else {
         probedUrls.set(url, "not-video");
       }
