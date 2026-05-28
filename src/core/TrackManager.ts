@@ -51,15 +51,20 @@ export class TrackManager extends EventEmitter<TrackManagerEvents> {
   }
   
   /**
-   * Heuristic to identify cover-art video streams when the WASM-side
-   * disposition flag (isAttachedPic) hasn't been populated yet (e.g. an
-   * unrebuilt module). Real video streams have a positive frame rate;
-   * embedded artwork uses a still-image codec (mjpeg / png / jpeg) and
-   * reports frameRate 0 because there's exactly one cached picture.
-   * Pair with a codec check so we don't mis-flag low-fps real video.
+   * Identify cover-art / attached-picture video streams (ID3v2 APIC,
+   * FLAC PICTURE, MP4 covr, Matroska attachment) so they're excluded
+   * from the playable video list and surfaced separately for artwork.
+   *
+   * Detection is a pure-JS heuristic: a still-image codec (mjpeg / png /
+   * jpeg) reporting frameRate 0 (a single cached picture, not a motion
+   * stream). We can't use a WASM-side disposition flag — adding the
+   * is_attached_pic field to the StreamInfo struct shifts the WASM
+   * memory layout and trips a latent FFmpeg audio overflow into a
+   * production OOB (see project memory "Album Art Crashes WASM"), so the
+   * whole album-art path stays JS-only. Real video is essentially never
+   * mjpeg/png-with-zero-fps, so the heuristic is safe in practice.
    */
   private isLikelyCoverArt(t: VideoTrack): boolean {
-    if (t.isAttachedPic) return true;
     const codec = (t.codec || "").toLowerCase();
     const stillCodec = codec === "mjpeg" || codec === "png" || codec === "jpeg";
     return stillCodec && (!t.frameRate || t.frameRate === 0);

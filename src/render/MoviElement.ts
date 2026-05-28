@@ -11732,14 +11732,14 @@ export class MoviElement extends HTMLElement {
       /* Video-only buttons. The right cluster mixes container divs (for
          buttons that have flyout menus) with bare <button>s — match both
          patterns. */
-      :host(.movi-audio-strip) .movi-subtitle-track-container,
-      :host(.movi-audio-strip) .movi-quality-container,
-      :host(.movi-audio-strip) .movi-hdr-container,
-      :host(.movi-audio-strip) .movi-aspect-ratio-btn,
-      :host(.movi-audio-strip) .movi-pip-btn,
-      :host(.movi-audio-strip) .movi-snapshot-btn,
-      :host(.movi-audio-strip) .movi-rotate-btn,
-      :host(.movi-audio-strip) .movi-fullscreen-btn {
+      :host(.movi-audio-mode) .movi-subtitle-track-container,
+      :host(.movi-audio-mode) .movi-quality-container,
+      :host(.movi-audio-mode) .movi-hdr-container,
+      :host(.movi-audio-mode) .movi-aspect-ratio-btn,
+      :host(.movi-audio-mode) .movi-pip-btn,
+      :host(.movi-audio-mode) .movi-snapshot-btn,
+      :host(.movi-audio-mode) .movi-rotate-btn,
+      :host(.movi-audio-mode) .movi-fullscreen-btn {
         display: none !important;
       }
       /* Strip-mode keyboard-shortcuts panel: the base CSS centres it
@@ -11756,7 +11756,7 @@ export class MoviElement extends HTMLElement {
         left: 50% !important;
         transform: translate(-50%, -50%) !important;
       }
-      :host(.movi-audio-strip) .movi-shortcut-row[data-video-only] {
+      :host(.movi-audio-mode) .movi-shortcut-row[data-video-only] {
         display: none !important;
       }
       /* Same treatment for the Stats-for-Nerds panel — its default
@@ -11783,15 +11783,15 @@ export class MoviElement extends HTMLElement {
          / timeline make no sense for an audio-only source. Keep
          play-pause, speed, loop, stable-audio, nerd-stats and
          keyboard-shortcuts; everything else is video-frame work. */
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="fit"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="pip"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="fullscreen"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="rotate-video"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="ambient-toggle"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="snapshot"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="timeline"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="hdr-toggle"],
-      :host(.movi-audio-strip) .movi-context-menu-item[data-action="subtitle-track"] {
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="fit"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="pip"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="fullscreen"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="rotate-video"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="ambient-toggle"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="snapshot"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="timeline"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="hdr-toggle"],
+      :host(.movi-audio-mode) .movi-context-menu-item[data-action="subtitle-track"] {
         display: none !important;
       }
       /* The more-button reveals the mobile-expandable cluster. On a wide
@@ -12818,11 +12818,20 @@ export class MoviElement extends HTMLElement {
     const hasVideoTrack = !!this.player?.trackManager?.getActiveVideoTrack?.();
     const hasAudio = !!this.player?.hasAudibleSource?.();
 
-    // Audio-strip mode: source has audio but neither a real video stream
-    // nor embedded artwork to paint. Collapse the player to a native-
-    // <audio>-style thin control strip (CSS handles the layout via the
-    // .movi-audio-strip host class).
-    const stripMode = !hasVideoTrack && !bitmap && hasAudio;
+    // Two related-but-distinct host states for an audio source (audio
+    // track, no real video stream):
+    //   .movi-audio-mode  — ANY audio source (with or without cover art).
+    //     Drives hiding of video-only controls (PiP, fullscreen, rotate,
+    //     aspect, snapshot, ambient, timeline, …) which make no sense for
+    //     audio. Applies in cover-art mode too, so the artwork view isn't
+    //     littered with inapplicable buttons.
+    //   .movi-audio-strip — audio source WITHOUT artwork. Collapses the
+    //     player to a native-<audio>-style 56px control strip. Cover art
+    //     needs the full surface to paint, so strip layout is suppressed
+    //     when a bitmap is present (audio-mode still hides the controls).
+    const audioMode = !hasVideoTrack && hasAudio;
+    const stripMode = audioMode && !bitmap;
+    this.classList.toggle("movi-audio-mode", audioMode);
     const wasStrip = this.classList.contains("movi-audio-strip");
     this.classList.toggle("movi-audio-strip", stripMode);
     if (stripMode !== wasStrip) {
@@ -13722,6 +13731,16 @@ export class MoviElement extends HTMLElement {
       // safely; the player will close() when it stomps its own slot.
       this.coverArtBitmap = bitmap;
       this.updateCoverArtOverlay();
+      // Re-dispatch to the embedding page (background art, MediaSession
+      // artwork, etc.). The bitmap is owned by the player — listeners must
+      // not close() it. bubbles/composed so it escapes the shadow root.
+      this.dispatchEvent(
+        new CustomEvent("coverart", {
+          detail: { bitmap, width: bitmap.width, height: bitmap.height },
+          bubbles: true,
+          composed: true,
+        }),
+      );
     };
     this.player.on("coverart", coverArtHandler);
     this.eventHandlers.set("coverart", () =>
@@ -13742,9 +13761,9 @@ export class MoviElement extends HTMLElement {
     // overlay so the new load doesn't briefly show last track's art.
     this.coverArtBitmap = null;
     if (this.coverArtOverlay) this.coverArtOverlay.style.display = "none";
-    // Also drop the audio-strip layout — re-decided once the new source's
-    // tracks land via loadEnd → updateCoverArtOverlay.
-    this.classList.remove("movi-audio-strip");
+    // Also drop the audio-mode/strip layout — re-decided once the new
+    // source's tracks land via loadEnd → updateCoverArtOverlay.
+    this.classList.remove("movi-audio-strip", "movi-audio-mode");
 
     this.resetTimeline();
 
@@ -13870,6 +13889,15 @@ export class MoviElement extends HTMLElement {
       this.posterElement.src = "";
       this.posterElement.style.display = "none";
     }
+
+    // Drop cover art from the previous source. The File-source path
+    // (set src) routes through dispose() → initializePlayer() and never
+    // touches load(), so without clearing here the old artwork + the
+    // audio-mode/strip layout leak into the next track. The classes are
+    // re-decided once the new source's tracks land (updateCoverArtOverlay).
+    this.coverArtBitmap = null;
+    if (this.coverArtOverlay) this.coverArtOverlay.style.display = "none";
+    this.classList.remove("movi-audio-strip", "movi-audio-mode");
 
     // Reset transient state
     this.isLoading = false;

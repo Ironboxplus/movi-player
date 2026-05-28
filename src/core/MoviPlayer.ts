@@ -82,6 +82,30 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private fileSize: number = -1; // Cached file size for buffer calculations
   private lastBufferedTime: number = 0;
 
+  // Above this source size we don't spin up the seek-bar thumbnail
+  // pipeline. Thumbnails open a SECOND, isolated WASM module + FFmpeg
+  // context against the same file. On large sources (1 GB+ MKV/MP4)
+  // the two heaps compete for the browser's per-tab memory budget;
+  // when the main demuxer then tries to grow memory for a cluster
+  // read, the grow fails, FFmpeg's matroska code dereferences the
+  // null allocation and the whole module traps with "memory access
+  // out of bounds" mid-playback (reproduced on Sintel 1080p, ~1.2 GB,
+  // and a 1 GB+ Dolby Vision MP4 — both crash in av_read_frame a
+  // couple seconds in, only in production where the minified bundle
+  // adds to the footprint). Thumbnails are cosmetic, so we trade them
+  // away for stable playback on big files.
+  private static readonly PREVIEW_MAX_FILE_SIZE = 600 * 1024 * 1024;
+
+  private previewsAllowed(): boolean {
+    if (!this.config.enablePreviews) return false;
+    if (this.fileSize > MoviPlayer.PREVIEW_MAX_FILE_SIZE) return false;
+    // No real video stream → nothing to scrub. Skipping here keeps
+    // audio-only sources from opening a useless second WASM context
+    // (the cover-art extractor already spins up its own short-lived one).
+    if (this.trackManager.getVideoTracks().length === 0) return false;
+    return true;
+  }
+
   // Decoders and Renderers
   private videoDecoder: MoviVideoDecoder;
   private audioDecoder: MoviAudioDecoder;
@@ -479,6 +503,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.emit("loadStart", undefined);
     this.lastBufferedTime = 0;
 
+    // Drop the previous source's cover art so a soft-reload on the same
+    // instance (no destroy) doesn't keep showing stale artwork when the
+    // new source has none.
+    this.coverArt?.close?.();
+    this.coverArt = null;
+
     // Clean up any existing preview pipeline
     this.destroyPreviewPipeline();
 
@@ -626,15 +656,21 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.stateManager.setState("ready");
       this.emit("loadEnd", undefined);
 
-      // Initialize preview pipeline in background (fire-and-forget)
-      // Only if enabled in config to save memory
-      if (this.config.enablePreviews) {
+      // Initialize preview pipeline in background (fire-and-forget).
+      // Skipped for large sources — see previewsAllowed() for why a
+      // second WASM context is unsafe there.
+      if (this.previewsAllowed()) {
         // This makes the first preview faster since WASM is already loaded
         this.previewInitPromise = this.initPreviewPipeline().catch((e) => {
           Logger.warn(TAG, "Preview pipeline init failed (non-critical)", e);
           // Clear promise on error so we can retry later if needed
           this.previewInitPromise = null;
         });
+      } else if (this.config.enablePreviews) {
+        Logger.info(
+          TAG,
+          `Seek-bar thumbnails disabled: source is ${(this.fileSize / (1024 * 1024)).toFixed(0)} MB (> ${MoviPlayer.PREVIEW_MAX_FILE_SIZE / (1024 * 1024)} MB cap) — avoiding a second WASM context.`,
+        );
       }
 
       Logger.info(
@@ -2340,7 +2376,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * Generates a preview frame for the given time using C for demuxing and WebCodecs for decoding.
    */
   async getPreviewFrame(time: number): Promise<Blob | null> {
-    if (!this.config.enablePreviews) return null; // Previews disabled
+    if (!this.previewsAllowed()) return null; // Disabled, or source too large for a 2nd WASM context
     if (this.hlsWrapper) return null; // Previews not supported for HLS
     if (this.isPreviewGenerating) return null; // Busy
     // Audio-only sources have no video track to thumbnail. Bail early
@@ -4670,24 +4706,48 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
-   * Read the attached_pic data from the demuxer, decode it once into an
-   * ImageBitmap, and emit a "coverart" event. Best-effort: a malformed
-   * artwork stream just leaves coverArt null and logs a warning.
+   * Extract embedded cover art once at load and emit a "coverart" event.
+   *
+   * Runs entirely in a short-lived, isolated thumbnail-style WASM context
+   * — the same isolated-demuxer machinery the seek-bar previews use — so
+   * reading the artwork packet never moves the MAIN demuxer's file
+   * position and therefore can't disturb playback or seeking. Done
+   * exactly once (artwork is static), then the context is torn down.
+   *
+   * Deliberately does NOT surface attached_pic through a new C/WASM
+   * StreamInfo field or export: that shifts the WASM memory layout and
+   * trips a latent FFmpeg audio overflow into a production-only OOB (see
+   * project memory "Album Art Crashes WASM"). Using only the existing
+   * thumbnail read/packet exports keeps the WASM binary byte-identical.
    */
   private async extractCoverArt(): Promise<void> {
+    // Opt-in via the `thumb` attribute (maps to config.enablePreviews).
+    // Without it the audio source just shows the bare strip — no artwork,
+    // and no isolated WASM context is spun up at all.
+    if (!this.config.enablePreviews) return;
+
+    // Cover art only makes sense for an audio-led source: there must be an
+    // audio track and NO real playable video (a real video file's frames
+    // are the content, not artwork). getVideoTracks() already excludes the
+    // still-image cover stream via the isLikelyCoverArt heuristic, so an
+    // audio file with embedded art reports zero video tracks here.
+    if (this.trackManager.getAudioTracks().length === 0) return;
+    if (this.trackManager.getVideoTracks().length > 0) return;
+
     const picTracks = this.trackManager.getAttachedPicTracks();
     if (picTracks.length === 0) return;
-    const bindings = this.demuxer?.getBindings();
-    if (!bindings) return;
+    if (!this.source || this.fileSize <= 0) return;
 
     try {
-      const streamIndex = picTracks[0].id;
-      const data = bindings.getAttachedPicData(streamIndex);
+      // Demuxer owns the isolated-context read; we just turn the encoded
+      // bytes into a bitmap and publish it.
+      const data = await Demuxer.extractAttachedPicture(
+        this.source,
+        this.fileSize,
+        this.config.wasmBinary,
+      );
       if (!data || data.length === 0) return;
 
-      // Codec name from the stream is the most reliable MIME hint (png /
-      // mjpeg / etc.); fall back to image/* so createImageBitmap can sniff
-      // it itself when the codec name is unfamiliar.
       const codec = (picTracks[0].codec || "").toLowerCase();
       const mime =
         codec === "png"
@@ -4697,12 +4757,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
             : codec === "webp"
               ? "image/webp"
               : "image/*";
-      // Pass the underlying ArrayBuffer (not the typed-array view) so the
-      // Blob constructor's TS overload accepts it under strict lib.dom —
-      // Uint8Array's buffer can be a SharedArrayBuffer in cross-origin
-      // isolated contexts, which the BlobPart type rejects. The buffer
-      // here is freshly allocated by getAttachedPicData so it's safe to
-      // hand off without a copy.
+      // getPacketDataCopy already .slice()s into a fresh, non-shared
+      // ArrayBuffer, so it's safe to hand straight to Blob.
       const blob = new Blob([data.buffer as ArrayBuffer], { type: mime });
       const bitmap = await createImageBitmap(blob);
 
