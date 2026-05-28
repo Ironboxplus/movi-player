@@ -74,6 +74,10 @@ export class MoviElement extends HTMLElement {
   private coverArtOverlay: HTMLDivElement | null = null;
   private coverArtCanvas: HTMLCanvasElement | null = null;
   private coverArtBitmap: ImageBitmap | null = null;
+  // True once cover-art extraction has settled for the current source (bitmap
+  // arrived OR extraction failed). Until then, if the source has an art track,
+  // we hold the audio-strip layout off so the player doesn't flash strip→cover.
+  private _coverArtResolved: boolean = false;
   private controlsTimeout: number | null = null;
   private isOverControls: boolean = false;
   private isSeeking: boolean = false;
@@ -2696,8 +2700,8 @@ export class MoviElement extends HTMLElement {
               startXPercent <= 0.5
             ) {
               if (deltaY < -60) {
-                // Swipe UP -> Enter Fullscreen
-                if (!document.fullscreenElement) {
+                // Swipe UP -> Enter Fullscreen (skip for any audio source)
+                if (!document.fullscreenElement && !this.classList.contains("movi-audio-mode")) {
                   this.requestFullscreen().catch((err) =>
                     Logger.error(TAG, "Error entering fullscreen", err),
                   );
@@ -4336,6 +4340,12 @@ export class MoviElement extends HTMLElement {
 
   private async toggleFullscreen(): Promise<void> {
     if (this.isLoading || this._isUnsupported || !this.player) {
+      return;
+    }
+    // Audio-only sources (bare strip OR cover-art view) have nothing to show
+    // fullscreen. Block it at this single chokepoint so double-click, the F
+    // key, and the button are all covered, in both audio layouts.
+    if (this.classList.contains("movi-audio-mode")) {
       return;
     }
 
@@ -11723,8 +11733,15 @@ export class MoviElement extends HTMLElement {
          dimensions only for the audio-relevant ones (speed, loop) — the
          video-only collapsed buttons stay hidden via their own display:
          none strip rules. */
-      :host(.movi-audio-strip) .movi-speed-container,
-      :host(.movi-audio-strip) .movi-loop-btn {
+      :host(.movi-audio-strip) .movi-speed-container {
+        width: auto !important;
+        height: auto !important;
+        margin: 0 !important;
+      }
+      /* Loop is force-shown for ANY audio source (strip + cover-art view),
+         not just the strip — it's relocated next to the more (<) button and
+         must override the base mobile collapse (width/height:0) in both. */
+      :host(.movi-audio-mode) .movi-loop-btn {
         width: auto !important;
         height: auto !important;
         margin: 0 !important;
@@ -12830,7 +12847,16 @@ export class MoviElement extends HTMLElement {
     //     needs the full surface to paint, so strip layout is suppressed
     //     when a bitmap is present (audio-mode still hides the controls).
     const audioMode = !hasVideoTrack && hasAudio;
-    const stripMode = audioMode && !bitmap;
+    // VLC-like: if the source HAS an attached-picture track and previews are
+    // on, cover art is on its way — hold the strip layout off until extraction
+    // settles (_coverArtResolved) so we don't flash the 56px strip and then
+    // reflow to the full cover-art surface. If extraction fails, the null
+    // "coverart" event flips _coverArtResolved and we fall back to the strip.
+    const hasArtTrack =
+      (this.player?.trackManager?.getAttachedPicTracks?.()?.length ?? 0) > 0;
+    const coverArtPending =
+      audioMode && !bitmap && this._thumb && hasArtTrack && !this._coverArtResolved;
+    const stripMode = audioMode && !bitmap && !coverArtPending;
     this.classList.toggle("movi-audio-mode", audioMode);
     const wasStrip = this.classList.contains("movi-audio-strip");
     this.classList.toggle("movi-audio-strip", stripMode);
@@ -12847,6 +12873,23 @@ export class MoviElement extends HTMLElement {
           composed: true,
         }),
       );
+    }
+
+    // Audio mode (bare strip AND cover-art view): lift the loop button out of
+    // the collapsed mobile-expandable so it stays visible to the RIGHT of the
+    // "more" (<) button instead of hiding behind it on narrow widths. Restore
+    // it into the cluster for video mode. Done deterministically (not just on
+    // a mode transition) and only when out of place, so it survives audio↔video
+    // src swaps and doesn't thrash the DOM on resize.
+    const loopBtn = this.shadowRoot?.querySelector(".movi-loop-btn");
+    const moreBtn = this.shadowRoot?.querySelector(".movi-more-btn");
+    const expandable = this.shadowRoot?.querySelector(".movi-mobile-expandable");
+    if (loopBtn && moreBtn && expandable) {
+      if (audioMode && loopBtn.previousElementSibling !== moreBtn) {
+        moreBtn.after(loopBtn);
+      } else if (!audioMode && loopBtn.parentElement !== expandable) {
+        expandable.appendChild(loopBtn);
+      }
     }
 
     if (!bitmap || hasVideoTrack) {
@@ -13725,22 +13768,28 @@ export class MoviElement extends HTMLElement {
       this.player?.off("error", errorHandler),
     );
 
-    const coverArtHandler = (bitmap: ImageBitmap) => {
+    const coverArtHandler = (bitmap: ImageBitmap | null) => {
       // Don't close the previous bitmap here — MoviPlayer owns its instance
       // and reuses one on subsequent loads. Our reference can be dropped
       // safely; the player will close() when it stomps its own slot.
       this.coverArtBitmap = bitmap;
+      // Extraction has settled (success or failure) — release the strip-layout
+      // hold so a failed extraction falls back to the strip cleanly.
+      this._coverArtResolved = true;
       this.updateCoverArtOverlay();
       // Re-dispatch to the embedding page (background art, MediaSession
       // artwork, etc.). The bitmap is owned by the player — listeners must
       // not close() it. bubbles/composed so it escapes the shadow root.
-      this.dispatchEvent(
-        new CustomEvent("coverart", {
-          detail: { bitmap, width: bitmap.width, height: bitmap.height },
-          bubbles: true,
-          composed: true,
-        }),
-      );
+      // Only forward real bitmaps; the null signal is internal.
+      if (bitmap) {
+        this.dispatchEvent(
+          new CustomEvent("coverart", {
+            detail: { bitmap, width: bitmap.width, height: bitmap.height },
+            bubbles: true,
+            composed: true,
+          }),
+        );
+      }
     };
     this.player.on("coverart", coverArtHandler);
     this.eventHandlers.set("coverart", () =>
@@ -13760,6 +13809,7 @@ export class MoviElement extends HTMLElement {
     // owned by MoviPlayer; we just clear our own pointer and hide the
     // overlay so the new load doesn't briefly show last track's art.
     this.coverArtBitmap = null;
+    this._coverArtResolved = false;
     if (this.coverArtOverlay) this.coverArtOverlay.style.display = "none";
     // Also drop the audio-mode/strip layout — re-decided once the new
     // source's tracks land via loadEnd → updateCoverArtOverlay.

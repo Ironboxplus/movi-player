@@ -280,7 +280,8 @@ export interface PlayerEventMap {
    * Embedded cover art extracted from the source (ID3v2 APIC, FLAC PICTURE,
    * MP4 covr, Matroska attachment). Fires once after track enumeration when
    * an attached_pic pseudo-stream is present. Recipients own the bitmap and
-   * should close() it on disposal.
+   * should close() it on disposal. Fires with `null` when an art track was
+   * present but extraction failed, so listeners waiting on it can stop.
    */
-  coverart: ImageBitmap;
+  coverart: ImageBitmap | null;
 }

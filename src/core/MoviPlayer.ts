@@ -4722,7 +4722,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     const picTracks = this.trackManager.getAttachedPicTracks();
     if (picTracks.length === 0) return;
-    if (!this.source || this.fileSize <= 0) return;
+    // Past this point an art track exists, so the UI is holding off the
+    // audio-strip layout waiting for a bitmap. Emit a null "coverart" on every
+    // failure exit so the element can stop waiting and fall back to the strip
+    // instead of sitting on a blank surface forever.
+    if (!this.source || this.fileSize <= 0) {
+      this.emit("coverart", null);
+      return;
+    }
 
     try {
       // Demuxer owns the isolated-context read; we just turn the encoded
@@ -4732,7 +4739,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.fileSize,
         this.config.wasmBinary,
       );
-      if (!data || data.length === 0) return;
+      if (!data || data.length === 0) {
+        this.emit("coverart", null);
+        return;
+      }
 
       const codec = (picTracks[0].codec || "").toLowerCase();
       const mime =
@@ -4761,6 +4771,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       );
     } catch (err) {
       Logger.warn(TAG, "Cover art extraction failed", err);
+      this.emit("coverart", null);
     }
   }
 

@@ -60,7 +60,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // In-memory cache so repeated probes for the same URL don't re-hit the network.
 // Service worker may be evicted; that's fine — cache is best-effort.
 const probeCache = new Map();
-const VIDEO_EXT_RE = /\.(mp4|mkv|webm|mov|avi|ts|m3u8|flv|m4v|ogv|wmv|m2ts|mts|3gp|mpg|mpeg)(\?|$|")/i;
+const MEDIA_EXT_RE = /\.(mp4|mkv|webm|mov|avi|ts|m3u8|flv|m4v|ogv|wmv|m2ts|mts|evo|3gp|mpg|mpeg|mp3|m4a|m4b|aac|flac|wav|wave|ogg|oga|opus|ac3|ec3|eac3|mka|dts)(\?|$|")/i;
 
 async function probeVideoUrl(url) {
   if (probeCache.has(url)) return probeCache.get(url);
@@ -105,13 +105,13 @@ async function runProbe(url) {
     const ctype = (res.headers.get("Content-Type") || "").toLowerCase();
     const cdisp = res.headers.get("Content-Disposition") || "";
 
-    if (ctype.startsWith("video/")) return { isVideo: true, reason: "content-type" };
-    if (ctype === "application/x-matroska" || ctype === "application/x-mpegurl" || ctype === "application/vnd.apple.mpegurl") {
+    if (ctype.startsWith("video/") || ctype.startsWith("audio/")) return { isVideo: true, reason: "content-type" };
+    if (ctype === "application/x-matroska" || ctype === "application/x-mpegurl" || ctype === "application/vnd.apple.mpegurl" || ctype === "application/ogg") {
       return { isVideo: true, reason: "content-type" };
     }
     // Content-Disposition with a video-extension filename — common for download endpoints
     // that serve as application/octet-stream.
-    if (cdisp && VIDEO_EXT_RE.test(cdisp)) {
+    if (cdisp && MEDIA_EXT_RE.test(cdisp)) {
       return { isVideo: true, reason: "content-disposition" };
     }
     return { isVideo: false };

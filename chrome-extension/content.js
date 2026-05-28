@@ -8,11 +8,13 @@ try {
   }
 } catch {}
 
-// Detect video URLs on page and add play button overlay
-const VIDEO_EXTENSIONS = /\.(mp4|mkv|webm|mov|avi|ts|m3u8|flv|m4v|ogv|wmv|m2ts|mts|3gp|mpg|mpeg)(\?|$)/i;
+// Detect media (video + audio) URLs on page and add a play button overlay.
+// Kept in sync with MEDIA_EXT_RE in player.js so anything the player can open
+// gets a button here too.
+const MEDIA_EXTENSIONS = /\.(mp4|mkv|webm|mov|avi|ts|m3u8|flv|m4v|ogv|wmv|m2ts|mts|evo|3gp|mpg|mpeg|mp3|m4a|m4b|aac|flac|wav|wave|ogg|oga|opus|ac3|ec3|eac3|mka|dts)(\?|$)/i;
 
-function isVideoUrl(url) {
-  return VIDEO_EXTENSIONS.test(url);
+function isMediaUrl(url) {
+  return MEDIA_EXTENSIONS.test(url);
 }
 
 function createPlayButton(link) {
@@ -41,13 +43,13 @@ function createPlayButton(link) {
   link.appendChild(btn);
 }
 
-// Scan page for video links — only the cheap regex match here. _blank link
+// Scan page for media links — only the cheap regex match here. _blank link
 // probing is hover-triggered (see the mouseover listener below) to avoid
 // firing HEAD requests for every target="_blank" on link-heavy pages.
 function scanPage() {
   const links = document.querySelectorAll("a[href]");
   links.forEach((link) => {
-    if (isVideoUrl(link.href)) {
+    if (isMediaUrl(link.href)) {
       createPlayButton(link);
     }
   });
@@ -62,7 +64,7 @@ document.addEventListener(
     const link = e.target.closest?.("a[href]");
     if (!link) return;
     if (link.dataset.moviBtn) return;
-    if (isVideoUrl(link.href)) return; // would already be handled by scanPage
+    if (isMediaUrl(link.href)) return; // would already be handled by scanPage
     maybeProbeLink(link);
   },
   true
