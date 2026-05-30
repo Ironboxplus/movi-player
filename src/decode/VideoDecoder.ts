@@ -739,7 +739,14 @@ export class MoviVideoDecoder {
       // and switch to the software decoder quickly. (Mid-stream Open-GOP on .ts
       // files still uses the reset+retry path below — justFlushed is false there
       // because frames have been decoding.)
-      if (this.justFlushed && !this.forceSoftware && !this.useSoftware) {
+      //
+      // Restrict to HEVC: this was only ever observed on HDR HEVC. H.264/AVC
+      // genuine Open-GOP keyframes get rejected on some seeks too, but the
+      // reset+retry path recovers fine — dropping them to the software decoder
+      // just throttles 1080p below realtime and triggers a desync/stall loop.
+      const codec = this.lastConfig?.codec ?? "";
+      const isHevc = codec.startsWith("hvc1.") || codec.startsWith("hev1.");
+      if (this.justFlushed && isHevc && !this.forceSoftware && !this.useSoftware) {
         this.postFlushKeyframeRejects++;
         if (
           this.postFlushKeyframeRejects >=
