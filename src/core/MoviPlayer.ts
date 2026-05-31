@@ -151,6 +151,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private seekingToKeyframeStartTime: number = 0;
   private static readonly KEYFRAME_SEEK_TIMEOUT = 5000; // 5 seconds timeout
 
+  // Set when an audio-starve video skip drops a non-keyframe, breaking AV1's
+  // reference chain. While true the demux loop keeps dropping deltas until the
+  // next keyframe (even after the starve clears) so no orphaned delta ever
+  // reaches the decoder — that orphan is what throws EncodingError. Cleared on
+  // the next keyframe, which rebuilds the chain. See the demux loop.
+  private videoChainBrokenUntilKeyframe: boolean = false;
+
   // Prebuffer targets — accumulate this much before reporting "ready" so
   // play() doesn't immediately stall on short videos where the demux burst
   // outruns the HTTP stream.
@@ -1968,16 +1975,35 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
             // Skip video decode when video buffer is full but audio is starving.
             // This keeps audio flowing at non-1x rates where video frames accumulate
             // faster than consumed. Some video frames are lost but audio stays smooth.
-            // NOTE: AV1's inter-frame dependency means dropping non-keyframes here
-            // breaks the decoder's reference chain → "EncodingError" logs every few
-            // seconds. The decoder's existing error-recovery silently re-seeks to
-            // the next keyframe, so visually playback continues without long stalls.
-            // We tried wrapping each drop in flush + seekingToKeyframe, but that
-            // produced visible multi-second freezes at every audio-starve event
-            // (GOP gap = stall length). For non-1x rates, glitches are preferable
-            // to stalls; the noisy decoder error log is the only real downside.
-            if (skipVideoDecodeForAudio) {
+            //
+            // Keyframes-only during the starve: AV1's inter-frame dependency means
+            // dropping a non-keyframe orphans every delta that references it, so
+            // feeding those deltas to the decoder throws EncodingError → decoder
+            // close → recreate→keyframe-wait recovery (noisy, and a momentary
+            // freeze). Dropping ALL video (the old behavior) is even worse — the
+            // next decoded delta is still an orphan, so the error fires the
+            // moment the starve ends. Instead we keep decoding keyframes and skip
+            // only deltas: each keyframe is a self-contained reference reset, so
+            // nothing the decoder receives is ever orphaned — no EncodingError.
+            // Video updates at roughly one frame per GOP (~0.5fps on a 2s GOP)
+            // until audio recovers, then full-rate decode resumes at the next
+            // keyframe with the reference chain intact.
+            if (skipVideoDecodeForAudio && !packet.keyframe) {
+              // A delta was skipped, so every following delta is now orphaned
+              // until the next keyframe rebuilds the reference chain. Latch this
+              // so that even after the starve clears we keep skipping deltas
+              // until a keyframe — otherwise the first post-starve delta is an
+              // orphan and throws the very EncodingError we're avoiding.
+              this.videoChainBrokenUntilKeyframe = true;
               continue;
+            }
+            // Reference chain broken by an earlier skip: keep dropping deltas
+            // until a keyframe resets it, regardless of current starve state.
+            if (this.videoChainBrokenUntilKeyframe) {
+              if (!packet.keyframe) {
+                continue;
+              }
+              this.videoChainBrokenUntilKeyframe = false;
             }
 
             // After seek, skip non-keyframe video packets until we find a keyframe
@@ -2347,6 +2373,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // This prevents decoder errors from non-keyframe packets after seek
       this.seekingToKeyframe = true;
       this.seekingToKeyframeStartTime = performance.now();
+      // A seek is a fresh keyframe-anchored start; any pending starve-induced
+      // chain break is moot.
+      this.videoChainBrokenUntilKeyframe = false;
 
       // IMPORTANT: Set seek target time for accurate seek positioning
       // FFmpeg seeks to the nearest keyframe BEFORE the target time,
@@ -3511,56 +3540,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // the AudioContext has — small with latencyHint="interactive" — and
     // the new rate is applied to subsequent stretcher output naturally.
 
-    // Debounced corrective seek to the current position. The no-flush path
-    // above keeps audio glitch-free during the rate change itself, but the
-    // stretcher/clock can drift by the time the rate settles. A short while
-    // after the last rate change we re-seek to where we are — suppressSpinner
-    // keeps the seek invisible (no loading UI). Debounced so dragging the
-    // speed slider only triggers one seek at the end, not one per step.
-    // Skip for HLS / native-audio paths which manage their own rate
-    // internally, and only fire while actually playing.
+    // Debounced corrective audio re-sync after the rate settles. Video snaps to
+    // the new rate immediately (the canvas renderer re-anchors its presentation
+    // clock on setPlaybackRate), but the audio pipeline lets its already-
+    // scheduled old-rate sources play out — a tail that, with the pitch-
+    // preserving stretcher, can run long enough to leave audio audibly behind
+    // video. We used to fix this with a corrective seek, but the seek flushes
+    // the decoder and re-reads from a keyframe BEFORE the current position,
+    // which feels like a small replay (and crashes the HW decoder on heavy AV1).
+    //
+    // Instead, reset only the audio renderer: it stops the stale old-rate
+    // sources and re-anchors its audio→media clock, so the next decoded chunks
+    // schedule at the new rate from the current position. No demuxer seek, no
+    // decoder flush — so no replay and no AV1 crash. The video frame queue is
+    // untouched. Debounced so dragging the speed slider triggers one reset at
+    // the end. Skip for HLS / native-audio paths which manage rate internally,
+    // and only fire while actually playing.
     if (this.hlsWrapper || this.nativeAudioEl) return;
     if (this.rateChangeSeekTimer !== null) {
       clearTimeout(this.rateChangeSeekTimer);
     }
     this.rateChangeSeekTimer = setTimeout(() => {
       this.rateChangeSeekTimer = null;
-      if (!this.demuxer) return;
       if (this.stateManager.getState() !== "playing") return;
-      // Skip the corrective seek only for AV1 sources heavy enough that the HW
-      // decoder can't keep up at the current rate. The crash mechanism: when
-      // decode falls behind, the demux loop drops video non-keyframes to keep
-      // audio fed (skipVideoDecodeForAudio); that breaks AV1's inter-frame
-      // reference chain, so the seek's decoder flush + keyframe-wait then feeds
-      // an orphan delta frame → EncodingError → recreate→skip buffering freeze.
-      // Light sources never fall behind, so they re-seek normally and the minor
-      // stretcher/clock drift gets corrected.
-      //
-      // Decode load ≈ pixels × fps × rate. The two reference cases:
-      //   4K@25 @2x  = 3840×2026×25×2 ≈ 0.39 Gpx/s → decodes fine, re-seek OK
-      //   8K@60 @2x  = 7680×4320×60×2 ≈ 3.98 Gpx/s → falls behind, must gate
-      // 1.0 Gpx/s sits in the wide gap between them: above any normal 4K stream,
-      // below 8K@60. Gating on actual load — not the codec or a hardcoded 8K
-      // dimension — lets a 4K (or any comfortably-decoding) AV1 re-seek while
-      // still protecting the heavy 8K@60 case.
-      const vt = this.trackManager.getActiveVideoTrack();
-      const PIXEL_RATE_GATE = 1_000_000_000; // 1 Gpx/s
-      const decodeLoad =
-        vt && vt.codec === "av1"
-          ? vt.width * vt.height * (vt.frameRate || 30) * rate
-          : 0;
-      if (decodeLoad > PIXEL_RATE_GATE) {
-        Logger.info(
-          TAG,
-          `Skipping rate-change corrective seek for heavy AV1 (${vt!.width}x${vt!.height}@${vt!.frameRate}fps×${rate} ≈ ${(decodeLoad / 1e9).toFixed(2)} Gpx/s) — avoids decoder crash`,
-        );
-        return;
-      }
-      const target = this.getCurrentTime();
-      this.seek(target, { suppressSpinner: true }).catch((error) => {
-        this.suppressSeekSpinner = false;
-        Logger.warn(TAG, "Rate-change corrective seek failed", error);
-      });
+      if (!this.audioRenderer) return;
+      Logger.info(TAG, "Rate-change audio re-sync (no seek)");
+      this.audioRenderer.reset();
     }, 150);
   }
 
@@ -4486,6 +4491,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
             this.seekTargetTime = Math.max(audioTime + this.startTime, audioBufferEnd);
             this.seekingToKeyframe = true;
             this.seekingToKeyframeStartTime = performance.now();
+            this.videoChainBrokenUntilKeyframe = false;
 
             // Restart video pipeline
             if (this.videoRenderer) {
