@@ -1259,12 +1259,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * Internal handler for seek completion when first target frame is found.
    * Clears the seek flag, synchronizes clock, and transitions to final state.
    */
-  private notifySeekCompletion(time: number): void {
-    Logger.debug(TAG, `notifySeekCompletion called: time=${time.toFixed(3)}s, waitingForVideoSync=${this.waitingForVideoSync}, seekTargetTime=${this.seekTargetTime.toFixed(3)}s`);
+  private notifySeekCompletion(time: number, forced: boolean = false): void {
+    Logger.debug(TAG, `notifySeekCompletion called: time=${time.toFixed(3)}s, waitingForVideoSync=${this.waitingForVideoSync}, seekTargetTime=${this.seekTargetTime.toFixed(3)}s, forced=${forced}`);
     if (!this.waitingForVideoSync) {
       Logger.warn(TAG, "notifySeekCompletion: early return (waitingForVideoSync=false)");
       return;
     }
+
+    // Forced completion (safety timeout) with no decoded video frame yet: the
+    // seek didn't actually produce a picture — slow network/decode just hasn't
+    // delivered one. Going straight to "playing" here advances the clock over a
+    // black screen and only recovers on a manual pause→play. Instead, finish
+    // the seek bookkeeping but resume into "buffering" with the play intent
+    // latched, so the normal buffering→resume path flips to "playing" the
+    // moment the first frame is actually decoded — no user interaction needed.
+    const noVideoFrameYet =
+      !!this.videoRenderer && this.videoRenderer.getQueueSize() === 0;
+    const forcedWithoutFrame =
+      forced && noVideoFrameYet && !!this.trackManager.getActiveVideoTrack();
 
     const seekTarget = this.seekTargetTime;
     this.seekTargetTime = -1;
@@ -1353,7 +1365,26 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
 
     // Transition to final state
-    if (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) {
+    if (
+      (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) &&
+      forcedWithoutFrame
+    ) {
+      // Wanted to resume, but the forced timeout fired before any video frame
+      // decoded. Enter buffering with the play intent kept so the process
+      // loop's buffering→resume path auto-flips to "playing" on the first
+      // frame — instead of advancing the clock over a black screen.
+      Logger.info(
+        TAG,
+        "Seek forced-complete with no video frame yet — buffering until first frame",
+      );
+      this.wasPlayingBeforeSeek = false;
+      this.wasPlayingBeforeRebuffer = true; // resume intent for buffering→play
+      this._bufferingEntryTime = performance.now();
+      this.stateManager.setState("buffering");
+      if (this._playStartTime === 0) {
+        this._playStartTime = performance.now();
+      }
+    } else if (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) {
       Logger.info(TAG, "Resuming playback after seek");
       // Consume the resume intent so it doesn't leak into the next seek. It's
       // never reset elsewhere, so a stale `true` would make a later paused
@@ -2437,7 +2468,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const seekTimeout = setTimeout(() => {
         if (this.seekSessionId === mySessionId && this.waitingForVideoSync) {
           Logger.warn(TAG, `Seek timeout after ${seekTimeoutMs}ms, forcing completion at ${seconds}s`);
-          this.notifySeekCompletion(seconds + this.startTime);
+          this.notifySeekCompletion(seconds + this.startTime, true);
         }
       }, seekTimeoutMs);
 
