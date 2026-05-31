@@ -844,16 +844,23 @@ export class AudioRenderer {
       this.maybeInitSignalsmith(this.audioContext.sampleRate);
     }
 
-    // Anchor the audio→media clock at the current play position so reads
-    // at the new rate stay correct. We deliberately do NOT stop active
-    // sources or rescale scheduledTime — that combination makes the audio
-    // clock leap forward to the next decoded chunk's mediaTime (which is
-    // wherever the demuxer has read ahead to). The video decoder cannot
-    // catch up to that jump on low-end hardware, so it presents stale
-    // reference frames out of context — visible as pixelation/blocking.
-    // Letting active sources play out at their original rate means a brief
-    // tail of "old rate" audio (≤ AudioContext output buffer, ~30–50 ms
-    // with latencyHint=interactive) instead of any mismatch.
+    // Re-anchor the audio→media clock at the CURRENT play position, then drop
+    // the stale old-rate audio that's still scheduled ahead of `now` so the
+    // rate change is heard immediately instead of after a multi-second tail.
+    //
+    // The scheduled read-ahead (each chunk queued at `scheduledTime`, which
+    // runs up to ~maxAudioBuffered seconds past `now`) is all old-rate audio.
+    // If we leave it playing (the old "do nothing" path) the audible rate
+    // change lags video by that whole span. So we stop the active sources and
+    // pull scheduledTime back to `now` — the next decoded chunk then plays at
+    // `now` at the new rate.
+    //
+    // Crucially we do NOT clear firstBufferMediaTime / hasFirstBuffer the way
+    // reset() does. Keeping the anchor (mapped through the OLD rate up to now)
+    // means the next chunk schedules via expectedTime against the current
+    // playhead — so the audio clock does NOT leap to the demuxer's read-ahead
+    // mediaTime, and the video does not hard-snap forward. That leap was the
+    // "jumps 1–3s ahead on rate change" regression.
     if (
       this.audioContext &&
       this.audioContext.state === "running" &&
@@ -865,6 +872,50 @@ export class AudioRenderer {
         (now - this.firstBufferScheduledAt) * oldRate;
       this.firstBufferScheduledAt = now;
       this.firstBufferMediaTime = currentMediaTime;
+
+      // Stop the stale old-rate sources scheduled ahead of now. Fade the gain
+      // briefly first (stable audio) to avoid a click at the cut.
+      if (this._stableAudio && this.gainNode && this.activeSources.length > 0) {
+        try {
+          this.gainNode.gain.cancelScheduledValues(now);
+          this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
+          this.gainNode.gain.linearRampToValueAtTime(
+            0,
+            now + AudioRenderer.FADE_OUT_TIME,
+          );
+        } catch {
+          /* ignore ramp errors */
+        }
+      }
+      for (const source of this.activeSources) {
+        try {
+          source.stop();
+          source.disconnect();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.activeSources = [];
+      // Next chunk schedules from now (its expectedTime, via the preserved
+      // anchor, lands just after now — the small forward gap is the buffered
+      // span we just discarded, not a clock leap). Stretcher ring already
+      // cleared above.
+      this.scheduledTime = now;
+
+      // Restore gain after the fade-out for the new-rate sources.
+      if (this._stableAudio && this.gainNode) {
+        try {
+          const restoreTime = now + AudioRenderer.FADE_OUT_TIME + 0.005;
+          this.gainNode.gain.linearRampToValueAtTime(
+            this._muted ? 0 : this.perceptualGain(this.volume),
+            restoreTime,
+          );
+        } catch {
+          this.gainNode.gain.value = this._muted
+            ? 0
+            : this.perceptualGain(this.volume);
+        }
+      }
     }
 
     this._playbackRate = newRate;

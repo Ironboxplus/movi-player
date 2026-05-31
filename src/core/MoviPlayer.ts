@@ -2262,15 +2262,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // spinner shows; play()-initiated seeks pass suppressSpinner to hide it.
     this.suppressSeekSpinner = opts?.suppressSpinner ?? false;
 
-    // A genuine user seek (non-suppressed) cancels a pending debounced
-    // rate-change corrective seek so it doesn't fire a redundant re-seek
-    // right after the user lands somewhere. The corrective seek itself is
-    // suppressed, so it never cancels its own (already-cleared) timer.
-    if (!opts?.suppressSpinner && this.rateChangeSeekTimer !== null) {
-      clearTimeout(this.rateChangeSeekTimer);
-      this.rateChangeSeekTimer = null;
-    }
-
     const currentState = this.stateManager.getState();
     Logger.info(TAG, `seek(${seconds.toFixed(2)}): state=${currentState}, waitingForVideoSync=${this.waitingForVideoSync}, demuxInFlight=${this.demuxInFlight}, seekSessionId=${this.seekSessionId}`);
 
@@ -3503,7 +3494,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   /**
    * Set playback rate
    */
-  private rateChangeSeekTimer: ReturnType<typeof setTimeout> | null = null;
   setPlaybackRate(rate: number): void {
     if (this.hlsWrapper) {
       this.hlsWrapper.setPlaybackRate(rate);
@@ -3540,33 +3530,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // the AudioContext has — small with latencyHint="interactive" — and
     // the new rate is applied to subsequent stretcher output naturally.
 
-    // Debounced corrective audio re-sync after the rate settles. Video snaps to
-    // the new rate immediately (the canvas renderer re-anchors its presentation
-    // clock on setPlaybackRate), but the audio pipeline lets its already-
-    // scheduled old-rate sources play out — a tail that, with the pitch-
-    // preserving stretcher, can run long enough to leave audio audibly behind
-    // video. We used to fix this with a corrective seek, but the seek flushes
-    // the decoder and re-reads from a keyframe BEFORE the current position,
-    // which feels like a small replay (and crashes the HW decoder on heavy AV1).
+    // No corrective re-sync (neither a seek nor an audioRenderer.reset()).
+    // AudioRenderer.setPlaybackRate already re-anchors its audio→media clock
+    // continuously using the OLD rate up to `now`, so getAudioClock() stays
+    // smooth and the new rate applies only to time elapsed afterward.
     //
-    // Instead, reset only the audio renderer: it stops the stale old-rate
-    // sources and re-anchors its audio→media clock, so the next decoded chunks
-    // schedule at the new rate from the current position. No demuxer seek, no
-    // decoder flush — so no replay and no AV1 crash. The video frame queue is
-    // untouched. Debounced so dragging the speed slider triggers one reset at
-    // the end. Skip for HLS / native-audio paths which manage rate internally,
-    // and only fire while actually playing.
-    if (this.hlsWrapper || this.nativeAudioEl) return;
-    if (this.rateChangeSeekTimer !== null) {
-      clearTimeout(this.rateChangeSeekTimer);
-    }
-    this.rateChangeSeekTimer = setTimeout(() => {
-      this.rateChangeSeekTimer = null;
-      if (this.stateManager.getState() !== "playing") return;
-      if (!this.audioRenderer) return;
-      Logger.info(TAG, "Rate-change audio re-sync (no seek)");
-      this.audioRenderer.reset();
-    }, 150);
+    // We previously tried reset() here to drop the short old-rate tail, but
+    // reset() clears firstBufferMediaTime/hasFirstBuffer — so the NEXT decoded
+    // chunk re-anchors the audio clock to the demuxer's read-ahead mediaTime
+    // (1–3s past the real play position). The audio clock then leapt forward
+    // and the video hard-snapped to it (drift > 0.4 in CanvasRenderer), which
+    // is exactly the "playback jumps 1–3s ahead on rate change" regression.
+    // The only artifact of doing nothing is the already-scheduled old-rate
+    // audio tail (≤ AudioContext output buffer, ~30–50ms with
+    // latencyHint="interactive") — imperceptible, and far better than a seek.
   }
 
   /**
@@ -4994,10 +4971,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
     this.stopBackgroundTimer();
     this.stopPauseBuffering();
-    if (this.rateChangeSeekTimer !== null) {
-      clearTimeout(this.rateChangeSeekTimer);
-      this.rateChangeSeekTimer = null;
-    }
 
     // Destroy HLS wrapper
     if (this.hlsWrapper) {
