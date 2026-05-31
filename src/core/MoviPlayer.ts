@@ -3527,17 +3527,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.rateChangeSeekTimer = null;
       if (!this.demuxer) return;
       if (this.stateManager.getState() !== "playing") return;
-      // Skip the corrective seek on AV1: the seek flushes the HW decoder, and
-      // AV1's recurring show_existing_frame packets make the post-flush
-      // keyframe-wait feed an orphan delta frame → EncodingError → recreate→skip
-      // buffering freeze on every speed change. The minor stretcher/clock drift
-      // the seek would correct is far cheaper to tolerate than that freeze.
-      // Other codecs re-seek normally.
+      // Skip the corrective seek only for AV1 sources heavy enough that the HW
+      // decoder can't keep up at the current rate. The crash mechanism: when
+      // decode falls behind, the demux loop drops video non-keyframes to keep
+      // audio fed (skipVideoDecodeForAudio); that breaks AV1's inter-frame
+      // reference chain, so the seek's decoder flush + keyframe-wait then feeds
+      // an orphan delta frame → EncodingError → recreate→skip buffering freeze.
+      // Light sources never fall behind, so they re-seek normally and the minor
+      // stretcher/clock drift gets corrected.
+      //
+      // Decode load ≈ pixels × fps × rate. The two reference cases:
+      //   4K@25 @2x  = 3840×2026×25×2 ≈ 0.39 Gpx/s → decodes fine, re-seek OK
+      //   8K@60 @2x  = 7680×4320×60×2 ≈ 3.98 Gpx/s → falls behind, must gate
+      // 1.0 Gpx/s sits in the wide gap between them: above any normal 4K stream,
+      // below 8K@60. Gating on actual load — not the codec or a hardcoded 8K
+      // dimension — lets a 4K (or any comfortably-decoding) AV1 re-seek while
+      // still protecting the heavy 8K@60 case.
       const vt = this.trackManager.getActiveVideoTrack();
-      if (vt && vt.codec === "av1") {
+      const PIXEL_RATE_GATE = 1_000_000_000; // 1 Gpx/s
+      const decodeLoad =
+        vt && vt.codec === "av1"
+          ? vt.width * vt.height * (vt.frameRate || 30) * rate
+          : 0;
+      if (decodeLoad > PIXEL_RATE_GATE) {
         Logger.info(
           TAG,
-          `Skipping rate-change corrective seek for AV1 (${vt.width}x${vt.height}) — avoids decoder crash`,
+          `Skipping rate-change corrective seek for heavy AV1 (${vt!.width}x${vt!.height}@${vt!.frameRate}fps×${rate} ≈ ${(decodeLoad / 1e9).toFixed(2)} Gpx/s) — avoids decoder crash`,
         );
         return;
       }
