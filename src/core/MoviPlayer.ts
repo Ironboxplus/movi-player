@@ -2125,6 +2125,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
                 packet.keyframe,
                 packet.dts,
                 packet.isIdr,
+                packet.isRasl,
               );
             }
           } else if (activeAudio && activeAudio.id === packet.streamIndex) {

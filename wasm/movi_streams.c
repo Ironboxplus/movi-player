@@ -230,49 +230,23 @@ int movi_seek_to(MoviContext *ctx, double timestamp, int stream_index,
   return ret;
 }
 
-EMSCRIPTEN_KEEPALIVE
-// Classify a single VCL NAL type for HEVC. Returns 1 (true IDR/BLA), 0 (CRA or
-// other open-GOP key), or -1 (not a VCL/random-access NAL — keep scanning).
-static int hevc_nal_class(int nal_type) {
-  // 19=IDR_W_RADL, 20=IDR_N_LP, 16/17/18=BLA_* — all true random access.
-  if (nal_type == 19 || nal_type == 20 || nal_type == 16 || nal_type == 17 ||
-      nal_type == 18)
-    return 1;
-  if (nal_type == 21)
-    return 0; // CRA — open-GOP
-  // Other VCL slice types (0–9 trailing/leading, 21 handled) on a keyframe
-  // packet shouldn't occur as the FIRST slice, but if some non-RAP slice leads,
-  // treat the packet as non-IDR (safer: JS sends it as delta).
-  if (nal_type >= 0 && nal_type <= 31)
-    return 0;
-  return -1; // non-VCL (VPS/SPS/PPS/AUD/SEI/…) — keep scanning
-}
-
-// Classify whether a keyframe packet is a TRUE random-access point that a
-// hardware WebCodecs decoder will accept as a `key` chunk.
+// Find the first VCL slice NAL in a (possibly multi-NAL) packet and return its
+// raw nal_unit_type — HEVC: (byte0 >> 1) & 0x3F (VCL = 0..31); H.264: byte0 &
+// 0x1F (VCL = 1..5). Returns -1 if no VCL slice is found, the packet is too
+// small, or the codec isn't H.264/HEVC.
 //
-// FFmpeg flags both closed-GOP IDR and open-GOP CRA pictures as AV_PKT_FLAG_KEY,
-// but WebCodecs rejects a CRA sent as `key` ("wasn't a key frame") because its
-// leading RASL pictures reference the previous GOP. We tell them apart by
-// finding the first VCL slice NAL and reading its type:
-//   HEVC: nal_type = (byte0 >> 1) & 0x3F. 19/20 = IDR, 16-18 = BLA (true RAP).
-//         21 = CRA (open-GOP) — NOT a true key.
-//   H.264: nal_type = byte0 & 0x1F. 5 = IDR (true key).
-//
-// CRITICAL: a keyframe packet is NOT just one NAL. In MKV/MP4 it's typically
+// CRITICAL: a packet is NOT just one NAL. In MKV/MP4 a keyframe is typically
 // [AUD][VPS][SPS][PPS][SEI…][slice…]. Reading only the first NAL (an AUD/PS)
 // always misclassifies — we must walk every NAL and inspect the first VCL one.
 // Packets may be Annex B (00 00 01 start codes) or length-prefixed (4-byte
 // big-endian, hvcC/avcC). We detect which by probing for a leading start code.
-//
-// Returns 1 if the keyframe is a true IDR/BLA random-access point, 0 otherwise.
-static int movi_packet_is_idr(enum AVCodecID codec_id, const uint8_t *data,
-                              int size) {
+static int movi_first_vcl_nal_type(enum AVCodecID codec_id, const uint8_t *data,
+                                   int size) {
   if (!data || size < 5)
-    return 1; // too small to inspect — assume true key (safe default)
+    return -1; // too small to inspect
 
   if (codec_id != AV_CODEC_ID_HEVC && codec_id != AV_CODEC_ID_H264)
-    return 1; // other codecs: honor container keyframe flag
+    return -1; // only H.264/HEVC carry the NAL types we classify
 
   // Detect format: Annex B if the packet starts with a 3- or 4-byte start code.
   int is_annexb = (data[0] == 0 && data[1] == 0 &&
@@ -288,15 +262,12 @@ static int movi_packet_is_idr(enum AVCodecID codec_id, const uint8_t *data,
         if (nal_off >= size)
           break;
         int hdr = data[nal_off];
-        int cls;
-        if (codec_id == AV_CODEC_ID_HEVC) {
-          cls = hevc_nal_class((hdr >> 1) & 0x3F);
-        } else {
-          int t = hdr & 0x1F;
-          cls = (t == 5) ? 1 : (t >= 1 && t <= 5) ? 0 : -1; // VCL types 1–5
-        }
-        if (cls >= 0)
-          return cls; // first VCL slice decides
+        int t = (codec_id == AV_CODEC_ID_HEVC) ? ((hdr >> 1) & 0x3F)
+                                               : (hdr & 0x1F);
+        int is_vcl = (codec_id == AV_CODEC_ID_HEVC) ? (t >= 0 && t <= 31)
+                                                    : (t >= 1 && t <= 5);
+        if (is_vcl)
+          return t; // first VCL slice decides
         i = nal_off + 1;
       } else {
         i++;
@@ -311,22 +282,59 @@ static int movi_packet_is_idr(enum AVCodecID codec_id, const uint8_t *data,
       if (nal_len == 0 || nal_off >= size)
         break;
       int hdr = data[nal_off];
-      int cls;
-      if (codec_id == AV_CODEC_ID_HEVC) {
-        cls = hevc_nal_class((hdr >> 1) & 0x3F);
-      } else {
-        int t = hdr & 0x1F;
-        cls = (t == 5) ? 1 : (t >= 1 && t <= 5) ? 0 : -1;
-      }
-      if (cls >= 0)
-        return cls;
+      int t = (codec_id == AV_CODEC_ID_HEVC) ? ((hdr >> 1) & 0x3F)
+                                             : (hdr & 0x1F);
+      int is_vcl = (codec_id == AV_CODEC_ID_HEVC) ? (t >= 0 && t <= 31)
+                                                  : (t >= 1 && t <= 5);
+      if (is_vcl)
+        return t;
       i = nal_off + (int)nal_len; // advance past this NAL
     }
   }
 
-  // No VCL slice found (shouldn't happen on a keyframe) — assume true key so we
-  // never wedge waiting for an IDR that we failed to recognize.
-  return 1;
+  return -1; // no VCL slice found
+}
+
+// Classify whether a keyframe packet is a TRUE random-access point that a
+// hardware WebCodecs decoder will accept as a `key` chunk.
+//
+// FFmpeg flags both closed-GOP IDR and open-GOP CRA pictures as AV_PKT_FLAG_KEY,
+// but WebCodecs rejects a CRA sent as `key` ("wasn't a key frame") because its
+// leading RASL pictures reference the previous GOP. We tell them apart by the
+// first VCL slice NAL type:
+//   HEVC: 19/20 = IDR, 16-18 = BLA (true RAP). 21 = CRA (open-GOP) — not a key.
+//   H.264: 5 = IDR (true key).
+//
+// Returns 1 if the keyframe is a true IDR/BLA random-access point, 0 otherwise.
+// Falls back to 1 (safe default: assume true key) when no VCL slice is found or
+// the codec isn't H.264/HEVC, so we never wedge waiting for an IDR we failed to
+// recognize.
+static int movi_packet_is_idr(enum AVCodecID codec_id, const uint8_t *data,
+                              int size) {
+  if (codec_id != AV_CODEC_ID_HEVC && codec_id != AV_CODEC_ID_H264)
+    return 1; // other codecs: honor container keyframe flag
+
+  int t = movi_first_vcl_nal_type(codec_id, data, size);
+  if (t < 0)
+    return 1; // too small / no VCL slice — assume true key (safe default)
+
+  if (codec_id == AV_CODEC_ID_HEVC)
+    return (t == 19 || t == 20 || t == 16 || t == 17 || t == 18) ? 1 : 0;
+  return (t == 5) ? 1 : 0; // H.264 IDR
+}
+
+// Classify whether a packet is an HEVC RASL leading picture (NAL type 8=RASL_N
+// / 9=RASL_R). RASL pictures trail a CRA in decode order but reference the
+// pre-CRA GOP; when the CRA is a random-access resume (references flushed) they
+// are orphaned and must be discarded (NoRaslOutputFlag=1). Chrome drops them
+// internally; Safari/VideoToolbox throws a hard EncodingError — so JS skips
+// them after a CRA resume. HEVC only; 0 for every other codec and NAL type.
+static int movi_packet_is_rasl(enum AVCodecID codec_id, const uint8_t *data,
+                               int size) {
+  if (codec_id != AV_CODEC_ID_HEVC)
+    return 0;
+  int t = movi_first_vcl_nal_type(codec_id, data, size);
+  return (t == 8 || t == 9) ? 1 : 0;
 }
 
 int movi_read_frame(MoviContext *ctx, PacketInfo *info, uint8_t *buffer,
@@ -352,6 +360,14 @@ int movi_read_frame(MoviContext *ctx, PacketInfo *info, uint8_t *buffer,
                            ctx->pkt->size);
   else
     info->is_idr = 0;
+  // Flag HEVC RASL leading pictures so JS can drop the orphaned ones after a
+  // CRA/BLA random-access resume (Safari hard-errors on them). Keyframes are
+  // never RASL; non-HEVC codecs always carry is_rasl = 0.
+  info->is_rasl =
+      info->keyframe
+          ? 0
+          : movi_packet_is_rasl(stream->codecpar->codec_id, ctx->pkt->data,
+                                ctx->pkt->size);
   if (ctx->pkt->pts != AV_NOPTS_VALUE)
     info->timestamp = ctx->pkt->pts * av_q2d(stream->time_base);
   else if (ctx->pkt->dts != AV_NOPTS_VALUE)

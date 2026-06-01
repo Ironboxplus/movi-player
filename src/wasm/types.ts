@@ -211,6 +211,11 @@ export interface PacketInfo {
   // keyframes but must be sent as `delta` mid-stream (see VideoDecoder). Always
   // false for non-keyframes.
   isIdr: boolean;
+  // True for an HEVC RASL leading picture (NAL 8/9). RASL trail a CRA/BLA in
+  // decode order but reference the pre-RAP GOP; orphaned after a random-access
+  // resume, so JS skips them (see VideoDecoder). Always false for keyframes and
+  // non-HEVC codecs.
+  isRasl: boolean;
 }
 
 // StreamInfo struct layout (matches C struct)
@@ -241,8 +246,10 @@ export const STREAM_INFO_OFFSETS = {
   isAttachedPic: 336, // 4 bytes (int)
 };
 
-// PacketInfo struct layout
-export const PACKET_INFO_SIZE = 40;
+// PacketInfo struct layout. Contains doubles (8-byte alignment), so the trailing
+// is_idr(36)+is_rasl(40) ints pad the struct from 44 up to 48 bytes — keep this
+// in sync with sizeof(PacketInfo) in movi.h.
+export const PACKET_INFO_SIZE = 48;
 export const PACKET_INFO_OFFSETS = {
   streamIndex: 0,
   keyframe: 4,
@@ -250,5 +257,6 @@ export const PACKET_INFO_OFFSETS = {
   dts: 16, // double
   duration: 24, // double
   size: 32,
-  isIdr: 36, // int — occupies the padding after `size`; struct stays 40 bytes
+  isIdr: 36, // int — occupies the padding after `size`
+  isRasl: 40, // int
 };

@@ -58,6 +58,15 @@ export class MoviVideoDecoder {
   // getting rejected, we fall back to software quickly instead of stalling the
   // whole seek waiting for the (impossible) HW recovery.
   private justFlushed: boolean = false;
+  // Latched when we resume (post-flush) on an IRAP keyframe: the RASL leading
+  // pictures that may trail a CRA/BLA random-access point reference the absent
+  // pre-RAP GOP, so they must be dropped (NoRaslOutputFlag=1). Chrome discards
+  // them internally; Safari/VideoToolbox throws a hard EncodingError. We latch
+  // on ANY post-flush keyframe and let the per-packet isRasl flag do the actual
+  // dropping — after an IDR (no RASL) the latch is a harmless no-op that the
+  // first trailing picture clears. Only mid-stream RAPs reached during
+  // continuous playback (references present, not post-flush) keep their RASL.
+  private skipRaslAfterResume: boolean = false;
   private postFlushKeyframeRejects: number = 0;
   // After this many consecutive keyframe rejections immediately following a
   // flush, give up on HW for this stream and switch to software decoding.
@@ -600,6 +609,9 @@ export class MoviVideoDecoder {
     // `delta` mid-stream so the HW decoder keeps running. Defaults to true so
     // callers that don't pass it (and non-keyframes) behave as before.
     isIdr: boolean = true,
+    // True for an HEVC RASL leading picture (NAL 8/9). Dropped after a
+    // random-access resume (see skipRaslAfterResume). Defaults to false.
+    isRasl: boolean = false,
   ): void {
     // A keyframe is only a real random-access point if the demuxer classified
     // it as IDR/BLA. Open-GOP CRA frames arrive flagged keyframe but isIdr
@@ -717,6 +729,22 @@ export class MoviVideoDecoder {
       }
     }
 
+    // Drop orphaned RASL leading pictures after a random-access resume. A
+    // CRA/BLA used as a seek target has NoRaslOutputFlag=1: its trailing RASL
+    // pictures reference the flushed pre-RAP GOP and are non-decodable. Chrome
+    // discards them internally; Safari/VideoToolbox throws a hard EncodingError
+    // that wedges the seek (recreate → wait-for-IDR → seek timeout → stuck). The
+    // RASL also have PTS < the RAP, so the seek-target frame filter would drop
+    // their output anyway — skipping here is free and correct on every browser.
+    if (this.skipRaslAfterResume && !keyframe) {
+      if (isRasl) {
+        return; // orphaned leading picture — discard
+      }
+      // First non-leading picture (trailing/RADL): references are valid from
+      // the RAP onward, so stop skipping and resume normal decode.
+      this.skipRaslAfterResume = false;
+    }
+
     // Pass packet data as-is — Chrome's WebCodecs handles both Annex B and
     // length-prefixed formats natively. Converting Annex B → length-prefixed
     // was causing decode errors on DoVi P8 non-keyframes.
@@ -756,6 +784,13 @@ export class MoviVideoDecoder {
     // points the decoder can restart on (we now resume on a post-flush CRA when
     // no IDR is available; see the keyframe-wait skip above).
     if (keyframe) {
+      // Post-flush resume on an IRAP: arm RASL-dropping for any leading
+      // pictures that trail this CRA/BLA (their pre-RAP refs were flushed, so
+      // they're orphaned). A mid-stream RAP reached during continuous playback
+      // (not waiting) keeps its RASL — references are present. Latch on ANY
+      // post-flush keyframe; after a true IDR (no RASL) it's a harmless no-op
+      // the first trailing picture clears.
+      this.skipRaslAfterResume = this.waitingForKeyframe;
       this.setWaitingForKeyframe(false);
       // Cache converted keyframe for instant recovery after decoder recreation
     }
@@ -1196,6 +1231,9 @@ export class MoviVideoDecoder {
     this.openGopErrorCount = 0;
     this.justFlushed = true;
     this.postFlushKeyframeRejects = 0;
+    // Re-derived on the next keyframe (post-flush resume re-latches it); clear
+    // here so a half-finished RASL skip from the prior position can't leak.
+    this.skipRaslAfterResume = false;
     this.pendingChunks = []; // Clear pending inputs
     // After a flush the decoder has NO reference frames, so it must restart on
     // a true IDR/BLA. Force the keyframe-wait so open-GOP CRA frames (and

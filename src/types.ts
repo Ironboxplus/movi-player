@@ -214,6 +214,10 @@ export interface Packet {
   // CRA sync frames (flagged keyframe but must be sent as delta mid-stream) and
   // for non-keyframes. See VideoDecoder.decode.
   isIdr: boolean;
+  // True for an HEVC RASL leading picture (NAL 8/9) that trails a CRA/BLA. After
+  // a random-access resume these reference an absent (pre-RAP) GOP and must be
+  // skipped — Safari's decoder hard-errors on them. See VideoDecoder.decode.
+  isRasl: boolean;
 }
 
 // ============================================================================
