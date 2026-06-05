@@ -185,8 +185,31 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
           ? Math.floor(e.code / 1000)
           : 0;
     switch (category) {
-      case 1: // NETWORK
+      case 1: { // NETWORK
+        // Not every network failure is the viewer's connection. Shaka splits
+        // this category by code: BAD_HTTP_STATUS (1001) means the server DID
+        // answer, with an error status (403/404/5xx) — blaming the user's wifi
+        // is wrong and unactionable. HTTP_ERROR (1002) / TIMEOUT (1003) are the
+        // genuine "request never landed" cases. Surface the real reason.
+        const code = typeof e?.code === "number" ? e.code : 0;
+        // BAD_HTTP_STATUS data: [uri, httpStatus, responseText, headers, type]
+        const status =
+          code === 1001 && Array.isArray(e?.data) ? Number(e.data[1]) || 0 : 0;
+        if (status === 401 || status === 403)
+          return `Access to this video was denied (HTTP ${status}). The link may have expired or be restricted.`;
+        if (status === 404 || status === 410)
+          return "This video could not be found. The link may be broken or removed.";
+        if (status === 429)
+          return "The video server is rate-limiting requests. Please wait a moment and try again.";
+        if (status >= 500)
+          return `The video server had a problem (HTTP ${status}). Please try again later.`;
+        if (status > 0)
+          return `The video server rejected the request (HTTP ${status}).`;
+        if (code === 1003) // TIMEOUT
+          return "The video took too long to load. Check your connection and try again.";
+        // HTTP_ERROR / CORS / offline — the request never reached the server.
         return "Couldn't load the video. Check your internet connection and try again.";
+      }
       case 3: // MEDIA
         return "This video can't be played on this device.";
       case 4: // MANIFEST
@@ -430,6 +453,20 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
             }
           });
       }
+    }
+
+    // Custom media headers: applied to EVERY outbound request Shaka makes —
+    // manifest, segments, init segments, timing, etc. (the "network media flow"
+    // the caller asked about). Registered unconditionally (independent of DRM)
+    // so auth tokens / signed headers reach the .mpd/.m3u8 and its segments.
+    // License headers above stack on top for LICENSE requests.
+    if (this.config.headers) {
+      const mediaHeaders = this.config.headers;
+      this.player
+        .getNetworkingEngine()
+        ?.registerRequestFilter((_type: any, request: any) => {
+          Object.assign(request.headers, mediaHeaders);
+        });
     }
 
     // Surface Shaka errors. load() rejects on a fatal load error; later

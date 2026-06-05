@@ -206,12 +206,22 @@ export class HLSPlayerWrapper extends EventEmitter<PlayerEventMap> {
       }
     }
 
+    // Custom media headers (auth tokens, signed headers, …) on every request
+    // hls.js makes — the manifest and all segments.
+    const mediaHeaders = this.config.headers;
     this.hls = new Hls({
       enableWorker: true,
       lowLatencyMode: false,
       backBufferLength: 90,
       maxBufferLength: 30,
       maxMaxBufferLength: 600,
+      ...(mediaHeaders && {
+        xhrSetup: (xhr: XMLHttpRequest) => {
+          for (const [k, v] of Object.entries(mediaHeaders)) {
+            xhr.setRequestHeader(k, v);
+          }
+        },
+      }),
     });
 
     this.hls.attachMedia(this.videoElement);

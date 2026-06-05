@@ -78,6 +78,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   // Separate audio source — uses native <audio> element (zero WASM overhead)
   private nativeAudioEl: HTMLAudioElement | null = null;
+  // When custom media headers are set, the native <audio> can't send them, so
+  // we fetch the file ourselves and feed it a blob: URL. Track the logical
+  // (pre-blob) URL for same-source detection and the object URL for revocation.
+  private _nativeAudioObjectUrl: string | null = null;
+  private _nativeAudioLogicalUrl: string | null = null;
   private _audioTracks: AudioSourceEntry[] = [];
   private _activeAudioLang: string = "";
 
@@ -3810,17 +3815,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private setupNativeAudio(url: string): void {
     const wasPlaying = this.nativeAudioEl && !this.nativeAudioEl.paused;
     const currentTime = this.nativeAudioEl?.currentTime ?? 0;
-    const sameSrc = this.nativeAudioEl && this.nativeAudioEl.src === url;
+    // Same-source detection: match the logical URL (the blob path rewrites
+    // .src to a blob: URL) OR the element's raw .src (an adopted element from a
+    // quality switch carries the URL but not our logical-URL field).
+    const sameSrc =
+      !!this.nativeAudioEl &&
+      (this._nativeAudioLogicalUrl === url || this.nativeAudioEl.src === url);
 
     // Reuse or create element
     if (!this.nativeAudioEl) {
       this.nativeAudioEl = new Audio();
-    }
-    // Skip src reassignment when adopting an already-playing element with the
-    // same URL (quality switch where audio track is shared) — reassigning the
-    // same src triggers a reload and loses the user-activated play() context.
-    if (!sameSrc) {
-      this.nativeAudioEl.src = url;
     }
     this.nativeAudioEl.preload = "auto";
     this.nativeAudioEl.volume = this.muted ? 0 : this.audioRenderer.getVolume();
@@ -3847,12 +3851,66 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       );
     }
 
-    // Restore position and playback state when switching tracks
-    if (currentTime > 0) {
-      audioEl.currentTime = currentTime;
+    // Restore position and resume after the source is in place. Also resume if
+    // the player has since entered "playing" (e.g. autoplay/play() fired while
+    // the headed blob was still fetching, so the earlier audio play() was a
+    // no-op) — this lets the audio join as soon as it's ready.
+    const restorePlayback = () => {
+      if (currentTime > 0) audioEl.currentTime = currentTime;
+      if (wasPlaying || this.stateManager.is("playing")) {
+        audioEl.play().catch(() => {});
+      }
+    };
+
+    if (sameSrc) {
+      // Adopting an already-playing element with the same URL (quality switch
+      // where the audio track is shared) — reassigning src would reload and
+      // lose the user-activated play() context, so leave it untouched.
+      restorePlayback();
+      return;
     }
-    if (wasPlaying) {
-      audioEl.play().catch(() => {});
+
+    this._nativeAudioLogicalUrl = url;
+    const headers = this.config.headers;
+    if (headers && Object.keys(headers).length > 0) {
+      // Native <audio> ignores custom request headers, so the .mpd-split / API
+      // audio file would 401/403 without them. Fetch it ourselves with the
+      // headers and play from an in-memory blob: URL. Trade-off: the whole file
+      // is buffered up front (no range streaming) — acceptable for a separate
+      // audio track, and only taken when headers are actually required.
+      this.revokeNativeAudioObjectUrl();
+      fetch(url, { headers })
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.blob();
+        })
+        .then((blob) => {
+          // A newer setup (track switch / new source) may have superseded this
+          // fetch while it was in flight — bail so we don't clobber it.
+          if (this.nativeAudioEl !== audioEl || this._nativeAudioLogicalUrl !== url) {
+            return;
+          }
+          this._nativeAudioObjectUrl = URL.createObjectURL(blob);
+          audioEl.src = this._nativeAudioObjectUrl;
+          restorePlayback();
+        })
+        .catch((e) => {
+          Logger.error(TAG, `Separate audio with custom headers failed to load: ${url}`, e);
+        });
+    } else {
+      this.revokeNativeAudioObjectUrl();
+      audioEl.src = url;
+      restorePlayback();
+    }
+  }
+
+  /** Release the in-memory blob: URL backing a header-authenticated audio file. */
+  private revokeNativeAudioObjectUrl(): void {
+    if (this._nativeAudioObjectUrl) {
+      try {
+        URL.revokeObjectURL(this._nativeAudioObjectUrl);
+      } catch {}
+      this._nativeAudioObjectUrl = null;
     }
   }
 
@@ -3867,6 +3925,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   releaseNativeAudio(): HTMLAudioElement | null {
     const el = this.nativeAudioEl;
     if (el) {
+      // Hand the blob: URL (and its logical URL) to the successor via the
+      // element itself, so it reuses the same in-memory audio instead of
+      // re-fetching — and so we DON'T revoke a URL the element still plays.
+      (el as any).__moviLogicalUrl = this._nativeAudioLogicalUrl;
+      (el as any).__moviObjectUrl = this._nativeAudioObjectUrl;
+      this._nativeAudioObjectUrl = null; // ownership moves with the element
+      this._nativeAudioLogicalUrl = null;
       this.nativeAudioEl = null;
     }
     return el;
@@ -3882,6 +3947,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       try { this.nativeAudioEl.pause(); } catch {}
     }
     this.nativeAudioEl = el;
+    // Reclaim the blob: URL ownership stashed by releaseNativeAudio, so the
+    // same-source check matches (no re-fetch) and destroy() later revokes it.
+    if ((el as any).__moviObjectUrl !== undefined) {
+      this._nativeAudioObjectUrl = (el as any).__moviObjectUrl ?? null;
+      this._nativeAudioLogicalUrl = (el as any).__moviLogicalUrl ?? null;
+      delete (el as any).__moviObjectUrl;
+      delete (el as any).__moviLogicalUrl;
+    }
   }
 
   /**
@@ -3931,6 +4004,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.nativeAudioEl.pause();
     this.nativeAudioEl.src = "";
     this.nativeAudioEl = null;
+    this.revokeNativeAudioObjectUrl();
+    this._nativeAudioLogicalUrl = null;
     this._activeAudioLang = "";
 
     // Re-enable WASM audio
@@ -5322,6 +5397,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.nativeAudioEl.src = "";
       this.nativeAudioEl = null;
     }
+    this.revokeNativeAudioObjectUrl();
+    this._nativeAudioLogicalUrl = null;
 
     // Cleanup external subtitles
     this.stopExternalSubtitles();

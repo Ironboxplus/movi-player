@@ -116,6 +116,10 @@ export class MoviElement extends HTMLElement {
   // wire any custom protocol (WebSocket, WebRTC data channel, IndexedDB,
   // bespoke encryption, etc.) into the element without losing the UI.
   private _sourceAdapter: SourceAdapter | null = null;
+  // Custom HTTP headers applied to all media network requests (manifest +
+  // segments for streams, progressive downloads too). Set declaratively via the
+  // `headers` attribute (JSON) or programmatically via the `headers` property.
+  private _headers: Record<string, string> | null = null;
   private _audioSrc: string | null = null; // Separate audio source URL
   // Pre-muxed video qualities declared via multiple <source> tags with
   // data-height / data-label. Lets the player drive a YouTube-style quality
@@ -358,6 +362,7 @@ export class MoviElement extends HTMLElement {
       "drm",
       "licenseurl",
       "licenseheaders",
+      "headers",
       "lcevc",
       "lcevcurl",
       "postertime",
@@ -12902,6 +12907,28 @@ export class MoviElement extends HTMLElement {
         }
         break;
       }
+      case "headers": {
+        // Declarative form of the `headers` property — a JSON object string,
+        // e.g. headers='{"Authorization":"Bearer <token>"}'. Applied to all
+        // media network requests (manifest + segments + progressive). The
+        // property setter (object form) is preferred for non-trivial maps.
+        if (!newValue) {
+          this._headers = null;
+        } else {
+          try {
+            const parsed = JSON.parse(newValue);
+            this._headers =
+              parsed && typeof parsed === "object" ? parsed : null;
+          } catch {
+            Logger.warn(TAG, "Invalid headers JSON attribute; ignoring");
+            this._headers = null;
+          }
+        }
+        if (this.isConnected && (this._src || this._sourceAdapter)) {
+          this.load();
+        }
+        break;
+      }
       case "autoplay":
         this._autoplay = newValue !== null;
         this.updateUnmuteOverlay();
@@ -13196,11 +13223,20 @@ export class MoviElement extends HTMLElement {
     // resize, collapses it to the 56px strip. In the error state there are no
     // tracks to trust, so decide from the src's own media type instead: a real
     // audio file stays a strip, a failed video/manifest shows full-size.
-    const errored = this.player?.getState?.() === "error" || this._isUnsupported;
+    // The SAME trap exists DURING load (idle/loading): tracks aren't resolved
+    // yet, hasVideoTrack is still false, yet hasAudibleSource() already reads
+    // true — so a resize mid-load (e.g. responsive layout settling, sidebar
+    // toggling) collapses a still-loading VIDEO into the strip. Treat that
+    // window like the error state and decide from the src's media type until
+    // the real tracks arrive.
+    const state = this.player?.getState?.();
+    const errored = state === "error" || this._isUnsupported;
+    const tracksUnresolved =
+      !hasVideoTrack && (errored || state === "idle" || state === "loading");
     const srcIsAudio =
       typeof this._src === "string" &&
       this.guessMediaType(this._src).startsWith("audio/");
-    const audioMode = errored ? srcIsAudio : !hasVideoTrack && hasAudio;
+    const audioMode = tracksUnresolved ? srcIsAudio : !hasVideoTrack && hasAudio;
     // VLC-like: if the source HAS an attached-picture track and previews are
     // on, cover art is on its way — hold the strip layout off until extraction
     // settles (_coverArtResolved) so we don't flash the 56px strip and then
@@ -13575,6 +13611,13 @@ export class MoviElement extends HTMLElement {
         throw new Error("Invalid source type");
       }
 
+      // Custom media headers: ride along on the SourceConfig (demuxer/HttpSource
+      // path) AND as a top-level config field the stream wrappers read for
+      // adaptive manifest + segment requests. One object, both code paths.
+      if (this._headers && source && source.type === "url") {
+        source.headers = this._headers;
+      }
+
       // Create MoviPlayer instance
       // Configure MoviPlayer options
       const playerConfig: any = {
@@ -13583,6 +13626,7 @@ export class MoviElement extends HTMLElement {
         cache: { type: "lru", maxSizeMB: 520 },
         enablePreviews: this._thumb,
         ...(this._fps > 0 && { frameRate: this._fps }),
+        ...(this._headers && { headers: this._headers }),
         ...(this._sourceAdapter && { sourceAdapter: this._sourceAdapter }),
       };
 
@@ -13891,6 +13935,11 @@ export class MoviElement extends HTMLElement {
             "The decoder ran out of memory while parsing this file. Try software decoding — it uses a different path that handles this case.";
         } else if (message.includes("decode")) {
           title = "Playback Error";
+        } else if (/\(HTTP \d|was denied|could not be found|video server/i.test(message)) {
+          // The stream wrapper already produced a precise HTTP reason (403/404/
+          // 5xx/…); "Initialization Failed" reads like a player bug, so use a
+          // neutral title and let the specific message carry the detail.
+          title = "Can't Play Video";
         }
       }
 
@@ -15661,6 +15710,29 @@ export class MoviElement extends HTMLElement {
   }
 
   /**
+   * Custom HTTP headers sent with every media network request — the adaptive
+   * manifest (.mpd/.m3u8) and all of its segments, plus progressive downloads.
+   * Use for auth tokens, signed headers, etc. The object form is the
+   * programmatic counterpart to the JSON `headers` attribute; objects can't go
+   * through attributes, so set non-trivial header maps via this property.
+   *
+   *   player.headers = { Authorization: "Bearer <token>" };
+   */
+  get headers(): Record<string, string> | null {
+    return this._headers;
+  }
+
+  set headers(value: Record<string, string> | null) {
+    this._headers = value && typeof value === "object" ? { ...value } : null;
+    // Headers are consumed when the player/stream-wrapper is constructed, so a
+    // live change only takes effect on the next load. Reload if a source is
+    // already active.
+    if (this.isConnected && (this._src || this._sourceAdapter)) {
+      this.load();
+    }
+  }
+
+  /**
    * Video.js-style source API
    *
    * Usage:
@@ -15852,17 +15924,23 @@ export class MoviElement extends HTMLElement {
     }
 
     try {
-      // Create player with encrypted source (respecting element properties)
+      // Create player with encrypted source (respecting element properties).
+      // Custom media headers ride on the SourceConfig — createSource forwards
+      // them to EncryptedHttpSource, which spreads them onto both the stream
+      // GET and the token-refresh request (alongside the per-request signing
+      // headers).
       this.player = new MoviPlayer({
         source: {
           type: "encrypted",
           encrypted: config,
+          ...(this._headers && { headers: this._headers }),
         },
         renderer: "canvas",
         decoder: this._sw,
         canvas: this.canvas,
         enablePreviews: this._thumb,
         frameRate: this._fps || undefined,
+        ...(this._headers && { headers: this._headers }),
       });
 
       this.setupEventHandlers();

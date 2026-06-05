@@ -198,6 +198,17 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
     }
 
     this.dash = MediaPlayer().create();
+
+    // Custom media headers on every request dash.js makes (manifest + segments).
+    // Must be registered before initialize() so the manifest fetch carries them.
+    const mediaHeaders = this.config.headers;
+    if (mediaHeaders) {
+      (this.dash as any).addRequestInterceptor((request: any) => {
+        request.headers = { ...(request.headers || {}), ...mediaHeaders };
+        return Promise.resolve(request);
+      });
+    }
+
     // autoplay=false — MoviPlayer/MoviElement decide when to play().
     this.dash.initialize(this.videoElement, url, false);
 
