@@ -16,7 +16,7 @@ interface StateEvents {
 const VALID_TRANSITIONS: Record<PlayerState, PlayerState[]> = {
   idle: ['loading'],
   loading: ['ready', 'error'],
-  ready: ['playing', 'seeking', 'error'],
+  ready: ['playing', 'paused', 'seeking', 'error'],
   playing: ['paused', 'seeking', 'buffering', 'ended', 'error'],
   paused: ['playing', 'seeking', 'error'],
   seeking: ['ready', 'playing', 'paused', 'buffering', 'error', 'seeking'],

@@ -1160,7 +1160,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // audio context. Running them concurrently let the audio renderer
       // accept the very first decoded packet before the demuxer cursor
       // had finished rewinding.
-      await this.demuxer.seek(targetTime);
+      //
+      // Guard the seek: the demuxer rejects with "error -1" when the source
+      // opened in a degenerate state (e.g. a non-faststart file whose prebuffer
+      // hit EOF with zero frames, or a rapid source-switch that tore down the
+      // read path mid-open). Unguarded, it escaped as an uncaught rejection —
+      // and with the caller re-issuing play() it spammed/looped. Bail cleanly
+      // and mark the source unplayable so the UI can show the broken state
+      // instead of retrying a seek that can never succeed.
+      try {
+        await this.demuxer.seek(targetTime);
+      } catch (error) {
+        Logger.error(TAG, "Demuxer seek on first play failed", error);
+        this.wasPlayingBeforeSeek = false;
+        this.suppressSeekSpinner = false;
+        this.stateManager.setState("error");
+        this.emit("error", error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
       // After Open-GOP recovery (decoder rejected the first keyframe past
       // the seek target and reset), the next decoded frames will begin at
       // the previous GOP's keyframe — often 1-2s behind targetTime. Without

@@ -134,6 +134,10 @@ export class MoviElement extends HTMLElement {
   // over the first frame during the brief pre-play startup window even
   // though the player is about to start on its own.
   private _autoplayStarting: boolean = false;
+  // Autoplay was requested while the tab was hidden — deferred until the tab
+  // is visible (a backgrounded first-play seek gets throttled and stalls in
+  // buffering). _onVisibilityChange starts it when the tab is shown.
+  private _autoplayPendingVisible: boolean = false;
   // True when autoplay-with-sound was blocked by the browser and we fell
   // back to muted playback (YouTube/Twitter behaviour). Unlike the `muted`
   // attribute, this is a runtime decision the user never asked for — so the
@@ -310,6 +314,14 @@ export class MoviElement extends HTMLElement {
       const lost = gl?.isContextLost?.() ?? false;
       if (!lost && this._contextLostTime === 0) {
         this._hideSnapshotPoster();
+      }
+
+      // An autoplay deferred while the tab was hidden — start it now that the
+      // tab is visible, so the first-play seek runs with rAF/decoding active
+      // instead of stalling in a throttled background.
+      if (this._autoplayPendingVisible && this.player && !this._isUnsupported) {
+        this._autoplayPendingVisible = false;
+        void this._startAutoplay();
       }
     }
   };
@@ -13351,6 +13363,30 @@ export class MoviElement extends HTMLElement {
    * resume() kicked off inside play() is async, so we give it a couple of
    * animation frames to settle before reading the state.
    */
+  /**
+   * Kick off autoplay: suppress the centre play overlay through the startup
+   * window, call play(), and run the muted-autoplay fallback. Shared by the
+   * initial load and the deferred (tab-was-hidden) path in _onVisibilityChange.
+   */
+  private async _startAutoplay(): Promise<void> {
+    if (!this.player || !this._autoplay || this._isUnsupported) return;
+    // Suppress the center play overlay through the startup window so the big
+    // play icon doesn't flash before playback begins on its own.
+    this._autoplayStarting = true;
+    this.updatePlayPauseIcon();
+    await this.player.play().catch(() => {
+      // Hard play() rejection (rare for canvas mode — video keeps going even
+      // when audio can't). Surface the overlay so there's something to click;
+      // the suspended-audio check below still runs.
+      this._autoplayStarting = false;
+      this.updatePlayPauseIcon();
+    });
+    // Browser autoplay policy blocks audio-with-sound silently: play() resolves
+    // and video rolls, but the AudioContext stays suspended. Poll the audio
+    // state and fall back to muted playback + a "Tap to unmute" pill.
+    this.maybeFallbackToMutedAutoplay();
+  }
+
   private maybeFallbackToMutedAutoplay(attempt: number = 0): void {
     if (!this.player || this._muted || this._userHasUnmuted) return;
     if (!this.player.hasAudibleSource()) return;
@@ -13835,27 +13871,21 @@ export class MoviElement extends HTMLElement {
         this.startResumeSaving();
       }
 
-      // Auto-play if requested
+      // Auto-play if requested — but never while the tab is hidden. A
+      // backgrounded autoplay kicks off a first-play seek the browser then
+      // throttles (rAF paused, WakeLock denied); it times out into a buffering
+      // state that doesn't cleanly resume on return (the user had to pause→play
+      // to unstick it). Defer to the first time the tab is visible — which is
+      // also how browsers gate background autoplay. _onVisibilityChange starts
+      // it via _startAutoplay() once shown. The center play button stays visible
+      // meanwhile (autoplayStarting unset), so a manual start works too.
       if (this._autoplay && this.player) {
-        // Suppress the center play overlay through the startup window so the
-        // big play icon doesn't flash before playback begins on its own.
-        this._autoplayStarting = true;
-        this.updatePlayPauseIcon();
-        await this.player.play().catch(() => {
-          // Hard play() rejection (rare for canvas mode — video keeps going
-          // even when audio can't). Surface the overlay so there's something
-          // to click; the suspended-audio check below still runs.
-          this._autoplayStarting = false;
-          this.updatePlayPauseIcon();
-        });
-        // Browser autoplay policy blocks audio-with-sound silently: play()
-        // resolves and video rolls, but the AudioContext stays suspended
-        // (resume() neither throws nor wakes it without a user gesture). So
-        // we can't detect this from the promise — poll the audio state right
-        // after play() and fall back to muted playback + a "Tap to unmute"
-        // pill (YouTube/Twitter behaviour) so the user has a one-tap path to
-        // audio instead of silently-broken sound.
-        this.maybeFallbackToMutedAutoplay();
+        if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+          this._autoplayPendingVisible = true;
+          Logger.info(TAG, "Autoplay deferred — tab hidden; will start when visible");
+        } else {
+          await this._startAutoplay();
+        }
       } else if (this._startAt === 0 && this.player && !this._poster) {
         // Render the poster frame on canvas via a seek on the main decoder
         // (never the thumbnail pipeline). With a `postertime`, seek to that
@@ -14054,6 +14084,20 @@ export class MoviElement extends HTMLElement {
       this.updateLoadingIndicator(state);
       this.updateControlsState();
       this.updatePlayPauseIcon();
+
+      // Autoplay suppression also ends when startup stops SHORT of playback —
+      // e.g. the browser blocked autoplay pending a user gesture (common with a
+      // separate native-audio track), leaving the player paused. play() doesn't
+      // reject in that case and no "playing" event fires, so without this the
+      // flag would stay set and keep the centre play button hidden. Clear it and
+      // repaint so the big play affordance surfaces for a manual start.
+      if (
+        this._autoplayStarting &&
+        (state === "paused" || state === "ended" || state === "error")
+      ) {
+        this._autoplayStarting = false;
+        this.updatePlayPauseIcon();
+      }
 
       if (state === "playing") {
         // Autoplay reached playback — startup window is over. Capture it
@@ -14350,6 +14394,9 @@ export class MoviElement extends HTMLElement {
     // Reset unsupported and loading state on source change so new source can load
     this._isUnsupported = false;
     this.isLoading = false;
+    // Drop any autoplay deferred for the previous source — initializePlayer
+    // re-arms it for the new one if still hidden.
+    this._autoplayPendingVisible = false;
     if (this.brokenIndicator) this.brokenIndicator.style.display = "none";
     // A fresh source may well support Range — clear any linear-mode lock.
     this._linearMode = false;
@@ -14415,6 +14462,7 @@ export class MoviElement extends HTMLElement {
     this._pendingPlay = false;
     this._preloadGateActive = false;
     this._resumeDialogPending = false;
+    this._autoplayPendingVisible = false;
 
     // Tear down internal player
     if (this.player) {
