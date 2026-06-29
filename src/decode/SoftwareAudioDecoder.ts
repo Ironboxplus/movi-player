@@ -62,7 +62,7 @@ export class SoftwareAudioDecoder {
     this.trackIndex = track.id;
 
     // Enable decoder in WASM
-    const ret = this.bindings.enableDecoder(this.trackIndex);
+    const ret = this.bindings.enableDecoder(this.trackIndex, track.extradata);
     if (ret < 0) {
       Logger.error(
         TAG,
@@ -86,15 +86,24 @@ export class SoftwareAudioDecoder {
   }
 
   async flush(): Promise<void> {
-    // No-op
+    if (!this.isConfigured || this.trackIndex < 0) return;
+    this.bindings.flushDecoder(this.trackIndex);
   }
 
   reset(): void {
     this.consecutiveFailures = 0;
+    this.isBroken = false;
+    if (this.isConfigured && this.trackIndex >= 0) {
+      this.bindings.flushDecoder(this.trackIndex);
+    }
   }
 
   close(): void {
     this.isConfigured = false;
+  }
+
+  get queueSize(): number {
+    return 0;
   }
 
   decode(data: Uint8Array, timestamp: number, keyframe: boolean): void {

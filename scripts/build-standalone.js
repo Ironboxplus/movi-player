@@ -8,7 +8,8 @@ import { resolve } from 'path';
 import dts from 'vite-plugin-dts';
 import terser from '@rollup/plugin-terser';
 import { fileURLToPath } from 'url';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
+import { readdir, rm } from 'fs/promises';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -20,6 +21,23 @@ const entries = [
   { name: 'element', path: 'src/element.ts' },
   { name: 'index', path: 'src/index.ts' },
 ];
+
+async function removeStaleAudioWorkerAssets() {
+  const assetsDir = join(rootDir, 'dist', 'assets');
+  let files = [];
+  try {
+    files = await readdir(assetsDir);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+
+  await Promise.all(
+    files
+      .filter((file) => /^SoftwareAudioDecoder\.worker-[\w-]+\.js$/.test(file))
+      .map((file) => rm(join(assetsDir, file), { force: true })),
+  );
+}
 
 // Rewrites every console.log/info/warn/error/debug call site to
 // globalThis.__movilog?.<level>(...). We do this BEFORE terser runs:
@@ -94,6 +112,7 @@ async function buildEntry(entry, format) {
 
   await build({
     configFile: false,
+    base: './',
     plugins: [
       // Only generate types once for ES format
       ...(format === 'es'
@@ -154,6 +173,7 @@ async function buildEntry(entry, format) {
 
 async function buildAll() {
   console.log('Building standalone modular bundles...\n');
+  await removeStaleAudioWorkerAssets();
 
   for (const entry of entries) {
     // Build ES format

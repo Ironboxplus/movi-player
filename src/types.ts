@@ -12,6 +12,7 @@ export interface Track {
   id: number;
   type: "video" | "audio" | "subtitle";
   codec: string;
+  codecId?: number;
   codecString?: string;
   extradata?: Uint8Array;
   profile?: number;

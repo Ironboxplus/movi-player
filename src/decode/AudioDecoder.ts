@@ -1,13 +1,18 @@
 import type { AudioTrack } from "../types";
 import { Logger } from "../utils/Logger";
 import { SoftwareAudioDecoder, type PCMFrame } from "./SoftwareAudioDecoder";
+import {
+  WorkerSoftwareAudioDecoder,
+  type AudioWorkerStats,
+} from "./WorkerSoftwareAudioDecoder";
 import { WasmBindings } from "../wasm/bindings";
 
 const TAG = "AudioDecoder";
 
 export class MoviAudioDecoder {
   private decoder: AudioDecoder | null = null;
-  private swDecoder: SoftwareAudioDecoder | null = null;
+  private swDecoder: SoftwareAudioDecoder | WorkerSoftwareAudioDecoder | null =
+    null;
   private bindings: WasmBindings | null = null;
   private useSoftware: boolean = false;
 
@@ -25,6 +30,7 @@ export class MoviAudioDecoder {
   private currentTrack: AudioTrack | null = null;
   private hasTriedSoftwareFallback: boolean = false; // Track if we've already tried software fallback
   private hasDescription: boolean = false; // Whether decoder was configured with description (AudioSpecificConfig)
+  private softwareFallbackReason = "";
   // Stereo downmix policy for the software path (truehd, dca, ac3,
   // eac3, …). Defaults to stereo so headphones / laptop speakers
   // sound right; flipped off by setDownmix() when the player has
@@ -52,8 +58,10 @@ export class MoviAudioDecoder {
    * Configure the decoder for a specific track
    */
   async configure(track: AudioTrack, extradata?: Uint8Array): Promise<boolean> {
-    this.currentTrack = track;
+    this.currentTrack =
+      extradata && extradata.length > 0 ? { ...track, extradata } : track;
     this.useSoftware = false;
+    this.softwareFallbackReason = "";
     this.hasTriedSoftwareFallback = false; // Reset fallback flag on new configuration
 
     if (this.swDecoder) {
@@ -218,21 +226,25 @@ export class MoviAudioDecoder {
       this.decoder = null;
     }
 
-    this.swDecoder = new SoftwareAudioDecoder(this.bindings);
-    // Carry forward the player-set downmix policy so a fresh swDecoder
-    // (e.g. an audio-track switch) doesn't snap back to stereo while
-    // the renderer is still wired for multi-channel output.
-    this.swDecoder.setDownmix(this._downmix);
-    this.swDecoder.setOnData((frame) => {
-      if (this.onPCM) this.onPCM(frame);
-      else this.pendingPCM.push(frame);
-    });
-    this.swDecoder.setOnError((e) => {
-      Logger.error(TAG, "Software decoder error", e);
-      if (this.onError) this.onError(e);
-    });
+    const decoder = await this.createSoftwareDecoder();
+    if (!decoder) return false;
 
-    const success = await this.swDecoder.configure(this.currentTrack);
+    let success = await this.configureSoftwareDecoder(decoder);
+    if (!success && decoder instanceof WorkerSoftwareAudioDecoder && this.bindings) {
+      const workerStats = decoder.getStats();
+      this.softwareFallbackReason =
+        workerStats.lastError ||
+        `Worker configure returned false (${workerStats.configureState})`;
+      decoder.close();
+      Logger.warn(
+        TAG,
+        `Worker software audio decoder unavailable, falling back to main thread: ${this.softwareFallbackReason}`,
+      );
+      success = await this.configureSoftwareDecoder(
+        new SoftwareAudioDecoder(this.bindings),
+      );
+    }
+
     if (success) {
       this.isConfigured = true;
 
@@ -247,6 +259,56 @@ export class MoviAudioDecoder {
       return true;
     }
     return false;
+  }
+
+  private async configureSoftwareDecoder(
+    decoder: SoftwareAudioDecoder | WorkerSoftwareAudioDecoder,
+  ): Promise<boolean> {
+    if (!this.currentTrack) return false;
+
+    this.swDecoder = decoder;
+    // Carry forward the player-set downmix policy so a fresh swDecoder
+    // (e.g. an audio-track switch) doesn't snap back to stereo while
+    // the renderer is still wired for multi-channel output.
+    decoder.setDownmix(this._downmix);
+    decoder.setOnData((frame) => {
+      if (this.onPCM) this.onPCM(frame);
+      else this.pendingPCM.push(frame);
+    });
+    decoder.setOnError((e) => {
+      Logger.error(TAG, "Software decoder error", e);
+      if (this.onError) this.onError(e);
+    });
+
+    try {
+      return await decoder.configure(this.currentTrack);
+    } catch (error) {
+      Logger.warn(TAG, "Software decoder configure failed", error);
+      return false;
+    }
+  }
+
+  private async createSoftwareDecoder(): Promise<
+    SoftwareAudioDecoder | WorkerSoftwareAudioDecoder | null
+  > {
+    if (WorkerSoftwareAudioDecoder.isSupported()) {
+      try {
+        const workerDecoder = new WorkerSoftwareAudioDecoder();
+        Logger.info(TAG, "Using worker software audio decoder");
+        return workerDecoder;
+      } catch (error) {
+        this.softwareFallbackReason =
+          error instanceof Error ? error.message : String(error);
+        Logger.warn(
+          TAG,
+          "Worker software audio decoder failed, falling back to main thread",
+          error,
+        );
+      }
+    }
+
+    if (!this.bindings) return null;
+    return new SoftwareAudioDecoder(this.bindings);
   }
 
   /**
@@ -422,6 +484,11 @@ export class MoviAudioDecoder {
    * Flush the decoder
    */
   async flush(): Promise<void> {
+    if (this.useSoftware && this.swDecoder) {
+      await this.swDecoder.flush();
+      return;
+    }
+
     if (!this.decoder) return;
 
     try {
@@ -435,6 +502,10 @@ export class MoviAudioDecoder {
    * Reset the decoder
    */
   reset(): void {
+    if (this.useSoftware && this.swDecoder) {
+      this.swDecoder.reset();
+    }
+
     if (this.decoder) {
       try {
         this.decoder.reset();
@@ -456,6 +527,11 @@ export class MoviAudioDecoder {
    */
   close(): void {
     this.reset();
+
+    if (this.swDecoder) {
+      this.swDecoder.close();
+      this.swDecoder = null;
+    }
 
     if (this.decoder) {
       try {
@@ -484,17 +560,41 @@ export class MoviAudioDecoder {
    * Get queue size
    */
   get queueSize(): number {
-    // Note: swDecoder is currently synchronous so its queue is effectively 0
-    return this.decoder?.decodeQueueSize ?? 0;
+    return (this.swDecoder?.queueSize ?? 0) + (this.decoder?.decodeQueueSize ?? 0);
+  }
+
+  /**
+   * Check if software decoder is being used
+   */
+  get isSoftware(): boolean {
+    return this.useSoftware;
   }
 
   /**
    * Get decoder stats for nerd stats overlay
    */
-  getStats(): { decoderType: string; queueSize: number } {
+  getStats(): {
+    decoderType: string;
+    queueSize: number;
+    isSoftware: boolean;
+    softwareFallbackReason: string;
+    worker?: AudioWorkerStats;
+  } {
+    const worker =
+      this.swDecoder instanceof WorkerSoftwareAudioDecoder
+        ? this.swDecoder.getStats()
+        : undefined;
+
     return {
-      decoderType: this.useSoftware ? "Software (FFmpeg)" : "Hardware (WebCodecs)",
+      decoderType: this.useSoftware
+        ? worker
+          ? "Software (FFmpeg Worker)"
+          : "Software (FFmpeg)"
+        : "Hardware (WebCodecs)",
       queueSize: this.queueSize,
+      isSoftware: this.useSoftware,
+      softwareFallbackReason: this.softwareFallbackReason,
+      worker,
     };
   }
 

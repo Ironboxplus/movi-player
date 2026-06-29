@@ -1,6 +1,106 @@
 #include "movi.h"
 #include <libavutil/imgutils.h>
 
+static int movi_audio_build_in_layout(AVChannelLayout *dst,
+                                      const AVChannelLayout *src) {
+  memset(dst, 0, sizeof(*dst));
+  int channels = src ? src->nb_channels : 0;
+  if (channels == 6) {
+    av_channel_layout_from_mask(dst, AV_CH_LAYOUT_5POINT1);
+    return 0;
+  }
+  if (channels == 8) {
+    av_channel_layout_from_mask(dst, AV_CH_LAYOUT_7POINT1);
+    return 0;
+  }
+  if (channels > 0 && (!src || src->order == AV_CHANNEL_ORDER_UNSPEC)) {
+    av_channel_layout_default(dst, channels);
+    return 0;
+  }
+  return src ? av_channel_layout_copy(dst, src) : -1;
+}
+
+static int movi_audio_build_out_layout(AVChannelLayout *dst,
+                                       const AVChannelLayout *src,
+                                       int target_channels) {
+  memset(dst, 0, sizeof(*dst));
+  if (target_channels == 2 && src && src->nb_channels > 2) {
+    av_channel_layout_default(dst, 2);
+    return 0;
+  }
+  if (src && src->nb_channels > 0 && src->order != AV_CHANNEL_ORDER_UNSPEC) {
+    return av_channel_layout_copy(dst, src);
+  }
+  if (target_channels > 0) {
+    av_channel_layout_default(dst, target_channels);
+    return 0;
+  }
+  return -1;
+}
+
+static void movi_audio_decoder_reset_swr(MoviAudioDecoderContext *ctx) {
+  if (!ctx)
+    return;
+  if (ctx->swr_ctx)
+    swr_free(&ctx->swr_ctx);
+  if (ctx->swr_configured) {
+    av_channel_layout_uninit(&ctx->swr_in_layout);
+    av_channel_layout_uninit(&ctx->swr_out_layout);
+  }
+  memset(&ctx->swr_in_layout, 0, sizeof(ctx->swr_in_layout));
+  memset(&ctx->swr_out_layout, 0, sizeof(ctx->swr_out_layout));
+  ctx->swr_in_sample_fmt = AV_SAMPLE_FMT_NONE;
+  ctx->swr_out_sample_fmt = AV_SAMPLE_FMT_NONE;
+  ctx->swr_in_sample_rate = 0;
+  ctx->swr_out_sample_rate = 0;
+  ctx->swr_target_channels = 0;
+  ctx->swr_configured = 0;
+}
+
+static int movi_audio_decoder_swr_matches(
+    MoviAudioDecoderContext *ctx, const AVChannelLayout *in_layout,
+    const AVChannelLayout *out_layout, enum AVSampleFormat in_sample_fmt,
+    enum AVSampleFormat out_sample_fmt, int in_sample_rate,
+    int out_sample_rate, int target_channels) {
+  return ctx && ctx->swr_ctx && ctx->swr_configured &&
+         ctx->swr_in_sample_fmt == in_sample_fmt &&
+         ctx->swr_out_sample_fmt == out_sample_fmt &&
+         ctx->swr_in_sample_rate == in_sample_rate &&
+         ctx->swr_out_sample_rate == out_sample_rate &&
+         ctx->swr_target_channels == target_channels &&
+         av_channel_layout_compare(&ctx->swr_in_layout, in_layout) == 0 &&
+         av_channel_layout_compare(&ctx->swr_out_layout, out_layout) == 0;
+}
+
+static int movi_audio_decoder_store_swr_params(
+    MoviAudioDecoderContext *ctx, const AVChannelLayout *in_layout,
+    const AVChannelLayout *out_layout, enum AVSampleFormat in_sample_fmt,
+    enum AVSampleFormat out_sample_fmt, int in_sample_rate,
+    int out_sample_rate, int target_channels) {
+  if (!ctx)
+    return -1;
+  if (ctx->swr_configured) {
+    av_channel_layout_uninit(&ctx->swr_in_layout);
+    av_channel_layout_uninit(&ctx->swr_out_layout);
+    ctx->swr_configured = 0;
+  }
+  memset(&ctx->swr_in_layout, 0, sizeof(ctx->swr_in_layout));
+  memset(&ctx->swr_out_layout, 0, sizeof(ctx->swr_out_layout));
+  if (av_channel_layout_copy(&ctx->swr_in_layout, in_layout) < 0)
+    return -1;
+  if (av_channel_layout_copy(&ctx->swr_out_layout, out_layout) < 0) {
+    av_channel_layout_uninit(&ctx->swr_in_layout);
+    return -1;
+  }
+  ctx->swr_in_sample_fmt = in_sample_fmt;
+  ctx->swr_out_sample_fmt = out_sample_fmt;
+  ctx->swr_in_sample_rate = in_sample_rate;
+  ctx->swr_out_sample_rate = out_sample_rate;
+  ctx->swr_target_channels = target_channels;
+  ctx->swr_configured = 1;
+  return 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 int movi_enable_decoder(MoviContext *ctx, int stream_index,
                         uint8_t *extradata, int extradata_size) {
@@ -125,25 +225,17 @@ int movi_receive_frame(MoviContext *ctx, int stream_index) {
       SwrContext **swr_p = &ctx->resamplers[stream_index];
 
       if (!*swr_p) {
-        // Calculate output layout
         AVChannelLayout out_layout;
-        memset(&out_layout, 0, sizeof(AVChannelLayout));
-
-        if (target_channels == 2 && ctx->frame->ch_layout.nb_channels > 2) {
-          av_channel_layout_default(&out_layout, 2);
-        } else {
-          av_channel_layout_copy(&out_layout, &ctx->frame->ch_layout);
-        }
-
-        // Input layout logic
-        AVChannelLayout in_layout = ctx->frame->ch_layout;
-        // Fix for potentially unspecified layouts in source
-        if (in_layout.nb_channels == 6) {
-          av_channel_layout_from_mask(&in_layout, AV_CH_LAYOUT_5POINT1);
-        } else if (in_layout.nb_channels == 8) {
-          av_channel_layout_from_mask(&in_layout, AV_CH_LAYOUT_7POINT1);
-        } else if (in_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
-          av_channel_layout_default(&in_layout, in_layout.nb_channels);
+        AVChannelLayout in_layout;
+        memset(&out_layout, 0, sizeof(out_layout));
+        memset(&in_layout, 0, sizeof(in_layout));
+        if (movi_audio_build_out_layout(&out_layout, &ctx->frame->ch_layout,
+                                        target_channels) < 0 ||
+            movi_audio_build_in_layout(&in_layout, &ctx->frame->ch_layout) <
+                0) {
+          av_channel_layout_uninit(&out_layout);
+          av_channel_layout_uninit(&in_layout);
+          return -1;
         }
 
         int r = swr_alloc_set_opts2(swr_p, &out_layout, AV_SAMPLE_FMT_FLTP,
@@ -152,6 +244,7 @@ int movi_receive_frame(MoviContext *ctx, int stream_index) {
                                     ctx->frame->sample_rate, 0, NULL);
 
         av_channel_layout_uninit(&out_layout);
+        av_channel_layout_uninit(&in_layout);
 
         if (r < 0 || !*swr_p) {
           av_log(NULL, AV_LOG_ERROR, "[MOVI-WASM] swr_alloc failed: %d\n", r);
@@ -205,6 +298,257 @@ int movi_receive_frame(MoviContext *ctx, int stream_index) {
   }
 
   return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+MoviAudioDecoderContext *movi_audio_decoder_create(
+    int codec_id, int sample_rate, int channels, uint8_t *extradata,
+    int extradata_size) {
+  const AVCodec *codec = avcodec_find_decoder((enum AVCodecID)codec_id);
+  if (!codec)
+    return NULL;
+
+  MoviAudioDecoderContext *ctx =
+      (MoviAudioDecoderContext *)calloc(1, sizeof(MoviAudioDecoderContext));
+  if (!ctx)
+    return NULL;
+
+  ctx->dec_ctx = avcodec_alloc_context3(codec);
+  ctx->frame = av_frame_alloc();
+  ctx->resampled_frame = av_frame_alloc();
+  ctx->downmix_to_stereo = 1;
+  if (!ctx->dec_ctx || !ctx->frame || !ctx->resampled_frame) {
+    movi_audio_decoder_destroy(ctx);
+    return NULL;
+  }
+
+  ctx->dec_ctx->sample_rate = sample_rate;
+  if (channels > 0) {
+    av_channel_layout_default(&ctx->dec_ctx->ch_layout, channels);
+  }
+  ctx->dec_ctx->pkt_timebase = AV_TIME_BASE_Q;
+  ctx->dec_ctx->thread_count = 1;
+
+  if (extradata && extradata_size > 0) {
+    ctx->dec_ctx->extradata =
+        av_malloc(extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!ctx->dec_ctx->extradata) {
+      movi_audio_decoder_destroy(ctx);
+      return NULL;
+    }
+    memcpy(ctx->dec_ctx->extradata, extradata, extradata_size);
+    memset(ctx->dec_ctx->extradata + extradata_size, 0,
+           AV_INPUT_BUFFER_PADDING_SIZE);
+    ctx->dec_ctx->extradata_size = extradata_size;
+  }
+
+  if (avcodec_open2(ctx->dec_ctx, codec, NULL) < 0) {
+    movi_audio_decoder_destroy(ctx);
+    return NULL;
+  }
+
+  return ctx;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void movi_audio_decoder_destroy(MoviAudioDecoderContext *ctx) {
+  if (!ctx)
+    return;
+  movi_audio_decoder_reset_swr(ctx);
+  if (ctx->frame)
+    av_frame_free(&ctx->frame);
+  if (ctx->resampled_frame)
+    av_frame_free(&ctx->resampled_frame);
+  if (ctx->dec_ctx)
+    avcodec_free_context(&ctx->dec_ctx);
+  free(ctx);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void movi_audio_decoder_enable_downmix(MoviAudioDecoderContext *ctx,
+                                       int enable) {
+  if (!ctx)
+    return;
+  ctx->downmix_to_stereo = enable ? 1 : 0;
+  movi_audio_decoder_reset_swr(ctx);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_audio_decoder_send_packet(MoviAudioDecoderContext *ctx, uint8_t *data,
+                                   int size, double pts, double dts,
+                                   int keyframe) {
+  if (!ctx || !ctx->dec_ctx)
+    return -1;
+
+  AVPacket *pkt = av_packet_alloc();
+  if (!pkt)
+    return -2;
+
+  if (size > 0 && data) {
+    if (av_new_packet(pkt, size) < 0) {
+      av_packet_free(&pkt);
+      return -3;
+    }
+    memcpy(pkt->data, data, size);
+  } else {
+    pkt->data = NULL;
+    pkt->size = 0;
+  }
+
+  if (pts >= 0)
+    pkt->pts = (int64_t)(pts * AV_TIME_BASE);
+  if (dts >= 0)
+    pkt->dts = (int64_t)(dts * AV_TIME_BASE);
+  if (keyframe)
+    pkt->flags |= AV_PKT_FLAG_KEY;
+
+  int ret = avcodec_send_packet(ctx->dec_ctx, pkt);
+  av_packet_free(&pkt);
+  return ret;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_audio_decoder_receive_frame(MoviAudioDecoderContext *ctx) {
+  if (!ctx || !ctx->dec_ctx || !ctx->frame)
+    return -1;
+
+  int ret = avcodec_receive_frame(ctx->dec_ctx, ctx->frame);
+  if (ret != 0)
+    return ret;
+
+  int target_channels = ctx->frame->ch_layout.nb_channels;
+  if (target_channels <= 0 && ctx->dec_ctx->ch_layout.nb_channels > 0) {
+    av_channel_layout_copy(&ctx->frame->ch_layout, &ctx->dec_ctx->ch_layout);
+    target_channels = ctx->frame->ch_layout.nb_channels;
+  }
+
+  if (ctx->downmix_to_stereo && target_channels > 2) {
+    target_channels = 2;
+  }
+
+  int needs_resample = (ctx->frame->format != AV_SAMPLE_FMT_FLTP) ||
+                       (ctx->frame->ch_layout.nb_channels != target_channels);
+
+  if (needs_resample) {
+    AVChannelLayout out_layout;
+    AVChannelLayout in_layout;
+    memset(&out_layout, 0, sizeof(out_layout));
+    memset(&in_layout, 0, sizeof(in_layout));
+
+    if (movi_audio_build_out_layout(&out_layout, &ctx->frame->ch_layout,
+                                    target_channels) < 0 ||
+        movi_audio_build_in_layout(&in_layout, &ctx->frame->ch_layout) < 0) {
+      av_channel_layout_uninit(&out_layout);
+      av_channel_layout_uninit(&in_layout);
+      return -1;
+    }
+
+    if (!movi_audio_decoder_swr_matches(
+            ctx, &in_layout, &out_layout,
+            (enum AVSampleFormat)ctx->frame->format, AV_SAMPLE_FMT_FLTP,
+            ctx->frame->sample_rate, ctx->frame->sample_rate,
+            target_channels)) {
+      movi_audio_decoder_reset_swr(ctx);
+      int r = swr_alloc_set_opts2(&ctx->swr_ctx, &out_layout,
+                                  AV_SAMPLE_FMT_FLTP, ctx->frame->sample_rate,
+                                  &in_layout,
+                                  (enum AVSampleFormat)ctx->frame->format,
+                                  ctx->frame->sample_rate, 0, NULL);
+
+      if (r < 0 || !ctx->swr_ctx || swr_init(ctx->swr_ctx) < 0) {
+        movi_audio_decoder_reset_swr(ctx);
+        av_channel_layout_uninit(&out_layout);
+        av_channel_layout_uninit(&in_layout);
+        return -1;
+      }
+
+      if (movi_audio_decoder_store_swr_params(
+              ctx, &in_layout, &out_layout,
+              (enum AVSampleFormat)ctx->frame->format, AV_SAMPLE_FMT_FLTP,
+              ctx->frame->sample_rate, ctx->frame->sample_rate,
+              target_channels) < 0) {
+        movi_audio_decoder_reset_swr(ctx);
+        av_channel_layout_uninit(&out_layout);
+        av_channel_layout_uninit(&in_layout);
+        return -1;
+      }
+    }
+
+    int max_out_samples = swr_get_out_samples(ctx->swr_ctx, ctx->frame->nb_samples);
+
+    av_frame_unref(ctx->resampled_frame);
+    ctx->resampled_frame->nb_samples = max_out_samples;
+    ctx->resampled_frame->format = AV_SAMPLE_FMT_FLTP;
+    ctx->resampled_frame->sample_rate = ctx->frame->sample_rate;
+
+    if (av_channel_layout_copy(&ctx->resampled_frame->ch_layout,
+                               &out_layout) < 0) {
+      av_channel_layout_uninit(&out_layout);
+      av_channel_layout_uninit(&in_layout);
+      return -1;
+    }
+
+    if (av_frame_get_buffer(ctx->resampled_frame, 0) < 0) {
+      av_channel_layout_uninit(&out_layout);
+      av_channel_layout_uninit(&in_layout);
+      return -1;
+    }
+
+    ret = swr_convert(ctx->swr_ctx, ctx->resampled_frame->extended_data,
+                      max_out_samples,
+                      (const uint8_t **)ctx->frame->extended_data,
+                      ctx->frame->nb_samples);
+    if (ret < 0) {
+      av_channel_layout_uninit(&out_layout);
+      av_channel_layout_uninit(&in_layout);
+      return ret;
+    }
+
+    ctx->resampled_frame->nb_samples = ret;
+    ctx->resampled_frame->pts = ctx->frame->pts;
+    ctx->resampled_frame->pkt_dts = ctx->frame->pkt_dts;
+
+    AVFrame *tmp = ctx->frame;
+    ctx->frame = ctx->resampled_frame;
+    ctx->resampled_frame = tmp;
+    av_channel_layout_uninit(&out_layout);
+    av_channel_layout_uninit(&in_layout);
+  }
+
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void movi_audio_decoder_flush(MoviAudioDecoderContext *ctx) {
+  if (!ctx || !ctx->dec_ctx)
+    return;
+  avcodec_flush_buffers(ctx->dec_ctx);
+  movi_audio_decoder_reset_swr(ctx);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_audio_decoder_get_frame_samples(MoviAudioDecoderContext *ctx) {
+  return (ctx && ctx->frame) ? ctx->frame->nb_samples : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_audio_decoder_get_frame_channels(MoviAudioDecoderContext *ctx) {
+  return (ctx && ctx->frame) ? ctx->frame->ch_layout.nb_channels : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_audio_decoder_get_frame_sample_rate(MoviAudioDecoderContext *ctx) {
+  return (ctx && ctx->frame) ? ctx->frame->sample_rate : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t *movi_audio_decoder_get_frame_data(MoviAudioDecoderContext *ctx,
+                                           int plane) {
+  if (!ctx || !ctx->frame || plane < 0 ||
+      plane >= ctx->frame->ch_layout.nb_channels)
+    return NULL;
+  return ctx->frame->extended_data ? ctx->frame->extended_data[plane]
+                                   : ctx->frame->data[plane];
 }
 
 /**

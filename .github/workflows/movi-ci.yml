@@ -1,0 +1,140 @@
+name: movi-player-ci
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_package:
+        description: "Build the Docker WASM bundle and npm package artifact"
+        required: false
+        default: "true"
+        type: choice
+        options: ["false", "true"]
+      playback_benchmark_url:
+        description: "Optional page URL for playback telemetry benchmark"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  unit-typecheck-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run test:run
+      - run: npm run typecheck
+      - run: npm run bench:audio -- --reporter=verbose
+
+  package-artifact:
+    if: >
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' || inputs.build_package == 'true')
+    runs-on: ubuntu-latest
+    needs: unit-typecheck-bench
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU for the arm64 Emscripten build image
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Start from a clean generated tree
+        run: rm -rf dist package-artifacts
+      - run: npm run build:wasm
+      - run: npm run build:ts
+      - run: npm run pack:verify
+      - name: Create npm tarball
+        run: |
+          mkdir -p package-artifacts
+          npm pack --pack-destination package-artifacts
+          sha256sum package-artifacts/*.tgz > package-artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: movi-player-package-${{ github.sha }}
+          path: package-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  playback-benchmark:
+    if: github.event_name == 'workflow_dispatch' && inputs.playback_benchmark_url != ''
+    runs-on: ubuntu-latest
+    needs: unit-typecheck-bench
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run bench:playback
+        env:
+          MOVI_BENCH_PAGE_URL: ${{ inputs.playback_benchmark_url }}
+          MOVI_BENCH_OUTPUT: bench-results/playback-current.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playback-benchmark
+          path: bench-results/*.json
+          if-no-files-found: error
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: package-artifact
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: movi-player-package-${{ github.sha }}
+          path: package-artifacts
+      - name: Attach package tarball to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || \
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --notes "movi-player package build for $TAG_NAME"
+          gh release upload "$TAG_NAME" package-artifacts/* --clobber
+
+  npm-publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: package-artifact
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: movi-player-package-${{ github.sha }}
+          path: package-artifacts
+      - name: Publish package to npm when NPM_TOKEN is configured
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is not configured; skipping npm publish."
+            exit 0
+          fi
+          npm publish package-artifacts/*.tgz --access public

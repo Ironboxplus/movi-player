@@ -43,6 +43,7 @@ import { ShakaPlayerWrapper } from "../render/ShakaPlayerWrapper";
 import { HLSPlayerWrapper } from "../render/HLSPlayerWrapper";
 import { DASHPlayerWrapper } from "../render/DASHPlayerWrapper";
 import { ThumbnailRenderer } from "../utils/ThumbnailRenderer";
+import { getDecodeMode, isSoftwareDecodePath } from "./decodeMode";
 
 // Any of the three adaptive-streaming engines (Shaka primary; hls.js / dash.js
 // as fallbacks). They share the same surface; the Shaka-only extras (isLive,
@@ -1924,7 +1925,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     // Check backpressure - relax limits for better throughput
     // After seek, use stricter limits to prevent overwhelming low-end devices
-    const isSoftware = this.isSoftwareDecoding();
+    const decodeMode = getDecodeMode(this.videoDecoder, this.audioDecoder);
+    const isSoftware = decodeMode.softwareHeavy;
+    const isVideoSoftware = decodeMode.videoSoftware;
+    const isAudioSoftware = decodeMode.audioSoftware;
+    const audioPolicyStats = this.audioDecoder.getStats();
+    const isAudioWorkerSoftware = Boolean(audioPolicyStats.worker);
+    const isMainThreadSoftwareDecode =
+      isVideoSoftware || (isAudioSoftware && !isAudioWorkerSoftware);
     const timeSinceSeek = performance.now() - this.seekTime;
     const isPostSeek =
       this.justSeeked && timeSinceSeek < MoviPlayer.POST_SEEK_THROTTLE_MS;
@@ -1939,16 +1947,18 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Adaptive limits for software/hardware modes
     // During post-seek or while waiting for initial sync, we are more permissive with decoder queues
     // to ensure they have enough data to output the first few frames.
-    const maxVideoQueue = isSoftware
+    const maxVideoQueue = isVideoSoftware
       ? 1000
       : isPostSeek || this.waitingForVideoSync
         ? 60
         : 30;
-    const maxAudioQueue = isSoftware
-      ? 500
-      : isPostSeek || this.waitingForVideoSync
+    const maxAudioQueue = isAudioWorkerSoftware
+      ? 96
+      : isAudioSoftware
         ? 40
-        : 20;
+        : isPostSeek || this.waitingForVideoSync
+          ? 40
+          : 20;
 
     // Buffer targets — scale up at slow speeds so both audio and video buffers
     // hold the same wall-clock duration as at 1x. Without this, at 0.5x the 100-frame
@@ -1961,7 +1971,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // quickly, so any decode jitter shows up as stutter. Cap at 2x scale
     // so 4x playback doesn't balloon VRAM/audio buffers on heavy sources.
     const rateScale = rate < 1.0 ? 1.0 / rate : Math.min(2.0, rate);
-    const maxAudioBuffered = (isSoftware ? 5.0 : isPostSeek ? 1.5 : 2.0) * rateScale;
+    const maxAudioBuffered = (isAudioSoftware ? 5.0 : isPostSeek ? 1.5 : 2.0) * rateScale;
     // Renderer queue limits (in frames). Two separate constraints:
     //
     //  1. High-res (≥4K): per-frame VRAM cost is huge (8K HDR ≈ 50MB/frame).
@@ -2006,7 +2016,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     } else {
       baseHwQueue = isPostSeek ? 20 : 100; // desktop default
     }
-    const maxVideoBuffered = Math.round((isSoftware ? 60 : baseHwQueue) * rateScale);
+    const maxVideoBuffered = Math.round((isVideoSoftware ? 60 : baseHwQueue) * rateScale);
 
     // Skip video backpressure when video isn't being consumed:
     // - Background (not PiP): video decode is skipped entirely
@@ -2117,9 +2127,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // During initial play grace period with audio active, use a gentler burst to
         // avoid overwhelming the main thread (audio decode + render + stable audio
         // processing is CPU-heavy alongside 4K video decode).
-        const bufferTarget = isSoftware ? 2.0 : fps >= 60 ? 1.0 : 0.5;
+        const bufferTarget = isAudioSoftware ? 2.0 : fps >= 60 ? 1.0 : 0.5;
         if (videoQueue < 30 || currentAudioBuffered < bufferTarget) {
-          if (inPlayGrace && !this.muted && !this.disableAudio && !isSoftware) {
+          if (inPlayGrace && !this.muted && !this.disableAudio && !isMainThreadSoftwareDecode) {
             burstSize = 20 * fpsScale; // Gentler ramp during initial fill with audio
           } else {
             burstSize = (isSoftware ? 80 : 40) * fpsScale;
@@ -2166,7 +2176,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
         // Yield periodically to prevent blocking the main thread, especially in software mode
         // Scale with FPS — at 120fps, packets are small and fast, yielding too often starves audio
-        const yieldInterval = isPostSeek ? 2 * fpsScale : isSoftware ? 3 : 20 * fpsScale;
+        const yieldInterval = isPostSeek
+          ? 2 * fpsScale
+          : isMainThreadSoftwareDecode
+            ? 3
+            : isAudioWorkerSoftware
+              ? 8
+              : 20 * fpsScale;
         if (i > 0 && i % yieldInterval === 0) {
           // Use MessageChannel for fast yielding (better than setTimeout)
           const channel = new MessageChannel();
@@ -4701,6 +4717,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         ? `${(audioTrack.bitRate / 1000).toFixed(0)} kbps`
         : "N/A";
       stats["Audio Decoder"] = audioDecoderStats.decoderType;
+      if (audioDecoderStats.softwareFallbackReason) {
+        stats["Audio Software Fallback Reason"] =
+          audioDecoderStats.softwareFallbackReason;
+      }
     }
 
     // Subtitle info
@@ -4722,13 +4742,38 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     stats["Playback Rate"] = `${this.clock.getPlaybackRate()}x`;
     stats["A/V Sync"] = this.clock.isSyncedToAudio() ? "Audio Master" : "Wall Clock";
     stats["Stable Volume"] = this.audioRenderer.getStableAudio() ? "On" : "Off";
+    stats["Decode Path"] = this.isSoftwareHeavyDecoding()
+      ? "Software-heavy"
+      : "Hardware/native";
 
     // Buffers
     stats["Audio Buffer"] = `${audioBuffered.toFixed(2)}s`;
+    stats["Audio Buffered Seconds"] = Number(audioBuffered.toFixed(3));
+    stats["Audio Underrun Risk"] = audioBuffered < 0.1 ? "High" :
+      audioBuffered < 0.5 ? "Medium" : "Low";
     stats["Video Queue"] = `${rendererStats?.frameQueueSize ?? 0} frames`;
     stats["Frames Rendered"] = rendererStats?.framesPresented ?? 0;
     stats["Video Decoder Queue"] = videoDecoderStats.queueSize;
     stats["Audio Decoder Queue"] = audioDecoderStats.queueSize;
+    if (audioDecoderStats.worker) {
+      stats["Audio Worker Generation"] = audioDecoderStats.worker.generation;
+      stats["Audio Worker Track"] = audioDecoderStats.worker.trackId;
+      stats["Audio Worker Queue Depth"] = audioDecoderStats.worker.queueDepth;
+      stats["Audio Worker In Flight"] = audioDecoderStats.worker.inFlight;
+      stats["Audio Worker Reorder Backlog"] =
+        audioDecoderStats.worker.reorderBacklog;
+      stats["Audio Worker Stale Drops"] =
+        audioDecoderStats.worker.droppedStaleMessages;
+      stats["Audio Worker Configure State"] =
+        audioDecoderStats.worker.configureState;
+      stats["Audio Worker Configure ms"] =
+        audioDecoderStats.worker.configureMs;
+      stats["Audio Worker Configure Timeout ms"] =
+        audioDecoderStats.worker.configureTimeoutMs;
+      if (audioDecoderStats.worker.lastError) {
+        stats["Audio Worker Last Error"] = audioDecoderStats.worker.lastError;
+      }
+    }
 
     // Memory usage (Chrome only)
     const mem = (performance as any).memory;
@@ -5554,6 +5599,28 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   isSoftwareDecoding(): boolean {
     return this.videoDecoder ? this.videoDecoder.isSoftware : false;
+  }
+
+  /**
+   * Check if any active decode path is software-backed.
+   * Unlike isSoftwareDecoding(), this includes worker audio software decode.
+   */
+  isSoftwareHeavyDecoding(): boolean {
+    return isSoftwareDecodePath(this.videoDecoder, this.audioDecoder);
+  }
+
+  /**
+   * True when software decode work runs on the main thread.
+   * Worker audio decode is intentionally excluded so UI effects are not
+   * disabled for healthy DTS/DTS-HD playback.
+   */
+  isMainThreadSoftwareDecoding(): boolean {
+    const decodeMode = getDecodeMode(this.videoDecoder, this.audioDecoder);
+    const audioStats = this.audioDecoder.getStats();
+    return (
+      decodeMode.videoSoftware ||
+      (decodeMode.audioSoftware && !audioStats.worker)
+    );
   }
 
   /**

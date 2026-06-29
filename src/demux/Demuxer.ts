@@ -312,6 +312,7 @@ export class Demuxer {
           id: info.index,
           type: "audio",
           codec: info.codecName,
+          codecId: info.codecId,
           channels: info.channels,
           sampleRate: info.sampleRate,
           bitRate: info.bitRate,

@@ -1,6 +1,6 @@
 {
   "name": "movi-player",
-  "version": "0.3.2",
+  "version": "0.3.3-dts-worker.0",
   "description": "Play MKV, HEVC, AV1, HDR videos in the browser. WebCodecs + FFmpeg WASM player with encrypted playback, chapters, subtitles, multi-audio tracks. No server transcoding needed.",
   "type": "module",
   "main": "dist/index.js",
@@ -30,6 +30,11 @@
   },
   "files": [
     "dist",
+    "!dist/wasm/*.bak*",
+    "!dist/wasm/*.old*",
+    "!dist/wasm/*.speed",
+    "!dist/wasm/wasm",
+    "!dist/wasm/wasm/**",
     "README.md",
     "AGENTS.md",
     "LICENSE"
@@ -41,6 +46,10 @@
     "build:wasm:force": "mkdir -p dist/wasm && docker compose run --rm -e FORCE_FFMPEG=true build",
     "dev": "vite",
     "test": "vitest",
+    "test:run": "vitest run",
+    "bench:audio": "vitest bench --run test/bench/audio-worker-protocol.bench.ts",
+    "bench:playback": "node scripts/benchmark-playback.mjs",
+    "pack:verify": "node scripts/verify-package.mjs",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm run typecheck",

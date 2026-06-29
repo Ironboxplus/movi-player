@@ -22,6 +22,7 @@ import type {
 } from "../types";
 import { Logger, LogLevel } from "../utils/Logger";
 import type { SourceAdapter } from "../source/SourceAdapter";
+import { renderStatsPanel } from "./StatsPanel";
 
 import { SettingsStorage } from "../utils/SettingsStorage";
 
@@ -9497,10 +9498,28 @@ export class MoviElement extends HTMLElement {
       }
 
       .movi-nerd-stats-body {
-        padding: 6px 12px 10px;
+        padding: 8px 12px 10px;
         overflow-y: auto;
         flex: 1;
         min-height: 0;
+      }
+
+      .movi-nerd-stats-section {
+        padding: 7px 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+      }
+
+      .movi-nerd-stats-section:first-child {
+        padding-top: 0;
+      }
+
+      .movi-nerd-stats-section-title {
+        color: rgba(255, 255, 255, 0.38);
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 0.9px;
+        text-transform: uppercase;
+        margin-bottom: 4px;
       }
 
       .movi-nerd-stats-row {
@@ -15569,7 +15588,10 @@ export class MoviElement extends HTMLElement {
     const loop = (timestamp: number) => {
       // If software decoding is active, pause ambient sampling to save main thread cycles
       // This is crucial for CPU-heavy 4K software decoding
-      const isSoftware = this.player?.isSoftwareDecoding() ?? false;
+      const isSoftware =
+        this.player?.isMainThreadSoftwareDecoding?.() ??
+        this.player?.isSoftwareDecoding() ??
+        false;
       // Also skip during seek/buffering — the renderer is recovering and any
       // canvas readback contends with frame presentation, magnifying stutter.
       const playerState = this.player?.getState();
@@ -16463,14 +16485,6 @@ export class MoviElement extends HTMLElement {
     overlay.style.maxHeight = `${hostHeight - controlsHeight - topGap}px`;
 
     const stats = this.player.getStats();
-    let html = "";
-    for (const [key, value] of Object.entries(stats)) {
-      html += `<div class="movi-nerd-stats-row">
-        <span class="movi-nerd-stats-key">${key}</span>
-        <span class="movi-nerd-stats-value">${value}</span>
-      </div>`;
-    }
-    // Append graph section at the end of stats body
     const speed = this.player.getNetworkSpeed();
     this.networkSpeedHistory.push(speed);
     if (this.networkSpeedHistory.length > MoviElement.GRAPH_MAX_SAMPLES) {
@@ -16484,15 +16498,10 @@ export class MoviElement extends HTMLElement {
         ? `${(speed / 1024).toFixed(0)} KB/s`
         : "—";
 
-    html += `<div class="movi-nerd-stats-graph-section">
-      <div class="movi-nerd-stats-graph-header">
-        <span class="movi-nerd-stats-graph-title">${graphLabel}</span>
-        <span class="movi-nerd-stats-graph-speed">${speedText}</span>
-      </div>
-      <canvas class="movi-nerd-stats-graph" width="300" height="80"></canvas>
-    </div>`;
-
-    body.innerHTML = html;
+    body.innerHTML = renderStatsPanel(stats, {
+      label: graphLabel,
+      speedText,
+    });
 
     // Draw graph
     this.drawNetworkGraph(shadowRoot);

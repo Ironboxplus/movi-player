@@ -107,6 +107,31 @@ export interface MoviWasmModule {
   _movi_get_frame_pts(ctx: number, streamIndex: number): number;
   _movi_flush_decoder(ctx: number, streamIndex: number): void;
 
+  // Standalone audio decoder API (used from Worker without an opened demux context)
+  _movi_audio_decoder_create: (
+    codecId: number,
+    sampleRate: number,
+    channels: number,
+    extradata: number,
+    extradataSize: number,
+  ) => number;
+  _movi_audio_decoder_destroy: (ctx: number) => void;
+  _movi_audio_decoder_enable_downmix: (ctx: number, enable: number) => void;
+  _movi_audio_decoder_send_packet: (
+    ctx: number,
+    data: number,
+    size: number,
+    pts: number,
+    dts: number,
+    keyframe: number,
+  ) => number;
+  _movi_audio_decoder_receive_frame: (ctx: number) => number;
+  _movi_audio_decoder_flush: (ctx: number) => void;
+  _movi_audio_decoder_get_frame_samples: (ctx: number) => number;
+  _movi_audio_decoder_get_frame_channels: (ctx: number) => number;
+  _movi_audio_decoder_get_frame_sample_rate: (ctx: number) => number;
+  _movi_audio_decoder_get_frame_data: (ctx: number, plane: number) => number;
+
   // RGBA conversion for software decoding
   _movi_get_frame_rgba(
     ctx: number,

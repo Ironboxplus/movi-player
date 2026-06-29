@@ -1,0 +1,4 @@
+dist/wasm/*.bak*
+dist/wasm/*.old*
+dist/wasm/*.speed
+dist/wasm/wasm/

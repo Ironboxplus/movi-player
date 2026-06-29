@@ -119,6 +119,45 @@ typedef struct {
   int prefetched_cue_capacity;
 } MoviContext;
 
+typedef struct {
+  AVCodecContext *dec_ctx;
+  SwrContext *swr_ctx;
+  AVFrame *frame;
+  AVFrame *resampled_frame;
+  AVChannelLayout swr_in_layout;
+  AVChannelLayout swr_out_layout;
+  enum AVSampleFormat swr_in_sample_fmt;
+  enum AVSampleFormat swr_out_sample_fmt;
+  int swr_in_sample_rate;
+  int swr_out_sample_rate;
+  int swr_target_channels;
+  int swr_configured;
+  int downmix_to_stereo;
+} MoviAudioDecoderContext;
+
+EMSCRIPTEN_KEEPALIVE MoviAudioDecoderContext *movi_audio_decoder_create(
+    int codec_id, int sample_rate, int channels, uint8_t *extradata,
+    int extradata_size);
+EMSCRIPTEN_KEEPALIVE void
+movi_audio_decoder_destroy(MoviAudioDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE void
+movi_audio_decoder_enable_downmix(MoviAudioDecoderContext *ctx, int enable);
+EMSCRIPTEN_KEEPALIVE int movi_audio_decoder_send_packet(
+    MoviAudioDecoderContext *ctx, uint8_t *data, int size, double pts,
+    double dts, int keyframe);
+EMSCRIPTEN_KEEPALIVE int
+movi_audio_decoder_receive_frame(MoviAudioDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE void
+movi_audio_decoder_flush(MoviAudioDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_audio_decoder_get_frame_samples(MoviAudioDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_audio_decoder_get_frame_channels(MoviAudioDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_audio_decoder_get_frame_sample_rate(MoviAudioDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE uint8_t *
+movi_audio_decoder_get_frame_data(MoviAudioDecoderContext *ctx, int plane);
+
 EMSCRIPTEN_KEEPALIVE double movi_get_start_time(MoviContext *ctx);
 EMSCRIPTEN_KEEPALIVE int movi_get_format_name(MoviContext *ctx, char *buffer, int buffer_size);
 EMSCRIPTEN_KEEPALIVE int movi_get_metadata_title(MoviContext *ctx, char *buffer, int buffer_size);
