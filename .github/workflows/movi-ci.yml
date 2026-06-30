@@ -104,6 +104,7 @@ jobs:
       - name: Attach package tarball to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           gh release view "$TAG_NAME" >/dev/null 2>&1 || \
