@@ -253,6 +253,7 @@ describe("WorkerSoftwareAudioDecoder protocol", () => {
   it.each([
     ["ac3", 86019],
     ["eac3", 86056],
+    ["flac", 86028],
     ["truehd", 86060],
     ["mlp", 86045],
     ["opus", 86076],

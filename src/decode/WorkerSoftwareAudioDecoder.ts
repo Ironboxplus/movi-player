@@ -5,6 +5,7 @@ const FFMPEG_AUDIO_CODEC_IDS: Record<string, number> = {
   ac3: 86019,
   dts: 86020,
   dca: 86020,
+  flac: 86028,
   mlp: 86045,
   eac3: 86056,
   ec3: 86056,
