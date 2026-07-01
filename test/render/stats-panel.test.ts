@@ -5,6 +5,10 @@ describe("stats panel renderer", () => {
   it("groups mpv-style playback, audio, video, and io stats into sections", () => {
     const sections = groupStats({
       "Playback State": "playing",
+      "Seek Waiting For Video": "No",
+      "Seek Audio Hold Packets": 0,
+      "Seek Audio Dropped Packets": 12,
+      "Pause Prebuffer Packets": 0,
       "Video Decoder": "Hardware (WebCodecs)",
       "Audio Decoder": "Software (FFmpeg Worker)",
       "Audio Worker In Flight": 3,
@@ -24,6 +28,13 @@ describe("stats panel renderer", () => {
     expect(sections[2]?.rows.map((row) => row.key)).toContain(
       "Audio Worker Reorder Backlog",
     );
+    expect(sections[0]?.rows.map((row) => row.key)).toEqual([
+      "Playback State",
+      "Seek Waiting For Video",
+      "Seek Audio Hold Packets",
+      "Seek Audio Dropped Packets",
+      "Pause Prebuffer Packets",
+    ]);
   });
 
   it("escapes dynamic stat values before rendering html", () => {

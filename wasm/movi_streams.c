@@ -180,15 +180,57 @@ int movi_seek_to(MoviContext *ctx, double timestamp, int stream_index,
   }
 
   int64_t seek_target = (int64_t)(timestamp * AV_TIME_BASE);
-  // Use INT64_MAX for max_ts to allow FFmpeg to find the nearest keyframe
-  // The BACKWARD flag ensures we prefer positions at or before seek_target
-  // Using seek_target as max_ts was too restrictive and caused seeks to fail
-  // or jump to EOF when no keyframe exactly matched the target position
-  int ret = avformat_seek_file(ctx->fmt_ctx, -1, INT64_MIN, seek_target,
-                               INT64_MAX, seek_flags);
+  int ret = -1;
+
+  if (stream_index >= 0 &&
+      stream_index < (int)ctx->fmt_ctx->nb_streams &&
+      ctx->fmt_ctx->streams[stream_index]->time_base.den != 0) {
+    // Guard time_base.den != 0: data/attachment/corrupt-header streams can
+    // report a zero denominator, and av_rescale_q(..., stream->time_base) below
+    // divides by it. A zero here would be a WASM div-by-zero trap. When it is
+    // zero we skip straight to the global fallback, which seeks in
+    // AV_TIME_BASE_Q (no per-stream rescale) and is safe for such streams.
+    AVStream *stream = ctx->fmt_ctx->streams[stream_index];
+    int64_t stream_target =
+        av_rescale_q(seek_target, AV_TIME_BASE_Q, stream->time_base);
+
+    // Seek against the active playback stream when the caller provides one.
+    // For interleaved containers (especially MKV), a broad max_ts lets FFmpeg
+    // pick an index point far from the requested video time. That makes JS scan
+    // minutes of packets while waiting for the first post-target video frame.
+    // Try the strict video-stream backward window first; only broaden/fallback
+    // when the demuxer rejects that range.
+    ret = avformat_seek_file(ctx->fmt_ctx, stream_index, INT64_MIN,
+                             stream_target, stream_target, seek_flags);
+    if (ret < 0) {
+      ret = av_seek_frame(ctx->fmt_ctx, stream_index, stream_target,
+                          seek_flags);
+    }
+    if (ret < 0) {
+      ret = avformat_seek_file(ctx->fmt_ctx, stream_index, INT64_MIN,
+                               stream_target, INT64_MAX, seek_flags);
+    }
+  }
+
   if (ret < 0) {
-    // Fallback to av_seek_frame if avformat_seek_file fails
-    ret = av_seek_frame(ctx->fmt_ctx, -1, seek_target, seek_flags);
+    // Global fallback preserves the old behavior for audio-only, invalid
+    // stream indexes, or formats whose demuxer cannot seek by stream.
+    //
+    // Converge max_ts to seek_target first (strict backward window). An
+    // interleaved MKV whose only cue points sit on the audio track would, with a
+    // broad INT64_MAX max_ts, let FFmpeg land on an index point minutes past the
+    // requested time; JS then scans forward through a storm of packets waiting
+    // for the first post-target video frame — the "infinite traffic" symptom.
+    // Only broaden to the whole file if the strict window is rejected.
+    ret = avformat_seek_file(ctx->fmt_ctx, -1, INT64_MIN, seek_target,
+                             seek_target, seek_flags);
+    if (ret < 0) {
+      ret = avformat_seek_file(ctx->fmt_ctx, -1, INT64_MIN, seek_target,
+                               INT64_MAX, seek_flags);
+    }
+    if (ret < 0) {
+      ret = av_seek_frame(ctx->fmt_ctx, -1, seek_target, seek_flags);
+    }
   }
 
   // After seek, clear stale EOF state.
@@ -329,13 +371,23 @@ static int movi_packet_is_idr(enum AVCodecID codec_id, const uint8_t *data,
   if (codec_id != AV_CODEC_ID_HEVC && codec_id != AV_CODEC_ID_H264)
     return 1; // other codecs: honor container keyframe flag
 
+  // H.264 in Matroska/MP4 commonly carries AVC length-prefixed access units
+  // where the container keyframe flag is the reliable random-access signal.
+  // Our lightweight first-VCL parser can miss IDR when parameter sets/AUD or
+  // container packetization differ, which made every H.264 keyframe report
+  // is_idr=0 and left WebCodecs waiting forever after flush/seek. HEVC still
+  // needs CRA/BLA/IDR distinction for open-GOP recovery; H.264 does not need
+  // the same negative classification here.
+  if (codec_id == AV_CODEC_ID_H264)
+    return 1;
+
   int t = movi_first_vcl_nal_type(codec_id, data, size);
   if (t < 0)
     return 1; // too small / no VCL slice — assume true key (safe default)
 
   if (codec_id == AV_CODEC_ID_HEVC)
     return (t == 19 || t == 20 || t == 16 || t == 17 || t == 18) ? 1 : 0;
-  return (t == 5) ? 1 : 0; // H.264 IDR
+  return 1;
 }
 
 // Classify whether a packet is an HEVC RASL leading picture (NAL type 8=RASL_N

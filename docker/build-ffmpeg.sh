@@ -23,8 +23,8 @@ cpp = 'em++'
 ar = 'emar'
 strip = 'emstrip'
 [built-in options]
-c_args = ['-Oz', '-flto', '-D_FILE_OFFSET_BITS=64']
-c_link_args = ['-Oz', '-flto']
+c_args = ['-O3', '-msimd128', '-flto', '-D_FILE_OFFSET_BITS=64']
+c_link_args = ['-O3', '-msimd128', '-flto']
 [host_machine]
 system = 'emscripten'
 cpu_family = 'wasm32'
@@ -80,10 +80,10 @@ else
     echo "=== Verifying dav1d pkg-config ==="
     pkg-config --libs --cflags dav1d || echo "WARNING: pkg-config cannot find dav1d"
     
-    # Configure FFmpeg for WASM with size optimizations
+    # Configure FFmpeg for WASM with speed optimizations
     # Using libdav1d for AV1 - pure software decoder that works in WASM
-    # -Oz: Maximum size optimization (instead of -O3 speed)
-    # --enable-small: Trade speed for size
+    # -O3 -msimd128: Speed + WASM SIMD. DTS 5.1 software decode runs in the
+    #   audio worker and is CPU-bound; -Oz/--enable-small pegged its throughput.
     # -flto: Link-time optimization
     # Note: Using --pkg-config to use native pkg-config, and EM_PKG_CONFIG_PATH for emscripten
     EM_PKG_CONFIG_PATH="${DAV1D_PREFIX}/lib/pkgconfig" \
@@ -104,7 +104,6 @@ else
         --disable-programs \
         --disable-doc \
         --disable-autodetect \
-        --enable-small \
         --enable-zlib \
         --enable-avcodec \
         --enable-avformat \
@@ -117,9 +116,9 @@ else
         --enable-decoder=h264,hevc,vp9,vp8,libdav1d,vvc,apv,mpeg1video,mpeg2video,mpeg4,h261,h263,h263p,mjpeg,dvvideo,theora,aac,aac_latm,mp3,mp2,mp1,opus,vorbis,flac,ac3,eac3,dca,truehd,mlp,pcm_s16le,pcm_s24le,pcm_s16be,pcm_f32le,pcm_mulaw,pcm_alaw,subrip,ass,ssa,mov_text,pgssub,dvbsub,dvdsub,webvtt,srt \
         --enable-parser=h264,hevc,vp8,vp9,av1,vvc,apv,lcevc,mpeg4video,mpegvideo,h261,h263,mjpeg,aac,mp3,opus,vorbis,flac,hdmv_pgs_subtitle \
         --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb,vvc_mp4toannexb,vvc_metadata,av1_metadata,av1_frame_merge,av1_frame_split,lcevc_metadata,pgs_frame_merge,iso_media_metadata_manipulator,extract_extradata,vp9_superframe \
-        --extra-cflags="-Oz -flto -s USE_PTHREADS=0 -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 -I${DAV1D_PREFIX}/include" \
-        --extra-cxxflags="-Oz -flto -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 -I${DAV1D_PREFIX}/include" \
-        --extra-ldflags="-s WASM=1 -s USE_ZLIB=1 -Oz -flto -L${DAV1D_PREFIX}/lib"
+        --extra-cflags="-O3 -msimd128 -flto -s USE_PTHREADS=0 -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 -I${DAV1D_PREFIX}/include" \
+        --extra-cxxflags="-O3 -msimd128 -flto -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 -I${DAV1D_PREFIX}/include" \
+        --extra-ldflags="-s WASM=1 -s USE_ZLIB=1 -O3 -flto -L${DAV1D_PREFIX}/lib"
 
     echo "=== Compiling FFmpeg ==="
     emmake make -j$(nproc)
@@ -137,8 +136,8 @@ mkdir -p /src/dist/wasm
 # Build the movi WASM module with Asyncify for async I/O
 # Uses custom AVIO with JavaScript callbacks instead of WORKERFS
 # Enable 64-bit file offsets for files >= 2GB support
-# Size optimizations:
-#   -Oz: Maximum size optimization (instead of -O3 for speed)
+# Speed optimizations (DTS 5.1 audio-worker throughput):
+#   -O3 -msimd128: Speed + WASM SIMD (instead of -Oz size optimization)
 #   -flto: Link-time optimization for better dead code elimination
 #   -s ASSERTIONS=0: Remove debug assertions
 #   -s DISABLE_EXCEPTION_THROWING=1: Remove exception handling overhead
@@ -162,13 +161,13 @@ mkdir -p "$OBJDIR"
 C_COMMON_FLAGS=(
     -I/src/dist/ffmpeg/include
     -I${DAV1D_PREFIX}/include
-    -Oz -flto -D_FILE_OFFSET_BITS=64
+    -O3 -msimd128 -flto -D_FILE_OFFSET_BITS=64
 )
 CXX_COMMON_FLAGS=(
     -I/src/wasm/signalsmith/signalsmith-stretch/include
     -I/src/wasm/signalsmith/signalsmith-linear/include
     -std=c++17 -fno-exceptions -fno-rtti
-    -Oz -flto
+    -O3 -msimd128 -flto
 )
 
 for f in /src/wasm/*.c; do
@@ -182,7 +181,7 @@ em++ "$OBJDIR"/*.o \
     -L/src/dist/ffmpeg/lib \
     -L${DAV1D_PREFIX}/lib \
     -lavformat -lavcodec -ldav1d -lavutil -lswresample -lswscale \
-    -Oz \
+    -O3 -msimd128 \
     -flto \
     -fno-exceptions \
     -fno-rtti \

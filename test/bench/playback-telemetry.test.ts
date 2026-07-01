@@ -16,6 +16,10 @@ describe("playback benchmark telemetry", () => {
         "Audio Worker In Flight": 5,
         "Audio Worker Reorder Backlog": 6,
         "Audio Worker Stale Drops": 7,
+        "Seek Waiting For Video": "Yes",
+        "Seek Audio Hold Packets": 8,
+        "Seek Audio Dropped Packets": 9,
+        "Pause Prebuffer Packets": 10,
         "Decode Path": "Software-heavy",
         "Audio Underrun Risk": "Low",
       }),
@@ -29,6 +33,10 @@ describe("playback benchmark telemetry", () => {
       audioWorkerInFlight: 5,
       audioWorkerReorderBacklog: 6,
       audioWorkerStaleDrops: 7,
+      seekWaitingForVideo: "Yes",
+      seekAudioHoldPackets: 8,
+      seekAudioDroppedPackets: 9,
+      pausePrebufferPackets: 10,
     });
   });
 
@@ -80,6 +88,10 @@ describe("playback benchmark telemetry", () => {
           audioWorkerInFlight: 0,
           audioWorkerReorderBacklog: 0,
           audioWorkerStaleDrops: 0,
+          seekWaitingForVideo: "No",
+          seekAudioHoldPackets: 0,
+          seekAudioDroppedPackets: 0,
+          pausePrebufferPackets: 0,
           decodePath: "Software-heavy",
           audioUnderrunRisk: "Low",
         },
@@ -95,6 +107,10 @@ describe("playback benchmark telemetry", () => {
           audioWorkerInFlight: 1,
           audioWorkerReorderBacklog: 0,
           audioWorkerStaleDrops: 4,
+          seekWaitingForVideo: "Yes",
+          seekAudioHoldPackets: 128,
+          seekAudioDroppedPackets: 64,
+          pausePrebufferPackets: 0,
           decodePath: "Software-heavy",
           audioUnderrunRisk: "Medium",
         },
@@ -113,6 +129,10 @@ describe("playback benchmark telemetry", () => {
     expect(summary.lastAudioWorkerInFlight).toBe(1);
     expect(summary.lastAudioWorkerReorderBacklog).toBe(0);
     expect(summary.lastAudioWorkerStaleDrops).toBe(4);
+    expect(summary.lastSeekWaitingForVideo).toBe("Yes");
+    expect(summary.lastSeekAudioHoldPackets).toBe(128);
+    expect(summary.lastSeekAudioDroppedPackets).toBe(64);
+    expect(summary.lastPausePrebufferPackets).toBe(0);
     expect(summary.lastDecodePath).toBe("Software-heavy");
     expect(summary.lastAudioUnderrunRisk).toBe("Medium");
   });

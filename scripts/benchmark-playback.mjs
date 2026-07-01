@@ -36,6 +36,17 @@ export function normalizeMoviStats(stats = {}) {
     audioWorkerStaleDrops: numeric(
       stats["Audio Worker Stale Drops"] ?? stats.audioWorkerStaleDrops,
     ),
+    seekWaitingForVideo:
+      stats["Seek Waiting For Video"] ?? stats.seekWaitingForVideo ?? "",
+    seekAudioHoldPackets: numeric(
+      stats["Seek Audio Hold Packets"] ?? stats.seekAudioHoldPackets,
+    ),
+    seekAudioDroppedPackets: numeric(
+      stats["Seek Audio Dropped Packets"] ?? stats.seekAudioDroppedPackets,
+    ),
+    pausePrebufferPackets: numeric(
+      stats["Pause Prebuffer Packets"] ?? stats.pausePrebufferPackets,
+    ),
   };
 }
 
@@ -124,6 +135,10 @@ export function summarize(samples) {
     lastAudioWorkerInFlight: last.movi.audioWorkerInFlight,
     lastAudioWorkerReorderBacklog: last.movi.audioWorkerReorderBacklog,
     lastAudioWorkerStaleDrops: last.movi.audioWorkerStaleDrops,
+    lastSeekWaitingForVideo: last.movi.seekWaitingForVideo,
+    lastSeekAudioHoldPackets: last.movi.seekAudioHoldPackets,
+    lastSeekAudioDroppedPackets: last.movi.seekAudioDroppedPackets,
+    lastPausePrebufferPackets: last.movi.pausePrebufferPackets,
     lastDecodePath: last.movi.decodePath,
     lastAudioUnderrunRisk: last.movi.audioUnderrunRisk,
   };
@@ -142,6 +157,9 @@ export function diffSummary(current, baseline) {
     "lastAudioWorkerInFlight",
     "lastAudioWorkerReorderBacklog",
     "lastAudioWorkerStaleDrops",
+    "lastSeekAudioHoldPackets",
+    "lastSeekAudioDroppedPackets",
+    "lastPausePrebufferPackets",
   ];
   const diff = {};
   for (const key of keys) {

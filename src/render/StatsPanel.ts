@@ -33,6 +33,10 @@ const SECTIONS: StatsSectionSpec[] = [
       "Audio Buffer",
       "Audio Buffered Seconds",
       "Audio Underrun Risk",
+      "Seek Waiting For Video",
+      "Seek Audio Hold Packets",
+      "Seek Audio Dropped Packets",
+      "Pause Prebuffer Packets",
     ],
   },
   {

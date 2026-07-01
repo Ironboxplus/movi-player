@@ -229,11 +229,34 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   // Buffer audio packets while waiting for video to catch up after seek
   private waitingForVideoSync: boolean = false;
+  private static readonly SEEK_AUDIO_HOLD_SECONDS = 4;
+  private static readonly SEEK_AUDIO_HOLD_MAX_PACKETS = 512;
+  // Safety bounds for a seek whose first video frame never arrives (decode
+  // stuck, unseekable/indexless stream, WASM decode error, etc). Without them
+  // the process loop keeps reading at full burst while waitingForVideoSync —
+  // backpressure is bypassed there (skipVideoBackpressure on buffering, stashed
+  // audio, pre-target frames dropped all read as "empty") — so the source
+  // sequentially Range-downloads the whole file (maxed bandwidth) and the
+  // demuxer piles packets that never unblock the seek. SEEK_MAX_DEMUX_AHEAD
+  // caps how far past the target we demux before pausing reads (media seconds);
+  // SEEK_SYNC_HARD_TIMEOUT_MS is the terminal backstop that force-completes the
+  // seek so playback can't hang forever. Neither triggers on a healthy seek —
+  // the first frame normally arrives within ~1 GOP.
+  private static readonly SEEK_MAX_DEMUX_AHEAD_SECONDS = 8;
+  private static readonly SEEK_SYNC_HARD_TIMEOUT_MS = 12000;
   private pendingAudioPackets: Array<{
     data: Uint8Array;
     timestamp: number;
     keyframe: boolean;
   }> = [];
+  private droppedSeekAudioPackets: number = 0;
+  // performance.now() when the current seek armed waitingForVideoSync (0 = not
+  // waiting). Drives the hard-timeout watchdog so a frame-starved seek can't
+  // hang or download forever.
+  private seekSyncArmedAt: number = 0;
+  // Newest packet timestamp (media seconds) demuxed since the seek armed; used
+  // to cap read-ahead while waiting for the first post-seek video frame.
+  private seekDemuxAheadTime: number = -1;
 
   // Packets read during prebuffer — stashed unmodified so that normal
   // playback consumes them before resuming demux. We cannot decode during
@@ -347,11 +370,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           return;
         }
 
-        // Queue frames for smooth presentation with A/V sync
-        // Allow processing if playing OR if we are seeking (waiting for sync)
+        // Queue frames for smooth presentation with A/V sync.
+        // During rebuffer/seek restart the presentation loop may be stopped,
+        // but the first decoded video frame must still enter the renderer
+        // queue; otherwise the buffering gate can never become video-ready.
+        const state = this.stateManager.getState();
         if (
           this.videoRenderer &&
-          (this.stateManager.getState() === "playing" ||
+          (state === "playing" ||
+            state === "buffering" ||
             this.waitingForVideoSync)
         ) {
           // IMPORTANT: Drop video frames before the seek target time
@@ -372,16 +399,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           // frames produced by Open-GOP recovery — we just clear the guard
           // so subsequent frames flow through without re-entering this
           // branch (which would log a warn-spam every frame).
-          if (this.seekTargetTime !== -1) {
-            if (this.waitingForVideoSync) {
-              Logger.debug(TAG, `onFrame: frameTime=${frameTime.toFixed(3)}s >= seekTargetTime=${this.seekTargetTime.toFixed(3)}s, calling notifySeekCompletion`);
-              this.notifySeekCompletion(frameTime);
-            } else {
-              this.seekTargetTime = -1;
-            }
+          const completesSeek =
+            this.seekTargetTime !== -1 && this.waitingForVideoSync;
+          if (this.seekTargetTime !== -1 && !this.waitingForVideoSync) {
+            this.seekTargetTime = -1;
           }
-
           this.videoRenderer.queueFrame(frame);
+          if (completesSeek) {
+            Logger.debug(TAG, `onFrame: frameTime=${frameTime.toFixed(3)}s >= seekTargetTime=${this.seekTargetTime.toFixed(3)}s, calling notifySeekCompletion`);
+            this.notifySeekCompletion(frameTime);
+          }
         } else {
           frame.close();
         }
@@ -1218,7 +1245,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // and mark the source unplayable so the UI can show the broken state
       // instead of retrying a seek that can never succeed.
       try {
-        await this.demuxer.seek(targetTime);
+        await this.demuxer.seek(targetTime, 1, this.getSeekStreamIndex());
       } catch (error) {
         Logger.error(TAG, "Demuxer seek on first play failed", error);
         this.wasPlayingBeforeSeek = false;
@@ -1243,6 +1270,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
       this.clock.seek(targetTime);
       this.pendingAudioPackets = [];
+      this.droppedSeekAudioPackets = 0;
       // Discard pause-time buffered packets — demuxer was just re-seeked,
       // so stashed packets are stale (would feed later timestamps into the
       // decoder, making first frame jump ahead instead of starting at targetTime).
@@ -1487,10 +1515,29 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       !!this.videoRenderer && this.videoRenderer.getQueueSize() === 0;
     const forcedWithoutFrame =
       forced && noVideoFrameYet && !!this.trackManager.getActiveVideoTrack();
+    if (forcedWithoutFrame) {
+      Logger.warn(
+        TAG,
+        "Seek timeout fired before a video frame arrived; staying sync-armed and buffering instead of completing seek",
+      );
+      this.suppressSeekSpinner = false;
+      if (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) {
+        this.wasPlayingBeforeSeek = false;
+        this.wasPlayingBeforeRebuffer = true;
+        this._bufferingEntryTime = performance.now();
+        if (this._playStartTime === 0) {
+          this._playStartTime = performance.now();
+        }
+        this.stateManager.setState("buffering");
+      }
+      return;
+    }
 
     const seekTarget = this.seekTargetTime;
     this.seekTargetTime = -1;
     this.waitingForVideoSync = false;
+    this.seekSyncArmedAt = 0; // disarm read-ahead cap + hard-timeout watchdog
+    this.seekDemuxAheadTime = -1;
     this.seekingToKeyframe = false; // Also clear keyframe skip flag
     // First-play/replay seek has produced its first frame — drop spinner
     // suppression so any later genuine rebuffer shows the loading UI.
@@ -1575,26 +1622,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
 
     // Transition to final state
-    if (
-      (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) &&
-      forcedWithoutFrame
-    ) {
-      // Wanted to resume, but the forced timeout fired before any video frame
-      // decoded. Enter buffering with the play intent kept so the process
-      // loop's buffering→resume path auto-flips to "playing" on the first
-      // frame — instead of advancing the clock over a black screen.
-      Logger.info(
-        TAG,
-        "Seek forced-complete with no video frame yet — buffering until first frame",
-      );
-      this.wasPlayingBeforeSeek = false;
-      this.wasPlayingBeforeRebuffer = true; // resume intent for buffering→play
-      this._bufferingEntryTime = performance.now();
-      this.stateManager.setState("buffering");
-      if (this._playStartTime === 0) {
-        this._playStartTime = performance.now();
-      }
-    } else if (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) {
+    if (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) {
       Logger.info(TAG, "Resuming playback after seek");
       // Consume the resume intent so it doesn't leak into the next seek. It's
       // never reset elsewhere, so a stale `true` would make a later paused
@@ -1631,6 +1659,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           this.audioDecoder.decode(pkt.data, pkt.timestamp, pkt.keyframe);
         }
         this.pendingAudioPackets = [];
+        this.droppedSeekAudioPackets = 0;
       }
     } else {
       Logger.info(TAG, "Seek completed in paused state");
@@ -1643,6 +1672,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // Keeping stale packets causes A/V desync (prebuffer audio at 0.4s+
       // would be processed before fresh audio at 0s).
       this.pendingAudioPackets = [];
+      this.droppedSeekAudioPackets = 0;
       this.pendingPrebufferPackets = [];
 
       // Don't start clock or audio — but continue buffering ahead
@@ -1652,6 +1682,62 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Emit seeked event now that we are actually ready
     // Convert back from media time to UI time
     this.emit("seeked", Math.max(0, time - this.startTime));
+  }
+
+  /**
+   * True once a seek has waited past the hard limit for its first video frame.
+   * The process loop then force-completes the seek so a frame-starved seek
+   * (decode stuck, unseekable stream) can neither hang the player nor keep the
+   * demuxer downloading forever. `now` is injected for testability.
+   */
+  private seekSyncHardTimedOut(now: number): boolean {
+    return (
+      this.waitingForVideoSync &&
+      this.seekSyncArmedAt > 0 &&
+      now - this.seekSyncArmedAt > MoviPlayer.SEEK_SYNC_HARD_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * True while a seek is still waiting for its first frame AND we have already
+   * demuxed more than SEEK_MAX_DEMUX_AHEAD_SECONDS past the target. The process
+   * loop then stops reading — every packet the first frame needs (keyframe ≤
+   * target) is already read, so this only halts a runaway that would otherwise
+   * sequentially download the whole file (the infinite-traffic bug).
+   */
+  private seekReadAheadExceeded(): boolean {
+    return (
+      this.waitingForVideoSync &&
+      this.seekTargetTime !== -1 &&
+      this.seekDemuxAheadTime >= 0 &&
+      this.seekDemuxAheadTime - this.seekTargetTime >
+        MoviPlayer.SEEK_MAX_DEMUX_AHEAD_SECONDS
+    );
+  }
+
+  private stashSeekAudioPacket(packet: Packet): void {
+    if (this.seekTargetTime !== -1) {
+      const maxHeldTime =
+        this.seekTargetTime + MoviPlayer.SEEK_AUDIO_HOLD_SECONDS;
+      if (packet.timestamp > maxHeldTime) {
+        this.droppedSeekAudioPackets++;
+        return;
+      }
+    }
+
+    if (
+      this.pendingAudioPackets.length >=
+      MoviPlayer.SEEK_AUDIO_HOLD_MAX_PACKETS
+    ) {
+      this.droppedSeekAudioPackets++;
+      return;
+    }
+
+    this.pendingAudioPackets.push({
+      data: packet.data,
+      timestamp: packet.timestamp,
+      keyframe: packet.keyframe,
+    });
   }
 
   /**
@@ -1676,6 +1762,23 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return;
     }
 
+    // Hard watchdog: a seek whose first video frame never arrives must not hang
+    // the player or let the demuxer download forever. Past the hard limit,
+    // force-complete the seek (hold/resume whatever we have) instead of staying
+    // sync-armed and reading packets indefinitely. The one-shot seek timeout
+    // can leave us buffering with waitingForVideoSync latched; this is the
+    // terminal backstop. Never fires on a healthy seek (first frame arrives in
+    // ~1 GOP, well under the limit).
+    if (this.seekSyncHardTimedOut(performance.now())) {
+      Logger.warn(
+        TAG,
+        `Seek sync hard-timeout (${MoviPlayer.SEEK_SYNC_HARD_TIMEOUT_MS}ms) with no video frame — force-completing seek to stop runaway demux`,
+      );
+      this.seekSyncArmedAt = 0;
+      this.notifySeekCompletion(this.seekTargetTime);
+      return;
+    }
+
     // Check if audio is rebuffering due to playback rate change
     if (!this.disableAudio && this.audioRenderer.isRebuffering()) {
       // Enter buffering state and pause clock until rebuffering completes
@@ -1692,16 +1795,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     } else if (this.stateManager.getState() === "buffering" && this.wasPlayingBeforeRebuffer) {
       // Resume after minimum dwell time to accumulate enough data
       const hasAudioTrack = !!this.trackManager.getActiveAudioTrack();
+      const hasVideoTrack = !!this.trackManager.getActiveVideoTrack();
       const audioReady = this.disableAudio || !hasAudioTrack || this.audioRenderer.getBufferedDuration() > 0.1;
-      const videoReady = !this.videoRenderer || this.videoRenderer.getQueueSize() > 0;
+      const videoReady =
+        !hasVideoTrack || !this.videoRenderer || this.videoRenderer.getQueueSize() > 0;
       const dwellMs = performance.now() - this._bufferingEntryTime;
       const minDwell = 1500; // Wait at least 1.5s to accumulate buffer
-      // Resume if: (1) both ready after minDwell, or (2) audio ready after longer wait
-      // Video decoder output is async — don't block forever if frames are delayed
-      const canResume = dwellMs >= minDwell && (
-        (audioReady && videoReady) ||
-        (audioReady && dwellMs >= 3000)
-      );
+      const canResume =
+        dwellMs >= minDwell &&
+        audioReady &&
+        videoReady &&
+        !this.waitingForVideoSync;
       if (canResume) {
         this.stateManager.setState("paused");
         this.wasPlayingBeforeRebuffer = false;
@@ -2083,6 +2187,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return;
     }
 
+    // Read-ahead cap: while a seek's first frame hasn't arrived, the backpressure
+    // checks above are all bypassed (skipVideoBackpressure on buffering, stashed
+    // audio → empty decoder/renderer queues), so stop reading once we've demuxed
+    // SEEK_MAX_DEMUX_AHEAD_SECONDS past the target. Every packet the first frame
+    // needs (keyframe ≤ target through target) is already read well before this,
+    // so this only halts a runaway that would otherwise download the whole file;
+    // the hard watchdog above terminates the seek if the frame never comes.
+    if (this.seekReadAheadExceeded()) {
+      return;
+    }
+
     // Read packet
     try {
       // Final check before starting async operation - ensure no new seek started
@@ -2247,6 +2362,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           break;
         }
 
+        // Track how far past the seek target we've demuxed so the read-ahead
+        // cap above can halt a frame-starved seek before it downloads forever.
+        if (
+          this.waitingForVideoSync &&
+          Number.isFinite(packet.timestamp) &&
+          packet.timestamp > this.seekDemuxAheadTime
+        ) {
+          this.seekDemuxAheadTime = packet.timestamp;
+        }
+
         // Dispatch to decoders/renderers
         if (this.trackManager.isActiveStream(packet.streamIndex)) {
           const activeVideo = this.trackManager.getActiveVideoTrack();
@@ -2370,7 +2495,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
                 this.waitingForVideoSync &&
                 this.trackManager.getActiveVideoTrack()
               ) {
-                this.pendingAudioPackets.push(packet);
+                this.stashSeekAudioPacket(packet);
                 continue;
               }
 
@@ -2568,6 +2693,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // cleared on seek completion (notifySeekCompletion).
   suppressSeekSpinner = false;
 
+  private getSeekStreamIndex(): number {
+    if (this._audioOnly) return -1;
+    return this.trackManager.getActiveVideoTrack()?.id ?? -1;
+  }
+
   async seek(
     seconds: number,
     opts?: { suppressSpinner?: boolean; preservePlaying?: boolean },
@@ -2687,8 +2817,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (this.seekSessionId !== mySessionId) return; // Superceded
 
       // Seek relative to start time (time 0 in UI = startTime in media)
-      Logger.info(TAG, `seek: demuxer.seek(${(seconds + this.startTime).toFixed(2)}) starting...`);
-      await this.demuxer.seek(seconds + this.startTime);
+      const seekStreamIndex = this.getSeekStreamIndex();
+      Logger.info(
+        TAG,
+        `seek: demuxer.seek(${(seconds + this.startTime).toFixed(2)}, stream=${seekStreamIndex}) starting...`,
+      );
+      await this.demuxer.seek(seconds + this.startTime, 1, seekStreamIndex);
       // Seek native audio element (separate audio source)
       if (this.nativeAudioEl) {
         this.nativeAudioEl.currentTime = seconds;
@@ -2720,6 +2854,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // Normalize target time against startTime offset
       this.seekTargetTime = seconds + this.startTime;
       this.waitingForVideoSync = true;
+      // Arm the read-ahead cap + hard-timeout watchdog for this seek so a
+      // never-arriving first frame can't run away downloading / hang forever.
+      this.seekSyncArmedAt = performance.now();
+      this.seekDemuxAheadTime = this.seekTargetTime;
       // Tag which seek session armed this completion. notifySeekCompletion
       // bails if a newer seek has since superseded this one, so a stale (e.g.
       // coalesced/rapid-seek) completion can't run the resume/paused branch and
@@ -2727,6 +2865,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // intermittently left rapid seeks stuck paused.
       this.seekArmedSessionId = mySessionId;
       this.pendingAudioPackets = [];
+      this.droppedSeekAudioPackets = 0;
       // Stashed prebuffer packets are pre-seek and now stale
       this.pendingPrebufferPackets = [];
 
@@ -3663,6 +3802,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.waitingForVideoSync = false; // no stale seek-completion armed
     this._playStartTime = 0; // keep first-play branch eligible
     this.pendingAudioPackets = []; // poster-era audio is stale; play() re-seeks
+    this.droppedSeekAudioPackets = 0;
     this.pendingPrebufferPackets = [];
     // The poster seek advanced HttpSource's monotonic buffered-end to ~poster
     // time; reset it (as a real seek does) so the buffer bar starts from 0
@@ -4586,9 +4726,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       await this.audioDecoder.flush();
       if (this.videoRenderer) this.videoRenderer.clearQueue();
       this.audioRenderer.reset();
-      await this.demuxer.seek(resumeTime);
+      await this.demuxer.seek(resumeTime, 1, this.getSeekStreamIndex());
       this.clock.seek(resumeTime);
       this.pendingAudioPackets = [];
+      this.droppedSeekAudioPackets = 0;
       this.pendingPrebufferPackets = [];
       this.eofReached = false;
       this.eofSince = 0;
@@ -4813,6 +4954,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     stats["Frames Rendered"] = rendererStats?.framesPresented ?? 0;
     stats["Video Decoder Queue"] = videoDecoderStats.queueSize;
     stats["Audio Decoder Queue"] = audioDecoderStats.queueSize;
+    stats["Seek Waiting For Video"] = this.waitingForVideoSync ? "Yes" : "No";
+    stats["Seek Audio Hold Packets"] = this.pendingAudioPackets.length;
+    stats["Seek Audio Dropped Packets"] = this.droppedSeekAudioPackets;
+    stats["Seek Demux Ahead"] =
+      this.waitingForVideoSync && this.seekDemuxAheadTime >= 0
+        ? `${(this.seekDemuxAheadTime - this.seekTargetTime).toFixed(1)}s / ${MoviPlayer.SEEK_MAX_DEMUX_AHEAD_SECONDS}s`
+        : "—";
+    stats["Pause Prebuffer Packets"] = this.pendingPrebufferPackets.length;
     if (audioDecoderStats.worker) {
       stats["Audio Worker Generation"] = audioDecoderStats.worker.generation;
       stats["Audio Worker Track"] = audioDecoderStats.worker.trackId;
@@ -5222,7 +5371,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
             // Seek demuxer to nearest keyframe before current audio position
             if (this.demuxer) {
-              await this.demuxer.seek(audioTime + this.startTime);
+              await this.demuxer.seek(
+                audioTime + this.startTime,
+                1,
+                this.getSeekStreamIndex(),
+              );
             }
 
             if (this.seekSessionId !== mySessionId) return; // Superseded
@@ -5335,6 +5488,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private startPauseBuffering(): void {
     if (this.pauseBufferTimerId !== null) return;
     if (!this.demuxer || this.eofReached) return;
+    if (this.waitingForVideoSync || this.seekTargetTime !== -1) return;
     // Native-audio-only: never read the demuxer — that would download the very
     // video body the data-saver mode exists to skip.
     if (this.nativeAudioOnlyPlayback()) return;
@@ -5363,6 +5517,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
     // Don't interfere with active WASM operations
     if (this.demuxInFlight || !this.demuxer) return;
+    if (this.waitingForVideoSync || this.seekTargetTime !== -1) {
+      this.stopPauseBuffering();
+      return;
+    }
     if (this.eofReached) {
       this.stopPauseBuffering();
       return;

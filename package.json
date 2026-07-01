@@ -1,6 +1,6 @@
 {
   "name": "movi-player",
-  "version": "0.3.4-dts-worker.3",
+  "version": "0.3.4-dts-worker.4",
   "description": "Play MKV, HEVC, AV1, HDR videos in the browser. WebCodecs + FFmpeg WASM player with encrypted playback, chapters, subtitles, multi-audio tracks. No server transcoding needed.",
   "type": "module",
   "main": "dist/index.js",
@@ -49,6 +49,7 @@
     "test:run": "vitest run",
     "bench:audio": "vitest bench --run test/bench/audio-worker-protocol.bench.ts",
     "bench:playback": "node scripts/benchmark-playback.mjs",
+    "smoke:wasm-seek": "node scripts/wasm-seek-smoke.mjs",
     "pack:verify": "node scripts/verify-package.mjs",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",

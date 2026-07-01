@@ -1779,8 +1779,11 @@ export class CanvasRenderer {
     // For true 60fps, always try to present a frame if available
     // This ensures we maintain frame rate even if timing is slightly off
     if (this.frameQueue.length === 0) {
-      // Even if no frames, still update subtitles based on current playback time
-      this.updateActiveSubtitle();
+      if (this.lastPresentedPts >= 0 || this.lastRenderedFrame) {
+        this.updateActiveSubtitle();
+      } else {
+        this.activeSubtitleCue = null;
+      }
       this.renderSubtitles();
       return; // No frames available, wait for next cycle
     }

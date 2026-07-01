@@ -449,12 +449,16 @@ export class Demuxer {
   /**
    * Seek to timestamp (async due to Asyncify)
    */
-  async seek(timestamp: number, flags: number = 1): Promise<void> {
+  async seek(
+    timestamp: number,
+    flags: number = 1,
+    streamIndex: number = -1,
+  ): Promise<void> {
     if (!this.bindings || !this.isOpened) {
       throw new Error("Demuxer not opened");
     }
 
-    await this.bindings.seek(timestamp, -1, flags);
+    await this.bindings.seek(timestamp, streamIndex, flags);
   }
 
   /**
