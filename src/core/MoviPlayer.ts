@@ -244,6 +244,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // the first frame normally arrives within ~1 GOP.
   private static readonly SEEK_MAX_DEMUX_AHEAD_SECONDS = 8;
   private static readonly SEEK_SYNC_HARD_TIMEOUT_MS = 12000;
+  private static readonly REBUFFER_VIDEO_UNLOCK_AUDIO_OVERSHOOT_SECONDS = 1;
   private pendingAudioPackets: Array<{
     data: Uint8Array;
     timestamp: number;
@@ -2167,11 +2168,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const videoDecoderFull = this.videoDecoder.queueSize > maxVideoQueue;
     const videoBufferFull = !skipVideoBackpressure && videoBuffered > maxVideoBuffered;
     const skipVideoDecodeForAudio = isNon1xRate && !this.muted && (videoBufferFull || videoDecoderFull) && audioStarving;
+    const needsRebufferVideoFrame =
+      currentState === "buffering" &&
+      this.wasPlayingBeforeRebuffer &&
+      !!activeVideo &&
+      videoBuffered === 0 &&
+      this.videoDecoder.queueSize === 0 &&
+      audioBuffered <=
+        maxAudioBuffered +
+          MoviPlayer.REBUFFER_VIDEO_UNLOCK_AUDIO_OVERSHOOT_SECONDS;
+    const audioBufferFull =
+      !this.disableAudio &&
+      audioBuffered > maxAudioBuffered &&
+      !needsRebufferVideoFrame;
 
     if (
       (!skipVideoBackpressure && !skipVideoDecodeForAudio && this.videoDecoder.queueSize > maxVideoQueue) ||
       (!this.disableAudio && this.audioDecoder.queueSize > maxAudioQueue) ||
-      (!this.disableAudio && audioBuffered > maxAudioBuffered) ||
+      audioBufferFull ||
       (!skipVideoBackpressure && !skipVideoDecodeForAudio && videoBuffered > maxVideoBuffered)
     ) {
       if (

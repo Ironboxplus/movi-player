@@ -23,6 +23,16 @@ export class AudioRenderer {
   private _playbackRate: number = 1.0;
   private activeSources: AudioBufferSourceNode[] = [];
   private _muted: boolean = false;
+  private pendingPCMFlushTimerId: ReturnType<typeof setTimeout> | null = null;
+  private nextPCMExpectedTimestamp: number | null = null;
+  private pendingPCM: {
+    sampleRate: number;
+    numberOfChannels: number;
+    startTimestamp: number;
+    expectedTimestamp: number;
+    numberOfFrames: number;
+    chunks: Float32Array<ArrayBuffer>[][];
+  } | null = null;
 
   // Audio clock tracking for A/V sync
   private firstBufferScheduledAt: number = 0;
@@ -58,6 +68,9 @@ export class AudioRenderer {
   // Stable audio: gain ramp duration for smooth transitions (prevents clicks/pops)
   private static readonly GAIN_RAMP_TIME = 0.015; // 15ms ramp
   private static readonly FADE_OUT_TIME = 0.03; // 30ms fade-out before seek/reset
+  private static readonly PCM_COALESCE_MIN_DURATION = 0.02; // 20ms
+  private static readonly PCM_COALESCE_MAX_DELAY_MS = 25;
+  private static readonly PCM_COALESCE_GAP_TOLERANCE_US = 20000;
 
   // Stable audio: AudioContext state monitoring & auto-recovery
   private contextStateHandler: (() => void) | null = null;
@@ -364,6 +377,8 @@ export class AudioRenderer {
         audioBuffer.copyToChannel(channelData, channel);
       }
 
+      this.flushPendingPCM();
+      this.nextPCMExpectedTimestamp = null;
       this.scheduleAudioBuffer(audioBuffer, audioTime);
     } catch (error) {
       Logger.error(TAG, "Render error", error);
@@ -379,28 +394,181 @@ export class AudioRenderer {
    */
   renderPCM(frame: PCMFrame): void {
     if (!this.audioContext || !this.gainNode) return;
-    if (!this.isPlaying) return;
-    if (this._muted && this.audioContext.state === "suspended") return;
+    if (!this.isPlaying) {
+      this.discardPendingPCM();
+      return;
+    }
+    if (this._muted && this.audioContext.state === "suspended") {
+      this.discardPendingPCM();
+      return;
+    }
 
     try {
-      const audioTime = frame.timestamp / 1_000_000;
-      const audioBuffer = this.audioContext.createBuffer(
-        frame.numberOfChannels,
-        frame.numberOfFrames,
-        frame.sampleRate,
-      );
-
-      for (let channel = 0; channel < frame.numberOfChannels; channel++) {
-        audioBuffer.copyToChannel(
-          frame.planes[channel] as Float32Array<ArrayBuffer>,
-          channel,
-        );
+      const frameDuration = frame.numberOfFrames / frame.sampleRate;
+      if (frameDuration < AudioRenderer.PCM_COALESCE_MIN_DURATION) {
+        this.appendPendingPCM(frame);
+        return;
       }
 
-      this.scheduleAudioBuffer(audioBuffer, audioTime);
+      this.flushPendingPCM();
+      this.schedulePCMFrame(frame);
     } catch (error) {
       Logger.error(TAG, "RenderPCM error", error);
     }
+  }
+
+  private appendPendingPCM(frame: PCMFrame): void {
+    const frameDurationUs = (frame.numberOfFrames / frame.sampleRate) * 1_000_000;
+    const pending = this.pendingPCM;
+    const formatChanged =
+      !!pending &&
+      (pending.sampleRate !== frame.sampleRate ||
+        pending.numberOfChannels !== frame.numberOfChannels);
+    if (formatChanged) {
+      this.flushPendingPCM();
+      this.nextPCMExpectedTimestamp = null;
+    }
+
+    const frameTimestamp = this.normalizePCMTimestamp(
+      frame.timestamp,
+      frameDurationUs,
+    );
+    const discontinuous =
+      !!this.pendingPCM &&
+      Math.abs(frameTimestamp - this.pendingPCM.expectedTimestamp) >
+        AudioRenderer.PCM_COALESCE_GAP_TOLERANCE_US;
+
+    if (discontinuous) {
+      this.flushPendingPCM();
+    }
+
+    if (!this.pendingPCM) {
+      this.pendingPCM = {
+        sampleRate: frame.sampleRate,
+        numberOfChannels: frame.numberOfChannels,
+        startTimestamp: frameTimestamp,
+        expectedTimestamp: frameTimestamp,
+        numberOfFrames: 0,
+        chunks: Array.from(
+          { length: frame.numberOfChannels },
+          () => [] as Float32Array<ArrayBuffer>[],
+        ),
+      };
+    }
+
+    const target = this.pendingPCM;
+    this.schedulePendingPCMFlush();
+    for (let channel = 0; channel < frame.numberOfChannels; channel++) {
+      target.chunks[channel].push(
+        frame.planes[channel] as Float32Array<ArrayBuffer>,
+      );
+    }
+    target.numberOfFrames += frame.numberOfFrames;
+    target.expectedTimestamp += frameDurationUs;
+    this.nextPCMExpectedTimestamp = target.expectedTimestamp;
+
+    const minFrames = Math.ceil(
+      AudioRenderer.PCM_COALESCE_MIN_DURATION * frame.sampleRate,
+    );
+    if (target.numberOfFrames >= minFrames) {
+      this.flushPendingPCM();
+    }
+  }
+
+  private schedulePendingPCMFlush(): void {
+    if (this.pendingPCMFlushTimerId !== null) return;
+    this.pendingPCMFlushTimerId = setTimeout(() => {
+      this.pendingPCMFlushTimerId = null;
+      this.flushPendingPCM();
+    }, AudioRenderer.PCM_COALESCE_MAX_DELAY_MS);
+  }
+
+  private clearPendingPCMFlushTimer(): void {
+    if (this.pendingPCMFlushTimerId === null) return;
+    clearTimeout(this.pendingPCMFlushTimerId);
+    this.pendingPCMFlushTimerId = null;
+  }
+
+  private discardPendingPCM(): void {
+    this.clearPendingPCMFlushTimer();
+    this.pendingPCM = null;
+    this.nextPCMExpectedTimestamp = null;
+  }
+
+  private normalizePCMTimestamp(timestamp: number, durationUs: number): number {
+    const expected = this.nextPCMExpectedTimestamp;
+    if (
+      expected !== null &&
+      (Math.abs(timestamp - expected) <=
+        AudioRenderer.PCM_COALESCE_GAP_TOLERANCE_US ||
+        (!!this.pendingPCM &&
+          Math.abs(timestamp - this.pendingPCM.startTimestamp) <=
+            AudioRenderer.PCM_COALESCE_GAP_TOLERANCE_US))
+    ) {
+      return expected;
+    }
+    this.nextPCMExpectedTimestamp = timestamp + durationUs;
+    return timestamp;
+  }
+
+  private flushPendingPCM(): void {
+    const pending = this.pendingPCM;
+    this.clearPendingPCMFlushTimer();
+    this.pendingPCM = null;
+    if (
+      !pending ||
+      !this.audioContext ||
+      !this.gainNode ||
+      !this.isPlaying ||
+      (this._muted && this.audioContext.state === "suspended") ||
+      pending.numberOfFrames <= 0
+    ) {
+      return;
+    }
+
+    try {
+      const audioBuffer = this.audioContext.createBuffer(
+        pending.numberOfChannels,
+        pending.numberOfFrames,
+        pending.sampleRate,
+      );
+      for (let channel = 0; channel < pending.numberOfChannels; channel++) {
+        let offset = 0;
+        const channelData = audioBuffer.getChannelData(channel);
+        for (const chunk of pending.chunks[channel]) {
+          channelData.set(chunk, offset);
+          offset += chunk.length;
+        }
+      }
+
+      this.scheduleAudioBuffer(audioBuffer, pending.startTimestamp / 1_000_000);
+    } catch (error) {
+      Logger.error(TAG, "Pending PCM flush error", error);
+    }
+  }
+
+  private schedulePCMFrame(frame: PCMFrame): void {
+    if (!this.audioContext) return;
+    const frameDurationUs = (frame.numberOfFrames / frame.sampleRate) * 1_000_000;
+    const frameTimestamp = this.normalizePCMTimestamp(
+      frame.timestamp,
+      frameDurationUs,
+    );
+    this.nextPCMExpectedTimestamp = frameTimestamp + frameDurationUs;
+    const audioBuffer = this.audioContext.createBuffer(
+      frame.numberOfChannels,
+      frame.numberOfFrames,
+      frame.sampleRate,
+    );
+
+    for (let channel = 0; channel < frame.numberOfChannels; channel++) {
+      audioBuffer.copyToChannel(
+        frame.planes[channel] as Float32Array<ArrayBuffer>,
+        channel,
+      );
+    }
+
+    this.scheduleAudioBuffer(audioBuffer, frameTimestamp / 1_000_000);
   }
 
   /**
@@ -792,6 +960,7 @@ export class AudioRenderer {
   private intentionalSuspend: boolean = false;
 
   pause(): void {
+    this.flushPendingPCM();
     this.isPlaying = false;
 
     // Don't stop sources or clear buffers!
@@ -874,6 +1043,7 @@ export class AudioRenderer {
   setPlaybackRate(rate: number): void {
     const newRate = Math.max(0.25, Math.min(4, rate));
     if (this._playbackRate === newRate) return;
+    this.discardPendingPCM();
 
     const oldRate = this._playbackRate;
 
@@ -1058,6 +1228,8 @@ export class AudioRenderer {
    * Reset timing and stop all scheduled audio with smooth fade-out
    */
   reset(): void {
+    this.discardPendingPCM();
+
     // Stable audio: fade out before stopping to prevent clicks
     if (this._stableAudio && this.audioContext && this.gainNode && this.activeSources.length > 0) {
       try {
