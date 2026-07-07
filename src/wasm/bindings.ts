@@ -54,6 +54,20 @@ function logLevelToFFmpeg(level: LogLevel): number {
 const activeBindings = new Set<WasmBindings>();
 
 /**
+ * Decode UTF-8 bytes that may live in WASM heap memory.
+ *
+ * Newer Emscripten runtimes back the heap with a RESIZABLE ArrayBuffer
+ * (WebAssembly.Memory.toResizableBuffer), and Chrome's TextDecoder.decode()
+ * throws "The provided ArrayBuffer value must not be resizable" for any view
+ * over such a buffer. Copy the bytes into a fresh fixed-size buffer first.
+ * The copy also keeps the result safe if a _malloc grows (and detaches) the
+ * heap mid-flight.
+ */
+export function decodeUtf8(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes.slice());
+}
+
+/**
  * Data source interface for async I/O
  */
 export interface DataSource {
@@ -75,7 +89,7 @@ function parseStreamInfo(module: MoviWasmModule, ptr: number): StreamInfo {
     ptr + STREAM_INFO_OFFSETS.codecName,
     ptr + STREAM_INFO_OFFSETS.codecName + 32,
   );
-  const codecName = new TextDecoder().decode(
+  const codecName = decodeUtf8(
     codecNameBytes.subarray(0, codecNameBytes.indexOf(0)),
   );
 
@@ -84,7 +98,7 @@ function parseStreamInfo(module: MoviWasmModule, ptr: number): StreamInfo {
     ptr + STREAM_INFO_OFFSETS.language,
     ptr + STREAM_INFO_OFFSETS.language + 8,
   );
-  const language = new TextDecoder().decode(
+  const language = decodeUtf8(
     languageBytes.subarray(0, languageBytes.indexOf(0)),
   );
 
@@ -93,9 +107,7 @@ function parseStreamInfo(module: MoviWasmModule, ptr: number): StreamInfo {
     ptr + STREAM_INFO_OFFSETS.label,
     ptr + STREAM_INFO_OFFSETS.label + 64,
   );
-  const label = new TextDecoder().decode(
-    labelBytes.subarray(0, labelBytes.indexOf(0)),
-  );
+  const label = decodeUtf8(labelBytes.subarray(0, labelBytes.indexOf(0)));
 
   return {
     index: view.getInt32(STREAM_INFO_OFFSETS.index, true),
@@ -144,9 +156,7 @@ function readString(
 ): string {
   const bytes = module.HEAPU8.subarray(ptr, ptr + maxLength);
   const nullIndex = bytes.indexOf(0);
-  return new TextDecoder().decode(
-    bytes.subarray(0, nullIndex >= 0 ? nullIndex : maxLength),
-  );
+  return decodeUtf8(bytes.subarray(0, nullIndex >= 0 ? nullIndex : maxLength));
 }
 
 /**
@@ -676,7 +686,7 @@ export class WasmBindings {
         this.module._movi_get_chapter_title(this.contextPtr, i, titleBufPtr, 256);
         const titleBytes = this.module.HEAPU8.subarray(titleBufPtr, titleBufPtr + 256);
         const nullIdx = titleBytes.indexOf(0);
-        const title = new TextDecoder().decode(titleBytes.subarray(0, nullIdx > 0 ? nullIdx : 256));
+        const title = decodeUtf8(titleBytes.subarray(0, nullIdx > 0 ? nullIdx : 256));
 
         chapters.push({
           title: title || `Chapter ${i + 1}`,
@@ -951,7 +961,7 @@ export class WasmBindings {
         bufferPtr,
         bufferPtr + result,
       );
-      const text = new TextDecoder().decode(textBytes);
+      const text = decodeUtf8(textBytes);
 
       // Trim whitespace and check if empty
       const trimmedText = text?.trim();
@@ -1063,7 +1073,7 @@ export class WasmBindings {
         const start = new DataView(this.module.HEAPU8.buffer, startPtr, 8).getFloat64(0, true);
         const end = new DataView(this.module.HEAPU8.buffer, endPtr, 8).getFloat64(0, true);
         const textBytes = this.module.HEAPU8.subarray(textPtr, textPtr + len);
-        const text = new TextDecoder().decode(textBytes).trim();
+        const text = decodeUtf8(textBytes).trim();
         if (text) cues.push({ start, end, text });
       }
     } finally {
