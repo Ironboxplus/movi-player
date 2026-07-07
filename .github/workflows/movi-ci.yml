@@ -50,8 +50,27 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - name: Start from a clean generated tree
-        run: rm -rf dist package-artifacts
+      - name: Start from a clean generated tree (keep cached FFmpeg/dav1d libs)
+        run: |
+          mkdir -p dist
+          find dist -mindepth 1 -maxdepth 1 ! -name ffmpeg ! -name dav1d -exec rm -rf {} +
+          rm -rf package-artifacts
+      - name: Resolve emsdk image digest for cache key
+        id: emsdk
+        run: |
+          DIGEST=$(docker buildx imagetools inspect emscripten/emsdk:latest --format '{{println .Manifest.Digest}}' | head -1)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "emsdk digest: ${DIGEST}"
+      # dav1d + FFmpeg compiles (~7 min) depend only on the toolchain and the
+      # build script, not on movi sources. Key on the live emsdk:latest digest
+      # so a toolchain upgrade rebuilds them instead of linking stale objects.
+      - name: Cache FFmpeg/dav1d WASM libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist/ffmpeg
+            dist/dav1d
+          key: wasm-libs-${{ steps.emsdk.outputs.digest }}-${{ hashFiles('docker/Dockerfile', 'docker/build-ffmpeg.sh') }}
       - run: npm run build:wasm
       - run: npm run build:ts
       - run: npm run pack:verify
