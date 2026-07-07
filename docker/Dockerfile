@@ -1,8 +1,5 @@
 # syntax=docker/dockerfile:1
-# Pinned: emsdk 6.x switched the heap to a resizable ArrayBuffer
-# (Memory.toResizableBuffer), which surfaced the TextDecoder-on-heap-view bug.
-# Keep this pinned so toolchain upgrades are deliberate, not CI surprises.
-FROM emscripten/emsdk:6.0.2
+FROM emscripten/emsdk:latest
 
 LABEL maintainer="movi"
 LABEL description="FFmpeg WASM build environment for movi"
