@@ -1113,6 +1113,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // wasPlayingBeforeSeek from the entry state ("ended" → false), which is
       // why we must force it true here up front rather than after the await.
       this.wasPlayingBeforeSeek = true;
+      // Re-arm the play grace so the stall/desync detectors don't fire on the
+      // replay-seek transient. Right after "Replaying from beginning" the video
+      // renderer's currentTime is still stale at the ended position (~duration)
+      // while audio resets to 0 — without a fresh grace the desync detector sees
+      // a ~full-duration "behind" and kicks off a spurious resync seek (an
+      // audible trip at the start of every replay).
+      this._playStartTime = performance.now();
       try {
         await this.seek(0, { suppressSpinner: true });
         // The separate native <audio> track ended with the video; seek(0)
