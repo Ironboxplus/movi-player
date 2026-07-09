@@ -17248,10 +17248,48 @@ export class MoviElement extends HTMLElement {
     // out perfectly capable browsers whose embedder couldn't set the headers,
     // and lite/mobile browsers (Opera Mini "high" mode, UC, etc.) that never
     // report crossOriginIsolated even when the server does send the headers.
+    // Cross-origin isolation (SharedArrayBuffer) is only actually REQUIRED for
+    // the HTTP-streaming HttpSource path. Local sources — a File, or a blob: /
+    // data: URL — and native adaptive streams (HLS .m3u8 / DASH .mpd, which
+    // play through the <video> element, not SAB) run fine without it. So gate
+    // the hard requirement on the source type: block a bare http(s) source
+    // when the headers are missing, but keep local/adaptive playback working.
     if (!window.crossOriginIsolated) {
+      const urlSrc = typeof this._src === "string" ? this._src : "";
+      const url = urlSrc || (this._encrypted ? this._videoUrl : "");
+      const httpStreaming =
+        /^https?:\/\//i.test(url) && !/\.(m3u8|mpd)(\?|#|$)/i.test(url);
+      if (httpStreaming) {
+        Logger.warn(
+          TAG,
+          "HTTP streaming (HttpSource) needs cross-origin isolation (COOP+COEP) for SharedArrayBuffer — headers missing, blocking.",
+        );
+        if (this.brokenIndicator) {
+          this.brokenIndicator.style.display = "flex";
+          if (this.emptyStateIndicator) {
+            this.emptyStateIndicator.style.display = "none";
+          }
+          const titleEl =
+            this.brokenIndicator.querySelector(".movi-broken-title");
+          if (titleEl) titleEl.textContent = "Security Headers Required";
+          const messageEl = this.brokenIndicator.querySelector(
+            ".movi-broken-message",
+          );
+          if (messageEl) {
+            messageEl.textContent =
+              "Streaming from a URL needs the COOP + COEP headers (cross-origin isolation) for SharedArrayBuffer. Set them on the page that hosts the player, or play a local file instead.";
+          }
+          const swFallbackBtn = this.brokenIndicator.querySelector(
+            ".movi-sw-fallback-btn",
+          ) as HTMLElement;
+          if (swFallbackBtn) swFallbackBtn.style.display = "none";
+        }
+        this._isUnsupported = true;
+        return;
+      }
       Logger.warn(
         TAG,
-        "Not cross-origin isolated (no COOP/COEP) — running without SharedArrayBuffer; single-threaded WASM is unaffected, HTTP streaming pays one extra copy.",
+        "Not cross-origin isolated (no COOP/COEP) — local/adaptive source runs without SharedArrayBuffer; single-threaded WASM is unaffected.",
       );
     }
 
