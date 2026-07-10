@@ -77,6 +77,8 @@ Also available as a **desktop app** (Windows / macOS / Linux) for playing local 
 <movi-player src="video.mp4" controls autoplay muted></movi-player>
 ```
 
+> Prefer the official hosted build? Load it straight from **`https://moviplayer.com/dist/element.js`** — always the latest release, and a drop-in on any page (no COOP/COEP or isolation headers required).
+
 Or with npm:
 
 ```html
