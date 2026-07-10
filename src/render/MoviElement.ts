@@ -2555,7 +2555,7 @@ export class MoviElement extends HTMLElement {
     // Setup gestures
     this.setupGestures(shadowRoot);
 
-    // Setup 360° look-around (mouse drag + wheel zoom)
+    // Setup 360° look-around (mouse/touch drag; two-finger pinch to zoom)
     this.setupVRControls(shadowRoot);
 
     // Setup context menu
@@ -3305,16 +3305,6 @@ export class MoviElement extends HTMLElement {
       };
       target.addEventListener("pointerup", endDrag);
       target.addEventListener("pointercancel", endDrag);
-
-      target.addEventListener(
-        "wheel",
-        (e: WheelEvent) => {
-          if (!this._vr360) return;
-          e.preventDefault();
-          this.player?.zoomVR360(e.deltaY);
-        },
-        { passive: false },
-      );
     });
 
     // ── On-screen pan joystick (the YouTube-style compass, desktop only) ──
@@ -9794,7 +9784,7 @@ export class MoviElement extends HTMLElement {
         touch-action: none;
       }
       /* Opt-in via the vrpad attribute. Without it the pad never shows —
-         drag-to-look + wheel-zoom already cover desktop navigation; the pad is
+         drag-to-look already covers desktop navigation; the pad is
          for those who want a YouTube-style continuous-pan compass. */
       :host(.movi-vr360-active[vrpad]) .movi-vr360-pad {
         opacity: 1;
