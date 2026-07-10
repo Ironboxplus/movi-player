@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4-dts-worker.8] - 2026-07-10
+
+### Fixed
+- **HTTP source: large-`buffersize` streams still stalled at the window boundary** (regression fix for the `.7` rebuffering change). The `.7` refill trigger fired when the demuxer had consumed `bufferSize * 0.25`, but the forward-download window is separately capped at `MAX_STREAM_BUFFER_SIZE`. When a consumer sets a large `buffersize` (the OpenList frontend uses **1024 MB** for 115 sources), the trigger (256 MB) sat *above* the whole capped window (250 MB) — so `waitForWindowRoom` could never slide, the window never refilled, and playback hard-stalled the moment the buffer drained (symptom: "downloads to ~256 MB, then stops and never resumes"). The window size is now a single source of truth (`streamWindowBytes()`), used identically by the range fetch, the read-loop limit check, **and** the refill trigger — which is now half of the *actual* window (`streamWindowBytes() * 0.5`), a fraction that is guaranteed to be reachable for every `buffersize`. The refill therefore always fires at the halfway mark, starting the reconnect while the other half is still buffered as runway. `MAX_STREAM_BUFFER_SIZE` was also raised 250 MB → 512 MB so a larger configured `buffersize` genuinely enlarges the cushion (up to a 512 MB window / ~256 MB of runway) instead of being silently capped at 250 MB.
+
 ## [0.3.4-dts-worker.7] - 2026-07-10
 
 ### Fixed

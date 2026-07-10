@@ -14,7 +14,7 @@ const TAG = "HttpSource";
 const MIN_BUFFER_SIZE = 2 * 1024 * 1024; // 2MB minimum
 const DEFAULT_MAX_BUFFER_SIZE_MB = 250; // ~250MB cap (YouTube-like: Chrome gives ~150-300MB per tab for video)
 const BUFFER_PERCENTAGE = 0.08; // 8% of file size — covers ~60-90s of content for large files
-const MAX_STREAM_BUFFER_SIZE = 250 * 1024 * 1024; // Match max buffer — stream until buffer is full
+const MAX_STREAM_BUFFER_SIZE = 512 * 1024 * 1024; // Cap on the forward-download window per fill. Bounds RAM + per-slide memmove cost, but sits well above the 250MB default so a larger configured `buffersize` (e.g. 115's 1024MB) actually enlarges the cushion instead of being silently capped at 250MB.
 const CORS_DETECTION_THRESHOLD = 3; // Only treat "Failed to fetch" as CORS after N consecutive failures while online
 // IMPORTANT: Header size increased to 6 Int32 values (24 bytes) to support 64-bit buffer start offsets
 const HEADER_SIZE = 24; // Header bytes for atomics (6 Int32 values)
@@ -745,6 +745,20 @@ export class HttpSource implements SourceAdapter {
     });
   }
 
+  // The forward-download window: how many bytes we keep buffered AHEAD of the
+  // demuxer before throttling the fetch. Capped by MAX_STREAM_BUFFER_SIZE so a
+  // single fill/seek can't pull an unbounded amount into RAM, but scales with
+  // the configured buffer so a larger `buffersize` (e.g. 115's 1024MB) genuinely
+  // enlarges the cushion. SINGLE SOURCE OF TRUTH: the range calc, the read-loop
+  // limit check, and the low-water refill trigger in waitForWindowRoom all derive
+  // the window from here. Deriving the refill trigger from bufferSize instead
+  // (bufferSize*0.25) was the stall bug: with buffersize=1024 the window is capped
+  // at 250MB but the trigger sat at 256MB — ABOVE anything ever buffered — so the
+  // window never slid and playback froze the moment the buffer drained.
+  private streamWindowBytes(): number {
+    return Math.floor(Math.min(MAX_STREAM_BUFFER_SIZE, this.bufferSize * 0.9));
+  }
+
   // Slide the streaming window forward by the bytes the demuxer has already
   // consumed (position − bufferStart), reclaiming that space at the front so
   // the forward download can keep filling. The CALLER must hold the write lock.
@@ -765,9 +779,10 @@ export class HttpSource implements SourceAdapter {
   // current fetch is range-capped at ~bufferSize, so by now its reader has
   // delivered its whole range and is spent; this just keeps the stream flag
   // "active" (so the caller reconnects instead of dying) and polls until one of:
-  //   "slid"       – the demuxer consumed enough (>25%); the window was
-  //                  compacted in place, so the caller can resume-append (the
-  //                  outer loop reconnects from the freed bufferEnd).
+  //   "slid"       – the demuxer consumed half the window (low-water); the
+  //                  window was compacted in place, so the caller can
+  //                  resume-append (the outer loop reconnects from the freed
+  //                  bufferEnd) while the other half is still buffered as runway.
   //   "eof"        – the whole remainder is already buffered — nothing to wait
   //                  for; the caller lets its EOF check fire.
   //   "superseded" – a new stream (e.g. a seek) replaced this one; the caller
@@ -802,7 +817,14 @@ export class HttpSource implements SourceAdapter {
         return "eof";
       }
 
-      if (this.position - bufStart > this.bufferSize * 0.25 && this.tryLock()) {
+      // Low-water refill trigger: slide (and let the caller reconnect+refill)
+      // once the demuxer has consumed HALF the forward window, so the reload
+      // starts while the other half is still buffered as runway — the reconnect
+      // latency is hidden instead of showing as a stall. MUST be a fraction of
+      // streamWindowBytes() (the ACTUAL window), never bufferSize: with a large
+      // buffersize the window is capped far below bufferSize, so bufferSize*0.25
+      // could exceed everything ever buffered and this would never fire.
+      if (this.position - bufStart > this.streamWindowBytes() * 0.5 && this.tryLock()) {
         const newBase = this.slideStreamWindow(buffer);
         this.unlock();
         if (newBase !== null) {
@@ -867,14 +889,14 @@ export class HttpSource implements SourceAdapter {
           break;
         }
 
-        // Calculate bounded range end: download at most MAX_STREAM_BUFFER_SIZE
-        // This prevents downloading too much data on seeks in large files.
-        // When the file fits entirely in the buffer, request the full remainder
-        // so we don't leave a gap at the end that forces a second fetch.
+        // Calculate bounded range end: download at most one streamWindowBytes()
+        // per fetch. This prevents downloading too much data on seeks in large
+        // files. When the file fits entirely in the buffer, request the full
+        // remainder so we don't leave a gap at the end that forces a second fetch.
         const fileCanFit = this.size > 0 && this.bufferSize >= this.size;
         const maxDownload = fileCanFit
           ? this.size  // Full file — no limit needed
-          : Math.floor(Math.min(MAX_STREAM_BUFFER_SIZE, this.bufferSize * 0.9));
+          : this.streamWindowBytes();
         const rangeEnd = this.size > 0
           ? Math.min(resumeOffset + maxDownload - 1, this.size - 1)
           : resumeOffset + maxDownload - 1;
@@ -1030,10 +1052,7 @@ export class HttpSource implements SourceAdapter {
 
                 // Check if buffer is getting full or download limit reached
                 const totalDownloaded = currentEnd - streamBaseOffset;
-                const maxDownload = Math.floor(Math.min(
-                  MAX_STREAM_BUFFER_SIZE,
-                  this.bufferSize * 0.9
-                ));
+                const maxDownload = this.streamWindowBytes();
                 const limitReached = !fileCanFitInBuffer && totalDownloaded >= maxDownload;
                 const bufferAlmostFull = !fileCanFitInBuffer && newWritePos >= buffer.length * 0.9;
 

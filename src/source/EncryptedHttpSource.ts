@@ -379,8 +379,8 @@ export class EncryptedHttpSource extends HttpSource {
     //
     // Firing ONE prefetch per read (the old behavior) topped out at
     // ~1 stream's worth of lead beyond playback — HttpSource maintains
-    // ~250 MB via its long-lived range GET, so encrypted mode needs
-    // to open several streams in parallel to visually match.
+    // a large forward window (up to ~512 MB) via its long-lived range GET,
+    // so encrypted mode needs to open several streams in parallel to match.
     for (;;) {
       if (this._activeStreams.size >= EncryptedHttpSource.MAX_CONCURRENT_STREAMS) return;
 
