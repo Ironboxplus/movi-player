@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4-dts-worker.9] - 2026-07-10
+
+### Fixed
+- **HTTP source: periodic mid-playback rebuffering from a silently-stalled download connection.** The background download loop's `await reader.read()` had **no timeout**. When the upstream connection went silent mid-stream — socket still open, zero bytes delivered, no error, no `done` (common with CDN/proxy hiccups, e.g. 115 through OpenList's `/p/` proxy on a large remux) — the read hung **indefinitely**. The loop could then neither slide the window nor reconnect, so the forward runway drained to zero and the demuxer starved into a visible rebuffer; recovery came only from the demuxer's far slower `waitForData` force-restart. Captured in the field as `dlR=0` for ~28 s while the window stayed frozen and runway bled from ~120 MB to 0, ending in a buffering spinner — despite the link being able to sustain ~50 MB/s. Each `reader.read()` is now raced against a **stall watchdog** (`READ_STALL_TIMEOUT_MS`, 6 s): on a silent read the loop abandons the dead fetch and reconnects (resume-append from the current frontier) while hundreds of MB of runway remain, hiding the reconnect entirely. A live-but-slow connection still delivers chunks many times a second, so it never false-trips; after `MAX_READ_STALLS` (5) consecutive zero-progress stalls the loop gives up and lets the demuxer restart the stream. This is the download-side counterpart to the consumer-side stall detection `waitForData` already had. Not an audio (DTS worker) or window-sizing issue — those were addressed in `.8`; this is a pure network-resilience gap.
+
 ## [0.3.4-dts-worker.8] - 2026-07-10
 
 ### Fixed

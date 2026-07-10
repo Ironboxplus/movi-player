@@ -16,6 +16,24 @@ const DEFAULT_MAX_BUFFER_SIZE_MB = 250; // ~250MB cap (YouTube-like: Chrome give
 const BUFFER_PERCENTAGE = 0.08; // 8% of file size — covers ~60-90s of content for large files
 const MAX_STREAM_BUFFER_SIZE = 512 * 1024 * 1024; // Cap on the forward-download window per fill. Bounds RAM + per-slide memmove cost, but sits well above the 250MB default so a larger configured `buffersize` (e.g. 115's 1024MB) actually enlarges the cushion instead of being silently capped at 250MB.
 const CORS_DETECTION_THRESHOLD = 3; // Only treat "Failed to fetch" as CORS after N consecutive failures while online
+// A single reader.read() that yields no chunk within this window means the
+// connection went silent mid-stream — socket still open, zero bytes, no error,
+// no `done` (common with CDN/proxy hiccups, e.g. 115 through OpenList's /p/
+// proxy). Without a watchdog the background download loop's `await reader.read()`
+// hangs indefinitely: it never reaches the window-full check, so it can neither
+// slide the window nor reconnect, and the forward runway drains to zero while
+// the demuxer starves — a visible rebuffer whose only recovery is the demuxer's
+// far slower force-restart path. Racing each read against this deadline lets us
+// abandon the dead fetch and reconnect (resume-append from the current frontier)
+// while hundreds of MB of runway remain, hiding the reconnect entirely. A live
+// connection — even a slow one — delivers *some* chunk many times a second, so a
+// full window of total silence is unambiguous and won't false-trip.
+const READ_STALL_TIMEOUT_MS = 6000;
+// Consecutive zero-progress read stalls before giving up on the background loop
+// and letting the demuxer's read-miss restart the whole stream. Bounds reconnect
+// churn against a genuinely dead server (each attempt costs one fetch round-trip)
+// while tolerating isolated hiccups. Reset whenever any bytes are written.
+const MAX_READ_STALLS = 5;
 // IMPORTANT: Header size increased to 6 Int32 values (24 bytes) to support 64-bit buffer start offsets
 const HEADER_SIZE = 24; // Header bytes for atomics (6 Int32 values)
 
@@ -858,6 +876,34 @@ export class HttpSource implements SourceAdapter {
     return "stopped";
   }
 
+  // Race a single reader.read() against a stall watchdog. Resolves to the read
+  // result, or `null` if no chunk arrives within READ_STALL_TIMEOUT_MS — the
+  // signal that the connection went silent (see the constant's note). The
+  // timed-out read() promise is intentionally left dangling; the caller cancels
+  // the reader on its way out of the loop, which settles it harmlessly.
+  private async readChunkWithStallTimeout(): Promise<
+    ReadableStreamReadResult<Uint8Array> | null
+  > {
+    const reader = this.reader;
+    if (!reader) return { done: true, value: undefined };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stall = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), READ_STALL_TIMEOUT_MS);
+    });
+    const readPromise = reader.read();
+    // Attach a no-op handler to a SEPARATE branch so that if the watchdog wins
+    // the race and the caller later cancels the reader (rejecting this same
+    // read), it isn't reported as an unhandled rejection. Promise.race still
+    // observes the original rejection, so a genuine mid-read error that beats
+    // the watchdog propagates to the retry/error handling below.
+    readPromise.catch(() => {});
+    try {
+      return await Promise.race([readPromise, stall]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   private async readStreamBackground(startOffset: number): Promise<void> {
     let retryCount = 0;
     // Track if we have committed the new buffer window to atomics
@@ -868,6 +914,7 @@ export class HttpSource implements SourceAdapter {
     const RANGE_RETRY_DELAY = 1500; // ms between range retries
     let rangeRetryCount = 0;
     let consecutiveOnlineFetchFailures = 0;
+    let consecutiveReadStalls = 0; // watchdog: silent-connection reconnects with no progress
     let streamBaseOffset = startOffset;
 
     while (this.atomicIsStreaming()) {
@@ -990,13 +1037,41 @@ export class HttpSource implements SourceAdapter {
 
         // Read Loop
         while (this.atomicIsStreaming()) {
-          const { done, value } = await this.reader.read();
+          const chunk = await this.readChunkWithStallTimeout();
+          if (chunk === null) {
+            // Connection went silent mid-stream (see READ_STALL_TIMEOUT_MS).
+            consecutiveReadStalls++;
+            if (consecutiveReadStalls >= MAX_READ_STALLS) {
+              // Repeated zero-progress stalls: the server/link is effectively
+              // dead. Drop the background stream; the demuxer's next read-miss
+              // restarts it cleanly (fresh link resolve) or surfaces the error.
+              Logger.error(
+                TAG,
+                `Read stalled ${consecutiveReadStalls}× with no progress; dropping background stream (demuxer will restart on next read-miss)`,
+              );
+              this.atomicSetStreaming(false);
+              break;
+            }
+            // Abandon THIS fetch without clearing the streaming flag: the outer
+            // loop reconnects and resume-appends from bufferStart+writePos, so
+            // the reconnect is hidden behind the runway still in front of the
+            // demuxer instead of showing as a stall.
+            Logger.warn(
+              TAG,
+              `Read stalled >${READ_STALL_TIMEOUT_MS}ms (connection silent), reconnecting from frontier (attempt ${consecutiveReadStalls}/${MAX_READ_STALLS})`,
+            );
+            break;
+          }
+          const { done, value } = chunk;
           if (done) {
             this.atomicSetStreaming(false);
             break;
           }
 
           if (value) {
+            // Any forward progress clears the stall streak — only *consecutive*
+            // silent reconnects count toward the give-up cap.
+            consecutiveReadStalls = 0;
             downloadedBytes += value.length;
 
             // Track global network stats
