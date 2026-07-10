@@ -307,6 +307,15 @@ export class HttpSource implements SourceAdapter {
     }
   }
 
+  // Snapshot the window-version counter (bumped by startStream on every new
+  // stream). 0 when not using the shared buffer, so comparisons are inert in
+  // the fallback path. Used to detect a stream being superseded mid-wait.
+  private atomicGetVersion(): number {
+    return this.useSharedBuffer && this.headerView
+      ? Atomics.load(this.headerView, HEADER.VERSION)
+      : 0;
+  }
+
   /**
    * Try to acquire lock (non-blocking)
    */
@@ -736,6 +745,97 @@ export class HttpSource implements SourceAdapter {
     });
   }
 
+  // Slide the streaming window forward by the bytes the demuxer has already
+  // consumed (position − bufferStart), reclaiming that space at the front so
+  // the forward download can keep filling. The CALLER must hold the write lock.
+  // Returns the new buffer-start offset (== streamBaseOffset), or null if there
+  // was nothing to reclaim.
+  private slideStreamWindow(buffer: Uint8Array): number | null {
+    const bufStart = this.atomicGetBufferStart();
+    const writePos = this.atomicGetWritePos();
+    const shift = Math.floor(this.position - bufStart);
+    if (shift <= 0 || writePos <= shift) return null;
+    buffer.copyWithin(0, shift, writePos);
+    this.atomicSetBufferStart(bufStart + shift);
+    this.atomicSetWritePos(writePos - shift);
+    return bufStart + shift;
+  }
+
+  // Called by the background stream loop when the byte window is full. The
+  // current fetch is range-capped at ~bufferSize, so by now its reader has
+  // delivered its whole range and is spent; this just keeps the stream flag
+  // "active" (so the caller reconnects instead of dying) and polls until one of:
+  //   "slid"       – the demuxer consumed enough (>25%); the window was
+  //                  compacted in place, so the caller can resume-append (the
+  //                  outer loop reconnects from the freed bufferEnd).
+  //   "eof"        – the whole remainder is already buffered — nothing to wait
+  //                  for; the caller lets its EOF check fire.
+  //   "superseded" – a new stream (e.g. a seek) replaced this one; the caller
+  //                  must abandon its loop.
+  //   "stopped"    – the demuxer made no progress for MAX_IDLE_MS (playback
+  //                  paused/backgrounded): streaming is set inactive and a later
+  //                  read-miss will restart it. The idle timer is progress-based,
+  //                  so a slow-but-steady drain never trips it.
+  private async waitForWindowRoom(
+    buffer: Uint8Array,
+  ): Promise<"slid" | "eof" | "superseded" | "stopped"> {
+    const MAX_IDLE_MS = 30000;
+    const versionAtEntry = this.atomicGetVersion();
+    // Reader identity is the robust supersede signal: it is a plain field valid
+    // in BOTH the shared-buffer and fallback paths, whereas atomicGetVersion()
+    // is inert (always 0) without SharedArrayBuffer. If startStream/stopStream
+    // (e.g. a seek, or a metadata read that restarts the stream) swaps or clears
+    // this.reader while we poll, we must abandon this loop — otherwise we'd
+    // slide/reconnect the NEW stream's window, or the caller's "stopped" cleanup
+    // would cancel the new stream's reader.
+    const readerAtEntry = this.reader;
+    let lastPosition = this.position;
+    let lastAdvance = Date.now();
+
+    while (this.atomicIsStreaming()) {
+      if (this.reader !== readerAtEntry || this.atomicGetVersion() !== versionAtEntry) {
+        return "superseded";
+      }
+
+      const bufStart = this.atomicGetBufferStart();
+      if (this.size > 0 && bufStart + this.atomicGetWritePos() >= this.size) {
+        return "eof";
+      }
+
+      if (this.position - bufStart > this.bufferSize * 0.25 && this.tryLock()) {
+        const newBase = this.slideStreamWindow(buffer);
+        this.unlock();
+        if (newBase !== null) {
+          Logger.debug(TAG, `Buffer slid forward to ${newBase}, resuming same stream`);
+          return "slid";
+        }
+      }
+
+      const now = Date.now();
+      if (this.position > lastPosition) {
+        lastPosition = this.position;
+        lastAdvance = now;
+      } else if (now - lastAdvance > MAX_IDLE_MS) {
+        // Reader isn't draining (paused/backgrounded). Stop; a later read-miss
+        // restarts the stream on resume — the pre-fix behavior, now only as a
+        // genuine-idle fallback rather than the every-window default.
+        Logger.debug(TAG, `Stream idle ${MAX_IDLE_MS}ms with buffer full, stopping (will restart on next read)`);
+        this.atomicSetStreaming(false);
+        return "stopped";
+      }
+
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    // Streaming flag went false while we polled. If our reader was swapped/
+    // cleared out from under us, a new stream owns this.reader — report
+    // "superseded" so the caller returns WITHOUT running its reader cleanup
+    // (which would cancel the new stream's reader). Only a genuine self/idle
+    // stop (reader unchanged) is a real "stopped".
+    if (this.reader !== readerAtEntry) return "superseded";
+    return "stopped";
+  }
+
   private async readStreamBackground(startOffset: number): Promise<void> {
     let retryCount = 0;
     // Track if we have committed the new buffer window to atomics
@@ -938,28 +1038,24 @@ export class HttpSource implements SourceAdapter {
                 const bufferAlmostFull = !fileCanFitInBuffer && newWritePos >= buffer.length * 0.9;
 
                 if (limitReached || bufferAlmostFull) {
-                  // Try buffer compaction for continuous forward streaming
-                  const bufStart = this.atomicGetBufferStart();
-                  const consumed = this.position - bufStart;
-
-                  if (consumed > this.bufferSize * 0.25 &&
-                      this.size > 0 && currentEnd < this.size) {
-                    const shift = Math.floor(consumed);
-                    if (shift > 0 && newWritePos > shift) {
-                      buffer.copyWithin(0, shift, newWritePos);
-                      this.atomicSetBufferStart(bufStart + shift);
-                      this.atomicSetWritePos(newWritePos - shift);
-                      streamBaseOffset = bufStart + shift;
-                      this.unlock();
-                      Logger.debug(TAG, `Buffer compacted: reclaimed ${(shift / 1024 / 1024).toFixed(1)}MB`);
-                      break; // Continue with new fetch in outer loop
-                    }
-                  }
-
-                  // Can't compact - stop stream
+                  // Buffer window is full. The old code set streaming=false
+                  // here, so downloading only resumed on a read-miss in
+                  // _readInternal — i.e. after the demuxer had drained the
+                  // buffer to its tail, giving the fetch()/link-resolve/CDN
+                  // round-trip ZERO runway and stalling on large files ("fills
+                  // ~bufferSize, stops, long pause, rebuffers"). Instead we keep
+                  // the stream ACTIVE and wait for the demuxer to consume enough
+                  // to slide the window forward, then let the outer loop
+                  // resume-append from the new bufferEnd. ~bufferSize of
+                  // read-ahead stays in front of the demuxer, so the reconnect
+                  // happens with plenty of runway and never shows as a gap.
                   this.unlock();
-                  Logger.debug(TAG, `Downloaded ${(totalDownloaded / 1024 / 1024).toFixed(1)}MB (${limitReached ? 'limit reached' : 'buffer full'}), stopping stream`);
-                  this.atomicSetStreaming(false);
+                  const room = await this.waitForWindowRoom(buffer);
+                  if (room === "superseded") return; // a seek replaced this stream
+                  if (room === "slid") streamBaseOffset = this.atomicGetBufferStart();
+                  // "slid"    → outer loop reconnects & resume-appends from bufferEnd
+                  // "eof"     → outer loop's resumeOffset >= size, stops cleanly
+                  // "stopped" → streaming already inactive, outer loop exits
                   break;
                 }
 
