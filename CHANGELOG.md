@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4-dts-worker.7] - 2026-07-10
+
+### Fixed
+- **HTTP source: periodic rebuffering on large files**: The background stream for plain-HTTP (proxied/remote) sources filled its read-ahead window (`bufferSize`, 250MB default) and hard-stopped, resuming only on a read-miss once the demuxer had already drained the buffer to its tail — leaving the fetch()/link-resolve/CDN reconnect zero runway, so a slow round-trip caused a visible rebuffer ("fills ~250MB, stops, long pause, rebuffers"; seen on a 60GB 4K Blu-ray remux over a proxied link). The stream now stays active when the window fills (`waitForWindowRoom`) and slides forward (`slideStreamWindow`) once the demuxer has consumed >25% of it, keeping a full window of read-ahead in front of the reader so the reconnect hides behind it — the idle timeout is progress-based, so a slow-but-steady drain never trips it, and a genuinely idle (paused/backgrounded) stream still falls back to the old stop + read-miss restart. Supersede detection now keys off reader identity in addition to the version counter, so a seek or metadata-triggered stream restart mid-wait can't slide/reconnect the new stream's window.
+
 ## [0.3.3] - 2026-06-29
 
 ### Added
