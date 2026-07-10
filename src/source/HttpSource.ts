@@ -112,6 +112,13 @@ export class HttpSource implements SourceAdapter {
   private consecutiveForceRestarts: number = 0;
   private lastForceRestartTime: number = 0;
   private readonly MAX_FORCE_RESTARTS = 3; // Max consecutive force restarts before giving up
+  // Consecutive one-off range fetches served while the read fell outside the
+  // stream window. A lone spike (stray metadata/index read) shouldn't disturb
+  // the sequential stream, but a run of them means the play position genuinely
+  // moved (a seek) — so after a couple we restart the stream at the new offset
+  // instead of dribbling the whole file out as tiny range requests.
+  private consecutiveOneOffFetches: number = 0;
+  private readonly MAX_ONEOFF_BEFORE_RESTART = 2;
 
   // Dynamic buffer size (3% of file size, clamped)
   // Start with minimum size, will be resized when file size is known
@@ -1545,6 +1552,9 @@ export class HttpSource implements SourceAdapter {
 
       // Reset force restart counter on successful read
       this.consecutiveForceRestarts = 0;
+      // Back on the sequential window — a stray one-off read didn't turn into
+      // a seek, so forget the streak.
+      this.consecutiveOneOffFetches = 0;
 
       Logger.debug(TAG, `Read: serving from buffer`);
       return this.readFromBuffer(offset, length);
@@ -1604,6 +1614,7 @@ export class HttpSource implements SourceAdapter {
       if (success) {
         // Reset force restart counter on successful read
         this.consecutiveForceRestarts = 0;
+        this.consecutiveOneOffFetches = 0;
         return this.readFromBuffer(offset, length);
       }
 
@@ -1649,36 +1660,62 @@ export class HttpSource implements SourceAdapter {
       }
     }
 
-    // If the main stream is actively filling a full-file-cache buffer,
-    // do a one-off range fetch instead of restarting the stream (which would
-    // discard all already-downloaded data and start over from the new offset).
-    // This handles WebM/MKV Cues reads from the end of file during open().
-    const fileCanFitInBuffer = this.size > 0 && this.bufferSize >= this.size;
-    if (fileCanFitInBuffer && this.atomicIsStreaming() && gap > GAP_RESTART_THRESHOLD) {
-      Logger.info(TAG, `Read: one-off range fetch for offset=${offset}, length=${length} (gap=${(gap / 1024).toFixed(0)}KB, main stream continues)`);
+    // A read outside the active stream window would otherwise force a stream
+    // restart — which aborts the in-flight sequential fetch and re-downloads
+    // from the new offset (users saw this as the main request being abruptly
+    // "cancelled" mid-playback). For a SMALL out-of-window read (metadata /
+    // Cues / index / a stray random packet) serve it with a one-off range
+    // fetch instead and let the main stream keep running.
+    //
+    // The old gate also required the whole file to fit in the buffer, so large
+    // streamed files (which never fit) restarted on every such read; dropping
+    // that requirement is what fixes the abrupt cancel for big remote files.
+    const ONEOFF_RANGE_MAX_BYTES = 15 * 1024 * 1024;
+    if (
+      !isCoveredByStream &&
+      this.atomicIsStreaming() &&
+      length <= ONEOFF_RANGE_MAX_BYTES &&
+      this.consecutiveOneOffFetches < this.MAX_ONEOFF_BEFORE_RESTART
+    ) {
+      Logger.info(TAG, `Read: one-off range fetch for offset=${offset}, length=${length} (outside stream window, main stream continues)`);
       try {
-        const rangeEnd = Math.min(offset + length - 1, this.size - 1);
+        const rangeEnd =
+          this.size > 0
+            ? Math.min(offset + length - 1, this.size - 1)
+            : offset + length - 1;
         const rangeLen = rangeEnd - offset + 1;
         const response = await fetch(this.url, {
           headers: await this.buildRequestHeaders({ offset, length: rangeLen }),
         });
-        if (response.ok || response.status === 206) {
+        if (response.status === 206 || response.ok) {
+          // Guard against a server that ignores the Range header and streams
+          // the whole file back: that huge body would be wrong to slot into a
+          // small window. Bail (→ stream restart) rather than mis-writing it.
+          const contentLength = response.headers.get("content-length");
+          if (contentLength && parseInt(contentLength, 10) > rangeLen * 1.5) {
+            throw new Error(
+              `Server ignored Range (Content-Length ${contentLength} for a ${rangeLen}-byte request)`,
+            );
+          }
           const arrayBuffer = await response.arrayBuffer();
+          if (
+            response.status !== 206 &&
+            arrayBuffer.byteLength > rangeLen * 1.5
+          ) {
+            throw new Error(
+              `Server ignored Range (returned ${arrayBuffer.byteLength} bytes for a ${rangeLen}-byte request)`,
+            );
+          }
           const data = new Uint8Array(arrayBuffer);
 
-          // Write the fetched data into the buffer at the correct position
-          // (the buffer is sized for the full file, so the offset maps directly)
+          // Cache into the buffer only when the offset maps inside the current
+          // window (small / buffer-fitting files). For large streamed files the
+          // offset falls outside the window, so we just serve the data directly.
           const buffer = this.getBuffer();
           const bufStart = this.atomicGetBufferStart();
           const localOffset = offset - bufStart;
           if (localOffset >= 0 && localOffset + data.length <= buffer.length) {
             buffer.set(data, localOffset);
-            // Extend writePos if this fetch goes beyond current end
-            const newEnd = localOffset + data.length;
-            if (newEnd > this.atomicGetWritePos()) {
-              // Don't extend writePos — the main stream owns it sequentially.
-              // Instead, just serve the data directly.
-            }
           }
 
           // Serve the fetched data directly
@@ -1686,6 +1723,9 @@ export class HttpSource implements SourceAdapter {
           result.set(data);
           this.position = offset + data.length;
           this.consecutiveForceRestarts = 0;
+          // Count this one-off; a run of them (a real seek) trips the gate above
+          // on the next read and restarts the stream at the new position.
+          this.consecutiveOneOffFetches++;
           return result.buffer;
         }
       } catch (e) {
@@ -1703,6 +1743,9 @@ export class HttpSource implements SourceAdapter {
 
     // Reset force restart counter on successful read
     this.consecutiveForceRestarts = 0;
+    // The stream is now repositioned at this offset, so the one-off streak is
+    // spent — subsequent sequential reads are covered by the fresh stream.
+    this.consecutiveOneOffFetches = 0;
 
     // Don't update maxBufferedEnd on reads - it's updated when streaming writes to buffer
     return this.readFromBuffer(offset, length);
