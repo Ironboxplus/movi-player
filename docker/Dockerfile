@@ -1,5 +1,11 @@
 # syntax=docker/dockerfile:1
-FROM emscripten/emsdk:latest
+# PINNED to 6.0.1 (was :latest). emsdk :latest rolled to 6.0.3, whose bundled
+# wasm-ld SIGSEGVs during -flto LTO codegen (crash in llvm SelectionDAG::
+# isKnownNeverNaN) — the link step of build:wasm dies with SIGSEGV, no code error.
+# 6.0.1 is the toolchain the 4090 uses to hand-build the speed WASM and is
+# known-good; it still has the resizable-heap behavior our decodeUtf8() copy fix
+# already handles. Revisit when a newer emsdk fixes the wasm-ld LTO crash.
+FROM emscripten/emsdk:6.0.1
 
 LABEL maintainer="movi"
 LABEL description="FFmpeg WASM build environment for movi"
