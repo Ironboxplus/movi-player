@@ -175,8 +175,11 @@ export class MoviVideoDecoder {
 
     // const codecString = this.mapCodecToWebCodecs(track.codec, track.width, track.height, track.profile, track.level);
     if (!codecString) {
-      Logger.error(TAG, `Unsupported codec: ${track.codec}`);
-      return false;
+      Logger.warn(
+        TAG,
+        `Codec ${track.codec} has no WebCodecs mapping, trying software.`,
+      );
+      return this.initSoftwareDecoder();
     }
 
 
