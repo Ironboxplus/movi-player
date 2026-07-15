@@ -63,6 +63,12 @@ const activeBindings = new Set<WasmBindings>();
  * The copy also keeps the result safe if a _malloc grows (and detaches) the
  * heap mid-flight.
  */
+// Decode UTF-8 bytes read out of the WASM heap. The `.slice()` (a copy), not a
+// view, is load-bearing: module.HEAPU8 is backed by a resizable ArrayBuffer
+// under -sALLOW_MEMORY_GROWTH, and TextDecoder.decode() throws "The provided
+// ArrayBuffer value must not be resizable" on a view of one. Copying into a
+// fresh, fixed-size buffer sidesteps it. Single helper so every heap-string read
+// gets the fix (newer Emscripten toolchains hit this; issue #11).
 export function decodeUtf8(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes.slice());
 }
@@ -820,6 +826,20 @@ export class WasmBindings {
     } finally {
       this.module._free(ptr);
     }
+  }
+
+  /**
+   * Persistently discard (or re-enable) a stream at the demuxer level. With
+   * discard=true, av_read_frame skips that stream's packets internally and never
+   * returns them — used to drop unused audio/subtitle tracks from the read path
+   * so the JS demux loop isn't flooded with packets it throws away (issue #11:
+   * a 2nd unused TrueHD track doubled the read load and starved audio on Safari).
+   */
+  setStreamDiscard(streamIndex: number, discard: boolean): void {
+    if (!this.contextPtr) return;
+    const fn = (this.module as any)._movi_set_stream_discard;
+    if (typeof fn !== "function") return; // older WASM without the export
+    fn(this.contextPtr, streamIndex, discard ? 1 : 0);
   }
 
   sendPacket(

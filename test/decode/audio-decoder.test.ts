@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MoviAudioDecoder } from "../../src/decode/AudioDecoder";
 import { WorkerSoftwareAudioDecoder } from "../../src/decode/WorkerSoftwareAudioDecoder";
-import type { PCMFrame } from "../../src/decode/SoftwareAudioDecoder";
+import {
+  SoftwareAudioDecoder,
+  type PCMFrame,
+} from "../../src/decode/SoftwareAudioDecoder";
 import type { AudioTrack } from "../../src/types";
 import type { WasmBindings } from "../../src/wasm/bindings";
 
@@ -636,5 +639,118 @@ describe("WorkerSoftwareAudioDecoder protocol", () => {
 
     expect(frames.map((frame) => frame.timestamp)).toEqual([1, 2]);
     expect(decoder.getStats().reorderBacklog).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Merge reconciliation guards (upstream 0.3.5 ← our DTS-worker fork)
+//
+// These lock the two hand-resolved conflict points where a merge mistake would
+// be silent: (1) SoftwareAudioDecoder.flush()/reset() is the UNION of our
+// WASM-flush-in-reset and upstream's queue+circuit-breaker clear; (2) keeping
+// our off-thread worker must not disable upstream's cold-prime, which gates on
+// usesSoftware === true.
+// ---------------------------------------------------------------------------
+
+function mockFn(fn: unknown): ReturnType<typeof vi.fn> {
+  return fn as unknown as ReturnType<typeof vi.fn>;
+}
+
+describe("merge: SoftwareAudioDecoder flush/reset reconciliation", () => {
+  it("reset() flushes the WASM decoder once configured (our flush-in-reset survives)", async () => {
+    const { bindings, calls } = makeBindings();
+    const dec = new SoftwareAudioDecoder(bindings);
+
+    await dec.configure(dtsTrack);
+    dec.reset();
+
+    // Upstream's reset() only cleared the JS-side queue; ours must also emit
+    // avcodec_flush_buffers so a post-seek run doesn't reject every packet
+    // against stale TrueHD/DTS codec state.
+    expect(calls.flushDecoder).toBe(1);
+    expect(bindings.flushDecoder).toHaveBeenLastCalledWith(dtsTrack.id);
+  });
+
+  it("flush() flushes the WASM decoder once configured", async () => {
+    const { bindings, calls } = makeBindings();
+    const dec = new SoftwareAudioDecoder(bindings);
+
+    await dec.configure(dtsTrack);
+    await dec.flush();
+
+    expect(calls.flushDecoder).toBe(1);
+    expect(bindings.flushDecoder).toHaveBeenLastCalledWith(dtsTrack.id);
+  });
+
+  it("never flushes the WASM decoder before configuration (no flushDecoder(-1))", async () => {
+    const { bindings, calls } = makeBindings();
+    const dec = new SoftwareAudioDecoder(bindings);
+
+    // trackIndex is still -1 here — the guard must suppress the flush so we
+    // never hand FFmpeg a bogus stream index.
+    await dec.flush();
+    dec.reset();
+
+    expect(calls.flushDecoder).toBe(0);
+    expect(bindings.flushDecoder).not.toHaveBeenCalled();
+  });
+
+  it("flush() clears the failure circuit-breaker so decoding resumes after a seek", async () => {
+    const { bindings } = makeBindings();
+    const dec = new SoftwareAudioDecoder(bindings);
+    await dec.configure(dtsTrack);
+
+    // Trip the breaker: 50 consecutive sendPacket failures mute the decoder.
+    mockFn(bindings.sendPacket).mockReturnValue(-1);
+    const pkt = new Uint8Array([1]);
+    for (let i = 0; i < 50; i++) dec.decode(pkt, i, true);
+
+    // Broken → decode() short-circuits before ever touching sendPacket.
+    mockFn(bindings.sendPacket).mockClear();
+    dec.decode(pkt, 50, true);
+    expect(bindings.sendPacket).not.toHaveBeenCalled();
+
+    // Our flush() clears isBroken (and flushes WASM) so the next run decodes
+    // again — upstream relied on this recovery for post-seek replay.
+    mockFn(bindings.sendPacket).mockReturnValue(0);
+    await dec.flush();
+    dec.decode(pkt, 51, true);
+    expect(bindings.sendPacket).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("merge: worker-decoded DTS still engages cold-prime", () => {
+  it("reports usesSoftware === true and the worker decoderType so prime engages", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("Worker", FakeWorker);
+    const { bindings } = makeBindings();
+    const decoder = new MoviAudioDecoder();
+    decoder.setBindings(bindings);
+
+    const configured = decoder.configure(dtsTrack);
+    await Promise.resolve();
+
+    FakeWorker.instances[0]!.emit({
+      type: "configured",
+      requestId: 1,
+      generation: 1,
+      trackId: dtsTrack.id,
+      success: true,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+    await expect(configured).resolves.toBe(true);
+
+    // MoviPlayer.activeAudioNeedsColdPrime() gates on usesSoftware — the
+    // off-thread worker MUST report software so keeping it doesn't silently
+    // disable upstream's DTS/TrueHD cold-prime mitigation.
+    expect(decoder.usesSoftware).toBe(true);
+    expect(decoder.isSoftware).toBe(true);
+    expect(decoder.getStats()).toMatchObject({
+      decoderType: "Software (FFmpeg Worker)",
+      isSoftware: true,
+    });
+    // ...yet decode ran in the worker: the main-thread WASM decoder is untouched.
+    expect(bindings.enableDecoder).not.toHaveBeenCalled();
   });
 });

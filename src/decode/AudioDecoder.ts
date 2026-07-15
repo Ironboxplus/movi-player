@@ -54,6 +54,13 @@ export class MoviAudioDecoder {
     this.bindings = bindings;
   }
 
+  /** True when audio runs through the WASM software decoder (TrueHD/DTS/AC-3/
+   *  Opus/FLAC/…) rather than WebCodecs. The software path decodes sub-realtime
+   *  on a cold start, so callers can gate cold-start mitigations on this. */
+  get usesSoftware(): boolean {
+    return this.useSoftware;
+  }
+
   /**
    * Configure the decoder for a specific track
    */
@@ -490,11 +497,16 @@ export class MoviAudioDecoder {
    * Flush the decoder
    */
   async flush(): Promise<void> {
+    // Software path (TrueHD/DTS/Opus/FLAC/…): the WebCodecs `decoder` is null,
+    // so flush the WASM decoder instead. Skipping this leaves stale decoder
+    // state across a seek/replay — TrueHD then rejects packets (sendPacket →
+    // AVERROR_INVALIDDATA) until the next major-sync, an audible buzz/dropout.
+    // Our swDecoder may be the off-thread WorkerSoftwareAudioDecoder — its
+    // flush() forwards to the worker, so this path is correct for both.
     if (this.useSoftware && this.swDecoder) {
       await this.swDecoder.flush();
       return;
     }
-
     if (!this.decoder) return;
 
     try {
