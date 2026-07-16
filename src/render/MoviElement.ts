@@ -16186,23 +16186,19 @@ export class MoviElement extends HTMLElement {
         }
       }
 
-      // Check for software decoding fallback (only for MoviPlayer/Canvas mode)
-      // Don't show broken icon if sw attribute is set (user explicitly wants software decoding)
+      // A successfully configured software fallback is a valid playback path,
+      // not an unsupported-format error. The old code displayed the blocking
+      // "Try Software Decoding" overlay after the fallback had already
+      // succeeded, forcing the user to request the same software path again.
       if (
         this.player instanceof MoviPlayer &&
-        this.player.isSoftwareDecoding() &&
-        this._sw !== "software" &&
-        this.getAttribute("sw") !== "auto" // Silent fallback for explicit "auto"
+        this.player.isSoftwareDecoding()
       ) {
-        Logger.warn(
-          TAG,
-          "Hardware decoding not supported, falling back to software. Showing broken icon as per user request.",
-        );
-        this.handleUnsupportedVideo(
-          "Format Unsupported",
-          "This video codec is not supported by your browser's hardware acceleration.",
-        );
-        return;
+        Logger.info(TAG, "Using automatic software video decoder fallback");
+        if (this.brokenIndicator) {
+          this.brokenIndicator.style.display = "none";
+        }
+        this._isUnsupported = false;
       }
 
       // Apply properties

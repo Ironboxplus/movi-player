@@ -98,6 +98,7 @@ export interface MoviWasmModule {
   _movi_get_frame_width: (ctx: number) => number;
   _movi_get_frame_height: (ctx: number) => number;
   _movi_get_frame_format(ctx: number): number;
+  _movi_get_frame_webcodecs_format?: (ctx: number) => number;
   _movi_get_frame_data(ctx: number, plane: number): number;
   _movi_get_frame_linesize(ctx: number, plane: number): number;
   _movi_get_frame_samples(ctx: number): number;

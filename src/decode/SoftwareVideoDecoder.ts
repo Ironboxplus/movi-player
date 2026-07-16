@@ -203,28 +203,57 @@ export class SoftwareVideoDecoder {
     }
 
     try {
-      // Use RGBA conversion for proper handling of all formats including 10-bit HDR
-      // WASM's sws_scale converts any pixel format (YUV420P10LE, etc.) to RGBA
-      // We pass the potentially downscaled dimensions here
-      const rgbaData = this.bindings.getFrameRGBA(width, height);
+      let frame: VideoFrame;
 
-      if (!rgbaData) {
-        Logger.error(TAG, "Failed to get RGBA frame data");
-        return;
-      }
-
-      const frameInit: VideoFrameBufferInit = {
-        format: "RGBA",
-        codedWidth: width,
-        codedHeight: height,
-        timestamp: timestamp,
+      const createRgbaFrame = (): VideoFrame | null => {
+        const rgbaData = this.bindings.getFrameRGBA(width, height);
+        if (!rgbaData) {
+          Logger.error(TAG, "Failed to get decoded frame data");
+          return null;
+        }
+        return new VideoFrame(rgbaData, {
+          format: "RGBA",
+          codedWidth: width,
+          codedHeight: height,
+          timestamp,
+        });
       };
 
-      // Note: For RGBA format, we don't need to set colorSpace
-      // The WASM sws_scale handles the color conversion internally
-      // For HDR content, the canvas renderer handles display-side tonemapping
+      // Keep the decoded planes in their WebCodecs-native layout whenever the
+      // current AVPixelFormat has a direct representation. This covers common
+      // 4:2:0 / 4:2:2 / 4:4:4 8/10/12-bit YUV, alpha variants, NV12, and packed
+      // RGB without paying for a full-frame sws_scale conversion to RGBA.
+      const canUseNativePlanes = width === this.bindings.getFrameWidth();
+      const nativeFrame = canUseNativePlanes
+        ? this.bindings.getFrameWebCodecsBuffer(width, height)
+        : null;
 
-      const frame = new VideoFrame(rgbaData, frameInit);
+      if (nativeFrame) {
+        try {
+          frame = new VideoFrame(nativeFrame.data, {
+            format: nativeFrame.format,
+            codedWidth: width,
+            codedHeight: height,
+            timestamp,
+            layout: nativeFrame.layout,
+          });
+        } catch (error) {
+          Logger.warn(
+            TAG,
+            `VideoFrame rejected native format ${nativeFrame.format}; falling back to RGBA`,
+            error,
+          );
+          const rgbaFrame = createRgbaFrame();
+          if (!rgbaFrame) return;
+          frame = rgbaFrame;
+        }
+      } else {
+        // Keep RGBA conversion for formats VideoFrame cannot consume directly
+        // or frames that need downscaling.
+        const rgbaFrame = createRgbaFrame();
+        if (!rgbaFrame) return;
+        frame = rgbaFrame;
+      }
 
       this.onFrame(frame);
       // Ownership transferred to caller

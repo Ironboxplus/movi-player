@@ -1297,6 +1297,169 @@ export class WasmBindings {
   }
 
   /**
+   * Pack the current FFmpeg frame into a WebCodecs-native pixel layout.
+   * Returns null for AVPixelFormats that require a real color conversion.
+   */
+  getFrameWebCodecsBuffer(
+    width: number,
+    height: number,
+  ): {
+    format: VideoPixelFormat;
+    data: Uint8Array;
+    layout: PlaneLayout[];
+  } | null {
+    if (!this.contextPtr || width <= 0 || height <= 0) return null;
+    const getFormat = this.module._movi_get_frame_webcodecs_format;
+    if (typeof getFormat !== "function") return null;
+    const formatId = getFormat(this.contextPtr);
+    const chromaWidth = Math.ceil(width / 2);
+    const chromaHeight = Math.ceil(height / 2);
+
+    type PlaneSpec = { width: number; height: number; bytes: number };
+    let format: VideoPixelFormat;
+    let planes: PlaneSpec[];
+    switch (formatId) {
+      case 1:
+        format = "I420";
+        planes = [
+          { width, height, bytes: 1 },
+          { width: chromaWidth, height: chromaHeight, bytes: 1 },
+          { width: chromaWidth, height: chromaHeight, bytes: 1 },
+        ];
+        break;
+      case 2:
+        format = "I420P10" as VideoPixelFormat;
+        planes = [
+          { width, height, bytes: 2 },
+          { width: chromaWidth, height: chromaHeight, bytes: 2 },
+          { width: chromaWidth, height: chromaHeight, bytes: 2 },
+        ];
+        break;
+      case 3:
+        format = "I420P12" as VideoPixelFormat;
+        planes = [
+          { width, height, bytes: 2 },
+          { width: chromaWidth, height: chromaHeight, bytes: 2 },
+          { width: chromaWidth, height: chromaHeight, bytes: 2 },
+        ];
+        break;
+      case 4:
+      case 5: {
+        format = (formatId === 4 ? "I420A" : "I420AP10") as VideoPixelFormat;
+        const bytes = formatId === 4 ? 1 : 2;
+        planes = [
+          { width, height, bytes },
+          { width: chromaWidth, height: chromaHeight, bytes },
+          { width: chromaWidth, height: chromaHeight, bytes },
+          { width, height, bytes },
+        ];
+        break;
+      }
+      case 6:
+      case 7:
+      case 8:
+      case 9:
+      case 10: {
+        const names = ["", "I422", "I422P10", "I422P12", "I422A", "I422AP10"];
+        format = names[formatId - 5] as VideoPixelFormat;
+        const bytes = formatId === 6 || formatId === 9 ? 1 : 2;
+        planes = [
+          { width, height, bytes },
+          { width: chromaWidth, height, bytes },
+          { width: chromaWidth, height, bytes },
+        ];
+        if (formatId >= 9) planes.push({ width, height, bytes });
+        break;
+      }
+      case 11:
+      case 12:
+      case 13:
+      case 14:
+      case 15: {
+        const names = ["", "I444", "I444P10", "I444P12", "I444A", "I444AP10"];
+        format = names[formatId - 10] as VideoPixelFormat;
+        const bytes = formatId === 11 || formatId === 14 ? 1 : 2;
+        planes = [
+          { width, height, bytes },
+          { width, height, bytes },
+          { width, height, bytes },
+        ];
+        if (formatId >= 14) planes.push({ width, height, bytes });
+        break;
+      }
+      case 16:
+        format = "NV12";
+        planes = [
+          { width, height, bytes: 1 },
+          { width: chromaWidth * 2, height: chromaHeight, bytes: 1 },
+        ];
+        break;
+      case 17:
+      case 18:
+      case 19:
+      case 20:
+        format = (["", "RGBA", "RGBX", "BGRA", "BGRX"] as string[])[
+          formatId - 16
+        ] as VideoPixelFormat;
+        planes = [{ width, height, bytes: 4 }];
+        break;
+      default:
+        return null;
+    }
+
+    const sizes = planes.map((plane) => plane.width * plane.bytes * plane.height);
+    const offsets: number[] = [];
+    let totalSize = 0;
+    for (const size of sizes) {
+      offsets.push(totalSize);
+      totalSize += size;
+    }
+    const data = new Uint8Array(totalSize);
+
+    const copyPlane = (
+      srcPtr: number,
+      srcStride: number,
+      dstOffset: number,
+      rowWidth: number,
+      rows: number,
+    ) => {
+      if (!srcPtr || Math.abs(srcStride) < rowWidth) return false;
+      for (let row = 0; row < rows; row++) {
+        const srcStart = srcPtr + row * srcStride;
+        data.set(
+          this.module.HEAPU8.subarray(srcStart, srcStart + rowWidth),
+          dstOffset + row * rowWidth,
+        );
+      }
+      return true;
+    };
+
+    for (let planeIndex = 0; planeIndex < planes.length; planeIndex++) {
+      const plane = planes[planeIndex];
+      if (
+        !copyPlane(
+          this.getFrameDataPointer(planeIndex),
+          this.getFrameLinesize(planeIndex),
+          offsets[planeIndex],
+          plane.width * plane.bytes,
+          plane.height,
+        )
+      ) {
+        return null;
+      }
+    }
+
+    return {
+      format,
+      data,
+      layout: planes.map((plane, index) => ({
+        offset: offsets[index],
+        stride: plane.width * plane.bytes,
+      })),
+    };
+  }
+
+  /**
    * Set frames to skip during decoding
    * 0: None, 1: NonRef, 2: Bidir, 3: NonKey, 4: All
    */
