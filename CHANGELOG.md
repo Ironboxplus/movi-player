@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-07-17
+
+### Fixed
+
+- **MPEG-2 and other WebCodecs-unmapped video codecs no longer render on the
+  main thread by default.** FFmpeg software video decoding now owns an isolated
+  Worker, transfers Worker-created `VideoFrame`s to the renderer, and falls back
+  to the legacy main-thread decoder only when Worker setup is unavailable.
+- **Software video frame conversion is codec-generic.** The Worker retains the
+  FFmpeg codec id, preserves frame timestamps, uses WebCodecs-native pixel
+  layouts where possible, and converts to RGBA only when required by the output
+  format.
+
 ## [0.3.5-dts-worker.1] - 2026-07-15
 
 Merged upstream movi-player **0.3.5** into the DTS-worker fork — bringing in all
