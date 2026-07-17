@@ -1943,9 +1943,11 @@ export class CanvasRenderer {
     }
 
     // Check audio for drift correction (but don't block video)
+    let audioHealthy: boolean | null = null;
     if (this.getAudioTime) {
       const audioTime = this.getAudioTime();
       const isHealthy = this._isAudioHealthy ? this._isAudioHealthy() : true;
+      audioHealthy = isHealthy;
 
       // Track last known audio time for capping video when audio drops out
       if (audioTime >= 0) {
@@ -1996,9 +1998,16 @@ export class CanvasRenderer {
       }
     }
 
-    // High-FPS slow playback: cap video to last known audio time when audio drops
-    const isSlowHighFps = this.playbackRate < 0.99 && this.videoFrameRate >= 50;
-    if (isSlowHighFps && videoTime >= 0 && this.lastKnownAudioTime >= 0 && this.syncedToAudio) {
+    // Once audio has established a clock, never let a hardware decoder drain
+    // video frames far ahead while that clock is unhealthy. This applies at
+    // every normal playback rate: the existing slow/high-FPS guard missed the
+    // common 24fps/1x case and allowed it to race through queued frames.
+    const shouldCapToAudio =
+      videoTime >= 0 &&
+      this.lastKnownAudioTime >= 0 &&
+      this.syncedToAudio &&
+      audioHealthy === false;
+    if (shouldCapToAudio) {
       return Math.min(videoTime, this.lastKnownAudioTime + 0.15);
     }
     return videoTime >= 0 ? videoTime : -1;

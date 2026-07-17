@@ -152,6 +152,40 @@ describe("MoviAudioDecoder software scheduling", () => {
   });
 });
 
+describe("SoftwareAudioDecoder PCM timestamps", () => {
+  it("advances PCM time when one DTS packet produces multiple decoded frames", async () => {
+    const heap = new Uint8Array(512 * Float32Array.BYTES_PER_ELEMENT);
+    const bindings = {
+      enableDecoder: vi.fn(() => 0),
+      enableAudioDownmix: vi.fn(),
+      flushDecoder: vi.fn(),
+      sendPacket: vi.fn(() => 0),
+      receiveFrame: vi
+        .fn()
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0)
+        .mockReturnValue(-1),
+      getFrameSamples: vi.fn(() => 512),
+      getFrameChannels: vi.fn(() => 1),
+      getFrameSampleRate: vi.fn(() => 48_000),
+      getFrameDataPointer: vi.fn(() => 0),
+      module: { HEAPU8: heap },
+    } as unknown as WasmBindings;
+    const decoder = new SoftwareAudioDecoder(bindings);
+    const frames: PCMFrame[] = [];
+    decoder.setOnData((frame) => frames.push(frame));
+
+    await expect(decoder.configure(dtsTrack)).resolves.toBe(true);
+    decoder.decode(new Uint8Array([1]), 0, true);
+
+    expect(frames.map((frame) => frame.timestamp)).toEqual([0, 32_000]);
+  });
+});
+
 describe("MoviPlayer scheduler classification", () => {
   it("treats hardware video plus software audio as a software-heavy path", async () => {
     const { getDecodeMode, isSoftwareDecodePath } = await import(

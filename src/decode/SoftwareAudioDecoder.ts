@@ -1,6 +1,7 @@
 import { WasmBindings } from "../wasm/bindings";
 import { AudioTrack } from "../types";
 import { Logger } from "../utils/Logger";
+import { PCMFrameTimestampClock } from "./PCMFrameTimestampClock";
 
 const TAG = "SoftwareAudioDecoder";
 
@@ -51,6 +52,7 @@ export class SoftwareAudioDecoder {
   private coalesceTarget = 0; // samples; derived from the frame sample rate
   private pending: PCMFrame[] = [];
   private pendingSamples = 0;
+  private readonly pcmTimestampClock = new PCMFrameTimestampClock();
 
   constructor(bindings: WasmBindings) {
     this.bindings = bindings;
@@ -90,6 +92,7 @@ export class SoftwareAudioDecoder {
     // detects the device can actually drive >2 discrete channels.
     this.bindings.enableAudioDownmix(this._downmix);
 
+    this.pcmTimestampClock.reset();
     this.isConfigured = true;
     Logger.info(
       TAG,
@@ -120,6 +123,7 @@ export class SoftwareAudioDecoder {
     this.isBroken = false;
     this.pending = [];
     this.pendingSamples = 0;
+    this.pcmTimestampClock.reset();
   }
 
   async flush(): Promise<void> {
@@ -134,6 +138,7 @@ export class SoftwareAudioDecoder {
     this.isConfigured = false;
     this.pending = [];
     this.pendingSamples = 0;
+    this.pcmTimestampClock.reset();
   }
 
   get queueSize(): number {
@@ -204,7 +209,11 @@ export class SoftwareAudioDecoder {
         numberOfFrames,
         numberOfChannels,
         sampleRate,
-        timestamp: timestamp * 1_000_000, // micro-seconds
+        timestamp: this.pcmTimestampClock.next(
+          timestamp,
+          numberOfFrames,
+          sampleRate,
+        ),
       };
 
       if (Math.random() < 0.01) {

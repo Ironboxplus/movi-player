@@ -1,6 +1,7 @@
 import type { AudioTrack } from "../types";
 import { loadWasmModuleNew } from "../wasm/FFmpegLoader";
 import type { MoviWasmModule } from "../wasm/types";
+import { PCMFrameTimestampClock } from "./PCMFrameTimestampClock";
 import type { PCMFrame } from "./SoftwareAudioDecoder";
 
 type WorkerRequest =
@@ -84,6 +85,7 @@ let trackId = -1;
 let queueDepth = 0;
 let inFlight = 0;
 let cancelGeneration: Int32Array | null = null;
+const pcmTimestampClock = new PCMFrameTimestampClock();
 
 function post(message: WorkerResponse, transfer: Transferable[] = []): void {
   scope.postMessage(message, transfer);
@@ -174,6 +176,7 @@ async function configure(
   trackId = nextTrackId;
   queueDepth = 0;
   inFlight = 0;
+  pcmTimestampClock.reset();
   closeDecoder();
 
   if (!track.codecId) {
@@ -275,7 +278,11 @@ function emitFrames(message: Extract<WorkerRequest, { type: "decode" }>): void {
           numberOfFrames,
           numberOfChannels,
           sampleRate,
-          timestamp: message.pts * 1_000_000,
+          timestamp: pcmTimestampClock.next(
+            message.pts,
+            numberOfFrames,
+            sampleRate,
+          ),
         },
         queueDepth,
         inFlight,
@@ -376,6 +383,7 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
         trackId = message.trackId;
         queueDepth = 0;
         inFlight = 0;
+        pcmTimestampClock.reset();
         if (moduleRef && decoderPtr) {
           moduleRef._movi_audio_decoder_flush(decoderPtr);
         }
@@ -386,11 +394,13 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
         trackId = message.trackId;
         queueDepth = 0;
         inFlight = 0;
+        pcmTimestampClock.reset();
         if (moduleRef && decoderPtr) {
           moduleRef._movi_audio_decoder_flush(decoderPtr);
         }
         break;
       case "close":
+        pcmTimestampClock.reset();
         closeDecoder();
         scope.close();
         break;
