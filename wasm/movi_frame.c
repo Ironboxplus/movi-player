@@ -22,12 +22,11 @@ int movi_get_frame_format(MoviContext *ctx) {
 //   11-15 I444 family
 //   16    NV12
 //   17-20 packed 8-bit RGB
-EMSCRIPTEN_KEEPALIVE
-int movi_get_frame_webcodecs_format(MoviContext *ctx) {
-  if (!ctx || !ctx->frame)
+int movi_frame_webcodecs_format(const AVFrame *frame) {
+  if (!frame)
     return 0;
 
-  switch ((enum AVPixelFormat)ctx->frame->format) {
+  switch ((enum AVPixelFormat)frame->format) {
   case AV_PIX_FMT_YUV420P:
   case AV_PIX_FMT_YUVJ420P:
     return 1; // I420
@@ -77,6 +76,11 @@ int movi_get_frame_webcodecs_format(MoviContext *ctx) {
   default:
     return 0;
   }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_get_frame_webcodecs_format(MoviContext *ctx) {
+  return ctx ? movi_frame_webcodecs_format(ctx->frame) : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE

@@ -1,5 +1,6 @@
 #include "movi.h"
 #include <libavutil/imgutils.h>
+#include <math.h>
 
 static int movi_audio_build_in_layout(AVChannelLayout *dst,
                                       const AVChannelLayout *src) {
@@ -571,70 +572,266 @@ uint8_t *movi_audio_decoder_get_frame_data(MoviAudioDecoderContext *ctx,
                                    : ctx->frame->data[plane];
 }
 
+static void movi_apply_skip_frame(AVCodecContext *dec_ctx, int skip_val) {
+  if (!dec_ctx)
+    return;
+  switch (skip_val) {
+  case 1:
+    dec_ctx->skip_frame = AVDISCARD_NONREF;
+    break;
+  case 2:
+    dec_ctx->skip_frame = AVDISCARD_BIDIR;
+    break;
+  case 3:
+    dec_ctx->skip_frame = AVDISCARD_NONKEY;
+    break;
+  case 4:
+    dec_ctx->skip_frame = AVDISCARD_ALL;
+    break;
+  default:
+    dec_ctx->skip_frame = AVDISCARD_DEFAULT;
+    break;
+  }
+}
+
+EMSCRIPTEN_KEEPALIVE
+MoviVideoDecoderContext *movi_video_decoder_create(
+    int codec_id, int width, int height, uint8_t *extradata,
+    int extradata_size) {
+  const AVCodec *codec = avcodec_find_decoder((enum AVCodecID)codec_id);
+  if (!codec)
+    return NULL;
+
+  MoviVideoDecoderContext *ctx =
+      (MoviVideoDecoderContext *)calloc(1, sizeof(MoviVideoDecoderContext));
+  if (!ctx)
+    return NULL;
+
+  ctx->dec_ctx = avcodec_alloc_context3(codec);
+  ctx->frame = av_frame_alloc();
+  if (!ctx->dec_ctx || !ctx->frame) {
+    movi_video_decoder_destroy(ctx);
+    return NULL;
+  }
+
+  ctx->dec_ctx->width = width;
+  ctx->dec_ctx->height = height;
+  ctx->dec_ctx->pkt_timebase = AV_TIME_BASE_Q;
+  ctx->dec_ctx->thread_count = 1;
+
+  if (extradata && extradata_size > 0) {
+    ctx->dec_ctx->extradata =
+        av_malloc(extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!ctx->dec_ctx->extradata) {
+      movi_video_decoder_destroy(ctx);
+      return NULL;
+    }
+    memcpy(ctx->dec_ctx->extradata, extradata, extradata_size);
+    memset(ctx->dec_ctx->extradata + extradata_size, 0,
+           AV_INPUT_BUFFER_PADDING_SIZE);
+    ctx->dec_ctx->extradata_size = extradata_size;
+  }
+
+  if (avcodec_open2(ctx->dec_ctx, codec, NULL) < 0) {
+    movi_video_decoder_destroy(ctx);
+    return NULL;
+  }
+  return ctx;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void movi_video_decoder_destroy(MoviVideoDecoderContext *ctx) {
+  if (!ctx)
+    return;
+  if (ctx->sws_ctx)
+    sws_freeContext(ctx->sws_ctx);
+  if (ctx->rgb_frame)
+    av_frame_free(&ctx->rgb_frame);
+  if (ctx->rgb_buffer)
+    av_free(ctx->rgb_buffer);
+  if (ctx->frame)
+    av_frame_free(&ctx->frame);
+  if (ctx->dec_ctx)
+    avcodec_free_context(&ctx->dec_ctx);
+  free(ctx);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void movi_video_decoder_set_skip_frame(MoviVideoDecoderContext *ctx,
+                                       int skip_val) {
+  if (ctx)
+    movi_apply_skip_frame(ctx->dec_ctx, skip_val);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_send_packet(MoviVideoDecoderContext *ctx,
+                                   uint8_t *data, int size, double pts,
+                                   double dts, int keyframe) {
+  if (!ctx || !ctx->dec_ctx)
+    return -1;
+  AVPacket *pkt = av_packet_alloc();
+  if (!pkt)
+    return -2;
+  if (size > 0 && data) {
+    if (av_new_packet(pkt, size) < 0) {
+      av_packet_free(&pkt);
+      return -3;
+    }
+    memcpy(pkt->data, data, size);
+  }
+  if (isfinite(pts))
+    pkt->pts = (int64_t)(pts * AV_TIME_BASE);
+  if (isfinite(dts))
+    pkt->dts = (int64_t)(dts * AV_TIME_BASE);
+  if (keyframe)
+    pkt->flags |= AV_PKT_FLAG_KEY;
+  int ret = avcodec_send_packet(ctx->dec_ctx, pkt);
+  av_packet_free(&pkt);
+  return ret;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_receive_frame(MoviVideoDecoderContext *ctx) {
+  if (!ctx || !ctx->dec_ctx || !ctx->frame)
+    return -1;
+  return avcodec_receive_frame(ctx->dec_ctx, ctx->frame);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void movi_video_decoder_flush(MoviVideoDecoderContext *ctx) {
+  if (ctx && ctx->dec_ctx)
+    avcodec_flush_buffers(ctx->dec_ctx);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_get_frame_width(MoviVideoDecoderContext *ctx) {
+  return (ctx && ctx->frame) ? ctx->frame->width : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_get_frame_height(MoviVideoDecoderContext *ctx) {
+  return (ctx && ctx->frame) ? ctx->frame->height : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_get_frame_format(MoviVideoDecoderContext *ctx) {
+  return (ctx && ctx->frame) ? ctx->frame->format : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_get_frame_webcodecs_format(
+    MoviVideoDecoderContext *ctx) {
+  return ctx ? movi_frame_webcodecs_format(ctx->frame) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t *movi_video_decoder_get_frame_data(MoviVideoDecoderContext *ctx,
+                                           int plane) {
+  return (ctx && ctx->frame && plane >= 0 && plane < AV_NUM_DATA_POINTERS)
+             ? ctx->frame->data[plane]
+             : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_get_frame_linesize(MoviVideoDecoderContext *ctx,
+                                          int plane) {
+  return (ctx && ctx->frame && plane >= 0 && plane < AV_NUM_DATA_POINTERS)
+             ? ctx->frame->linesize[plane]
+             : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+double movi_video_decoder_get_frame_pts(MoviVideoDecoderContext *ctx) {
+  if (!ctx || !ctx->frame)
+    return NAN;
+  int64_t pts = ctx->frame->pts;
+  if (pts == AV_NOPTS_VALUE)
+    pts = ctx->frame->pkt_dts;
+  return pts == AV_NOPTS_VALUE ? NAN : (double)pts / AV_TIME_BASE;
+}
+
+static uint8_t *movi_convert_frame_rgba(
+    AVFrame *frame, struct SwsContext **sws_ctx, AVFrame **rgb_frame,
+    uint8_t **rgb_buffer, int *rgb_buffer_size, int *rgb_data_size,
+    int target_width, int target_height) {
+  if (!frame || frame->width <= 0 || frame->height <= 0)
+    return NULL;
+
+  if (target_width <= 0)
+    target_width = frame->width;
+  if (target_height <= 0)
+    target_height = frame->height;
+  int required_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, target_width,
+                                                target_height, 1);
+  if (required_size <= 0)
+    return NULL;
+
+  if (!*rgb_buffer || *rgb_buffer_size < required_size) {
+    if (*rgb_buffer)
+      av_free(*rgb_buffer);
+    *rgb_buffer = av_malloc(required_size);
+    if (!*rgb_buffer) {
+      *rgb_buffer_size = 0;
+      *rgb_data_size = 0;
+      return NULL;
+    }
+    *rgb_buffer_size = required_size;
+  }
+  if (!*rgb_frame) {
+    *rgb_frame = av_frame_alloc();
+    if (!*rgb_frame)
+      return NULL;
+  }
+
+  *sws_ctx = sws_getCachedContext(
+      *sws_ctx, frame->width, frame->height, frame->format, target_width,
+      target_height, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
+  if (!*sws_ctx)
+    return NULL;
+
+  av_image_fill_arrays((*rgb_frame)->data, (*rgb_frame)->linesize, *rgb_buffer,
+                       AV_PIX_FMT_RGBA, target_width, target_height, 1);
+  int rows = sws_scale(*sws_ctx, (const uint8_t *const *)frame->data,
+                       frame->linesize, 0, frame->height, (*rgb_frame)->data,
+                       (*rgb_frame)->linesize);
+  if (rows <= 0)
+    return NULL;
+  *rgb_data_size = required_size;
+  return *rgb_buffer;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t *movi_video_decoder_get_frame_rgba(MoviVideoDecoderContext *ctx,
+                                           int target_width,
+                                           int target_height) {
+  if (!ctx)
+    return NULL;
+  return movi_convert_frame_rgba(
+      ctx->frame, &ctx->sws_ctx, &ctx->rgb_frame, &ctx->rgb_buffer,
+      &ctx->rgb_buffer_size, &ctx->rgb_data_size, target_width, target_height);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_get_frame_rgba_size(MoviVideoDecoderContext *ctx) {
+  return ctx ? ctx->rgb_data_size : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_video_decoder_get_frame_rgba_linesize(MoviVideoDecoderContext *ctx) {
+  return (ctx && ctx->rgb_frame) ? ctx->rgb_frame->linesize[0] : 0;
+}
+
 /**
  * Get decoded video frame as RGBA buffer (converts any format including 10-bit HDR)
  * Returns pointer to RGBA buffer, or NULL on error
  */
 EMSCRIPTEN_KEEPALIVE
 uint8_t* movi_get_frame_rgba(MoviContext *ctx, int target_width, int target_height) {
-  if (!ctx || !ctx->frame) return NULL;
-  
-  // For audio frames, return NULL
-  if (ctx->frame->width == 0 || ctx->frame->height == 0) return NULL;
-  
-  int src_width = ctx->frame->width;
-  int src_height = ctx->frame->height;
-  
-  // Use original size if target is 0
-  if (target_width <= 0) target_width = src_width;
-  if (target_height <= 0) target_height = src_height;
-  
-  // Calculate required buffer size
-  int buffer_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, target_width, target_height, 1);
-  
-  // Allocate or reallocate RGB buffer if needed
-  if (!ctx->rgb_buffer || ctx->rgb_buffer_size < buffer_size) {
-    if (ctx->rgb_buffer) {
-      av_free(ctx->rgb_buffer);
-    }
-    ctx->rgb_buffer = av_malloc(buffer_size);
-    ctx->rgb_buffer_size = buffer_size;
-    if (!ctx->rgb_buffer) {
-      av_log(NULL, AV_LOG_ERROR, "[MOVI-WASM] Failed to allocate RGB buffer\n");
-      return NULL;
-    }
-  }
-  
-  // Allocate rgb_frame if needed
-  if (!ctx->rgb_frame) {
-    ctx->rgb_frame = av_frame_alloc();
-    if (!ctx->rgb_frame) {
-      av_log(NULL, AV_LOG_ERROR, "[MOVI-WASM] Failed to allocate RGB frame\n");
-      return NULL;
-    }
-  }
-  
-  // Create or update sws context
-  ctx->sws_ctx = sws_getCachedContext(ctx->sws_ctx,
-      src_width, src_height, ctx->frame->format,
-      target_width, target_height, AV_PIX_FMT_RGBA,
-      SWS_FAST_BILINEAR, NULL, NULL, NULL);
-  
-  if (!ctx->sws_ctx) {
-    av_log(NULL, AV_LOG_ERROR, "[MOVI-WASM] Failed to create SwsContext for format %d\n", ctx->frame->format);
+  if (!ctx)
     return NULL;
-  }
-  
-  // Setup rgb_frame to point to rgb_buffer
-  av_image_fill_arrays(ctx->rgb_frame->data, ctx->rgb_frame->linesize,
-                       ctx->rgb_buffer, AV_PIX_FMT_RGBA, target_width, target_height, 1);
-  
-  // Convert to RGBA
-  sws_scale(ctx->sws_ctx, (const uint8_t *const *)ctx->frame->data,
-            ctx->frame->linesize, 0, src_height,
-            ctx->rgb_frame->data, ctx->rgb_frame->linesize);
-  
-  return ctx->rgb_buffer;
+  return movi_convert_frame_rgba(
+      ctx->frame, &ctx->sws_ctx, &ctx->rgb_frame, &ctx->rgb_buffer,
+      &ctx->rgb_buffer_size, &ctx->rgb_data_size, target_width, target_height);
 }
 
 /**
@@ -642,7 +839,7 @@ uint8_t* movi_get_frame_rgba(MoviContext *ctx, int target_width, int target_heig
  */
 EMSCRIPTEN_KEEPALIVE
 int movi_get_frame_rgba_size(MoviContext *ctx) {
-  return ctx ? ctx->rgb_buffer_size : 0;
+  return ctx ? ctx->rgb_data_size : 0;
 }
 
 /**

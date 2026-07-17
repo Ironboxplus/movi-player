@@ -133,6 +133,41 @@ export interface MoviWasmModule {
   _movi_audio_decoder_get_frame_sample_rate: (ctx: number) => number;
   _movi_audio_decoder_get_frame_data: (ctx: number, plane: number) => number;
 
+  // Standalone video decoder API (used from Worker without a demux context)
+  _movi_video_decoder_create: (
+    codecId: number,
+    width: number,
+    height: number,
+    extradata: number,
+    extradataSize: number,
+  ) => number;
+  _movi_video_decoder_destroy: (ctx: number) => void;
+  _movi_video_decoder_set_skip_frame: (ctx: number, skip: number) => void;
+  _movi_video_decoder_send_packet: (
+    ctx: number,
+    data: number,
+    size: number,
+    pts: number,
+    dts: number,
+    keyframe: number,
+  ) => number;
+  _movi_video_decoder_receive_frame: (ctx: number) => number;
+  _movi_video_decoder_flush: (ctx: number) => void;
+  _movi_video_decoder_get_frame_width: (ctx: number) => number;
+  _movi_video_decoder_get_frame_height: (ctx: number) => number;
+  _movi_video_decoder_get_frame_format: (ctx: number) => number;
+  _movi_video_decoder_get_frame_webcodecs_format: (ctx: number) => number;
+  _movi_video_decoder_get_frame_data: (ctx: number, plane: number) => number;
+  _movi_video_decoder_get_frame_linesize: (ctx: number, plane: number) => number;
+  _movi_video_decoder_get_frame_pts: (ctx: number) => number;
+  _movi_video_decoder_get_frame_rgba: (
+    ctx: number,
+    targetWidth: number,
+    targetHeight: number,
+  ) => number;
+  _movi_video_decoder_get_frame_rgba_size: (ctx: number) => number;
+  _movi_video_decoder_get_frame_rgba_linesize: (ctx: number) => number;
+
   // RGBA conversion for software decoding
   _movi_get_frame_rgba(
     ctx: number,

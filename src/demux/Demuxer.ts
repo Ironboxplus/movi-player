@@ -185,6 +185,7 @@ export class Demuxer {
           id: info.index,
           type: "video",
           codec: info.codecName,
+          codecId: info.codecId,
           width: info.width,
           height: info.height,
           frameRate: info.frameRate,

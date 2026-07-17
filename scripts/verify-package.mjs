@@ -50,53 +50,72 @@ for (const file of required) {
   }
 }
 
-const workerAssets = files.filter((file) =>
-  /^dist\/assets\/SoftwareAudioDecoder\.worker-[^/]+\.js$/.test(file),
-);
-if (workerAssets.length === 0) {
-  fail(
-    "Package is missing SoftwareAudioDecoder worker asset under dist/assets. " +
-      "DTS software audio would fall back or fail at runtime.",
-  );
-}
-
 const bundleFiles = [
   "dist/index.js",
   "dist/element.js",
   "dist/player.js",
   "dist/demuxer.js",
 ];
+const workerSpecs = [
+  {
+    name: "SoftwareAudioDecoder",
+    purpose: "software audio decoding",
+  },
+  {
+    name: "SoftwareVideoDecoder",
+    purpose: "software video decoding",
+  },
+];
+const workerAssets = [];
 const referencedWorkers = new Set();
-for (const bundle of bundleFiles) {
-  if (!fileSet.has(bundle)) continue;
+for (const worker of workerSpecs) {
+  const assetPattern = new RegExp(
+    `^dist/assets/${worker.name}\\.worker-[^/]+\\.js$`,
+  );
+  const assets = files.filter((file) => assetPattern.test(file));
+  workerAssets.push(...assets);
+  if (assets.length === 0) {
+    fail(
+      `Package is missing ${worker.name} worker asset under dist/assets. ` +
+        `${worker.purpose} would fall back or fail at runtime.`,
+    );
+  }
 
-  const code = await readFile(bundle, "utf8");
-  const refs = code.match(/assets\/SoftwareAudioDecoder\.worker-[\w-]+\.js/g) ?? [];
-  if (refs.length === 0) {
-    fail(`Bundle does not reference the software audio worker asset: ${bundle}`);
-    continue;
-  }
-  if (code.includes('new URL("/assets/SoftwareAudioDecoder.worker-')) {
-    fail(`Bundle uses an absolute /assets worker URL: ${bundle}`);
-  }
-  for (const ref of refs) {
-    const packedPath = `dist/${ref}`;
-    referencedWorkers.add(packedPath);
-    if (!fileSet.has(packedPath)) {
-      fail(`${bundle} references a worker asset missing from npm pack: ${packedPath}`);
+  const refPattern = new RegExp(
+    `assets/${worker.name}\\.worker-[\\w-]+\\.js`,
+    "g",
+  );
+  for (const bundle of bundleFiles) {
+    if (!fileSet.has(bundle)) continue;
+
+    const code = await readFile(bundle, "utf8");
+    const refs = code.match(refPattern) ?? [];
+    if (refs.length === 0) {
+      fail(`Bundle does not reference ${worker.name} worker asset: ${bundle}`);
+      continue;
+    }
+    if (code.includes(`new URL("/assets/${worker.name}.worker-`)) {
+      fail(`Bundle uses an absolute /assets worker URL: ${bundle}`);
+    }
+    for (const ref of refs) {
+      const packedPath = `dist/${ref}`;
+      referencedWorkers.add(packedPath);
+      if (!fileSet.has(packedPath)) {
+        fail(`${bundle} references a worker asset missing from npm pack: ${packedPath}`);
+      }
     }
   }
-}
 
-const unreferencedWorkers = workerAssets.filter(
-  (workerAsset) => !referencedWorkers.has(workerAsset),
-);
-if (unreferencedWorkers.length > 0) {
-  fail(
-    "Package would include unreferenced software audio worker assets. " +
-      "Start from a clean dist/ before packing:\n" +
-      unreferencedWorkers.map((file) => `  - ${file}`).join("\n"),
+  const unreferencedWorkers = assets.filter(
+    (workerAsset) => !referencedWorkers.has(workerAsset),
   );
+  if (unreferencedWorkers.length > 0) {
+    fail(
+      `Package would include unreferenced ${worker.name} worker assets. ` +
+        "Start from a clean dist/ before packing:\n" +
+        unreferencedWorkers.map((file) => `  - ${file}`).join("\n"),
+    );
+  }
 }
 
 const staleArtifacts = files.filter(

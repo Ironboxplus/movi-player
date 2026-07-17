@@ -2225,10 +2225,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const isSoftware = decodeMode.softwareHeavy;
     const isVideoSoftware = decodeMode.videoSoftware;
     const isAudioSoftware = decodeMode.audioSoftware;
+    const videoPolicyStats = this.videoDecoder.getStats?.();
     const audioPolicyStats = this.audioDecoder.getStats();
+    const isVideoWorkerSoftware = Boolean(videoPolicyStats?.worker);
     const isAudioWorkerSoftware = Boolean(audioPolicyStats.worker);
     const isMainThreadSoftwareDecode =
-      isVideoSoftware || (isAudioSoftware && !isAudioWorkerSoftware);
+      (isVideoSoftware && !isVideoWorkerSoftware) ||
+      (isAudioSoftware && !isAudioWorkerSoftware);
     const timeSinceSeek = performance.now() - this.seekTime;
     const isPostSeek =
       this.justSeeked && timeSinceSeek < MoviPlayer.POST_SEEK_THROTTLE_MS;
@@ -2243,8 +2246,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Adaptive limits for software/hardware modes
     // During post-seek or while waiting for initial sync, we are more permissive with decoder queues
     // to ensure they have enough data to output the first few frames.
-    const maxVideoQueue = isVideoSoftware
-      ? 1000
+    const maxVideoQueue = isVideoWorkerSoftware
+      ? 48
+      : isVideoSoftware
+        ? 1000
       : isPostSeek || this.waitingForVideoSync
         ? 60
         : 30;
@@ -6114,14 +6119,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   /**
    * True when software decode work runs on the main thread.
-   * Worker audio decode is intentionally excluded so UI effects are not
-   * disabled for healthy DTS/DTS-HD playback.
+   * Worker video/audio decode is intentionally excluded so UI effects are not
+   * disabled when FFmpeg work is isolated off the main thread.
    */
   isMainThreadSoftwareDecoding(): boolean {
     const decodeMode = getDecodeMode(this.videoDecoder, this.audioDecoder);
+    const videoStats = this.videoDecoder.getStats?.();
     const audioStats = this.audioDecoder.getStats();
     return (
-      decodeMode.videoSoftware ||
+      (decodeMode.videoSoftware && !videoStats?.worker) ||
       (decodeMode.audioSoftware && !audioStats.worker)
     );
   }

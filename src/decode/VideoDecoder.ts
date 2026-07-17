@@ -5,6 +5,10 @@
 import type { VideoTrack, VideoDecoderConfig } from "../types";
 import { Logger } from "../utils/Logger";
 import { SoftwareVideoDecoder } from "./SoftwareVideoDecoder";
+import {
+  WorkerSoftwareVideoDecoder,
+  type VideoWorkerStats,
+} from "./WorkerSoftwareVideoDecoder";
 import { WasmBindings } from "../wasm/bindings";
 
 import { CodecParser } from "./CodecParser";
@@ -13,7 +17,8 @@ const TAG = "VideoDecoder";
 
 export class MoviVideoDecoder {
   private decoder: VideoDecoder | null = null;
-  private swDecoder: SoftwareVideoDecoder | null = null;
+  private swDecoder: SoftwareVideoDecoder | WorkerSoftwareVideoDecoder | null =
+    null;
   private bindings: WasmBindings | null = null;
   private useSoftware: boolean = false;
 
@@ -119,7 +124,8 @@ export class MoviVideoDecoder {
     extradata?: Uint8Array,
     targetFps: number = 0,
   ): Promise<boolean> {
-    this.currentTrack = track;
+    this.currentTrack =
+      extradata && extradata.length > 0 ? { ...track, extradata } : track;
     this.targetFps = targetFps;
     this.currentProfile = track.profile;
 
@@ -463,31 +469,22 @@ export class MoviVideoDecoder {
       this.decoder = null;
     }
 
-    this.swDecoder = new SoftwareVideoDecoder(this.bindings);
-    this.swDecoder.setOnFrame((frame) => {
-      if (this.onFrame) this.onFrame(frame);
-      else {
-        this.pendingFrames.push(frame);
-      }
-    });
-    this.swDecoder.setOnError((e) => {
-      Logger.error(TAG, "Software decoder error", e);
-      if (this.onError) this.onError(e);
-    });
+    const decoder = this.createSoftwareDecoder();
+    if (!decoder) return false;
 
-    // For high-FPS content (>60fps), cap software decode at 60fps to prevent
-    // main thread blocking that starves the audio pipeline.
-    // The presentation loop already targets 60fps — extra frames are wasted CPU.
-    const swTargetFps = this.targetFps > 0
-      ? this.targetFps
-      : (this.currentTrack.frameRate > 60 ? 60 : 0);
-    const success = await this.swDecoder.configure(
-      this.currentTrack,
-      swTargetFps,
-    );
-    if (swTargetFps > 0 && this.currentTrack.frameRate > swTargetFps) {
-      Logger.info(TAG, `Software decoder FPS capped: ${this.currentTrack.frameRate}fps → ${swTargetFps}fps`);
+    let success = await this.configureSoftwareDecoder(decoder);
+    if (!success && decoder instanceof WorkerSoftwareVideoDecoder) {
+      const workerStats = decoder.getStats();
+      decoder.close();
+      Logger.warn(
+        TAG,
+        `Worker software video decoder unavailable, falling back to main thread: ${workerStats.lastError || workerStats.configureState}`,
+      );
+      success = await this.configureSoftwareDecoder(
+        new SoftwareVideoDecoder(this.bindings),
+      );
     }
+
     if (success) {
       this.isConfigured = true;
       this.setWaitingForKeyframe(true); // Wait for keyframe on new decoder
@@ -509,6 +506,60 @@ export class MoviVideoDecoder {
       return true;
     }
     return false;
+  }
+
+  private createSoftwareDecoder():
+    | SoftwareVideoDecoder
+    | WorkerSoftwareVideoDecoder
+    | null {
+    if (WorkerSoftwareVideoDecoder.isSupported()) {
+      try {
+        Logger.info(TAG, "Using worker software video decoder");
+        return new WorkerSoftwareVideoDecoder();
+      } catch (error) {
+        Logger.warn(
+          TAG,
+          "Worker software video decoder failed, falling back to main thread",
+          error,
+        );
+      }
+    }
+    return this.bindings ? new SoftwareVideoDecoder(this.bindings) : null;
+  }
+
+  private async configureSoftwareDecoder(
+    decoder: SoftwareVideoDecoder | WorkerSoftwareVideoDecoder,
+  ): Promise<boolean> {
+    if (!this.currentTrack) return false;
+
+    this.swDecoder = decoder;
+    decoder.setOnFrame((frame) => {
+      if (this.onFrame) this.onFrame(frame);
+      else {
+        this.pendingFrames.push(frame);
+      }
+    });
+    decoder.setOnError((e) => {
+      Logger.error(TAG, "Software decoder error", e);
+      if (this.onError) this.onError(e);
+    });
+
+    // For high-FPS content (>60fps), cap software decode at 60fps to prevent
+    // main thread blocking that starves the audio pipeline.
+    // The presentation loop already targets 60fps — extra frames are wasted CPU.
+    const swTargetFps = this.targetFps > 0
+      ? this.targetFps
+      : (this.currentTrack.frameRate > 60 ? 60 : 0);
+    let success = false;
+    try {
+      success = await decoder.configure(this.currentTrack, swTargetFps);
+    } catch (error) {
+      Logger.warn(TAG, "Software video decoder configure failed", error);
+    }
+    if (swTargetFps > 0 && this.currentTrack.frameRate > swTargetFps) {
+      Logger.info(TAG, `Software decoder FPS capped: ${this.currentTrack.frameRate}fps → ${swTargetFps}fps`);
+    }
+    return success;
   }
 
   /**
@@ -1472,11 +1523,25 @@ export class MoviVideoDecoder {
   /**
    * Get decoder stats for nerd stats overlay
    */
-  getStats(): { decoderType: string; queueSize: number; errorCount: number } {
+  getStats(): {
+    decoderType: string;
+    queueSize: number;
+    errorCount: number;
+    worker?: VideoWorkerStats;
+  } {
+    const worker =
+      this.swDecoder instanceof WorkerSoftwareVideoDecoder
+        ? this.swDecoder.getStats()
+        : undefined;
     return {
-      decoderType: this.useSoftware ? "Software (FFmpeg)" : "Hardware (WebCodecs)",
+      decoderType: this.useSoftware
+        ? worker
+          ? "Software (FFmpeg Worker)"
+          : "Software (FFmpeg)"
+        : "Hardware (WebCodecs)",
       queueSize: this.queueSize,
       errorCount: this.errorCount,
+      worker,
     };
   }
 

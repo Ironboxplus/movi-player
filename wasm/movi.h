@@ -119,6 +119,7 @@ typedef struct {
   AVFrame *rgb_frame;
   uint8_t *rgb_buffer;
   int rgb_buffer_size;
+  int rgb_data_size;
 
   // Prefetched subtitle cues (lazy — populated on demand for non-zero
   // subtitle delay). Owned by the context; freed in movi_destroy.
@@ -143,6 +144,16 @@ typedef struct {
   int downmix_to_stereo;
 } MoviAudioDecoderContext;
 
+typedef struct {
+  AVCodecContext *dec_ctx;
+  AVFrame *frame;
+  struct SwsContext *sws_ctx;
+  AVFrame *rgb_frame;
+  uint8_t *rgb_buffer;
+  int rgb_buffer_size;
+  int rgb_data_size;
+} MoviVideoDecoderContext;
+
 EMSCRIPTEN_KEEPALIVE MoviAudioDecoderContext *movi_audio_decoder_create(
     int codec_id, int sample_rate, int channels, uint8_t *extradata,
     int extradata_size);
@@ -165,6 +176,43 @@ EMSCRIPTEN_KEEPALIVE int
 movi_audio_decoder_get_frame_sample_rate(MoviAudioDecoderContext *ctx);
 EMSCRIPTEN_KEEPALIVE uint8_t *
 movi_audio_decoder_get_frame_data(MoviAudioDecoderContext *ctx, int plane);
+
+EMSCRIPTEN_KEEPALIVE MoviVideoDecoderContext *movi_video_decoder_create(
+    int codec_id, int width, int height, uint8_t *extradata,
+    int extradata_size);
+EMSCRIPTEN_KEEPALIVE void
+movi_video_decoder_destroy(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE void movi_video_decoder_set_skip_frame(
+    MoviVideoDecoderContext *ctx, int skip_val);
+EMSCRIPTEN_KEEPALIVE int movi_video_decoder_send_packet(
+    MoviVideoDecoderContext *ctx, uint8_t *data, int size, double pts,
+    double dts, int keyframe);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_receive_frame(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE void
+movi_video_decoder_flush(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_get_frame_width(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_get_frame_height(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_get_frame_format(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_get_frame_webcodecs_format(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE uint8_t *
+movi_video_decoder_get_frame_data(MoviVideoDecoderContext *ctx, int plane);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_get_frame_linesize(MoviVideoDecoderContext *ctx, int plane);
+EMSCRIPTEN_KEEPALIVE double
+movi_video_decoder_get_frame_pts(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE uint8_t *movi_video_decoder_get_frame_rgba(
+    MoviVideoDecoderContext *ctx, int target_width, int target_height);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_get_frame_rgba_size(MoviVideoDecoderContext *ctx);
+EMSCRIPTEN_KEEPALIVE int
+movi_video_decoder_get_frame_rgba_linesize(MoviVideoDecoderContext *ctx);
+
+int movi_frame_webcodecs_format(const AVFrame *frame);
 
 EMSCRIPTEN_KEEPALIVE double movi_get_start_time(MoviContext *ctx);
 EMSCRIPTEN_KEEPALIVE int movi_get_format_name(MoviContext *ctx, char *buffer, int buffer_size);
