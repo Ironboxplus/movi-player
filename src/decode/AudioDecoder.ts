@@ -379,6 +379,48 @@ export class MoviAudioDecoder {
   /**
    * Decode an encoded audio chunk
    */
+  /**
+   * True while packets are going through the WASM software decoder, i.e. when
+   * decodeBatch() is worth using. Codecs that land here (TrueHD/MLP/DTS) emit
+   * very small access units, so the per-packet round-trip dominates.
+   */
+  canBatch(): boolean {
+    return (
+      this.isConfigured &&
+      this.useSoftware &&
+      // The fork normally uses WorkerSoftwareAudioDecoder. Its transport keeps
+      // the native-frame/PCM ABI off the main thread and deliberately does not
+      // use upstream's split-audio batch ABI. The legacy main-thread decoder
+      // may opt in only when a matching WASM module actually exports it.
+      this.swDecoder instanceof SoftwareAudioDecoder &&
+      // A .wasm older than this bundle has no batch exports — decode per packet
+      // rather than calling into undefined and losing audio outright.
+      !!this.bindings?.supportsAudioBatch()
+    );
+  }
+
+  /**
+   * Decode a run of packets in as few WASM round-trips as possible. Only the
+   * software path actually batches; WebCodecs has no such cost (and its own
+   * queue), so it just replays them one by one. Returns packets consumed —
+   * always all of them unless the software batch stopped early (format change
+   * or pts discontinuity), in which case the caller re-submits the rest.
+   */
+  decodeBatch(packets: { data: Uint8Array; pts: number }[]): number {
+    if (packets.length === 0) return 0;
+    if (!this.canBatch()) {
+      for (const p of packets) this.decode(p.data, p.pts, true);
+      return packets.length;
+    }
+    // canBatch() above narrows this to the legacy main-thread implementation.
+    // Keep the guard here as well: decoder teardown can race a queued submit.
+    if (this.swDecoder instanceof SoftwareAudioDecoder) {
+      return this.swDecoder.decodeBatch(packets);
+    }
+    for (const p of packets) this.decode(p.data, p.pts, true);
+    return packets.length;
+  }
+
   decode(data: Uint8Array, timestamp: number, keyframe: boolean): void {
     if (!this.isConfigured) {
       this.pendingChunks.push({ data, timestamp, keyframe });

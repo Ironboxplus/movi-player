@@ -6491,6 +6491,10 @@ export class MoviElement extends HTMLElement {
   // Pre-switch playback position. Used as a fallback while the new player
   // is initialising so the time-display doesn't flash 00:00.
   private _switchResumeTime: number = 0;
+  // A quality switch seeds the replacement player's deterministic initial seek
+  // with the old playhead. Restore the caller's configured start position once
+  // that switch settles so a later reload does not unexpectedly seek again.
+  private _startAtBeforeSwitch: number = 0;
   // Pre-switch total duration. Cached for the same reason — duration is
   // identical across quality variants, but the new player's mediaInfo
   // isn't populated until the demuxer opens.
@@ -6530,7 +6534,11 @@ export class MoviElement extends HTMLElement {
     // is still loading, where seeking is intentionally rejected. Preserve the
     // resume target through the element's existing seek-when-ready channel so
     // a quality switch cannot intermittently restart at zero.
-    if (resumeTime > 0) this._pendingSeek = resumeTime;
+    this._startAtBeforeSwitch = this._startAt;
+    if (resumeTime > 0) {
+      this._startAt = resumeTime;
+      this._pendingSeek = resumeTime;
+    }
     try {
       this._switchResumeDuration = this.player ? (this.player as any).getDuration?.() || 0 : 0;
     } catch {
@@ -6562,6 +6570,7 @@ export class MoviElement extends HTMLElement {
         this._qualitySwitchInProgress = false;
         this._switchResumeTime = 0;
         this._switchResumeDuration = 0;
+        this._startAt = this._startAtBeforeSwitch;
         this._hideSnapshotPoster();
         this.updatePoster();
       }
@@ -16504,6 +16513,7 @@ export class MoviElement extends HTMLElement {
             this._qualitySwitchInProgress = false;
             this._switchResumeTime = 0;
             this._switchResumeDuration = 0;
+            this._startAt = this._startAtBeforeSwitch;
             this.posterElement.style.display = "none";
           }
         } else {

@@ -95,6 +95,24 @@ export interface MoviWasmModule {
     keyframe: number,
   ) => number;
   _movi_receive_frame: (ctx: number, stream_index: number) => number;
+  // Batched audio decode — many packets per round-trip, PCM accumulated into
+  // one contiguous planar block. See WasmBindings.decodeAudioBatch.
+  // Optional: the element bundle and the .wasm ship separately, so a bundle
+  // newer than the module must detect these are missing (supportsAudioBatch)
+  // and fall back to per-packet decode instead of calling into undefined.
+  _movi_decode_audio_batch?: (
+    ctx: number,
+    stream_index: number,
+    blob: number,
+    sizes: number,
+    ptss: number,
+    count: number,
+  ) => number;
+  _movi_audio_batch_samples?: (ctx: number) => number;
+  _movi_audio_batch_channels?: (ctx: number) => number;
+  _movi_audio_batch_sample_rate?: (ctx: number) => number;
+  _movi_audio_batch_pts?: (ctx: number) => number;
+  _movi_audio_batch_plane?: (ctx: number, channel: number) => number;
   _movi_get_frame_width: (ctx: number) => number;
   _movi_get_frame_height: (ctx: number) => number;
   _movi_get_frame_format(ctx: number): number;
@@ -280,6 +298,10 @@ export interface PacketInfo {
   // resume, so JS skips them (see VideoDecoder). Always false for keyframes and
   // non-HEVC codecs.
   isRasl: boolean;
+  // True for a disposable (non-reference) frame. Nothing references it, so it's
+  // safe to drop before the decoder when the device can't sustain the source
+  // rate (see VideoDecoder adaptive skip). Always false for keyframes.
+  disposable: boolean;
 }
 
 // StreamInfo struct layout (matches C struct)
@@ -315,9 +337,10 @@ export const STREAM_INFO_OFFSETS = {
   isAttachedPic: 340, // 4 bytes (int)
 };
 
-// PacketInfo struct layout. Contains doubles (8-byte alignment), so the trailing
-// is_idr(36)+is_rasl(40) ints pad the struct from 44 up to 48 bytes — keep this
-// in sync with sizeof(PacketInfo) in movi.h.
+// PacketInfo struct layout. Contains doubles (8-byte alignment). The trailing
+// ints is_idr(36)+is_rasl(40)+disposable(44) fill what was padding — the struct
+// stays 48 bytes (44 data was already padded to 48). Keep in sync with
+// sizeof(PacketInfo) in movi.h.
 export const PACKET_INFO_SIZE = 48;
 export const PACKET_INFO_OFFSETS = {
   streamIndex: 0,
@@ -328,4 +351,5 @@ export const PACKET_INFO_OFFSETS = {
   size: 32,
   isIdr: 36, // int — occupies the padding after `size`
   isRasl: 40, // int
+  disposable: 44, // int — fills the final padding slot, size stays 48
 };
