@@ -25,6 +25,7 @@ export class FileSource implements SourceAdapter {
   private duration: number = 0;
   private preloadOffset: number = 0; // Current byte offset being preloaded around
   private preloadAbort: boolean = false; // Signal to abort current preload cycle
+  private fullFilePreload: boolean = true;
 
   // Disk read stats
   private totalBytesRead: number = 0;
@@ -71,6 +72,14 @@ export class FileSource implements SourceAdapter {
       return;
     }
     this.onPreloadCompleteCallback = cb;
+  }
+
+  /**
+   * Disable the eager whole-file cache fill while retaining bounded read-ahead.
+   * Mobile 4K playback uses this to avoid competing disk I/O and RAM pressure.
+   */
+  setFullFilePreload(enabled: boolean): void {
+    this.fullFilePreload = enabled;
   }
 
   /**
@@ -241,7 +250,10 @@ export class FileSource implements SourceAdapter {
       // during playback (which causes stutter on 4K content with heavy processLoop).
       const totalChunks = Math.ceil(this.size / CHUNK_SIZE);
       const cacheMaxBytes = this.cache.getMaxSize();
-      const fileFitsInCache = cacheMaxBytes > 0 && this.size < cacheMaxBytes * 0.8;
+      const fileFitsInCache =
+        this.fullFilePreload &&
+        cacheMaxBytes > 0 &&
+        this.size < cacheMaxBytes * 0.8;
       const PRELOAD_AHEAD_CHUNKS = fileFitsInCache ? totalChunks : 20;
       const PRELOAD_BEHIND_CHUNKS = fileFitsInCache ? 0 : 5;
 

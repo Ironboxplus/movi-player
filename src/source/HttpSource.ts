@@ -91,6 +91,18 @@ export class HttpSource implements SourceAdapter {
   // fetch resolving the reader, so read()'s waitForData bailed and every load
   // failed with "Timeout at 0" when cross-origin isolation was absent.
   private fallbackStreaming: boolean = false;
+  // Mirrors HEADER.VERSION outside the SharedArrayBuffer path. Generation
+  // tracking must not disappear merely because COOP/COEP is unavailable:
+  // seeks can supersede an in-flight Range stream in either buffer mode.
+  private fallbackVersion: number = 0;
+
+  // Readers parked in waitForData(), each waiting for bufferEnd to reach its
+  // own `needed` byte. The stream writer wakes them the moment their bytes
+  // land (see atomicSetWritePos). Without this, waitForData polled on a timer
+  // and a read could sit idle for most of a poll interval after its bytes had
+  // already arrived — and because WASM I/O is Asyncify-suspended, that idle
+  // time froze the whole module, decoders included.
+  private bufferWaiters: Set<{ needed: number; wake: () => void }> = new Set();
 
   // Stream state
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -120,11 +132,12 @@ export class HttpSource implements SourceAdapter {
   // point). Monotonic — unlike `position`, an internal rewind doesn't pull it
   // back — so the linear window can keep ~trail of history behind the frontier.
   private readMax: number = 0;
-  // Ring of recent read offsets (linear mode). Their minimum approximates the
-  // lowest offset any demuxer stream / a just-happened backward seek still
-  // needs, so the sliding window never drops bytes a live reader is using —
-  // even when streams sit far apart in the file or a rewind just occurred.
-  private recentReads: number[] = [];
+  // Reads currently waiting for the forward-only stream to reach their byte
+  // range. The linear writer may discard consumed history, but never bytes an
+  // active waiter still needs. Tracking active demand is important: a fixed
+  // ring of historical read offsets can retain byte 0 longer than the entire
+  // buffer capacity and permanently prevent the first window from sliding.
+  private pendingLinearReads: Set<{ offset: number }> = new Set();
 
   // Force restart tracking (to prevent cascading failures)
   private consecutiveForceRestarts: number = 0;
@@ -137,6 +150,12 @@ export class HttpSource implements SourceAdapter {
   // instead of dribbling the whole file out as tiny range requests.
   private consecutiveOneOffFetches: number = 0;
   private readonly MAX_ONEOFF_BEFORE_RESTART = 2;
+  // Armed by MoviPlayer immediately before a demuxer seek. Without an explicit
+  // signal, a small first landing read looks identical to a stray metadata
+  // request and is served as a one-off while the old stream keeps downloading
+  // the abandoned region. The next actual stream-window read consumes it.
+  private seekHinted: boolean = false;
+  private seekHintOffset: number | null = null;
 
   // Dynamic buffer size (3% of file size, clamped)
   // Start with minimum size, will be resized when file size is known
@@ -148,6 +167,10 @@ export class HttpSource implements SourceAdapter {
   private lastSpeedBytes: number = 0;
   private lastSpeedTime: number = 0;
   private currentSpeed: number = 0; // bytes per second
+  private lastProgressAt: number = 0;
+  private rangeOpenEndedSwitches: number = 0;
+  private readStalls: number = 0;
+  private supersededStreams: number = 0;
 
   // Maximum buffer size (from cache config, defaults to DEFAULT_MAX_BUFFER_SIZE_MB)
   private maxBufferSizeMB: number;
@@ -284,11 +307,67 @@ export class HttpSource implements SourceAdapter {
   }
 
   private atomicSetWritePos(value: number): void {
+    const previous = this.atomicGetWritePos();
     if (this.useSharedBuffer && this.headerView) {
       Atomics.store(this.headerView, HEADER.WRITE_POS, value);
     } else {
       this.fallbackWritePos = value;
     }
+    if (value > previous) this.lastProgressAt = Date.now();
+    // Every buffer advance funnels through here, so this is the one place that
+    // can tell a parked reader its bytes have landed. Window shifts also call
+    // atomicSetBufferStart, but always paired with a write pos update, so the
+    // hook stays here rather than on both.
+    this.wakeBufferWaiters();
+  }
+
+  /**
+   * Wake readers parked in waitForData() whose bytes are now buffered.
+   * `force` wakes every waiter regardless of its byte target — used when the
+   * stream stops, so waiters re-evaluate the loop condition and exit rather
+   * than waiting on bytes that are never coming.
+   */
+  private wakeBufferWaiters(force: boolean = false): void {
+    if (this.bufferWaiters.size === 0) return;
+    const end = force ? Infinity : this.bufferEnd;
+    // Snapshot: wake() removes the waiter from the live set.
+    for (const waiter of [...this.bufferWaiters]) {
+      if (end >= waiter.needed) waiter.wake();
+    }
+  }
+
+  /**
+   * Resolve as soon as bufferEnd reaches `needed`, or after maxWaitMs.
+   * The timer is a safety net for the checks waitForData runs each pass
+   * (deadline, stall, superseded) — not the mechanism for spotting new bytes.
+   */
+  private waitForBufferAdvance(
+    needed: number,
+    maxWaitMs: number,
+  ): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const waiter = {
+        needed,
+        wake: () => {
+          if (settled) return;
+          settled = true;
+          if (timer !== undefined) clearTimeout(timer);
+          this.bufferWaiters.delete(waiter);
+          resolve();
+        },
+      };
+      this.bufferWaiters.add(waiter);
+      // Bytes may already be present (writer raced ahead of the park) — check
+      // once before arming the timer so we never sit out a full safety window
+      // for data that landed a tick earlier.
+      if (this.bufferEnd >= needed) {
+        waiter.wake();
+        return;
+      }
+      timer = setTimeout(waiter.wake, maxWaitMs);
+    });
   }
 
   // IMPORTANT: Split 64-bit offset into low/high 32-bit parts to support files >= 2GB
@@ -332,21 +411,26 @@ export class HttpSource implements SourceAdapter {
     } else {
       this.fallbackStreaming = active;
     }
+    // Bytes will never arrive once the stream is down, so release parked
+    // readers immediately instead of leaving them on the safety timer.
+    if (!active) this.wakeBufferWaiters(true);
   }
 
   private atomicIncrementVersion(): void {
     if (this.useSharedBuffer && this.headerView) {
       Atomics.add(this.headerView, HEADER.VERSION, 1);
+    } else {
+      this.fallbackVersion++;
     }
   }
 
   // Snapshot the window-version counter (bumped by startStream on every new
-  // stream). 0 when not using the shared buffer, so comparisons are inert in
-  // the fallback path. Used to detect a stream being superseded mid-wait.
+  // stream). The fallback counter mirrors the SAB header so supersede checks
+  // remain active when cross-origin isolation is unavailable.
   private atomicGetVersion(): number {
     return this.useSharedBuffer && this.headerView
       ? Atomics.load(this.headerView, HEADER.VERSION)
-      : 0;
+      : this.fallbackVersion;
   }
 
   /**
@@ -441,6 +525,16 @@ export class HttpSource implements SourceAdapter {
         if (/Access denied|Authentication required|Video not found/.test(msg)) {
           throw err;
         }
+        // The HEAD itself failed — a thrown fetch, not a status. Some origins
+        // reject HEAD entirely (or the OPTIONS preflight it triggers) while
+        // serving GET Range perfectly, so a HEAD network/CORS error must NOT be
+        // treated as "the file is unreachable". Recover the size from a ranged
+        // GET (then a plain GET) before retrying/failing — mirrors the 403/401
+        // fallback above. (issue #14)
+        const sizeViaRange = await this.resolveSizeViaRange();
+        if (sizeViaRange !== null) return sizeViaRange;
+        const sizeViaGet = await this.resolveSizeViaPlainGet();
+        if (sizeViaGet !== null) return sizeViaGet;
         lastError = err instanceof Error ? err : new Error(String(err));
       }
 
@@ -570,12 +664,20 @@ export class HttpSource implements SourceAdapter {
    *              this; pass-through callers can ignore it.
    */
   protected async buildRequestHeaders(
-    range?: { offset: number; length: number },
+    range?: { offset: number; length: number; openEnded?: boolean },
   ): Promise<Record<string, string>> {
     if (range) {
       return {
         ...this.headers,
-        Range: `bytes=${range.offset}-${range.offset + range.length - 1}`,
+        // openEnded requests `bytes=<offset>-` (to EOF) instead of a bounded
+        // `bytes=<offset>-<end>`. Some token/proxy servers reject a bounded
+        // range that starts at offset 0 (e.g. bytes=0-1048575) with 403 while
+        // accepting the same range open-ended — the stream read loop caps the
+        // actual download at the window regardless, so this stays bounded in
+        // practice. See readStreamBackground's 403 retry.
+        Range: range.openEnded
+          ? `bytes=${range.offset}-`
+          : `bytes=${range.offset}-${range.offset + range.length - 1}`,
       };
     }
     return { ...this.headers };
@@ -848,19 +950,19 @@ export class HttpSource implements SourceAdapter {
   ): Promise<"slid" | "eof" | "superseded" | "stopped"> {
     const MAX_IDLE_MS = 30000;
     const versionAtEntry = this.atomicGetVersion();
-    // Reader identity is the robust supersede signal: it is a plain field valid
-    // in BOTH the shared-buffer and fallback paths, whereas atomicGetVersion()
-    // is inert (always 0) without SharedArrayBuffer. If startStream/stopStream
-    // (e.g. a seek, or a metadata read that restarts the stream) swaps or clears
-    // this.reader while we poll, we must abandon this loop — otherwise we'd
-    // slide/reconnect the NEW stream's window, or the caller's "stopped" cleanup
-    // would cancel the new stream's reader.
+    // Reader identity and the generation counter are independent supersede
+    // signals in both SAB and fallback modes. If startStream/stopStream (e.g. a
+    // seek, or a metadata read that restarts the stream) swaps either while we
+    // poll, we must abandon this loop — otherwise we'd slide/reconnect the NEW
+    // stream's window, or the caller's cleanup would cancel its reader.
     const readerAtEntry = this.reader;
     let lastPosition = this.position;
     let lastAdvance = Date.now();
 
     while (this.atomicIsStreaming()) {
       if (this.reader !== readerAtEntry || this.atomicGetVersion() !== versionAtEntry) {
+        this.supersededStreams++;
+        Logger.debug(TAG, `source.read.superseded generation=${versionAtEntry}`);
         return "superseded";
       }
 
@@ -906,7 +1008,11 @@ export class HttpSource implements SourceAdapter {
     // "superseded" so the caller returns WITHOUT running its reader cleanup
     // (which would cancel the new stream's reader). Only a genuine self/idle
     // stop (reader unchanged) is a real "stopped".
-    if (this.reader !== readerAtEntry) return "superseded";
+    if (this.reader !== readerAtEntry) {
+      this.supersededStreams++;
+      Logger.debug(TAG, `source.read.superseded generation=${versionAtEntry}`);
+      return "superseded";
+    }
     return "stopped";
   }
 
@@ -950,6 +1056,12 @@ export class HttpSource implements SourceAdapter {
     let consecutiveOnlineFetchFailures = 0;
     let consecutiveReadStalls = 0; // watchdog: silent-connection reconnects with no progress
     let streamBaseOffset = startOffset;
+    // Set once a bounded range fetch is rejected with 403 by a server that only
+    // accepts open-ended ranges; from then on this stream requests `bytes=N-`.
+    // (Our streamWindowBytes() / waitForWindowRoom / read-stall watchdog still
+    // bound how much we actually keep — open-ended only changes the Range
+    // header shape, not the window policy.)
+    let useOpenEndedRange = false;
 
     while (this.atomicIsStreaming()) {
       try {
@@ -982,16 +1094,36 @@ export class HttpSource implements SourceAdapter {
           ? Math.min(resumeOffset + maxDownload - 1, this.size - 1)
           : resumeOffset + maxDownload - 1;
 
-        // Fetch with bounded range
-        Logger.debug(TAG, `Fetching range: ${resumeOffset}-${rangeEnd} (max ${(maxDownload / 1024 / 1024).toFixed(1)}MB)`);
+        // Fetch with bounded range (or open-ended after a 403 flip).
+        Logger.debug(TAG, `Fetching range: ${resumeOffset}-${rangeEnd} (max ${(maxDownload / 1024 / 1024).toFixed(1)}MB${useOpenEndedRange ? ", open-ended" : ""})`);
         const response = await fetch(this.url, {
           headers: await this.buildRequestHeaders({
             offset: resumeOffset,
             length: rangeEnd - resumeOffset + 1,
+            openEnded: useOpenEndedRange,
           }),
           cache: 'no-store', // Prevent cached 200 responses
           signal: this.abortController!.signal,
         });
+
+        // Some token/proxy file servers reject a BOUNDED range that starts at
+        // offset 0 (e.g. `bytes=0-1048575`) with 403, yet serve the very same
+        // range OPEN-ENDED (`bytes=0-`) — and any non-zero-offset bounded range
+        // — as 206. (Seen with Telegram/CDN proxy workers whose first-chunk
+        // logic caps a 0-based bounded range.) Retry this stream open-ended; the
+        // read loop still stops at the window (maxDownload / streamWindowBytes)
+        // and cancels, so we never pull the whole file. Only flips once, so if
+        // the open-ended fetch also 403s it falls through to the fatal-4xx path.
+        if (response.status === 403 && !useOpenEndedRange) {
+          useOpenEndedRange = true;
+          this.rangeOpenEndedSwitches++;
+          try { response.body?.cancel(); } catch {}
+          Logger.warn(
+            TAG,
+            `source.range.open-ended status=403 offset=${resumeOffset} boundedEnd=${rangeEnd}`,
+          );
+          continue;
+        }
 
         // Check for 206 Partial Content response
         // If server returns 200, it may be a CDN cache warming issue (e.g. Cloudflare first hit)
@@ -1075,6 +1207,7 @@ export class HttpSource implements SourceAdapter {
           if (chunk === null) {
             // Connection went silent mid-stream (see READ_STALL_TIMEOUT_MS).
             consecutiveReadStalls++;
+            this.readStalls++;
             if (consecutiveReadStalls >= MAX_READ_STALLS) {
               // Repeated zero-progress stalls: the server/link is effectively
               // dead. Drop the background stream; the demuxer's next read-miss
@@ -1244,7 +1377,12 @@ export class HttpSource implements SourceAdapter {
               const corsError = new Error(
                 "Failed to fetch video resource. Check your connection or CORS settings."
               );
-              Logger.error(TAG, `CORS error accessing ${this.url} (${consecutiveOnlineFetchFailures} consecutive failures while online)`);
+              // Never log the source URL: OpenList/object-store URLs commonly
+              // carry access tokens or signatures in their query string.
+              Logger.error(
+                TAG,
+                `CORS-like fetch failure (${consecutiveOnlineFetchFailures} consecutive failures while online)`,
+              );
               this.atomicSetStreaming(false);
               this.streamError = corsError;
               throw corsError;
@@ -1529,15 +1667,13 @@ export class HttpSource implements SourceAdapter {
     const writePos = this.atomicGetWritePos();
     // Decide the oldest byte to keep. Two pulls, take whichever is LOWER so we
     // never drop something in use:
-    //  - lag: the lowest recent read offset — covers a lagging interleaved
-    //    stream or a just-happened backward seek (their bytes must stay).
-    //  - readMax - trail: keep ~half a buffer of history behind the frontier
-    //    for backward seeking when the streams sit close together.
-    // Both rise as playback advances, so keepFrom advances and the window can
-    // always slide forward to feed the frontier — no deadlock on a rewind.
+    //  - lag: the lowest read that is actively waiting for more bytes.
+    //  - readMax - trail: keep half a buffer of history behind the frontier.
+    // Active demand disappears as soon as its read settles, so stale historical
+    // offsets cannot pin the window forever.
     const trail = Math.floor(this.bufferSize / 2);
-    const lag = this.recentReads.length
-      ? Math.min(...this.recentReads)
+    const lag = this.pendingLinearReads.size
+      ? Math.min(...[...this.pendingLinearReads].map((read) => read.offset))
       : this.readMax;
     const keepFrom = Math.max(0, Math.min(lag, this.readMax - trail));
     const shift = Math.min(keepFrom - bufStart, writePos);
@@ -1590,10 +1726,7 @@ export class HttpSource implements SourceAdapter {
     // If we're already past/at EOF, return true (will read 0 bytes)
     if (offset >= needed && this.size > 0 && offset >= this.size) return true;
 
-    const initialVersion =
-      this.useSharedBuffer && this.headerView
-        ? Atomics.load(this.headerView, HEADER.VERSION)
-        : 0;
+    const initialVersion = this.atomicGetVersion();
 
     // Track progress to allow slow but steady streams
     let lastProgress = this.bufferEnd;
@@ -1643,17 +1776,20 @@ export class HttpSource implements SourceAdapter {
       }
 
       // Check if stream was superseded by another startStream call
-      if (this.useSharedBuffer && this.headerView) {
-        if (Atomics.load(this.headerView, HEADER.VERSION) !== initialVersion) {
-          Logger.warn(TAG, `Stream superseded while waiting for ${offset}`);
-          return false;
-        }
+      if (this.atomicGetVersion() !== initialVersion) {
+        Logger.warn(TAG, `Stream superseded while waiting for ${offset}`);
+        return false;
       }
 
+      // Park until the bytes actually land. The timer only bounds how long we
+      // go without re-running the checks above; on the SAB path the writer is
+      // another thread and never calls wakeBufferWaiters, so keep polling
+      // tight there. On the main-thread path the wake is exact, so the timer
+      // can be loose.
       if (this.useSharedBuffer && this.headerView) {
         await new Promise((r) => setTimeout(r, 2));
       } else {
-        await new Promise((r) => setTimeout(r, 10));
+        await this.waitForBufferAdvance(needed, 250);
       }
     }
 
@@ -1719,6 +1855,7 @@ export class HttpSource implements SourceAdapter {
     // (FFmpeg commonly over-reads; readFromBuffer clamps to available data).
     if (this.fullyBuffered && offset >= this.atomicGetBufferStart() && offset < this.bufferEnd) {
       this.consecutiveForceRestarts = 0;
+      this.consumeSeekHintAt(offset);
       Logger.debug(TAG, `Read: served from full-file cache`);
       return this.readFromBuffer(offset, length);
     }
@@ -1745,6 +1882,7 @@ export class HttpSource implements SourceAdapter {
       // Back on the sequential window — a stray one-off read didn't turn into
       // a seek, so forget the streak.
       this.consecutiveOneOffFetches = 0;
+      this.consumeSeekHintAt(offset);
 
       Logger.debug(TAG, `Read: serving from buffer`);
       return this.readFromBuffer(offset, length);
@@ -1755,21 +1893,34 @@ export class HttpSource implements SourceAdapter {
     // single sequential stream to reach them; reads behind the sliding window
     // were discarded (linear mode) and can't be served.
     if (this.rangeUnsupported) {
+      this.clearSeekHint();
       if (offset < this.atomicGetBufferStart()) {
         // Behind the window — only happens on a backward seek / random access
         // in linear mode, which this source can't satisfy.
         throw new Error("Server does not support range requests.");
       }
-      // Linear mode holds at most one bufferSize-wide window. A read whose end
-      // is past (windowStart + bufferSize) can never sit in the window — that's
-      // a far forward seek / moov-at-end on an over-cap file, or a single read
-      // bigger than the buffer. Bail rather than wait forever.
-      if (this.linearMode && offset + length > this.atomicGetBufferStart() + this.bufferSize) {
+      // A request that starts beyond the downloaded frontier is a genuine far
+      // seek on a forward-only origin and can never be fulfilled. A request AT
+      // the frontier is different: it is the normal next sequential read that
+      // tells the writer it may slide the full window and continue.
+      if (
+        this.linearMode &&
+        (length > this.bufferSize || offset > this.bufferEnd)
+      ) {
         throw new Error("Server does not support range requests.");
       }
       if (this.atomicIsStreaming()) {
-        const ok = await this.waitForData(offset, length);
-        if (ok) return this.readFromBuffer(offset, length);
+        // Use a per-read identity rather than Set<number>: two concurrent reads
+        // may legitimately wait at the same offset, and one settling must not
+        // remove the other read's window-protection entry.
+        const pendingRead = { offset };
+        this.pendingLinearReads.add(pendingRead);
+        try {
+          const ok = await this.waitForData(offset, length);
+          if (ok) return this.readFromBuffer(offset, length);
+        } finally {
+          this.pendingLinearReads.delete(pendingRead);
+        }
       }
       if (this.isInBuffer(offset, length)) return this.readFromBuffer(offset, length);
       if (this.streamError) throw this.streamError;
@@ -1805,6 +1956,7 @@ export class HttpSource implements SourceAdapter {
         // Reset force restart counter on successful read
         this.consecutiveForceRestarts = 0;
         this.consecutiveOneOffFetches = 0;
+        this.consumeSeekHintAt(offset);
         return this.readFromBuffer(offset, length);
       }
 
@@ -1861,11 +2013,15 @@ export class HttpSource implements SourceAdapter {
     // streamed files (which never fit) restarted on every such read; dropping
     // that requirement is what fixes the abrupt cancel for big remote files.
     const ONEOFF_RANGE_MAX_BYTES = 15 * 1024 * 1024;
+    const hintedMetadataRead =
+      this.seekHinted && !this.isSeekHintedLanding(offset);
     if (
       !isCoveredByStream &&
       this.atomicIsStreaming() &&
       length <= ONEOFF_RANGE_MAX_BYTES &&
-      this.consecutiveOneOffFetches < this.MAX_ONEOFF_BEFORE_RESTART
+      (hintedMetadataRead ||
+        (!this.seekHinted &&
+          this.consecutiveOneOffFetches < this.MAX_ONEOFF_BEFORE_RESTART))
     ) {
       Logger.info(TAG, `Read: one-off range fetch for offset=${offset}, length=${length} (outside stream window, main stream continues)`);
       try {
@@ -1915,7 +2071,7 @@ export class HttpSource implements SourceAdapter {
           this.consecutiveForceRestarts = 0;
           // Count this one-off; a run of them (a real seek) trips the gate above
           // on the next read and restarts the stream at the new position.
-          this.consecutiveOneOffFetches++;
+          if (!hintedMetadataRead) this.consecutiveOneOffFetches++;
           return result.buffer;
         }
       } catch (e) {
@@ -1936,6 +2092,7 @@ export class HttpSource implements SourceAdapter {
     // The stream is now repositioned at this offset, so the one-off streak is
     // spent — subsequent sequential reads are covered by the fresh stream.
     this.consecutiveOneOffFetches = 0;
+    this.clearSeekHint();
 
     // Don't update maxBufferedEnd on reads - it's updated when streaming writes to buffer
     return this.readFromBuffer(offset, length);
@@ -1952,17 +2109,42 @@ export class HttpSource implements SourceAdapter {
 
     this.position = offset + available;
     if (this.position > this.readMax) this.readMax = this.position;
-    // Track recent read offsets so the linear window knows the lowest byte any
-    // stream still needs (see slideWindow). Bounded ring — ~64 reads ≈ 32MB of
-    // activity, plenty to span the streams + a transient rewind.
-    this.recentReads.push(offset);
-    if (this.recentReads.length > 64) this.recentReads.shift();
     return result.buffer;
   }
 
   seek(offset: number): number {
     this.position = offset;
     return this.position;
+  }
+
+  /** Reposition the primary Range stream on the next out-of-window read. */
+  hintSeek(expectedOffset?: number): void {
+    this.seekHinted = true;
+    this.seekHintOffset = Number.isFinite(expectedOffset)
+      ? Math.max(0, expectedOffset!)
+      : null;
+  }
+
+  private isSeekHintedLanding(offset: number): boolean {
+    if (!this.seekHinted) return false;
+    if (this.seekHintOffset === null) return true;
+    // Byte/time mapping is approximate for VBR media. A 15% file span plus at
+    // least one active window is broad enough for bitrate skew, yet still
+    // separates a normal mid-file landing from an EOF Cues/index probe.
+    const tolerance = Math.max(
+      this.bufferSize,
+      this.size > 0 ? this.size * 0.15 : this.bufferSize * 2,
+    );
+    return Math.abs(offset - this.seekHintOffset) <= tolerance;
+  }
+
+  private consumeSeekHintAt(offset: number): void {
+    if (this.isSeekHintedLanding(offset)) this.clearSeekHint();
+  }
+
+  private clearSeekHint(): void {
+    this.seekHinted = false;
+    this.seekHintOffset = null;
   }
 
   getPosition(): number {
@@ -2054,13 +2236,29 @@ export class HttpSource implements SourceAdapter {
   /**
    * Get network stats for nerd stats overlay
    */
-  getNetworkStats(): { totalBytes: number; currentSpeed: number; elapsed: number } {
+  getNetworkStats(): {
+    totalBytes: number;
+    currentSpeed: number;
+    elapsed: number;
+    streamGeneration: number;
+    rangeOpenEndedSwitches: number;
+    readStalls: number;
+    supersededStreams: number;
+    bufferWaiters: number;
+    lastProgressAt: number;
+  } {
     const timeSinceLastRead = this.lastSpeedTime > 0 ? (Date.now() - this.lastSpeedTime) / 1000 : 0;
     const speed = timeSinceLastRead > 1 ? 0 : this.currentSpeed;
     return {
       totalBytes: this.totalBytesDownloaded,
       currentSpeed: speed,
       elapsed: this.streamStartTime > 0 ? (Date.now() - this.streamStartTime) / 1000 : 0,
+      streamGeneration: this.atomicGetVersion(),
+      rangeOpenEndedSwitches: this.rangeOpenEndedSwitches,
+      readStalls: this.readStalls,
+      supersededStreams: this.supersededStreams,
+      bufferWaiters: this.bufferWaiters.size,
+      lastProgressAt: this.lastProgressAt,
     };
   }
 }

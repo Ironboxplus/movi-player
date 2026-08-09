@@ -34,6 +34,7 @@ import { PlayerStateManager } from "./PlayerState";
 import { Logger, LogLevel } from "../utils/Logger";
 import { MoviVideoDecoder } from "../decode/VideoDecoder";
 import { MoviAudioDecoder } from "../decode/AudioDecoder";
+import type { PCMFrame } from "../decode/SoftwareAudioDecoder";
 import { SubtitleDecoder } from "../decode/SubtitleDecoder";
 import { CanvasRenderer, type VRView } from "../render/CanvasRenderer";
 import { AudioRenderer } from "../render/AudioRenderer";
@@ -103,6 +104,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private mediaInfo: MediaInfo | null = null;
   private fileSize: number = -1; // Cached file size for buffer calculations
   private lastBufferedTime: number = 0;
+  // Media-time anchor of the current network buffering run. It is zero on
+  // load/poster reset and the requested time after a real seek, allowing the
+  // UI to draw the actual buffered interval instead of inventing [0, end].
+  private bufferedRangeStart: number = 0;
 
   /**
    * Enable/disable seek-bar scrub previews on an already-constructed player.
@@ -193,6 +198,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private _audioOnly: boolean = false;
   private muted: boolean = false; // Mute state
   private wasPlayingBeforeRebuffer: boolean = false; // Track if we were playing before entering rebuffering state
+  // Starting playback crosses async browser boundaries (AudioContext/media
+  // element resume). A user play request can race the automatic
+  // buffering->play recovery during that await. Keep the operation
+  // single-flight so a late duplicate cannot observe the first caller's
+  // `playing` state as an invalid transition and pause the shared clock.
+  private playInFlight: Promise<void> | null = null;
   private _stallStartTime: number = 0; // When stall was first detected
   private _bufferingEntryTime: number = 0; // When we entered buffering state
   private _playStartTime: number = 0; // When play() was called — grace period for stall detection
@@ -457,17 +468,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       };
     }
 
-    this.audioDecoder.setOnData((data) => {
-      // WebCodecs / hardware path: AudioData lands here.
-      this.audioRenderer.render(data);
-    });
+    this.audioDecoder.setOnData((data) => this.renderDecodedAudio(data));
 
-    this.audioDecoder.setOnPCM((frame) => {
-      // Software path (FFmpeg/WASM) emits planar Float32 PCM so we avoid
-      // the WebCodecs AudioData constructor — which Firefox on Android
-      // doesn't implement.
-      this.audioRenderer.renderPCM(frame);
-    });
+    this.audioDecoder.setOnPCM((frame) => this.renderDecodedPCM(frame));
 
     this.audioDecoder.setOnError((error) => {
       Logger.error(TAG, "Audio decoder error", error);
@@ -509,13 +512,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         }
       }
 
-      this.audioDecoder.setOnData((data) => {
-        this.audioRenderer.render(data);
-      });
+      this.audioDecoder.setOnData((data) => this.renderDecodedAudio(data));
 
-      this.audioDecoder.setOnPCM((frame) => {
-        this.audioRenderer.renderPCM(frame);
-      });
+      this.audioDecoder.setOnPCM((frame) => this.renderDecodedPCM(frame));
 
       this.audioDecoder.setOnError((error) => {
         Logger.error(TAG, "Audio decoder error", error);
@@ -595,6 +594,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.stateManager.setState("loading");
     this.emit("loadStart", undefined);
     this.lastBufferedTime = 0;
+    this.bufferedRangeStart = 0;
 
     // Drop the previous source's cover art so a soft-reload on the same
     // instance (no destroy) doesn't keep showing stale artwork when the
@@ -822,6 +822,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private async createSource(config: SourceConfig): Promise<SourceAdapter> {
     if (config.type === "file" && config.file) {
       const fs = new FileSource(config.file, this.cache);
+      if (MoviPlayer._isMobileDevice) fs.setFullFilePreload(false);
       fs.setOnRevoked((info) => {
         Logger.error(TAG, `File handle revoked: ${info.reason}`);
         this.emit("filerevoked", info);
@@ -1111,7 +1112,23 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   /**
    * Start playback
    */
-  async play(): Promise<void> {
+  play(): Promise<void> {
+    if (this.playInFlight) return this.playInFlight;
+
+    const operation = this.playInternal();
+    this.playInFlight = operation;
+    operation.then(
+      () => {
+        if (this.playInFlight === operation) this.playInFlight = null;
+      },
+      () => {
+        if (this.playInFlight === operation) this.playInFlight = null;
+      },
+    );
+    return operation;
+  }
+
+  private async playInternal(): Promise<void> {
     if (this.streamWrapper) {
       return this.streamWrapper.play();
     }
@@ -1541,6 +1558,38 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private eofSince = 0;
 
   /**
+   * Keep decoded audio from rewinding the renderer during a seek. FFmpeg seeks
+   * to a point before the requested timestamp and decoder flushes may also
+   * emit an old in-flight frame. Packet-level filtering cannot catch either
+   * case once the packet has entered a decoder, so both output formats are
+   * guarded at the final renderer boundary, mirroring the video-frame guard.
+   */
+  private renderDecodedAudio(data: AudioData): void {
+    if (
+      this.seekTargetTime !== -1 &&
+      data.timestamp / 1_000_000 < this.seekTargetTime
+    ) {
+      try {
+        data.close();
+      } catch {
+        // Already closed by a decoder shutdown race.
+      }
+      return;
+    }
+    this.audioRenderer.render(data);
+  }
+
+  private renderDecodedPCM(frame: PCMFrame): void {
+    if (
+      this.seekTargetTime !== -1 &&
+      frame.timestamp / 1_000_000 < this.seekTargetTime
+    ) {
+      return;
+    }
+    this.audioRenderer.renderPCM(frame);
+  }
+
+  /**
    * Internal handler for seek completion when first target frame is found.
    * Clears the seek flag, synchronizes clock, and transitions to final state.
    */
@@ -1965,7 +2014,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // keeps the lighter 0.1s threshold for responsiveness. NOTE: with our
       // worker audio path the decode is off-thread, so this cushion is usually
       // reached fast — but keeping the gate makes cold starts robust on any tier.
-      const audioTargetS = this._primingAudio ? 2.0 : 0.1;
+      const softwareAudioStall =
+        !this.disableAudio && this.audioDecoder.usesSoftware;
+      const audioTargetS =
+        this._primingAudio || softwareAudioStall ? 2.0 : 0.1;
       const audioReady =
         this.disableAudio ||
         !hasAudioTrack ||
@@ -2046,16 +2098,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // detector from piling on right after.
     const decoderRecovering =
       !!this.videoDecoder && this.videoDecoder.isRecentlyRecovering();
-    if (this.stateManager.getState() === "playing" && !this.eofReached && !this.waitingForVideoSync && !nearEnd && !this.isBackgrounded && !inPlayGrace && !decoderRecovering) {
+    if (this.stateManager.getState() === "playing" && !this.eofReached && !this.waitingForVideoSync && !nearEnd && !this.isBackgrounded && !inPlayGrace) {
       const videoEmpty = this.videoRenderer ? this.videoRenderer.getQueueSize() === 0 : false;
       const hasAudio = !!this.trackManager.getActiveAudioTrack() && !this.disableAudio;
       const audioLow = !hasAudio || this.audioRenderer.getBufferedDuration() < 0.05;
-      if (videoEmpty && audioLow) {
+      const audioUnderrunning =
+        hasAudio && this.audioRenderer.isUnderrunning();
+      if ((videoEmpty && audioLow && !decoderRecovering) || audioUnderrunning) {
+        const effectiveStallTimeout =
+          audioUnderrunning && !videoEmpty ? 200 : stallTimeout;
         if (!this._stallStartTime) {
           this._stallStartTime = performance.now();
-        } else if (performance.now() - this._stallStartTime > stallTimeout) {
-          // Only enter buffering after 500ms of continuous stall
-          Logger.warn(TAG, "Stall detected: buffers empty for 500ms, entering buffering state");
+        } else if (performance.now() - this._stallStartTime > effectiveStallTimeout) {
+          Logger.warn(
+            TAG,
+            audioUnderrunning
+              ? "Stall detected: sustained audio underrun, entering buffering state"
+              : "Stall detected: buffers empty, entering buffering state",
+          );
           this.wasPlayingBeforeRebuffer = true;
           this._bufferingEntryTime = performance.now();
           this.stateManager.setState("buffering");
@@ -2429,6 +2489,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
       if (isPostSeek) {
         burstSize = 5 * fpsScale;
+        // The cap counts container packets, not decoded samples. Dense audio
+        // codecs such as TrueHD/DTS can carry only a fraction of a millisecond
+        // per packet, so five interleaved packets cannot rebuild a realtime
+        // audio cushion. Temporarily use the normal dense-interleave burst
+        // until one second is buffered; the outer queue limits remain the
+        // backpressure boundary.
+        const hasMuxedAudio =
+          !this.disableAudio && !!this.trackManager.getActiveAudioTrack();
+        if (hasMuxedAudio && audioBuffered < 1.0) {
+          burstSize = 160 * fpsScale;
+        }
         Logger.debug(
           TAG,
           `Post-seek throttling: using burst size ${burstSize}`,
@@ -3050,6 +3121,21 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
       if (this.seekSessionId !== mySessionId) return; // Superceded
 
+      // Declare the next landing read as a seek before FFmpeg touches the
+      // source. Stateful HTTP sources can then replace the abandoned primary
+      // stream immediately instead of spending the first reads on one-off
+      // metadata requests while the old position still consumes bandwidth.
+      let expectedSeekOffset: number | undefined;
+      const mediaSpan = (this.mediaInfo?.duration ?? 0) + this.startTime;
+      if (this.fileSize > 0 && mediaSpan > 0) {
+        const ratio = Math.max(
+          0,
+          Math.min(1, (seconds + this.startTime) / mediaSpan),
+        );
+        expectedSeekOffset = Math.round(this.fileSize * ratio);
+      }
+      this.source?.hintSeek?.(expectedSeekOffset);
+
       // Seek relative to start time (time 0 in UI = startTime in media)
       const seekStreamIndex = this.getSeekStreamIndex();
       Logger.info(
@@ -3069,8 +3155,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.eofSince = 0;
 
       // Buffered region restarts from the new position; drop the
-      // monotonic clamp so the bar can shrink to reflect the new range.
+      // monotonic clamp and anchor the visible range at the seek target.
       this.lastBufferedTime = 0;
+      this.bufferedRangeStart = seconds;
 
       // Mark that we need to skip to keyframe after seek
       // This prevents decoder errors from non-keyframe packets after seek
@@ -4052,6 +4139,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // time; reset it (as a real seek does) so the buffer bar starts from 0
     // instead of showing a false prebuffer at the poster timestamp.
     this.lastBufferedTime = 0;
+    this.bufferedRangeStart = 0;
     this.emit("timeUpdate", this.getCurrentTime()); // snap seek bar to 00:00
   }
 
@@ -5229,7 +5317,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
 
     // Playback
-    stats["Playback State"] = this.stateManager.getState();
+    const playbackState = this.stateManager.getState();
+    const clockRunning = this.clock.isPlaying();
+    stats["Playback State"] = playbackState;
+    stats["Master Clock"] = clockRunning ? "Running" : "Stopped";
+    stats["Playback Invariant"] =
+      playbackState === "playing" && !clockRunning ? "VIOLATION" : "OK";
     stats["Playback Rate"] = `${this.clock.getPlaybackRate()}x`;
     stats["A/V Sync"] = this.clock.isSyncedToAudio() ? "Audio Master" : "Wall Clock";
     stats["Stable Volume"] = this.audioRenderer.getStableAudio() ? "On" : "Off";
@@ -5240,8 +5333,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Buffers
     stats["Audio Buffer"] = `${audioBuffered.toFixed(2)}s`;
     stats["Audio Buffered Seconds"] = Number(audioBuffered.toFixed(3));
-    stats["Audio Underrun Risk"] = audioBuffered < 0.1 ? "High" :
-      audioBuffered < 0.5 ? "Medium" : "Low";
+    const audioUnderrunning = this.audioRenderer.isUnderrunning();
+    stats["Audio Underrunning"] = audioUnderrunning ? "Yes" : "No";
+    stats["Audio Underrun Risk"] = audioUnderrunning || audioBuffered < 0.1
+      ? "High"
+      : audioBuffered < 0.5
+        ? "Medium"
+        : "Low";
     stats["Video Queue"] = `${rendererStats?.frameQueueSize ?? 0} frames`;
     stats["Frames Rendered"] = rendererStats?.framesPresented ?? 0;
     stats["Video Decoder Queue"] = videoDecoderStats.queueSize;
@@ -6029,6 +6127,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * Get buffer start time in seconds (for HttpSource)
    * Converts buffer start bytes to time position using current read position as reference
    */
+  getBufferedRangeStart(): number {
+    return this.bufferedRangeStart;
+  }
+
   getBufferStartTime(): number {
     if (
       !this.mediaInfo ||

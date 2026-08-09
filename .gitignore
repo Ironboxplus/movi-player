@@ -11,6 +11,11 @@ docs/.vitepress/dist/
 .dev.vars
 .dev.vars.*
 .playwright-mcp/
+.blackbox-results/
+.debug-pw/
+.omc/
+coverage/
+package-artifacts/
 
 chrome-extension/screenshots/
 test-media/

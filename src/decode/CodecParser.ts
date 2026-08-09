@@ -260,6 +260,35 @@ export class CodecParser {
 
     const toHex = (n: number) => n.toString(16).padStart(2, "0");
 
+    // Some MKV/REMUX extradata carries a structurally valid avcC record whose
+    // summary bytes are all zero even though the embedded SPS is valid. Using
+    // those zeros produces `avc1.000000`, which WebCodecs correctly rejects;
+    // the player then falls all the way to FFmpeg WASM for an ordinary H.264
+    // stream. Recover profile/compatibility/level from the first SPS NAL:
+    //   NAL header (type 7), profile_idc, constraint flags, level_idc.
+    if (profile === 0 && profileCompat === 0 && level === 0) {
+      // Standard avcC layout: byte 5 holds numOfSequenceParameterSets, then
+      // each SPS is prefixed by a big-endian uint16 length.
+      if (data.length >= 9 && data[0] === 1) {
+        const spsCount = data[5] & 0x1f;
+        let offset = 6;
+        for (let index = 0; index < spsCount && offset + 2 <= data.length; index++) {
+          const size = (data[offset] << 8) | data[offset + 1];
+          offset += 2;
+          if (size >= 4 && offset + size <= data.length) {
+            const nalType = data[offset] & 0x1f;
+            if (nalType === 7) {
+              return `avc1.${toHex(data[offset + 1])}${toHex(data[offset + 2])}${toHex(data[offset + 3])}`;
+            }
+          }
+          offset += size;
+        }
+      }
+
+      Logger.warn(TAG, "H.264 avcC summary and SPS profile bytes are unavailable");
+      return null;
+    }
+
     return `avc1.${toHex(profile)}${toHex(profileCompat)}${toHex(level)}`;
   }
 

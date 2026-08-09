@@ -42,6 +42,8 @@ export class AudioRenderer {
   private firstBufferScheduledAt: number = 0;
   private firstBufferMediaTime: number = 0;
   private hasFirstBuffer: boolean = false;
+  private lastUnderrunAt: number = 0;
+  private underrunDucked: boolean = false;
   private currentMediaTime: number = 0;
   private maxScheduledMediaTime: number = 0; // Track the furthest media time we've scheduled
 
@@ -75,6 +77,9 @@ export class AudioRenderer {
   private static readonly PCM_COALESCE_MIN_DURATION = 0.02; // 20ms
   private static readonly PCM_COALESCE_MAX_DELAY_MS = 25;
   private static readonly PCM_COALESCE_GAP_TOLERANCE_US = 20000;
+  private static readonly UNDERRUN_DUCK_OUT_SECONDS = 0.01;
+  private static readonly UNDERRUN_DUCK_IN_SECONDS = 0.04;
+  private static readonly UNDERRUN_CLEAR_MS = 300;
 
   // Stable audio: AudioContext state monitoring & auto-recovery
   private contextStateHandler: (() => void) | null = null;
@@ -642,6 +647,10 @@ export class AudioRenderer {
 
     // Detect buffer underrun
     if (this.scheduledTime < now) {
+      if (this.hasFirstBuffer) {
+        this.lastUnderrunAt = performance.now();
+        this.duckForUnderrun();
+      }
       // Stable audio: fill the gap with a short silence buffer to prevent pops
       if (this._stableAudio && this.hasFirstBuffer && this.audioContext) {
         const gapDuration = now - this.scheduledTime;
@@ -673,6 +682,8 @@ export class AudioRenderer {
         this.firstBufferMediaTime = audioTime;
       }
     }
+
+    this.releaseUnderrunDuckIfClean();
 
     // Calculate expected playback time based on timestamp
     let targetScheduleTime = this.scheduledTime;
@@ -1315,6 +1326,18 @@ export class AudioRenderer {
     this.activeSources = [];
     this.scheduledTime = this.audioContext?.currentTime ?? 0;
 
+    this.underrunDucked = false;
+    this.lastUnderrunAt = 0;
+    if (this.inputNode && this.audioContext) {
+      try {
+        const now = this.audioContext.currentTime;
+        this.inputNode.gain.cancelScheduledValues(now);
+        this.inputNode.gain.setValueAtTime(1, now);
+      } catch {
+        // The context may be closing during teardown.
+      }
+    }
+
     // Reset clock tracking
     this.hasFirstBuffer = false;
     this.firstBufferScheduledAt = 0;
@@ -1480,6 +1503,55 @@ export class AudioRenderer {
   getBufferedDuration(): number {
     if (!this.audioContext) return 0;
     return Math.max(0, this.scheduledTime - this.audioContext.currentTime);
+  }
+
+  /** True while decoded audio has recently arrived too late for its slot. */
+  isUnderrunning(withinMs: number = 500): boolean {
+    return (
+      this.lastUnderrunAt > 0 &&
+      performance.now() - this.lastUnderrunAt < withinMs
+    );
+  }
+
+  private duckForUnderrun(): void {
+    if (this.underrunDucked || !this.inputNode || !this.audioContext) return;
+    this.underrunDucked = true;
+    try {
+      const now = this.audioContext.currentTime;
+      const gain = this.inputNode.gain;
+      gain.cancelScheduledValues(now);
+      gain.setValueAtTime(gain.value, now);
+      gain.linearRampToValueAtTime(
+        0,
+        now + AudioRenderer.UNDERRUN_DUCK_OUT_SECONDS,
+      );
+    } catch {
+      // Ignore a context shutdown race.
+    }
+  }
+
+  private releaseUnderrunDuckIfClean(): void {
+    if (
+      !this.underrunDucked ||
+      !this.inputNode ||
+      !this.audioContext ||
+      this.isUnderrunning(AudioRenderer.UNDERRUN_CLEAR_MS)
+    ) {
+      return;
+    }
+    this.underrunDucked = false;
+    try {
+      const now = this.audioContext.currentTime;
+      const gain = this.inputNode.gain;
+      gain.cancelScheduledValues(now);
+      gain.setValueAtTime(gain.value, now);
+      gain.linearRampToValueAtTime(
+        1,
+        now + AudioRenderer.UNDERRUN_DUCK_IN_SECONDS,
+      );
+    } catch {
+      // Ignore a context shutdown race.
+    }
   }
 
   /**

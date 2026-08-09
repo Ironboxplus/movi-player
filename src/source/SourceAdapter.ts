@@ -27,6 +27,13 @@ export interface SourceAdapter {
   seek(offset: number): number;
 
   /**
+   * Optional intent signal for stateful streaming sources. A player calls this
+   * immediately before a media seek so the source can reposition its primary
+   * stream on the first landing read instead of mistaking it for metadata.
+   */
+  hintSeek?(expectedOffset?: number): void;
+
+  /**
    * Get the current read position
    */
   getPosition(): number;

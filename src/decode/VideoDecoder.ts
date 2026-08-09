@@ -354,11 +354,32 @@ export class MoviVideoDecoder {
 
         if (manualCodec && manualCodec !== codecString) {
           Logger.info(TAG, `Retrying with manual codec string: ${manualCodec}`);
-          const manualConfig = { ...config, codec: manualCodec };
+          let manualConfig = { ...config, codec: manualCodec };
           if (manualConfig.colorSpace) delete manualConfig.colorSpace; // Also strip color for fallback
 
-          const manualSupport =
-            await VideoDecoder.isConfigSupported(manualConfig);
+          let manualSupport = await VideoDecoder.isConfigSupported(manualConfig);
+
+          // The parser-derived codec may be malformed while the manual codec
+          // is valid. Repeat the same hardware→no-preference fallback used for
+          // the primary config; otherwise a browser with WebCodecs but without
+          // an exposed hardware backend incorrectly falls through to FFmpeg
+          // WASM even though its native decoder supports the stream.
+          if (
+            !manualSupport.supported &&
+            manualConfig.hardwareAcceleration === "prefer-hardware"
+          ) {
+            const manualNoHw = { ...manualConfig };
+            delete manualNoHw.hardwareAcceleration;
+            const supportNoHw = await VideoDecoder.isConfigSupported(manualNoHw);
+            if (supportNoHw.supported) {
+              Logger.info(
+                TAG,
+                `Manual codec ${manualCodec} supported with no-preference WebCodecs`,
+              );
+              manualConfig = manualNoHw;
+              manualSupport = supportNoHw;
+            }
+          }
 
           if (manualSupport.supported) {
             Logger.info(
@@ -366,6 +387,9 @@ export class MoviVideoDecoder {
               `Manual codec string IS supported. Using ${manualCodec} instead of ${codecString}`,
             );
             config.codec = manualCodec;
+            if (manualConfig.hardwareAcceleration === undefined) {
+              delete config.hardwareAcceleration;
+            }
             if (config.colorSpace) delete config.colorSpace;
             codecString = manualCodec;
             support = manualSupport;
@@ -1538,7 +1562,9 @@ export class MoviVideoDecoder {
         ? worker
           ? "Software (FFmpeg Worker)"
           : "Software (FFmpeg)"
-        : "Hardware (WebCodecs)",
+        : this.lastConfig?.hardwareAcceleration === "prefer-hardware"
+          ? "WebCodecs (hardware-preferred)"
+          : "WebCodecs (no-preference)",
       queueSize: this.queueSize,
       errorCount: this.errorCount,
       worker,

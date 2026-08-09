@@ -487,22 +487,24 @@ export class ThumbnailRenderer {
     // Build codec string first (outside Promise)
     let codecString: string | null = null;
 
-    if (profile !== undefined) {
+    // Container extradata is authoritative. The generic profile mapper uses a
+    // conservative level (for H.264, avc1.640028), which can disagree with the
+    // real SPS (e.g. avc1.640029) and make a supported thumbnail decoder fail
+    // configuration. Match the main decoder: parse first, map only as fallback.
+    codecString = CodecParser.getCodecString(
+      codec,
+      extradata ?? undefined,
+      width,
+      height,
+    );
+
+    if (!codecString && profile !== undefined) {
       codecString = this.mapCodecToWebCodecs(
         codec,
         width,
         height,
         profile,
         level,
-      );
-    }
-
-    if (!codecString) {
-      codecString = CodecParser.getCodecString(
-        codec,
-        extradata ?? undefined,
-        width,
-        height,
       );
     }
 
@@ -517,19 +519,36 @@ export class ThumbnailRenderer {
       Logger.debug(TAG, "Resolved codec string:", codecString);
     }
 
-    // Check if codec is supported before creating decoder
+    let hardwareAcceleration: NonNullable<
+      VideoDecoderConfig["hardwareAcceleration"]
+    > = "prefer-hardware";
+    // Check if codec is supported before creating decoder. A headless/Linux
+    // browser may expose WebCodecs without a hardware backend; its generic
+    // no-preference path is still much cheaper than spinning up a second
+    // FFmpeg/WASM preview decoder, so mirror the main decoder's fallback.
     try {
       const checkConfig: VideoDecoderConfig = {
         codec: codecString,
         codedWidth: width,
         codedHeight: height,
-        hardwareAcceleration: "prefer-hardware",
+        hardwareAcceleration,
       };
 
-      const support = await VideoDecoder.isConfigSupported(checkConfig);
+      let support = await VideoDecoder.isConfigSupported(checkConfig);
       if (!support.supported) {
-        Logger.warn(TAG, `Codec not supported by WebCodecs: ${codecString}`);
-        return false;
+        hardwareAcceleration = "no-preference";
+        support = await VideoDecoder.isConfigSupported({
+          ...checkConfig,
+          hardwareAcceleration,
+        });
+        if (!support.supported) {
+          Logger.warn(TAG, `Codec not supported by WebCodecs: ${codecString}`);
+          return false;
+        }
+        Logger.info(
+          TAG,
+          `Hardware thumbnail decode unavailable for ${codecString}; using no-preference`,
+        );
       }
     } catch (e) {
       Logger.warn(TAG, `Failed to check codec support: ${codecString}`, e);
@@ -564,7 +583,7 @@ export class ThumbnailRenderer {
           codec: finalCodecString,
           codedWidth: width,
           codedHeight: height,
-          hardwareAcceleration: "prefer-hardware",
+          hardwareAcceleration,
           optimizeForLatency: true,
         };
 

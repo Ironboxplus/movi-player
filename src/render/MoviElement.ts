@@ -6495,6 +6495,9 @@ export class MoviElement extends HTMLElement {
   // identical across quality variants, but the new player's mediaInfo
   // isn't populated until the demuxer opens.
   private _switchResumeDuration: number = 0;
+  // Owned by the active quality switch. Cancelling the previous timer avoids
+  // an older switch clearing a newer switch's frozen-frame cover mid-resume.
+  private _switchPosterTimeout: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * Swap the active video source and resume playback at the same position.
@@ -6523,6 +6526,11 @@ export class MoviElement extends HTMLElement {
     // overlay (which would flash the thumbnail in over the last video frame).
     this._qualitySwitchInProgress = true;
     this._switchResumeTime = resumeTime;
+    // The direct restore seek below can race the replacement player while it
+    // is still loading, where seeking is intentionally rejected. Preserve the
+    // resume target through the element's existing seek-when-ready channel so
+    // a quality switch cannot intermittently restart at zero.
+    if (resumeTime > 0) this._pendingSeek = resumeTime;
     try {
       this._switchResumeDuration = this.player ? (this.player as any).getDuration?.() || 0 : 0;
     } catch {
@@ -6547,7 +6555,9 @@ export class MoviElement extends HTMLElement {
     // Safety net: if the new player never reaches "playing" (e.g. autoplay
     // blocked AND user never resumes), make sure we don't leave the poster
     // permanently suppressed.
-    setTimeout(() => {
+    if (this._switchPosterTimeout) clearTimeout(this._switchPosterTimeout);
+    this._switchPosterTimeout = setTimeout(() => {
+      this._switchPosterTimeout = null;
       if (this._qualitySwitchInProgress) {
         this._qualitySwitchInProgress = false;
         this._switchResumeTime = 0;
@@ -6560,6 +6570,13 @@ export class MoviElement extends HTMLElement {
     // Setting the attribute funnels through the existing observedAttributes
     // path which destroys the player and reinitialises with the new src.
     this._suppressSwReload = true;
+    // A different rendition may use a hardware-decodable codec/profile. Never
+    // carry a per-source forced-software decision across the quality boundary.
+    if (this._swForcedForCurrentSource) {
+      this._swForcedForCurrentSource = false;
+      this._sw = "auto";
+      if (this.hasAttribute("sw")) this.removeAttribute("sw");
+    }
     this.setAttribute("src", newSrc);
 
     let restored = false;
@@ -16221,21 +16238,8 @@ export class MoviElement extends HTMLElement {
       // Update loading indicator after load
       this.updateLoadingIndicator();
 
-      // Mobile 4K+ FileSource: hold the spinner and defer play() until the
-      // initial preload settles. Reads height from the active video track.
-      if (this.player) {
-        const activeVideoTrack = (this.player as any)?.trackManager?.getActiveVideoTrack?.();
-        const videoHeight = activeVideoTrack?.height ?? 0;
-        if (
-          MoviPlayer.isMobileDevice() &&
-          videoHeight >= 2160 &&
-          this.player.isFileSource() &&
-          !this.player.isFileSourcePreloadComplete()
-        ) {
-          this._preloadGateActive = true;
-          this.updateLoadingIndicator();
-        }
-      }
+      // Mobile FileSource now uses bounded read-ahead instead of eager
+      // whole-file preload, so playback never waits behind a 4K preload gate.
 
       // Auto-play if requested
       // Seek to initial position if set
@@ -16484,15 +16488,27 @@ export class MoviElement extends HTMLElement {
       }
       // Hide poster on state change to playing
       if (state === "playing" && this.posterElement) {
-        // Drop the frozen-frame snapshot overlay used during quality switch
-        // so the live canvas underneath is visible again.
+        // Keep the switch cover until the deferred resume seek has actually
+        // moved the replacement player. Its initial autoplay may briefly enter
+        // playing at zero before _pendingSeek is applied.
         if (this._qualitySwitchInProgress) {
-          this._hideSnapshotPoster();
-          this._qualitySwitchInProgress = false;
-          this._switchResumeTime = 0;
-          this._switchResumeDuration = 0;
+          const at = this.player?.getCurrentTime?.() ?? 0;
+          const resumed =
+            this._switchResumeTime <= 0 || at >= this._switchResumeTime - 1;
+          if (resumed) {
+            if (this._switchPosterTimeout) {
+              clearTimeout(this._switchPosterTimeout);
+              this._switchPosterTimeout = null;
+            }
+            this._hideSnapshotPoster();
+            this._qualitySwitchInProgress = false;
+            this._switchResumeTime = 0;
+            this._switchResumeDuration = 0;
+            this.posterElement.style.display = "none";
+          }
+        } else {
+          this.posterElement.style.display = "none";
         }
-        this.posterElement.style.display = "none";
       }
 
       this.dispatchEvent(new CustomEvent("statechange", { detail: state }));
@@ -17695,12 +17711,9 @@ export class MoviElement extends HTMLElement {
         progressHandle.style.left = `${percent}%`;
       }
 
-      // Buffer draws from 0 to bufferEnd; the filled bar overlays it on top
-      // so the buffer's left rounded edge is hidden beneath the played
-      // portion. Only the trailing (right) rounded edge is visible, which
-      // sits cleanly against the filled bar without a radius-on-radius
-      // notch. bufferEnd math is already correct (relative to real read
-      // cursor), so drawing from 0 is purely a visual choice.
+      // Draw the real buffered interval. After a remote seek the network run
+      // begins at the landing time, so painting [0, end] falsely claims all
+      // earlier media is cached.
       if (this.player && progressBuffer) {
         // During the postertime poster seek the buffered-end transiently sits
         // at the poster timestamp (before the clock/buffer are reset to 0);
@@ -17709,14 +17722,11 @@ export class MoviElement extends HTMLElement {
           ? 0
           : this.player.getBufferEndTime();
         if (bufferEnd > 0) {
-          // In linear mode the RAM window has a moving start (older bytes are
-          // dropped), so draw the buffer bar as [bufferStart, bufferEnd] — the
-          // actual window of bytes held in memory. (Seeks clamp to a slightly
-          // inset seekableStart, but showing the true window reads better — no
-          // gap between the playhead and the buffered segment.) Otherwise from 0.
+          // Linear playback uses the actual moving RAM window. Seekable Range
+          // playback uses the media-time anchor recorded by MoviPlayer.
           const bufferStart = this._linearMode
             ? Math.max(0, this.player.getBufferStartTime?.() ?? 0)
-            : 0;
+            : Math.max(0, this.player.getBufferedRangeStart?.() ?? 0);
           const startPercent = Math.min(100, (bufferStart / this.duration) * 100);
           const endPercent = Math.min(100, (bufferEnd / this.duration) * 100);
           progressBuffer.style.left = `${startPercent}%`;
@@ -18009,12 +18019,30 @@ export class MoviElement extends HTMLElement {
       this.brokenIndicator.style.display = "none";
     }
 
+    // Decoder fallback may already have completed inside MoviPlayer. Rebuilding
+    // the same software path here is redundant and can tear down a demuxer
+    // while a seek/read is still resolving. Accept and resume the live player.
+    if (
+      this.player?.isSoftwareDecoding?.() &&
+      this.player.getState?.() !== "error"
+    ) {
+      Logger.info(TAG, "Already software-decoding — accepting without reinit");
+      try {
+        await this.player.play?.();
+      } catch {
+        // The normal UI play gesture can retry if autoplay is blocked.
+      }
+      return;
+    }
+
     // Set sw attribute to enable software decoding for THIS source. The
     // flag is cleared on dispose so the next source isn't forced into
     // software just because the previous one had to fall back.
     this._sw = "software";
     this._swForcedForCurrentSource = true;
+    this._suppressSwReload = true;
     this.setAttribute("sw", "");
+    this._suppressSwReload = false;
 
     // Get current source
     const currentSrc = this._src;
