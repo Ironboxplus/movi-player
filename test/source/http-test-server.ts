@@ -33,6 +33,24 @@ export interface HttpFixtureOptions {
   responseChunkDelayMs?: number;
   /** Delay before the first response-body byte, after headers are flushed. */
   responseInitialDelayMs?: number;
+  /**
+   * Cut the connection after writing this many body bytes — a real truncated
+   * response, the way a proxy timing out mid-transfer behaves. The client sees
+   * headers and some bytes, then the socket dies.
+   */
+  abortBodyAfterBytes?: number;
+  /**
+   * Limit `abortBodyAfterBytes` to the first N GETs; later ones are served in
+   * full. Lets a test exercise the retry path and then let it succeed.
+   */
+  abortBodyForFirstGets?: number;
+  /**
+   * Statuses to return for successive GETs before serving normally, e.g.
+   * [503] for "one transient server error, then fine".
+   */
+  getFailStatuses?: number[];
+  /** Answer an unsatisfiable Range (start >= size) with a real 416. */
+  strict416?: boolean;
 }
 
 export interface HttpFixture {
@@ -67,9 +85,25 @@ export async function startHttpFixture(
   const rangePolicy = options.rangePolicy ?? "normal";
   const requests: HttpFixture["requests"] = [];
 
-  const sendBody = (res: http.ServerResponse, payload: Buffer): void => {
+  let getCount = 0;
+
+  const sendBody = (
+    res: http.ServerResponse,
+    payload: Buffer,
+    abortAfter?: number,
+  ): void => {
     const chunkBytes = options.responseChunkBytes ?? payload.length;
     const delayMs = options.responseChunkDelayMs ?? 0;
+
+    if (abortAfter !== undefined && abortAfter < payload.length) {
+      // Headers promised more than we send, then the socket dies: undici
+      // surfaces this to the reader as a real terminated-stream error.
+      res.flushHeaders();
+      res.write(payload.subarray(0, abortAfter));
+      setTimeout(() => res.socket?.destroy(), 10);
+      return;
+    }
+
     const writePayload = () => {
       if (res.destroyed || res.writableEnded) return;
       if (delayMs <= 0 || chunkBytes >= payload.length) {
@@ -138,7 +172,34 @@ export async function startHttpFixture(
       return;
     }
 
+    getCount++;
+    const failStatus = options.getFailStatuses?.[getCount - 1];
+    if (failStatus) {
+      res.writeHead(failStatus, { "Content-Type": "text/plain" });
+      res.end("injected failure");
+      requests.push({ method, range: rangeHeader, status: failStatus });
+      return;
+    }
+    const abortAfter =
+      options.abortBodyAfterBytes !== undefined &&
+      (options.abortBodyForFirstGets === undefined ||
+        getCount <= options.abortBodyForFirstGets)
+        ? options.abortBodyAfterBytes
+        : undefined;
+
     const parsed = parseRange(rangeHeader, size);
+
+    if (options.strict416 && rangeHeader && !parsed) {
+      // Only a start beyond EOF is unsatisfiable here; a malformed header would
+      // have been ignored by a real server rather than refused.
+      const startOnly = /^bytes=(\d+)-/i.exec(rangeHeader.trim());
+      if (startOnly && parseInt(startOnly[1], 10) >= size) {
+        res.writeHead(416, { "Content-Range": `bytes */${size}` });
+        res.end();
+        requests.push({ method, range: rangeHeader, status: 416 });
+        return;
+      }
+    }
 
     if (parsed) {
       if (rangePolicy === "all-forbidden") {
@@ -179,7 +240,7 @@ export async function startHttpFixture(
             ? { "Content-Disposition": options.contentDisposition }
             : {}),
         });
-        sendBody(res, slice);
+        sendBody(res, slice, abortAfter);
         requests.push({ method, range: rangeHeader, status: 206 });
         return;
       }
@@ -195,7 +256,7 @@ export async function startHttpFixture(
         ? { "Content-Disposition": options.contentDisposition }
         : {}),
     });
-    sendBody(res, body);
+    sendBody(res, body, abortAfter);
     requests.push({ method, range: rangeHeader, status: 200 });
   });
   const sockets = new Set<Socket>();

@@ -38,12 +38,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+// The first `await import` here pulls in the whole MoviPlayer module graph,
+// which after the 0.4.0 merge is large enough to exceed the 5s default on a
+// cold transform — and does so reliably under `--coverage`, whose V8
+// instrumentation runs over every module regardless of the report filter. The
+// assertions themselves are instant; this is import cost, not a hang. Same
+// allowance the other MoviPlayer-importing suites already make.
 describe("software video Worker scheduling policy", () => {
   it("does not classify Worker video decode as main-thread software work", async () => {
     expect((await makePlayer(true)).isMainThreadSoftwareDecoding()).toBe(false);
-  });
+  }, 20_000);
 
   it("still classifies the legacy software video decoder as main-thread work", async () => {
     expect((await makePlayer(false)).isMainThreadSoftwareDecoding()).toBe(true);
-  });
+  }, 20_000);
 });
