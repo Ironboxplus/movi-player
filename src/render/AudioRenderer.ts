@@ -1217,8 +1217,10 @@ export class AudioRenderer {
     // Reset last decode time to prevent false unhealthy buffer detection after long pause
     this.lastDecodeTime = performance.now();
 
-    // isPlaying / intentionalSuspend already set synchronously at the top of
-    // play() so no decoded frames are dropped during the async resume window.
+    // isPlaying is already set synchronously at the top of play() so no decoded
+    // frames are dropped during the async resume window. (The fork's companion
+    // `intentionalSuspend` flag is gone — isDroppingAudio() answers the same
+    // question, and answers it for the browser's own suspends too.)
 
     // NOTE: We do NOT reset scheduledTime or sync anchors here.
     // If we are resuming from pause (suspend), the buffer is preserved
