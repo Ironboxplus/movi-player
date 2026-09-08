@@ -86,15 +86,25 @@ function assertInterfaceCovers(attrs) {
   }
 }
 
-/** The body of the `#### \`attr\`` section, stopping at the next `---` rule. */
+/**
+ * The body of the `#### \`attr\`` section, stopping at the next `---` rule OR at
+ * the next heading of the same level or higher — whichever comes first.
+ *
+ * Stopping only at `---` assumed every attribute section ends with a rule. Not
+ * all of them do, and a section that ran on swallowed the following ones,
+ * including THEIR "**Values:**" lists: every attribute from `src` down was typed
+ * `"canvas"` (the renderer's first value), so editors offered `src="canvas"`.
+ */
 function docSection(doc, attr) {
   const esc = attr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const heading =
-    new RegExp(`^#{2,5}\\s+\`${esc}\`(?:\\s*/\\s*\`[a-z0-9-]+\`)?\\s*$`, "m").exec(doc) ??
-    new RegExp(`^#{2,5}\\s+\`[a-z0-9-]+\`\\s*/\\s*\`${esc}\`\\s*$`, "m").exec(doc);
+    new RegExp(`^(#{2,5})\\s+\`${esc}\`(?:\\s*/\\s*\`[a-z0-9-]+\`)?\\s*$`, "m").exec(doc) ??
+    new RegExp(`^(#{2,5})\\s+\`[a-z0-9-]+\`\\s*/\\s*\`${esc}\`\\s*$`, "m").exec(doc);
   if (!heading) return null;
-  const body = doc.slice(heading.index + heading[0].length);
-  return body.split(/\n---\n/)[0];
+  const body = doc.slice(heading.index + heading[0].length).split(/\n---\n/)[0];
+  // Deeper headings belong to this attribute; same-or-higher ones start the next.
+  const next = new RegExp(`^#{1,${heading[1].length}}\\s`, "m").exec(body);
+  return next ? body.slice(0, next.index) : body;
 }
 
 /** First real prose line — skips fences, bold labels, admonitions, tables. */
