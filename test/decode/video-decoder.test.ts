@@ -136,6 +136,82 @@ describe("MoviVideoDecoder software fallback", () => {
 });
 
 // ---------------------------------------------------------------------------
+// V1: WHY the CPU is decoding, not just THAT it is.
+//
+// The fork's element used to raise the blocking "Try Software Decoding" overlay
+// whenever isSoftwareDecoding() was true, and carried a hand-rolled branch to
+// suppress it again after an automatic fallback had already succeeded (the
+// `automatic-software-fallback-source` test guarded that branch). Upstream
+// replaces the suppression with a reason: only "hardware-refused" is a trade
+// the viewer can weigh, because only there is there a hardware path to go back
+// to. "unmapped" (Motion JPEG in an AVI, MPEG-2) has no hardware path at all,
+// so prompting dead-ends a file that was already decoding.
+//
+// The element's gate is therefore only as good as this reason, and nothing
+// covered it. Both cases run the real MoviVideoDecoder.configure(); the only
+// stand-ins are WebCodecs itself (genuinely unreachable in node — see the
+// window stub) and WasmBindings, whose calls are the assertions.
+// ---------------------------------------------------------------------------
+describe("merge: software fallback reports why the CPU is decoding", () => {
+  it('reports "unmapped" when WebCodecs has no codec string for the track', async () => {
+    // WebCodecs present and willing — the codec is simply not one it knows.
+    vi.stubGlobal("window", { VideoDecoder: class {} });
+    const bindings = {
+      enableDecoder: vi.fn(() => 0),
+      setSkipFrame: vi.fn(),
+    } as unknown as WasmBindings;
+    const decoder = new MoviVideoDecoder();
+    decoder.setBindings(bindings);
+
+    await expect(decoder.configure(mpeg2Track)).resolves.toBe(true);
+
+    expect(decoder.isSoftware).toBe(true);
+    // Not "hardware-refused": there is no hardware path for MPEG-2 here, so the
+    // element must fall through to normal init rather than offering a trade.
+    expect(decoder.softwareReason).toBe("unmapped");
+  });
+
+  it('reports "hardware-refused" when WebCodecs rejects a codec it does know', async () => {
+    const isConfigSupported = vi.fn(async () => ({ supported: false }));
+    class RefusingVideoDecoder {
+      static isConfigSupported = isConfigSupported;
+      constructor() {}
+      configure(): void {}
+      close(): void {}
+    }
+    vi.stubGlobal("window", { VideoDecoder: RefusingVideoDecoder });
+    vi.stubGlobal("VideoDecoder", RefusingVideoDecoder);
+
+    const bindings = {
+      enableDecoder: vi.fn(() => 0),
+      setSkipFrame: vi.fn(),
+    } as unknown as WasmBindings;
+    const decoder = new MoviVideoDecoder();
+    decoder.setBindings(bindings);
+
+    const h264Track: VideoTrack = {
+      id: 3,
+      type: "video",
+      codec: "h264",
+      codecId: 27,
+      width: 1920,
+      height: 1080,
+      frameRate: 24,
+      bitRate: 0,
+      profile: 77,
+      level: 40,
+      pixelFormat: "yuv420p",
+    };
+
+    await expect(decoder.configure(h264Track)).resolves.toBe(true);
+
+    expect(isConfigSupported).toHaveBeenCalled();
+    expect(decoder.isSoftware).toBe(true);
+    expect(decoder.softwareReason).toBe("hardware-refused");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Upstream's adaptive load shedding (PLAN.md Batch 5). The renderer calls
 // setPerformanceSkip(true) when the device can't sustain the source frame rate;
 // both decode paths then drop non-reference frames, which nothing references,

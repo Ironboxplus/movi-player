@@ -156,6 +156,9 @@ describe("MoviPlayer seek sync", () => {
         queueSize: 0,
         isWaitingForKeyframe: false,
         isRecentlyRecovering: () => false,
+        // How long the decoder has been holding out for a keyframe —
+        // upstream's bound-to-audio hold check reads it every pass.
+        keyframeWaitMs: () => 0,
         flush: vi.fn(),
       },
       audioDecoder: {
@@ -172,6 +175,10 @@ describe("MoviPlayer seek sync", () => {
       audioRenderer: {
         getBufferedDuration: () => 5.1, // audio well-buffered → audioReady=true
         isRebuffering: () => false,
+        // Upstream's processLoop asks the renderer whether audio is being
+        // DROPPED (muted-and-suspended), not whether it is muted — these
+        // fixtures all have audio genuinely in the pipeline.
+        isDroppingAudio: () => false,
         getAudioClock: () => -1,
         getMaxScheduledMediaTime: () => 0,
         resumeFromBuffering,
@@ -381,6 +388,9 @@ describe("MoviPlayer seek sync", () => {
         queueSize: 0,
         isWaitingForKeyframe: false,
         isRecentlyRecovering: () => false,
+        // How long the decoder has been holding out for a keyframe —
+        // upstream's bound-to-audio hold check reads it every pass.
+        keyframeWaitMs: () => 0,
         flush: vi.fn(),
       },
       audioDecoder: {
@@ -397,6 +407,10 @@ describe("MoviPlayer seek sync", () => {
       audioRenderer: {
         getBufferedDuration: () => 5.1,
         isRebuffering: () => false,
+        // Upstream's processLoop asks the renderer whether audio is being
+        // DROPPED (muted-and-suspended), not whether it is muted — these
+        // fixtures all have audio genuinely in the pipeline.
+        isDroppingAudio: () => false,
         getAudioClock: () => -1,
         getMaxScheduledMediaTime: () => 0,
       },
@@ -444,6 +458,9 @@ describe("MoviPlayer seek sync", () => {
         queueSize: 0,
         isWaitingForKeyframe: false,
         isRecentlyRecovering: () => false,
+        // How long the decoder has been holding out for a keyframe —
+        // upstream's bound-to-audio hold check reads it every pass.
+        keyframeWaitMs: () => 0,
         flush: vi.fn(),
       },
       audioDecoder: {
@@ -460,6 +477,10 @@ describe("MoviPlayer seek sync", () => {
       audioRenderer: {
         getBufferedDuration: () => 6.2,
         isRebuffering: () => false,
+        // Upstream's processLoop asks the renderer whether audio is being
+        // DROPPED (muted-and-suspended), not whether it is muted — these
+        // fixtures all have audio genuinely in the pipeline.
+        isDroppingAudio: () => false,
         getAudioClock: () => -1,
         getMaxScheduledMediaTime: () => 0,
       },
