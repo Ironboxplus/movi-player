@@ -51,6 +51,18 @@ export interface HttpFixtureOptions {
   getFailStatuses?: number[];
   /** Answer an unsatisfiable Range (start >= size) with a real 416. */
   strict416?: boolean;
+  /**
+   * Go silent mid-body: send this many bytes, then send nothing at all for
+   * `stallMs` while holding the connection open — a link that hangs rather
+   * than resets, which is what the read-stall watchdog exists for.
+   */
+  stallAfterBytes?: number;
+  /** How long the mid-body silence lasts. Default 8000ms. */
+  stallMs?: number;
+  /** Limit the mid-body stall to the first N GETs. */
+  stallForFirstGets?: number;
+  /** Start stalling only from this GET onwards (1-based). Default 1. */
+  stallFromGet?: number;
 }
 
 export interface HttpFixture {
@@ -91,9 +103,24 @@ export async function startHttpFixture(
     res: http.ServerResponse,
     payload: Buffer,
     abortAfter?: number,
+    stallAfter?: number,
   ): void => {
     const chunkBytes = options.responseChunkBytes ?? payload.length;
     const delayMs = options.responseChunkDelayMs ?? 0;
+
+    if (stallAfter !== undefined && stallAfter < payload.length) {
+      // Headers, a few bytes, then nothing — connection open, no data. The
+      // socket never errors, so only a watchdog can notice.
+      res.flushHeaders();
+      if (stallAfter > 0) res.write(payload.subarray(0, stallAfter));
+      // unref: a long silence must not hold the test runner's event loop open
+      // after the suite has moved on.
+      setTimeout(() => {
+        if (res.destroyed || res.writableEnded) return;
+        res.end(payload.subarray(stallAfter));
+      }, options.stallMs ?? 8000).unref();
+      return;
+    }
 
     if (abortAfter !== undefined && abortAfter < payload.length) {
       // Headers promised more than we send, then the socket dies: undici
@@ -186,6 +213,13 @@ export async function startHttpFixture(
         getCount <= options.abortBodyForFirstGets)
         ? options.abortBodyAfterBytes
         : undefined;
+    const stallAfter =
+      options.stallAfterBytes !== undefined &&
+      getCount >= (options.stallFromGet ?? 1) &&
+      (options.stallForFirstGets === undefined ||
+        getCount <= options.stallForFirstGets)
+        ? options.stallAfterBytes
+        : undefined;
 
     const parsed = parseRange(rangeHeader, size);
 
@@ -240,7 +274,7 @@ export async function startHttpFixture(
             ? { "Content-Disposition": options.contentDisposition }
             : {}),
         });
-        sendBody(res, slice, abortAfter);
+        sendBody(res, slice, abortAfter, stallAfter);
         requests.push({ method, range: rangeHeader, status: 206 });
         return;
       }
@@ -256,7 +290,7 @@ export async function startHttpFixture(
         ? { "Content-Disposition": options.contentDisposition }
         : {}),
     });
-    sendBody(res, body, abortAfter);
+    sendBody(res, body, abortAfter, stallAfter);
     requests.push({ method, range: rangeHeader, status: 200 });
   });
   const sockets = new Set<Socket>();

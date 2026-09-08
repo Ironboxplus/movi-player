@@ -14,7 +14,7 @@
  * substituting a fake fetch — which would make the test assert nothing about
  * the real transport. Left uncovered on purpose rather than mocked.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { HttpSource } from "../../src/source/HttpSource";
 import {
   startHttpFixture,
@@ -36,7 +36,25 @@ afterEach(async () => {
   for (const f of fixtures.splice(0)) {
     await f.close();
   }
+  vi.unstubAllGlobals();
 });
+
+/**
+ * Give the module the browser worker global it reaches for.
+ *
+ * `self` is not a mock of anything HttpSource does — it is the environment the
+ * code was written against, the same way the existing suites hand it `window`.
+ * A real EventTarget is used so `addEventListener("online", …)` and the
+ * dispatch below are the genuine DOM-event mechanism, not a callback registry
+ * we control; and `navigator.onLine` is a real property the source reads.
+ */
+function stubSelf(onLine: boolean): EventTarget & { navigator: { onLine: boolean } } {
+  const target = Object.assign(new EventTarget(), {
+    navigator: { onLine },
+  });
+  vi.stubGlobal("self", target);
+  return target;
+}
 
 async function openFixture(
   opts: Parameters<typeof startHttpFixture>[0],
@@ -114,6 +132,124 @@ describe("HttpSource stream retry", () => {
     expect(fixture.requests.some((r) => r.status === 503)).toBe(true);
     expect(source.getFatalError()).toBeNull();
   }, 60_000);
+});
+
+// ─── Connectivity loss ─────────────────────────────────────────────────────
+
+describe("HttpSource while the browser reports no connection", () => {
+  it("parks on the offline signal instead of burning retries, and resumes on 'online'", async () => {
+    const selfTarget = stubSelf(false); // offline before the first byte moves
+    const payload = makePayload(512 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      rangePolicy: "normal",
+      abortBodyAfterBytes: 16 * 1024,
+      abortBodyForFirstGets: 1,
+    });
+    const source = openSource(fixture.url);
+
+    expect(await source.getSize()).toBe(payload.length);
+
+    // Read past the truncation point. The first body GET dies at 16 KiB; the
+    // loop then finds navigator.onLine false and parks rather than spending a
+    // retry on a link the browser says is down.
+    const readPromise = source.read(0, 128 * 1024);
+
+    // Come back online for real: flip the property the source reads, then
+    // dispatch the actual DOM event it listens for. Repeated because the park
+    // is entered asynchronously — only the dispatch that lands inside the wait
+    // matters, and the others are no-ops with no listener attached.
+    const reconnect = setInterval(() => {
+      selfTarget.navigator.onLine = true;
+      selfTarget.dispatchEvent(new Event("online"));
+    }, 100);
+
+    try {
+      const span = bytesOf(await readPromise);
+      expect(Buffer.from(span).equals(payload.subarray(0, 128 * 1024))).toBe(
+        true,
+      );
+    } finally {
+      clearInterval(reconnect);
+    }
+
+    // Parking is not failing.
+    expect(source.getFatalError()).toBeNull();
+    // The 30s offline timeout must NOT have been what freed it.
+    expect(
+      fixture.requests.filter((r) => r.method === "GET" && r.status === 206)
+        .length,
+    ).toBeGreaterThan(1);
+  }, 60_000);
+
+  it("cuts the retry backoff short when the connection comes back", async () => {
+    // Online throughout, so the failure takes the ordinary backoff path — and
+    // an 'online' event during that backoff should end the wait early.
+    const selfTarget = stubSelf(true);
+    const payload = makePayload(512 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      rangePolicy: "normal",
+      abortBodyAfterBytes: 16 * 1024,
+      abortBodyForFirstGets: 1,
+    });
+    const source = openSource(fixture.url);
+
+    expect(await source.getSize()).toBe(payload.length);
+
+    const startedAt = Date.now();
+    const readPromise = source.read(0, 128 * 1024);
+    const nudge = setInterval(
+      () => selfTarget.dispatchEvent(new Event("online")),
+      50,
+    );
+
+    try {
+      const span = bytesOf(await readPromise);
+      expect(Buffer.from(span).equals(payload.subarray(0, 128 * 1024))).toBe(
+        true,
+      );
+    } finally {
+      clearInterval(nudge);
+    }
+
+    // First backoff is ~1.5s; an online event during it should beat that.
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
+    expect(source.getFatalError()).toBeNull();
+  }, 60_000);
+});
+
+// ─── A link that hangs rather than resets ──────────────────────────────────
+
+describe("HttpSource read-stall watchdog, end to end", () => {
+  it("reconnects from the frontier when the body goes silent mid-transfer", async () => {
+    const payload = makePayload(512 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      rangePolicy: "normal",
+      // Real silence: headers, 16 KiB, then nothing for longer than the 6s
+      // watchdog, with the socket still open the whole time.
+      stallAfterBytes: 16 * 1024,
+      stallMs: 12_000,
+      stallForFirstGets: 1,
+    });
+    const source = openSource(fixture.url);
+
+    expect(await source.getSize()).toBe(payload.length);
+
+    const span = bytesOf(await source.read(0, 128 * 1024));
+    expect(Buffer.from(span).equals(payload.subarray(0, 128 * 1024))).toBe(true);
+
+    // The watchdog is what noticed — a silent socket produces no error event.
+    const stats = source.getNetworkStats();
+    expect(stats.readStalls).toBeGreaterThan(0);
+    // …and the reconnect resumed rather than restarting from zero.
+    expect(
+      fixture.requests.filter((r) => r.method === "GET" && r.status === 206)
+        .length,
+    ).toBeGreaterThan(1);
+    expect(source.getFatalError()).toBeNull();
+  }, 120_000);
 });
 
 // ─── Range refused outright ────────────────────────────────────────────────
@@ -262,6 +398,88 @@ describe("HttpSource streaming window", () => {
         64 * 1024,
       );
     }
+  }, 60_000);
+});
+
+// ─── A stream that is up but delivering nothing ────────────────────────────
+
+describe("HttpSource force restart", () => {
+  it("restarts a live-but-starved stream when the reader waits out the progress timeout", async () => {
+    const payload = makePayload(4 * 1024 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      rangePolicy: "normal",
+      // GET #1 (the opening chunk) is served normally, so a stream is genuinely
+      // RUNNING and the next read is "covered" by it. Every reconnect after
+      // that answers with headers and then nothing, for longer than
+      // waitForData's 15s no-progress limit — including the reconnects the 6s
+      // read-stall watchdog makes, so the watchdog alone cannot rescue it. The
+      // sockets stay open: the reader is not failing, it is never fed.
+      stallAfterBytes: 0,
+      stallMs: 30_000,
+      stallFromGet: 2,
+      stallForFirstGets: 6,
+    });
+    const source = openSource(fixture.url);
+    source.setFirstRangeBytes(128 * 1024); // small opening chunk → reconnects
+
+    expect(await source.getSize()).toBe(payload.length);
+
+    // Establishes the stream and leaves it running.
+    const head = bytesOf(await source.read(0, 4096));
+    expect(Buffer.from(head).equals(payload.subarray(0, 4096))).toBe(true);
+
+    // Now ask for bytes just past the opening chunk: inside the window, so the
+    // read waits on the running stream rather than starting its own.
+    const startedAt = Date.now();
+    const later = bytesOf(await source.read(160 * 1024, 4096));
+    expect(
+      Buffer.from(later).equals(payload.subarray(160 * 1024, 160 * 1024 + 4096)),
+    ).toBe(true);
+
+    // It cannot have come from the starved connection — that one is still
+    // holding its silence — so only the reader-side restart can have served it.
+    expect(Date.now() - startedAt).toBeGreaterThan(14_000);
+    expect(source.getFatalError()).toBeNull();
+  }, 180_000);
+});
+
+// ─── Size resolution when the first attempts fail ──────────────────────────
+
+describe("HttpSource size resolution", () => {
+  it("retries the whole attempt after HEAD, ranged GET and plain GET all fail", async () => {
+    const payload = makePayload(96 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      rangePolicy: "normal",
+      rejectHead: true, // HEAD destroys the socket, as some CDNs do
+      // …and the two GET fallbacks the first attempt tries are refused too, so
+      // only the outer retry can produce a size.
+      getFailStatuses: [500, 500],
+    });
+    const source = openSource(fixture.url);
+
+    expect(await source.getSize()).toBe(payload.length);
+    expect(fixture.requests.filter((r) => r.status === 500).length).toBe(2);
+    expect(fixture.requests.filter((r) => r.method === "HEAD").length).toBeGreaterThan(
+      0,
+    );
+  }, 60_000);
+
+  it("recovers the total size from Content-Range when HEAD omits Content-Length", async () => {
+    const payload = makePayload(48 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      rangePolicy: "normal",
+      headNoContentLength: true,
+    });
+    const source = openSource(fixture.url);
+
+    expect(await source.getSize()).toBe(payload.length);
+    // The size can only have come from a 206's Content-Range total.
+    expect(
+      fixture.requests.some((r) => r.method === "GET" && r.status === 206),
+    ).toBe(true);
   }, 60_000);
 });
 
