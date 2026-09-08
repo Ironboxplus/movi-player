@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -14,10 +14,28 @@ import { describe, expect, it } from "vitest";
  * `"canvas"` — the renderer's first value — and editors would have offered
  * `src="canvas"`.
  */
+const OUTPUTS = [
+  "custom-elements.json",
+  "vscode-extension/html-custom-data.json",
+  "vscode-extension/css-custom-data.json",
+];
+
 function generate() {
-  execFileSync(process.execPath, ["scripts/build-custom-data.mjs"], {
-    encoding: "utf8",
-  });
+  // The generator writes its three tracked artifacts in place. Put them back
+  // byte for byte afterwards: on a checkout with core.autocrlf the rewrite alone
+  // (LF vs CRLF) would leave the tree dirty after every test run.
+  const before = OUTPUTS.map((f) => [f, readFileSync(f)] as const);
+  try {
+    execFileSync(process.execPath, ["scripts/build-custom-data.mjs"], {
+      encoding: "utf8",
+    });
+    return parseManifest();
+  } finally {
+    for (const [file, contents] of before) writeFileSync(file, contents);
+  }
+}
+
+function parseManifest() {
   const manifest = JSON.parse(readFileSync("custom-elements.json", "utf8"));
   const declaration = manifest.modules[0].declarations[0];
   const byName = new Map<string, { type?: { text: string } }>(
