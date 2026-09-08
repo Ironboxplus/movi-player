@@ -114,7 +114,10 @@ function sendPaths(paths) {
   // PiP is the active player — load the file there instead of the main window.
   if (pipWindow) {
     const src = pipSrcForPath(media[0]);
-    pipState = { src, time: 0 };
+    // New file, same viewer: the language and speed they picked carry over,
+    // exactly as they would opening it in the main window. Only the position
+    // starts again.
+    pipState = { src, time: 0, settings: pipState.settings || null };
     pipWindow.webContents.send("pip:load", { src, time: 0 });
     pipWindow.focus();
     return;
@@ -220,6 +223,12 @@ ipcMain.on("renderer-ready", () => {
     foreground();
   }
 });
+// The player's own fullscreen button/F key routes here so it drives OS window
+// fullscreen (matching the green button). The enter/leave-full-screen listeners
+// above then send window-fullscreen back to sync the player UI.
+ipcMain.on("window:toggle-fullscreen", () => {
+  if (mainWindow) mainWindow.setFullScreen(!mainWindow.isFullScreen());
+});
 ipcMain.handle("dialog:open", () => openViaDialog());
 ipcMain.handle("recents:get", () => listRecents());
 ipcMain.handle("recents:clear", () => writeRecents([]));
@@ -237,12 +246,12 @@ ipcMain.handle("files:grant", (_e, paths) => {
 //     source. Electron doesn't render Document PiP, so we build our own. ---
 let pipWindow = null;
 // What the PiP window is currently playing, so we can hand it back on return.
-let pipState = { src: null, time: 0 };
+let pipState = { src: null, time: 0, settings: null };
 
 const pipSrcForPath = (p) =>
   "/_local/" + encodeURIComponent(path.basename(p)) + "?p=" + encodeURIComponent(p);
 
-function openPip(src, time, playing) {
+function openPip(src, time, playing, settings) {
   if (!serverPort || !src) return;
   if (pipWindow) {
     pipWindow.focus();
@@ -252,15 +261,17 @@ function openPip(src, time, playing) {
   // OS green-button fullscreen) so PiP pops out as a floating window instead of
   // opening into the main window's fullscreen Space.
   if (mainWindow && mainWindow.isFullScreen()) {
-    mainWindow.once("leave-full-screen", () => createPipWindow(src, time, playing));
+    mainWindow.once("leave-full-screen", () =>
+      createPipWindow(src, time, playing, settings),
+    );
     mainWindow.setFullScreen(false);
     return;
   }
-  createPipWindow(src, time, playing);
+  createPipWindow(src, time, playing, settings);
 }
 
-function createPipWindow(src, time, playing) {
-  pipState = { src, time: time || 0 };
+function createPipWindow(src, time, playing, settings) {
+  pipState = { src, time: time || 0, settings: settings || null };
   pipWindow = new BrowserWindow({
     width: 480,
     height: 270,
@@ -286,6 +297,14 @@ function createPipWindow(src, time, playing) {
   u.searchParams.set("src", src);
   u.searchParams.set("t", String(time || 0));
   if (playing) u.searchParams.set("playing", "1");
+  // Audio language, captions, volume, speed — see renderer/handoff.js. Rides
+  // the URL alongside the source rather than arriving over IPC afterwards, so
+  // it is in hand before the PiP player opens the file and picks its own.
+  if (settings) {
+    try {
+      u.searchParams.set("s", JSON.stringify(settings));
+    } catch {}
+  }
   pipWindow.loadURL(u.toString());
 
   pipWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -312,11 +331,19 @@ function createPipWindow(src, time, playing) {
 // PiP reports its current source + position so we can resume from it on return.
 ipcMain.on("pip:state", (_e, s) => {
   if (!s) return;
-  if (s.src) pipState = { src: s.src, time: s.time || 0 };
-  else pipState.time = s.time || pipState.time;
+  if (s.src) {
+    pipState = { src: s.src, time: s.time || 0, settings: pipState.settings || null };
+  } else {
+    pipState.time = s.time || pipState.time;
+  }
+  // Either way the settings are the PiP window's own answer, and they are what
+  // the main window puts back on itself when the float closes.
+  if (s.settings) pipState.settings = s.settings;
 });
 ipcMain.on("pip:close", () => { if (pipWindow) pipWindow.close(); });
-ipcMain.on("pip:open", (_e, payload) => openPip(payload?.src, payload?.time, payload?.playing));
+ipcMain.on("pip:open", (_e, payload) =>
+  openPip(payload?.src, payload?.time, payload?.playing, payload?.settings),
+);
 
 // --- Single-instance: route a second launch (with a file arg) to us ---
 const gotLock = app.requestSingleInstanceLock();

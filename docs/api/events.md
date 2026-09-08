@@ -501,31 +501,72 @@ The custom element re-exposes player activity as DOM events so you can wire `add
 | Event                  | Detail payload                       | Description                                        |
 | ---------------------- | ------------------------------------ | -------------------------------------------------- |
 | `loadstart`            | `{ src: string \| null }`            | A new source is being loaded                       |
+| `abort`                | —                                    | A load was stopped before it had data              |
+| `suspend`              | —                                    | Preload settled; no more bytes are being pulled    |
+| `encrypted`            | `{ initDataType, tokenUrl, videoUrl }` | The source needs a key; the handshake is starting |
+| `waitingforkey`        | —                                    | Playback is held until the licence lands           |
+| `cuechange`            | —                                    | Fired on the `TextTrack`, not on the element       |
+| `loadedmetadata`       | —                                    | Duration and track list are known                  |
 | `loadeddata`           | —                                    | First frame is decoded and ready to render         |
+| `canplay`              | —                                    | Enough data buffered to begin playback             |
+| `durationchange`       | `number` (seconds)                   | Duration became known, or was corrected mid-playback |
 | `play`                 | —                                    | Playback started                                   |
+| `playing`              | —                                    | Playback actually resumed (after a stall or start) |
+| `waiting`              | —                                    | Playback stalled waiting for data                  |
 | `pause`                | —                                    | Playback paused                                    |
+| `seeking`              | `number` (target time)               | A seek started                                     |
+| `seeked`               | `number` (landed time)               | The seek completed                                 |
+| `progress`             | `number` (buffered end, seconds)     | Fetching advanced the buffered end                 |
+| `canplaythrough`       | —                                    | Buffer reached the end of the media. Unlike `<video>`, this is **not** an estimate — it fires only when the rest is genuinely buffered, at most once per source |
+| `stalled`              | —                                    | No data arrived for ~3s while fetching             |
+| `emptied`              | —                                    | Previous media torn down; a new load is starting   |
+| `resize`               | `{ width: number, height: number }`  | Intrinsic video size changed (i.e. a quality switch) |
 | `ended`                | —                                    | Playback reached the end                           |
 | `timeupdate`           | `number` (current time)              | Current time advanced (fires repeatedly)           |
 | `error`                | `Error`                              | Internal player error surfaced to the DOM          |
+| `errordisplay`         | `{ title, message, canRetry, canTrySoftware }` | An error screen went up, with the wording on it. Unlike `error`, whose payload is the raw `Error`, this is what the viewer is shown — and it also covers the format/codec failures that raise no runtime error. See [Customizing the Error Screen](./element.md#customizing-the-error-screen) |
 | `statechange`          | `PlayerState`                        | Underlying `MoviPlayer` state transitioned         |
 | `volumechange`         | `{ volume: number, muted: boolean }` | Volume or mute toggled (UI, hotkey, or property)   |
 | `ratechange`           | `{ playbackRate: number }`           | Playback speed changed                             |
 | `titlechange`          | `{ title: string \| null }`          | Resolved/cleaned video title changed               |
 | `audiotrackchange`     | —                                    | Active audio track switched                        |
-| `subtitleTrackChange`  | —                                    | Active subtitle track switched (note camelCase)    |
+| `subtitletrackchange`  | —                                    | Active subtitle track switched                     |
 | `trackschange`         | `Track[]`                            | Available tracks list updated                      |
 | `fullscreenchange`     | `{ fullscreen: boolean }`            | Player entered/exited fullscreen                   |
 | `movi-fullscreen-request` | —                                 | **Cancelable** — fires before `requestFullscreen()`. `preventDefault()` blocks it so a host can take over via [`setHostFullscreen()`](./element.md#sethostfullscreen-active-boolean-void) |
 | `pipchange`            | `{ pip: boolean }`                   | Picture-in-Picture window opened/closed            |
+| `enterpictureinpicture` | —                                   | `HTMLVideoElement` alias, fired alongside `pipchange` |
+| `leavepictureinpicture` | —                                   | `HTMLVideoElement` alias, fired alongside `pipchange` |
 | `qualitychange`        | `{ trackId: number }`                | Active video quality / track switched              |
 | `subtitledelaychange`  | `{ subtitleDelay: number }`          | Subtitle offset changed via property/attribute     |
 | `coverart`             | `ImageBitmap \| null`                | Embedded cover art extracted at load (close the bitmap when done) |
 | `preloadcomplete`      | —                                    | Initial preload buffer filled, ready to play       |
+| `linearmode`           | —                                    | Source server ignores `Range` (`200`, not `206`) — playback is forward-only via a sliding RAM window; hide seek-dependent UI |
+| `audiotrackchange`     | —                                    | Active audio track switched                        |
+| `audiooutputchange`    | `{ deviceId: string \| null }`       | Audio output device (sink) changed                 |
+| `audiostripchange`     | `{ active: boolean }`                | Audio-only strip layout entered/left               |
+| `nativefallback`       | `{ src: string }`                    | Source handed to a native `<video>` (`fallback="native"`) |
+| `movi-qoe`             | QoE snapshot                         | Playback-quality telemetry sample                  |
 | `filerevoked`          | `{ offset, length, reason }`         | Underlying `File` handle was revoked by the browser (mobile background / memory pressure). Prompt the user to re-pick. |
 
 ::: tip Casing note
-`subtitleTrackChange` keeps camelCase for backward compatibility while every other custom event uses lowercase. If you're listening for both `audiotrackchange` and subtitle changes, mind the casing.
+`subtitletrackchange` is the canonical name, matching every other DOM event here. A camelCase `subtitleTrackChange` is dispatched alongside it as a compatibility alias — earlier versions of this page documented only that spelling. Prefer the lowercase one.
 :::
+
+### Parity with `<video>`
+
+The element aims to be drop-in for code written against a native media element. Every `HTMLMediaElement` event above behaves the same way, with these deliberate exceptions:
+
+| Native event    | Status | Why                                                                                       |
+| --------------- | ------ | ----------------------------------------------------------------------------------------- |
+| `canplaythrough` | Stricter | `<video>` fires it on a heuristic estimate. We fire it only when the media is genuinely buffered to the end, so it may arrive later — or, on a slow link, not at all. Gate optional UI on it, never playback. |
+| `abort`         | Fires | A load counts as in flight until it has data, not merely while the loading flag is up, so a source taken away mid-open reports it. Ordered before `emptied`, as the spec has it. |
+| `suspend`       | Fires | Raised when preload settles — the moment this player stops pulling bytes on purpose. |
+| `encrypted`     | Fires, differently | `<video>` raises it on meeting initialisation data it needs a key for. This player is told up front, so it fires where the key handshake begins: the load about to ask the token endpoint. |
+| `waitingforkey` | Fires | Follows `encrypted` — playback is held until the token lands. |
+| `cuechange`     | Fires | On the mirrored `TextTrack` whose caption changed, which is where native fires it. |
+
+`seeking` / `seeked` / `timeupdate` / `durationchange` / `progress` / `resize` carry a `detail` payload (see the table) where `<video>` carries none — read the property off the element instead if you want identical code across both.
 
 ### Subscribing
 

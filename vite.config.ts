@@ -1,8 +1,19 @@
 import { defineConfig } from 'vite';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const pkgVersion = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf8'),
+).version;
 
 // Production build is handled by scripts/build-standalone.js (not this config)
 // This config is only used for dev server (vite dev) and vitest
 export default defineConfig({
+  // Keep the dev server / vitest in sync with the same version define the
+  // production build injects, so MoviElement.version works there too.
+  define: {
+    __MOVI_VERSION__: JSON.stringify(pkgVersion),
+  },
   worker: {
     format: 'es',
   },

@@ -527,6 +527,50 @@ describe("HttpSource fork optimisations still present", () => {
     expect(typeof source.readChunkWithStallTimeout).toBe("function");
   });
 
+  // H5: upstream's prefetch gate lets MoviPlayer hand the link back to a
+  // bandwidth-starved split-audio track. It is orthogonal to our supersede
+  // mechanism (reader identity + generation), so the two coexist — and the gate
+  // has to sit BEFORE the read-stall watchdog starts timing, or a deliberate
+  // park reads as a silent connection and the watchdog tears down a stream that
+  // is doing exactly what it was told.
+  it("parks the background download while the prefetch gate is closed, over a real socket", async () => {
+    // 3 MiB in 64 KiB chunks with a real inter-chunk delay, so the download is
+    // genuinely in flight and can be observed stopping and restarting.
+    const payload = makePayload(3 * 1024 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      responseChunkBytes: 64 * 1024,
+      responseChunkDelayMs: 5,
+    });
+    const source = openSource(fixture.url, 8) as any;
+
+    expect(typeof source.setPrefetchThrottle).toBe("function");
+
+    await source.getSize();
+    // Kick the background stream off and let it get moving.
+    await source.read(0, 64 * 1024);
+    await waitUntil(() => source.getNetworkStats().totalBytes > 128 * 1024, 5_000);
+
+    source.setPrefetchThrottle(true);
+    // Let whatever read was already in flight land, then take the reading.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const parked = source.getNetworkStats().totalBytes;
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    // Throttled: the loop is parked, so no further bytes are pulled. The
+    // fixture still has ~2.8 MiB to give at 64 KiB per 5 ms, so an unparked
+    // loop would have moved a long way in 600 ms.
+    expect(source.getNetworkStats().totalBytes).toBe(parked);
+    // ...and parking must not be mistaken for a stalled connection.
+    expect(source.getNetworkStats().readStalls).toBe(0);
+
+    source.setPrefetchThrottle(false);
+    await waitUntil(
+      () => source.getNetworkStats().totalBytes > parked,
+      5_000,
+    );
+  }, 30_000);
+
   it("still slides the window via waitForWindowRoom after a full fill", async () => {
     // 3 MiB payload, 2 MiB buffer cap → cannot full-cache; stream must fill a
     // window, waitForWindowRoom, slide, and keep serving sequential reads.

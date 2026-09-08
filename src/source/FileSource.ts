@@ -14,6 +14,17 @@ const TAG = "FileSource";
 // Chunk size for reading file (2MB chunks)
 const CHUNK_SIZE = 2 * 1024 * 1024;
 
+// How long the preload sweep stays out of the way after a read somebody was
+// actually waiting on. Long enough to cover the gaps inside one demuxer burst
+// (a seek asks for several chunks back to back), short enough that the sweep
+// resumes the moment playback stops asking. See waitForDemandReads.
+const PRELOAD_YIELD_MS = 200;
+
+// …and the longest anything will wait its turn. Continuous playback reads would
+// otherwise hold a seek-bar preview off forever, and a preview that never
+// arrives is its own bug. See waitForDemandReads.
+const DEMAND_YIELD_CAP_MS = 1500;
+
 export class FileSource implements SourceAdapter {
   private file: File;
   private cache: LRUCache;
@@ -25,7 +36,14 @@ export class FileSource implements SourceAdapter {
   private duration: number = 0;
   private preloadOffset: number = 0; // Current byte offset being preloaded around
   private preloadAbort: boolean = false; // Signal to abort current preload cycle
+  // When false, never preload the whole file even if it fits in cache — use a
+  // bounded read-ahead instead. The host sets this on low-end mobile, where the
+  // sequential whole-file read competes with heavy 4K decode and fills RAM.
   private fullFilePreload: boolean = true;
+  // A second reader over a file some other source already owns — the thumbnail
+  // pipeline's. It shares that source's LRU under the same key, so it must
+  // neither run a preload sweep of its own nor throw the cache away on close.
+  private secondary: boolean = false;
 
   // Disk read stats
   private totalBytesRead: number = 0;
@@ -63,6 +81,41 @@ export class FileSource implements SourceAdapter {
   }
 
   /**
+   * Disable whole-file preloading (bounded read-ahead only). Set by the host on
+   * low-end mobile so the initial sequential disk read doesn't compete with a
+   * strained 4K decode or fill RAM. Small files fall in the read-ahead window
+   * anyway, so they still cache fully.
+   */
+  setFullFilePreload(enabled: boolean): void {
+    this.fullFilePreload = enabled;
+  }
+
+  /**
+   * Mark this as a SECOND reader over a file another source already owns — the
+   * thumbnail pipeline builds one of these for file sources.
+   *
+   * Both readers share one LRU under one key (the key is name/size/mtime, so
+   * it is the same string), which is what makes the arrangement work at all.
+   * What did not work was leaving the second one behaving like an owner:
+   *
+   *   - It ran its own whole-file preload sweep. Each pass checks the cache
+   *     before reading, but the two run CONCURRENTLY, so both miss on the same
+   *     not-yet-finished chunk and both read it — the whole file pulled twice.
+   *     Invisible on an SSD; on a Google Drive / OneDrive virtual file, where
+   *     every chunk is a network fetch through the filesystem shim, it doubles
+   *     the download and makes the two readers queue behind each other.
+   *   - Its close() cleared the cache. Not its own entries — the whole LRU,
+   *     including everything the main source had spent that download filling.
+   *     A thumbnail init that gets superseded (a quick second source change)
+   *     therefore threw away the file mid-playback and it was fetched again.
+   *
+   * Read-through still caches every chunk it touches, so previews stay warm.
+   */
+  markSecondary(): void {
+    this.secondary = true;
+  }
+
+  /**
    * Register a one-shot callback fired when the initial preload pass settles.
    * If preload is already complete, fires synchronously.
    */
@@ -72,14 +125,6 @@ export class FileSource implements SourceAdapter {
       return;
     }
     this.onPreloadCompleteCallback = cb;
-  }
-
-  /**
-   * Disable the eager whole-file cache fill while retaining bounded read-ahead.
-   * Mobile 4K playback uses this to avoid competing disk I/O and RAM pressure.
-   */
-  setFullFilePreload(enabled: boolean): void {
-    this.fullFilePreload = enabled;
   }
 
   /**
@@ -96,8 +141,9 @@ export class FileSource implements SourceAdapter {
     if (this.size === -1) {
       this.size = this.file.size;
     }
-    // Start preloading chunks into cache (from beginning initially)
-    this.startPreload();
+    // Start preloading chunks into cache (from beginning initially).
+    // A secondary reader never sweeps — see markSecondary.
+    if (!this.secondary) this.startPreload();
     return this.size;
   }
 
@@ -199,8 +245,9 @@ export class FileSource implements SourceAdapter {
    * Close the source and release resources
    */
   close(): void {
-    // Clear cache entries for this source
-    this.cache.clear();
+    // Clear cache entries for this source — unless the cache belongs to the
+    // source this one is reading alongside. See markSecondary.
+    if (!this.secondary) this.cache.clear();
     this.position = 0;
   }
 
@@ -250,6 +297,11 @@ export class FileSource implements SourceAdapter {
       // during playback (which causes stutter on 4K content with heavy processLoop).
       const totalChunks = Math.ceil(this.size / CHUNK_SIZE);
       const cacheMaxBytes = this.cache.getMaxSize();
+      // Full-file preload trades one big upfront read for zero disk I/O during
+      // playback — a win on desktop. On low-end mobile the host disables it
+      // (fullFilePreload=false): that sequential read of the whole file
+      // competes with an already-strained 4K decode and fills RAM, so fall back
+      // to a bounded read-ahead that follows playback instead.
       const fileFitsInCache =
         this.fullFilePreload &&
         cacheMaxBytes > 0 &&
@@ -280,6 +332,10 @@ export class FileSource implements SourceAdapter {
         const cached = this.cache.get(this.sourceKey, offset, chunkLength);
         if (cached) continue;
 
+        // Never in front of a read somebody is blocked on.
+        await this.waitForDemandReads();
+        if (this.preloadAbort) break;
+
         // Read and cache chunk
         const chunk = await this.readChunkFromFile(offset, chunkLength);
         this.cache.set(this.sourceKey, offset, chunkLength, chunk);
@@ -297,6 +353,10 @@ export class FileSource implements SourceAdapter {
         // Check if already cached
         const cached = this.cache.get(this.sourceKey, offset, chunkLength);
         if (cached) continue;
+
+        // Never in front of a read somebody is blocked on.
+        await this.waitForDemandReads();
+        if (this.preloadAbort) break;
 
         // Read and cache chunk
         const chunk = await this.readChunkFromFile(offset, chunkLength);
@@ -326,6 +386,36 @@ export class FileSource implements SourceAdapter {
   /**
    * Check if preloading should stop (cache full)
    */
+  /**
+   * Hold the preload sweep while somebody is waiting on bytes of their own.
+   *
+   * The sweep walks the file from the front. A seek needs bytes from wherever
+   * the playhead landed, which on a long file is far ahead of wherever the
+   * sweep has got to — so the two ask the filesystem for different parts of
+   * the same file at the same time, and the one nobody is waiting for gets
+   * served alongside the one everybody is. Captured on a 94MB 4K AV1 file: a
+   * seek to 110s needs the chunk at 58MB, and what actually arrived in the
+   * next second and a half were the sweep's chunks at 37MB and 39MB. No frame
+   * decoded, the seek hit its deadline, black-frame recovery seeked again.
+   *
+   * So the sweep stands down for a moment after every demand read. It is a
+   * read-ahead: being late costs nothing, and being in the way costs a seek.
+   */
+  private async waitForDemandReads(): Promise<void> {
+    // Read off the shared cache, not this instance: the reader most in need of
+    // giving way — the thumbnail pipeline's — never issues a demand read of its
+    // own, so its local stamp would say the coast was clear forever.
+    let waited = 0;
+    while (
+      !this.preloadAbort &&
+      this.cache.msSinceDemandRead() < PRELOAD_YIELD_MS &&
+      waited < DEMAND_YIELD_CAP_MS
+    ) {
+      await new Promise((r) => setTimeout(r, 30));
+      waited += 30;
+    }
+  }
+
   private async shouldStopPreload(): Promise<boolean> {
     // Check if cache is nearly full (95% utilization)
     const utilization = this.cache.getUtilization();
@@ -421,8 +511,26 @@ export class FileSource implements SourceAdapter {
       let chunkData = this.cache.get(this.sourceKey, chunkOffset, chunkLength);
 
       if (!chunkData) {
-        // Not in cache, read it from file
+        // Not in cache, read it from file. This is a DEMAND read — somebody is
+        // blocked on these exact bytes — so stamp it, both before and after:
+        // the preload sweep stands down while these are in flight, and the
+        // after-stamp keeps it down until the burst really ends rather than
+        // letting it barge back in between two demand chunks.
+        //
+        // A SECONDARY reader's "demand" is a seek-bar preview — a picture that
+        // has not been asked for yet and that nobody is watching playback for.
+        // It waits behind playback's reads instead of announcing itself as one.
+        // This is the case both of the captured logs were stuck on: a preview
+        // read went in flight as the user clicked, the seek's own bytes queued
+        // behind it, and a second and a half later the seek gave up having
+        // decoded nothing — then the preview landed.
+        if (this.secondary) {
+          await this.waitForDemandReads();
+        } else {
+          this.cache.markDemandRead();
+        }
         chunkData = await this.readChunkFromFile(chunkOffset, chunkLength);
+        if (!this.secondary) this.cache.markDemandRead();
         // Cache the standard chunk
         this.cache.set(this.sourceKey, chunkOffset, chunkLength, chunkData);
       }

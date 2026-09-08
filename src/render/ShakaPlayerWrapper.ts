@@ -307,12 +307,12 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
     if (!this.canvasRenderer) return;
 
     try {
-      const frame = new VideoFrame(this.videoElement);
-      this.canvasRenderer.render(frame);
-      frame.close();
+      // Element straight to the renderer — a VideoFrame wrapper around it
+      // uploads nothing on Firefox Android (see RenderSource in CanvasRenderer).
+      this.canvasRenderer.render(this.videoElement);
       this._framesRendered++;
     } catch (e) {
-      Logger.warn(TAG, "Failed to create VideoFrame", e);
+      Logger.warn(TAG, "Failed to render video frame", e);
     }
   }
 
@@ -399,6 +399,16 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
         tc.style.zIndex = "2"; // above the canvas, below the controls bar
         root.appendChild(tc);
         this.textContainer = tc;
+        // Register with our OWN canvas renderer (not the external
+        // setSubtitleOverlay() API below, which stays a no-op — Shaka draws
+        // cues into this container itself, unrelated to MoviElement's demuxed-
+        // subtitle overlay). This makes resize()'s existing rotation-aware
+        // sizing (dimension swap for 90/270°, centering, rotate transform —
+        // the same logic that keeps the WASM subtitle overlay tracking a
+        // rotated video) apply to Shaka's captions too; otherwise the
+        // container stays inset:0 of the UNROTATED box and captions don't
+        // turn with the video.
+        this.canvasRenderer?.setSubtitleOverlay(tc);
 
         // The lib build ships NO Shaka UI CSS, so Shaka's `.shaka-text-container`
         // would collapse to the top of the overlay (static, content-height) and
@@ -896,7 +906,10 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
     if (!p) {
       p = (async () => {
         try {
-          const res = await fetch(uri, { mode: "cors" });
+          const res = await fetch(uri, {
+            mode: "cors",
+            signal: this.lifetimeAbort.signal,
+          });
           if (!res.ok) return null;
           return await createImageBitmap(await res.blob());
         } catch (e) {
@@ -986,6 +999,22 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
   async selectSubtitleTrack(id: number | null): Promise<boolean> {
     if (!this.player) return false;
     return this.trackManager.selectSubtitleTrack(id);
+  }
+
+  /** Route manual rotation to our own canvas renderer so its resize() applies
+   *  the same centering/dimension-swap as the WASM path (otherwise a rotated
+   *  stream ends up pinned to one side). No-op in DRM/native-video mode. */
+  setVideoRotation(deg: number): void {
+    this.canvasRenderer?.setManualRotation(deg);
+  }
+
+  /** The actual rotate-button/shortcut entry point — increments by 90°. */
+  rotateVideo(): number {
+    return this.canvasRenderer?.rotate90() ?? 0;
+  }
+
+  getVideoRotation(): number {
+    return this.canvasRenderer?.getRotation() ?? 0;
   }
 
   setFitMode(mode: any) {
@@ -1080,7 +1109,11 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
     return false;
   }
 
+  /** Aborted by destroy(), so a thumbnail/image fetch can't outlive the wrapper. */
+  private readonly lifetimeAbort = new AbortController();
+
   destroy(): void {
+    this.lifetimeAbort.abort();
     this.stopFrameLoop();
 
     // Release cached thumbnail sprite sheets.
@@ -1098,6 +1131,10 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
       this.player = null;
     }
 
+    // canvasRenderer itself is torn down as a whole right after (no separate
+    // destroy() call, same as its other resources) — just detach the overlay
+    // reference so it can't keep this (about-to-be-removed) node alive.
+    this.canvasRenderer?.setSubtitleOverlay(null);
     if (this.textContainer?.parentNode) {
       this.textContainer.parentNode.removeChild(this.textContainer);
     }

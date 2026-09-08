@@ -177,46 +177,75 @@ for f in /src/wasm/*.cpp; do
     em++ "$f" -c -o "$OBJDIR/$(basename "$f" .cpp).o" "${CXX_COMMON_FLAGS[@]}"
 done
 
-em++ "$OBJDIR"/*.o \
-    -L/src/dist/ffmpeg/lib \
-    -L${DAV1D_PREFIX}/lib \
-    -lavformat -lavcodec -ldav1d -lavutil -lswresample -lswscale \
-    -O3 -msimd128 \
-    -flto \
-    -fno-exceptions \
-    -fno-rtti \
-    -D_FILE_OFFSET_BITS=64 \
-    -s WASM=1 \
-    -s EXPORT_ES6=1 \
-    -s MODULARIZE=1 \
-    -s EXPORT_NAME="createMoviModule" \
-    -s ENVIRONMENT=web,worker \
-    -s INITIAL_MEMORY=256MB \
-    -s MAXIMUM_MEMORY=4GB \
-    -s ALLOW_MEMORY_GROWTH=1 \
-    -s ASYNCIFY=1 \
-    -s ASYNCIFY_STACK_SIZE=524288 \
-    -s "ASYNCIFY_ADD=['movi_open','movi_read_frame','movi_seek_to','movi_thumbnail_open','movi_thumbnail_read_keyframe','movi_prefetch_subtitle_cues']" \
-    -s "ASYNCIFY_IMPORTS=['js_read_async','js_seek_async','js_thumbnail_packet_ready']" \
-    -s EXPORTED_RUNTIME_METHODS='["ccall", "cwrap", "FS", "stringToNewUTF8", "UTF8ToString", "lengthBytesUTF8", "addFunction", "HEAPU8", "HEAPF32"]' \
-    -s EXPORTED_FUNCTIONS='["_malloc", "_free", "_movi_create", "_movi_destroy", "_movi_open", "_movi_read_frame", "_movi_seek_to", "_movi_get_duration", "_movi_get_start_time", "_movi_get_stream_count", "_movi_get_stream_info", "_movi_get_extradata", "_movi_set_log_level", "_movi_set_file_size", "_movi_enable_decoder", "_movi_set_stream_discard", "_movi_send_packet", "_movi_receive_frame", "_movi_decode_subtitle", "_movi_get_subtitle_text", "_movi_get_subtitle_times", "_movi_get_subtitle_image_info", "_movi_get_subtitle_image_data", "_movi_free_subtitle", "_movi_prefetch_subtitle_cues", "_movi_get_prefetched_cue_count", "_movi_get_prefetched_cue", "_movi_clear_prefetched_cues", "_movi_get_frame_width", "_movi_get_frame_height", "_movi_get_frame_format", "_movi_get_frame_webcodecs_format", "_movi_get_frame_linesize", "_movi_get_frame_data", "_movi_get_frame_samples", "_movi_get_frame_channels", "_movi_get_frame_sample_rate", "_movi_enable_audio_downmix", "_movi_audio_decoder_create", "_movi_audio_decoder_destroy", "_movi_audio_decoder_enable_downmix", "_movi_audio_decoder_send_packet", "_movi_audio_decoder_receive_frame", "_movi_audio_decoder_flush", "_movi_audio_decoder_get_frame_samples", "_movi_audio_decoder_get_frame_channels", "_movi_audio_decoder_get_frame_sample_rate", "_movi_audio_decoder_get_frame_data", "_movi_video_decoder_create", "_movi_video_decoder_destroy", "_movi_video_decoder_set_skip_frame", "_movi_video_decoder_send_packet", "_movi_video_decoder_receive_frame", "_movi_video_decoder_flush", "_movi_video_decoder_get_frame_width", "_movi_video_decoder_get_frame_height", "_movi_video_decoder_get_frame_format", "_movi_video_decoder_get_frame_webcodecs_format", "_movi_video_decoder_get_frame_data", "_movi_video_decoder_get_frame_linesize", "_movi_video_decoder_get_frame_pts", "_movi_video_decoder_get_frame_rgba", "_movi_video_decoder_get_frame_rgba_size", "_movi_video_decoder_get_frame_rgba_linesize", "_movi_thumbnail_create", "_movi_thumbnail_destroy", "_movi_thumbnail_open", "_movi_thumbnail_read_keyframe", "_movi_thumbnail_get_packet_data", "_movi_thumbnail_decode_frame", "_movi_thumbnail_decode_frame_yuv", "_movi_thumbnail_get_plane_data", "_movi_thumbnail_get_plane_linesize", "_movi_thumbnail_get_frame_width", "_movi_thumbnail_get_frame_height", "_movi_thumbnail_clear_buffer", "_movi_thumbnail_get_extradata", "_movi_thumbnail_get_stream_info", "_movi_stretch_new", "_movi_stretch_delete", "_movi_stretch_reset", "_movi_stretch_set_transpose_semitones", "_movi_stretch_input_latency", "_movi_stretch_output_latency", "_movi_stretch_process"]' \
-    -s ASSERTIONS=0 \
-    -s DISABLE_EXCEPTION_THROWING=1 \
-    -s ALLOW_TABLE_GROWTH=1 \
-    -s INVOKE_RUN=0 \
+# Shared link flags for BOTH outputs. Keeping them in one array guarantees the
+# two builds are byte-for-byte identical except for how the WASM ships:
+#   movi.js       SINGLE_FILE=1 — WASM base64-embedded in the JS (the default,
+#                 zero-config build; consumers host one file).
+#   movi-slim.js  no SINGLE_FILE — emits movi-slim.js + movi-slim.wasm, so the
+#                 WASM streams+compiles as a separate cached asset (the opt-in
+#                 "slim" build; consumers host the extra .wasm).
+LINK_FLAGS=(
+    -L/src/dist/ffmpeg/lib
+    -L${DAV1D_PREFIX}/lib
+    -lavformat -lavcodec -ldav1d -lavutil -lswresample -lswscale
+    # -O3 -msimd128 (ours, not upstream's -Oz): the ffmpeg/dav1d objects linked
+    # here are compiled with exactly these flags (see the configure step above,
+    # which auto-merged to ours), so linking -Oz would be inconsistent as well
+    # as slower. The reason is recorded there and is stronger after A5, not
+    # weaker: software decode is CPU-bound in the audio worker and -Oz pegged
+    # its throughput — and A5 made the worker the path for EVERY codec, not
+    # just DTS 5.1.
+    -O3 -msimd128
+    -flto
+    -fno-exceptions
+    -fno-rtti
+    -D_FILE_OFFSET_BITS=64
+    -s WASM=1
+    -s EXPORT_ES6=1
+    -s MODULARIZE=1
+    -s EXPORT_NAME="createMoviModule"
+    -s ENVIRONMENT=web,worker
+    -s INITIAL_MEMORY=256MB
+    -s MAXIMUM_MEMORY=4GB
+    -s ALLOW_MEMORY_GROWTH=1
+    -s ASYNCIFY=1
+    -s ASYNCIFY_STACK_SIZE=524288
+    -s "ASYNCIFY_ADD=['movi_open','movi_read_frame','movi_seek_to','movi_thumbnail_open','movi_thumbnail_read_keyframe','movi_prefetch_subtitle_cues']"
+    -s "ASYNCIFY_IMPORTS=['js_read_async','js_seek_async','js_thumbnail_packet_ready']"
+    -s EXPORTED_RUNTIME_METHODS='["ccall", "cwrap", "FS", "stringToNewUTF8", "UTF8ToString", "lengthBytesUTF8", "addFunction", "HEAPU8", "HEAPF32"]'
+    -s EXPORTED_FUNCTIONS='["_malloc", "_free", "_movi_create", "_movi_destroy", "_movi_open", "_movi_read_frame", "_movi_seek_to", "_movi_get_duration", "_movi_get_start_time", "_movi_get_stream_count", "_movi_get_stream_info", "_movi_get_extradata", "_movi_set_log_level", "_movi_set_file_size", "_movi_set_probe_limits", "_movi_enable_decoder", "_movi_set_stream_discard", "_movi_send_packet", "_movi_receive_frame", "_movi_decode_audio_batch", "_movi_audio_batch_samples", "_movi_audio_batch_channels", "_movi_audio_batch_sample_rate", "_movi_audio_batch_pts", "_movi_audio_batch_plane", "_movi_decode_subtitle", "_movi_get_subtitle_text", "_movi_get_subtitle_times", "_movi_get_subtitle_image_info", "_movi_get_subtitle_image_data", "_movi_free_subtitle", "_movi_prefetch_subtitle_cues", "_movi_get_prefetched_cue_count", "_movi_get_prefetched_cue", "_movi_clear_prefetched_cues", "_movi_get_frame_width", "_movi_get_frame_height", "_movi_get_frame_format", "_movi_get_frame_linesize", "_movi_get_frame_data", "_movi_get_frame_samples", "_movi_get_frame_channels", "_movi_get_frame_sample_rate", "_movi_enable_audio_downmix", "_movi_thumbnail_create", "_movi_thumbnail_destroy", "_movi_thumbnail_open", "_movi_thumbnail_read_keyframe", "_movi_thumbnail_get_packet_data", "_movi_thumbnail_decode_frame", "_movi_thumbnail_decode_frame_yuv", "_movi_thumbnail_get_plane_data", "_movi_thumbnail_get_plane_linesize", "_movi_thumbnail_get_frame_width", "_movi_thumbnail_get_frame_height", "_movi_thumbnail_clear_buffer", "_movi_thumbnail_get_extradata", "_movi_thumbnail_get_stream_info", "_movi_stretch_new", "_movi_stretch_delete", "_movi_stretch_reset", "_movi_stretch_set_transpose_semitones", "_movi_stretch_input_latency", "_movi_stretch_output_latency", "_movi_stretch_process", "_movi_get_frame_webcodecs_format", "_movi_audio_decoder_create", "_movi_audio_decoder_destroy", "_movi_audio_decoder_enable_downmix", "_movi_audio_decoder_send_packet", "_movi_audio_decoder_receive_frame", "_movi_audio_decoder_flush", "_movi_audio_decoder_get_frame_samples", "_movi_audio_decoder_get_frame_channels", "_movi_audio_decoder_get_frame_sample_rate", "_movi_audio_decoder_get_frame_data", "_movi_video_decoder_create", "_movi_video_decoder_destroy", "_movi_video_decoder_set_skip_frame", "_movi_video_decoder_send_packet", "_movi_video_decoder_receive_frame", "_movi_video_decoder_flush", "_movi_video_decoder_get_frame_width", "_movi_video_decoder_get_frame_height", "_movi_video_decoder_get_frame_format", "_movi_video_decoder_get_frame_webcodecs_format", "_movi_video_decoder_get_frame_data", "_movi_video_decoder_get_frame_linesize", "_movi_video_decoder_get_frame_pts", "_movi_video_decoder_get_frame_rgba", "_movi_video_decoder_get_frame_rgba_size", "_movi_video_decoder_get_frame_rgba_linesize"]'
+    -s ASSERTIONS=0
+    -s DISABLE_EXCEPTION_THROWING=1
+    -s ALLOW_TABLE_GROWTH=1
+    -s INVOKE_RUN=0
+    -s LEGACY_RUNTIME=0
+    -g0
+    -s MINIFY_HTML=0
+    -s ELIMINATE_DUPLICATE_FUNCTIONS=1
+    -s STACK_OVERFLOW_CHECK=0
+    -s TEXTDECODER=2
+    -s SUPPORT_LONGJMP=0
+    -s SUPPORT_ERRNO=0
+    -sUSE_ZLIB=1
+    --closure 0
+    --js-library /src/wasm/library_movi.js
+)
+
+# Default build — WASM embedded (SINGLE_FILE). Unchanged output.
+em++ "$OBJDIR"/*.o "${LINK_FLAGS[@]}" \
     -s SINGLE_FILE=1 \
-    -s LEGACY_RUNTIME=0 \
-    -g0 \
-    -s MINIFY_HTML=0 \
-    -s ELIMINATE_DUPLICATE_FUNCTIONS=1 \
-    -s STACK_OVERFLOW_CHECK=0 \
-    -s TEXTDECODER=2 \
-    -s SUPPORT_LONGJMP=0 \
-    -s SUPPORT_ERRNO=0 \
-    -sUSE_ZLIB=1 \
-    --closure 0 \
-    --js-library /src/wasm/library_movi.js \
     -o /src/dist/wasm/movi.js
+
+# External-WASM build — identical binary, just shipped as a standalone
+# movi.wasm alongside its glue instead of embedded. The WASM itself is NOT
+# slimmed (same code, same flags); only the JS bundle that consumes it is
+# smaller, so the .wasm is plainly named `movi.wasm`. Emscripten derives the
+# .wasm name from the -o basename, so this emits external/movi.js +
+# external/movi.wasm. The subdir keeps `movi.js` from colliding with the
+# embedded SINGLE_FILE glue above.
+mkdir -p /src/dist/wasm/external
+em++ "$OBJDIR"/*.o "${LINK_FLAGS[@]}" \
+    -o /src/dist/wasm/external/movi.js
 
 echo "=== Build complete ==="
 ls -la /src/dist/wasm/

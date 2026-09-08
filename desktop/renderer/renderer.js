@@ -6,6 +6,8 @@
  *   pick / recent / OS open-with → path → /_local?p=…   (range-streamed)
  *   URL bar      → /_proxy?url=…                         (range pass-through)
  */
+import { applySettings, captureSettings } from "/handoff.js";
+
 const player = document.getElementById("player");
 const welcome = document.getElementById("welcome");
 const dropzone = document.getElementById("dropzone");
@@ -335,7 +337,27 @@ player.addEventListener("error", (e) => {
 
 // ---------- Wires from main ----------
 window.movi.onLoadPaths(loadPaths);
-window.movi.onFullscreen((on) => document.body.classList.toggle("osfs", on));
+window.movi.onFullscreen((on) => {
+  document.body.classList.toggle("osfs", on);
+  // Sync the player's own fullscreen UI (icon, context-menu label, auto-hide /
+  // cursor behaviour) to the OS window fullscreen. The macOS green button and the
+  // menu toggle only move the OS window — without this the player never learns it
+  // went fullscreen, so its state stays out of sync.
+  try {
+    player.setHostFullscreen(on);
+  } catch {}
+});
+
+// Route the player's own fullscreen button / F key / double-click to the OS
+// window fullscreen (same as the green button) instead of HTML element
+// fullscreen — the two would otherwise fight (after a green-button fullscreen,
+// document.fullscreenElement is null, so the player's button would ENTER element
+// fullscreen instead of exiting). The resulting window-fullscreen event drives
+// setHostFullscreen above to keep the UI in sync.
+player.addEventListener("movi-fullscreen-request", (e) => {
+  e.preventDefault();
+  window.movi.toggleFullscreen();
+});
 
 // ---------- Open-URL modal (works during playback; the welcome URL bar is hidden then) ----------
 function playUrl(u) {
@@ -469,7 +491,14 @@ function openPip() {
     return;
   }
   pipWasPlaying = !player.paused;
-  window.movi.pipOpen({ src, time: player.currentTime || 0, playing: pipWasPlaying });
+  window.movi.pipOpen({
+    src,
+    time: player.currentTime || 0,
+    playing: pipWasPlaying,
+    // The PiP window builds its own player from nothing, so how this one was
+    // set up has to travel with the file — see handoff.js.
+    settings: captureSettings(player),
+  });
 }
 
 // The built-in "p" shortcut calls the element's Document PiP (dead in Electron).
@@ -512,12 +541,18 @@ window.movi.onPipClosed((state) => {
       }
       prime();
       player.src = src;
+      // After the assignment: the picks wait on the NEW file's trackschange,
+      // and reading the lists before it would be reading the file we just left.
+      applySettings(player, state && state.settings);
       let n = 0;
       const iv = setInterval(() => {
         if (++n > 100) return clearInterval(iv);
         if (player.duration > 0) { clearInterval(iv); resume(); }
       }, 100);
     } else {
+      // Whatever was changed inside the PiP window comes back with it. The file
+      // never left this player, so the track lists are already there to match.
+      applySettings(player, state && state.settings);
       resume();
     }
   };

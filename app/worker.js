@@ -1,6 +1,7 @@
 import HTML_RAW from "./index.html";
 import TEST_NATIVE_HTML from "./test-native.html";
 import COMPARE_HTML from "./compare.html";
+import EXAMPLES_HTML from "./examples.html";
 import DRIVE_HTML from "./drive.html";
 import SITEMAP from "./sitemap.xml";
 import ROBOTS from "./robots.txt";
@@ -10,6 +11,7 @@ const BUILD_VERSION = "__BUILD_VERSION__";
 const HTML_WITH_VERSION = HTML_RAW.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
 const TEST_NATIVE_WITH_VERSION = TEST_NATIVE_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
 const COMPARE_WITH_VERSION = COMPARE_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
+const EXAMPLES_WITH_VERSION = EXAMPLES_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
 const DRIVE_WITH_VERSION = DRIVE_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
 
 // Turnstile site key is injected per-request from env so it can be
@@ -338,6 +340,22 @@ export default {
       });
     }
 
+    // --- Examples gallery: real, copy-paste <movi-player> setups. Served
+    // WITHOUT COEP: it embeds cross-origin demo streams (HLS/DASH), and
+    // require-corp would fight their opaque/CORS fetches. The player needs no
+    // SharedArrayBuffer (single-threaded WASM + Asyncify I/O), so dropping
+    // cross-origin isolation costs nothing here. ---
+    if (path === "/examples" || path === "/examples.html" || path === "/examples/") {
+      return new Response(EXAMPLES_WITH_VERSION, {
+        headers: {
+          "Content-Type": "text/html;charset=UTF-8",
+          "Cache-Control": "public, max-age=600",
+          "X-Content-Type-Options": "nosniff",
+          "Referrer-Policy": "strict-origin-when-cross-origin",
+        },
+      });
+    }
+
     // --- "Open with Movi Player" for Google Drive. Also the Drive UI
     // Integration Open URL: Drive appends ?state={ids,action} and the page
     // signs in + streams the picked file. Uses DRIVE_HEADERS (popup-safe COOP,
@@ -405,6 +423,14 @@ export default {
       return handleEncVideo(request, env);
     }
 
+    // --- Visitor feedback wall (landing page, under the FAQ) ---
+    if (path === "/api/comments") {
+      if (request.method === "GET") return handleCommentsList(env, url);
+      if (request.method === "POST") return handleCommentPost(request, env);
+      if (request.method === "DELETE") return handleCommentDelete(request, env, url);
+      return jsonResponse({ error: "Method not allowed" }, 405);
+    }
+
     // --- Sitemap & Robots ---
     if (path === "/sitemap.xml") {
       return new Response(SITEMAP, { headers: { "Content-Type": "application/xml", "Cache-Control": "public, max-age=86400" } });
@@ -425,6 +451,7 @@ export default {
     if (path === "/badge/chrome.svg") return handleBadge("chrome");
     if (path === "/badge/vscode.svg") return handleBadge("vscode");
     if (path === "/badge/npm.svg") return handleBadge("npm");
+    if (path === "/badge/jsdelivr.svg") return handleBadge("jsdelivr");
 
     // --- Serve static assets from R2 (favicons, etc.) ---
     if (path.startsWith("/favicon") || path === "/apple-touch-icon.png" || path === "/og-image.png") {
@@ -813,21 +840,36 @@ const BADGE_SOURCES = {
 };
 
 async function handleBadge(which) {
-  const src = BADGE_SOURCES[which];
-  if (!src) return new Response("Not Found", { status: 404 });
+  if (which !== "jsdelivr" && !BADGE_SOURCES[which]) {
+    return new Response("Not Found", { status: 404 });
+  }
   try {
-    // cf.cacheEverything caches the upstream SVG at the edge for 12h so
-    // we don't hit the badge service on every page view.
-    const upstream = await fetch(src, {
-      cf: { cacheTtl: 43200, cacheEverything: true },
+    // jsDelivr's own shields badge bakes "/year" into the value; we want the
+    // yearly hit count with no period wording, so resolve it to a static
+    // shields badge ("jsDelivr | 9.5k"). Everything else proxies directly.
+    const src =
+      which === "jsdelivr" ? await jsdelivrBadgeUrl() : BADGE_SOURCES[which];
+    // `_v` (the deploy timestamp) busts Cloudflare's subrequest cache on every
+    // deploy so a redeploy refreshes every badge's count — the upstream badge
+    // services ignore the extra param. (jsdelivrBadgeUrl already busts its own
+    // stats fetch; this covers the store/npm counts too.)
+    const bustedSrc = src + (src.includes("?") ? "&" : "?") + "_v=" + BUILD_VERSION;
+    // cf.cacheEverything caches the upstream SVG at the edge for 1h so we don't
+    // hit the badge service on every page view. Bound the fetch: a slow badge
+    // service (vsmarketplacebadges.dev has stalled 100s+) must never hold the
+    // request — and thus the page's <img> and the tab's load spinner — open.
+    // On timeout we fall through to the static fallback.
+    const upstream = await fetch(bustedSrc, {
+      cf: { cacheTtl: 3600, cacheEverything: true },
       headers: { "User-Agent": "movi-app-badge-proxy" },
+      signal: AbortSignal.timeout(4000),
     });
     if (!upstream.ok) throw new Error("badge upstream " + upstream.status);
     const svg = await upstream.text();
     return new Response(svg, {
       headers: {
         "Content-Type": "image/svg+xml;charset=utf-8",
-        "Cache-Control": "public, max-age=21600, s-maxage=43200",
+        "Cache-Control": "public, max-age=3600, s-maxage=3600",
         "Cross-Origin-Resource-Policy": "cross-origin",
       },
     });
@@ -835,7 +877,7 @@ async function handleBadge(which) {
     // Upstream down/changed → serve a static badge so the <img> never
     // renders broken. Short cache so it self-heals when upstream returns.
     const label =
-      { chrome: "Chrome Web Store", vscode: "VS Code", npm: "npm downloads" }[which] ||
+      { chrome: "Chrome Web Store", vscode: "VS Code", npm: "npm downloads", jsdelivr: "jsDelivr" }[which] ||
       "extension";
     const w = Math.max(60, label.length * 7 + 16);
     const fallback =
@@ -851,6 +893,35 @@ async function handleBadge(which) {
       },
     });
   }
+}
+
+// jsDelivr's yearly hit count, resolved to a static shields badge URL so the
+// value renders as "9.5k" instead of shields' built-in "9.5k/year" wording.
+// Throws on any upstream trouble so handleBadge falls back to a static badge.
+async function jsdelivrBadgeUrl() {
+  // `_v` (the deploy timestamp) busts Cloudflare's subrequest cache on every
+  // deploy, so a redeploy always refreshes the count. The 1h cacheTtl keeps it
+  // reasonably fresh between deploys (jsDelivr's own stats update ~daily).
+  const stats = await fetch(
+    `https://data.jsdelivr.com/v1/stats/packages/npm/movi-player?period=year&_v=${BUILD_VERSION}`,
+    {
+      cf: { cacheTtl: 3600, cacheEverything: true },
+      headers: { "User-Agent": "movi-app-badge-proxy" },
+      signal: AbortSignal.timeout(4000),
+    },
+  );
+  if (!stats.ok) throw new Error("jsdelivr stats " + stats.status);
+  const data = await stats.json();
+  const value = humanizeCount(data?.hits?.total ?? 0);
+  return `https://img.shields.io/badge/jsDelivr-${encodeURIComponent(value)}-7c6cf0?labelColor=23232e`;
+}
+
+// 9455 → "9.5k", 1_200_000 → "1.2M". Mirrors how shields humanizes counts so
+// the jsDelivr badge sits consistently next to the npm one.
+function humanizeCount(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  return String(n);
 }
 
 async function handleStaticAsset(env, key) {
@@ -2396,4 +2467,509 @@ function jsonResponse(data, status = 200) {
       ...CORS_HEADERS,
     },
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Visitor feedback wall — /api/comments
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Comments publish instantly (no approval queue), so every gate has to be
+// automatic and server-side:
+//
+//   1. Turnstile  — same invisible widget the encrypted-playback session
+//                   uses. Falls open when TURNSTILE_SECRET_KEY is unset.
+//   2. Profanity  — English + Hinglish + Devanagari abuse list, matched
+//                   against several de-obfuscated views of the text.
+//   3. Links      — any domain outside a small allowlist is rejected. An
+//                   unmoderated public wall is an SEO-spam magnet, and
+//                   link spam is far more common here than swearing.
+//   4. Rate limit — per hashed IP, enforced with a COUNT over D1.
+//
+// Client-side checks are duplicated in index.html purely for instant
+// feedback; they are not the control. Everything below re-validates.
+
+const COMMENT_MAX_NAME = 40;
+const COMMENT_MAX_BODY = 1000;
+const COMMENT_MIN_BODY = 2;
+const COMMENT_PAGE_SIZE = 20;
+
+// Rate limit: at most 3 comments per IP per 10 minutes, and never two
+// within 30 seconds of each other.
+const COMMENT_RATE_WINDOW_MS = 10 * 60 * 1000;
+const COMMENT_RATE_MAX = 3;
+const COMMENT_COOLDOWN_MS = 30 * 1000;
+
+// Characters swapped in before matching, so "sh1t" / "f@g" / "@ss" don't
+// slip past the word list. Applied only to the throwaway matching copy —
+// the stored text is never rewritten.
+const LEET_MAP = {
+  "0": "o", "1": "i", "3": "e", "4": "a", "5": "s",
+  "7": "t", "8": "b", "@": "a", "$": "s", "!": "i",
+  "|": "i", "+": "t", "€": "e", "£": "l",
+};
+
+/**
+ * Compile a word list into a single letter-bounded alternation.
+ *
+ * `\b` is the wrong boundary here: it treats digits as word characters,
+ * so "\bfuck\b" would miss "fuck1". Explicit letter lookarounds match the
+ * word plus any digit/punctuation padding while still refusing to fire in
+ * the middle of a longer word.
+ */
+function buildWordRegex(words) {
+  const escaped = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(`(?<![a-z])(?:${escaped.join("|")})(?![a-z])`, "u");
+}
+
+// The blocklist itself lives in the profanity_terms table (see schema.sql)
+// so terms can be added or retired with a `wrangler d1 execute` instead of
+// a redeploy. Only the matching logic lives here.
+//
+// Loading it per submission would mean a D1 round trip on every comment,
+// so the compiled form is cached in the isolate. Workers reuses isolates
+// across requests, and each edge location has its own — a term added now
+// is live everywhere within PROFANITY_CACHE_MS.
+const PROFANITY_CACHE_MS = 5 * 60 * 1000;
+let profanityCache = null;
+let profanityCachedAt = 0;
+
+/**
+ * Fetch the active blocklist and compile it into the three matchers
+ * screenCommentText needs. Throws if the list can't be loaded — the caller
+ * turns that into a 503 rather than accepting an unscreened comment.
+ */
+async function loadProfanityFilter(env) {
+  const now = Date.now();
+  if (profanityCache && now - profanityCachedAt < PROFANITY_CACHE_MS) {
+    return profanityCache;
+  }
+
+  const { results } = await env.COMMENTS_DB.prepare(
+    "SELECT term, kind FROM profanity_terms WHERE active = 1",
+  ).all();
+
+  const words = [];
+  const phrases = [];
+  const strong = [];
+  for (const row of results || []) {
+    const term = String(row.term || "").toLowerCase();
+    if (!term) continue;
+    if (row.kind === "word") words.push(term);
+    else if (row.kind === "phrase") phrases.push(term);
+    else if (row.kind === "strong") strong.push(term);
+  }
+
+  // An empty list would silently pass every comment — that's a broken
+  // deploy (schema.sql not seeded), not a valid "allow everything" config.
+  if (!words.length && !phrases.length && !strong.length) {
+    throw new Error("profanity_terms is empty — run schema.sql against this database");
+  }
+
+  profanityCache = {
+    // buildWordRegex on an empty array would produce `(?:)`, which matches
+    // the empty string everywhere and blocks every comment.
+    wordRe: words.length ? buildWordRegex(words) : null,
+    phrases,
+    strong,
+  };
+  profanityCachedAt = now;
+  return profanityCache;
+}
+
+/**
+ * Fold text into the form the word lists are written in: lowercase, no
+ * accents, no zero-width/bidi tricks, leet characters restored, and runs
+ * of 3+ identical characters squashed to one ("fuuuuck" → "fuck").
+ *
+ * The squash stops at runs of 3 on purpose. Collapsing pairs too would
+ * turn "ass" into "as", and "as" is a perfectly ordinary word.
+ */
+function normalizeForFilter(text) {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    // Recompose after stripping the Latin combining marks. Devanagari
+    // nukta letters (ड़ = U+095C) decompose under NFD, and the word list
+    // is written in the precomposed form — without this, "भोसड़ी" would
+    // arrive as भ+ो+स+ड+़+ी and never match.
+    .normalize("NFC")
+    // Zero-width joiners/spaces and bidi overrides are the cheapest way to
+    // break up a banned word without changing how it renders.
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, "")
+    .replace(/[0134578@$!|+€£]/g, (c) => LEET_MAP[c] || c)
+    .replace(/(.)\1{2,}/gu, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Rejoin letters that were spaced out to dodge the filter — "f u c k",
+ * "c.h.u.t", "g-a-n-d". Only runs of 3+ single letters are joined, so
+ * ordinary prose ("I do") is left alone.
+ */
+function joinSpacedLetters(s) {
+  return s.replace(
+    /(?<![a-z])((?:[a-z][^a-z\n]{1,2}){2,}[a-z])(?![a-z])/g,
+    (m) => m.replace(/[^a-z]/g, ""),
+  );
+}
+
+/**
+ * Domains a comment is allowed to mention. Anything else — including bare
+ * "spam-site.xyz" with no scheme — gets the comment rejected. Feedback
+ * about the player rarely needs an outbound link, and letting them
+ * through on an instantly-published page invites SEO spam.
+ */
+const COMMENT_LINK_ALLOWLIST = new Set([
+  "moviplayer.com", "www.moviplayer.com",
+  "github.com", "www.github.com",
+  "npmjs.com", "www.npmjs.com",
+  "youtube.com", "www.youtube.com", "youtu.be",
+]);
+
+const DOMAIN_LIKE_RE =
+  /\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:com|net|org|io|dev|app|co|in|uk|us|de|ru|cn|xyz|info|biz|top|link|shop|club|online|site|live|me|tv|to|cc|ly|gg|ai|pro|store|vip|win|icu|buzz))\b/gi;
+
+/**
+ * Screen one field of a submission against a filter from
+ * loadProfanityFilter(). Returns null when it's clean, or a
+ * `{ reason, message }` object naming the first rule it broke.
+ */
+function screenCommentText(text, field, filter) {
+  const normalized = normalizeForFilter(text);
+  const joined = joinSpacedLetters(normalized);
+  const stripped = normalized.replace(/[^a-z0-9\u0900-\u097f]/g, "");
+
+  if (filter.wordRe && (filter.wordRe.test(normalized) || filter.wordRe.test(joined))) {
+    return {
+      reason: "profanity",
+      message: `Please rephrase your ${field} — abusive language isn't allowed here.`,
+    };
+  }
+
+  for (const phrase of filter.phrases) {
+    if (normalized.includes(phrase)) {
+      return {
+        reason: "profanity",
+        message: `Please rephrase your ${field} — abusive language isn't allowed here.`,
+      };
+    }
+  }
+
+  for (const term of filter.strong) {
+    if (stripped.includes(term)) {
+      return {
+        reason: "profanity",
+        message: `Please rephrase your ${field} — abusive language isn't allowed here.`,
+      };
+    }
+  }
+
+  // Links. Screened against the raw text, not the normalized copy — leet
+  // folding mangles hostnames ("bit.ly" → "bit.iy") and would let some
+  // through. DOMAIN_LIKE_RE is /g, so reset lastIndex between calls.
+  DOMAIN_LIKE_RE.lastIndex = 0;
+  const hosts = [...text.matchAll(DOMAIN_LIKE_RE)].map((m) => m[1].toLowerCase());
+  const hasScheme = /https?:\/\/|\bwww\./i.test(text);
+  // A bare scheme with no recognizable host ("http://1.2.3.4/x") is still a
+  // link, so an empty host list counts as a hit once a scheme is present.
+  if (hosts.some((h) => !COMMENT_LINK_ALLOWLIST.has(h)) || (hasScheme && hosts.length === 0)) {
+    return { reason: "link", message: "Links aren't allowed in comments." };
+  }
+
+  return null;
+}
+
+/**
+ * SHA-256(ip + secret), truncated to 32 hex chars. Enough to rate-limit
+ * on, and — because the secret is mixed in — not reversible by hashing
+ * every IPv4 address. Falls back to a constant when ENC_SERVER_SECRET is
+ * unset, which collapses all visitors into one rate-limit bucket. That's
+ * deliberately conservative: a misconfigured deploy throttles hard rather
+ * than accepting unlimited posts.
+ */
+async function hashCommentIp(env, ip) {
+  const data = new TextEncoder().encode(`${ip}|${env.ENC_SERVER_SECRET || "no-secret"}`);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(digest)]
+    .slice(0, 16)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Strip control characters and clamp length. Stored text stays raw
+ * otherwise — the client renders it with textContent, so escaping here
+ * would only double-encode legitimate "&" and "<" characters.
+ */
+function sanitizeCommentField(value, maxLen) {
+  return String(value ?? "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .replace(/\r\n/g, "\n")
+    // Cap consecutive blank lines so one comment can't scroll the page.
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, maxLen);
+}
+
+/** GET /api/comments?before=<id> — newest first, paginated by id. */
+async function handleCommentsList(env, url) {
+  if (!env.COMMENTS_DB) {
+    return jsonResponse({ error: "Comments are not configured on this deployment" }, 503);
+  }
+
+  const before = Number(url.searchParams.get("before"));
+  const hasCursor = Number.isFinite(before) && before > 0;
+
+  try {
+    // Top level only — a reply belongs to its parent's card, not to the page,
+    // and letting one occupy a page slot would push a real comment off it.
+    const rows = hasCursor
+      ? await env.COMMENTS_DB.prepare(
+          "SELECT id, name, body, rating, created_at FROM comments " +
+            "WHERE hidden = 0 AND parent_id IS NULL AND id < ? ORDER BY id DESC LIMIT ?",
+        ).bind(before, COMMENT_PAGE_SIZE + 1).all()
+      : await env.COMMENTS_DB.prepare(
+          "SELECT id, name, body, rating, created_at FROM comments " +
+            "WHERE hidden = 0 AND parent_id IS NULL ORDER BY id DESC LIMIT ?",
+        ).bind(COMMENT_PAGE_SIZE + 1).all();
+
+    const all = rows.results || [];
+    // We asked for one extra row purely to learn whether more exist.
+    const hasMore = all.length > COMMENT_PAGE_SIZE;
+    const page = hasMore ? all.slice(0, COMMENT_PAGE_SIZE) : all;
+
+    // One query for the whole page's replies rather than one per card.
+    const repliesBy = new Map();
+    if (page.length) {
+      const marks = page.map(() => "?").join(",");
+      const rep = await env.COMMENTS_DB.prepare(
+        "SELECT id, name, body, created_at, parent_id, author_role FROM comments " +
+          `WHERE hidden = 0 AND parent_id IN (${marks}) ORDER BY id ASC`,
+      ).bind(...page.map((r) => r.id)).all();
+      for (const r of rep.results || []) {
+        if (!repliesBy.has(r.parent_id)) repliesBy.set(r.parent_id, []);
+        repliesBy.get(r.parent_id).push({
+          id: r.id,
+          name: r.name,
+          body: r.body,
+          createdAt: r.created_at,
+          role: r.author_role || "visitor",
+        });
+      }
+    }
+
+    // Replies are answers, not feedback: counting them would inflate the
+    // comment count and they carry no rating to average anyway.
+    const totals = await env.COMMENTS_DB.prepare(
+      "SELECT COUNT(*) AS total, AVG(rating) AS avgRating, " +
+        "COUNT(rating) AS rated FROM comments WHERE hidden = 0 AND parent_id IS NULL",
+    ).first();
+
+    return new Response(
+      JSON.stringify({
+        comments: page.map((r) => ({
+          id: r.id,
+          name: r.name,
+          body: r.body,
+          rating: r.rating,
+          createdAt: r.created_at,
+          replies: repliesBy.get(r.id) || [],
+        })),
+        hasMore,
+        total: totals?.total ?? page.length,
+        avgRating: totals?.avgRating ?? null,
+        ratedCount: totals?.rated ?? 0,
+      }),
+      {
+        headers: {
+          "Content-Type": "application/json",
+          // Comments publish instantly; a cached list would show a visitor
+          // a page that's missing the comment they just posted.
+          "Cache-Control": "no-store",
+          ...CORS_HEADERS,
+        },
+      },
+    );
+  } catch (err) {
+    console.error("Comment list failed", err);
+    return jsonResponse({ error: "Could not load comments" }, 500);
+  }
+}
+
+/** POST /api/comments — validate, screen, rate-limit, insert, return the row. */
+async function handleCommentPost(request, env) {
+  if (!env.COMMENTS_DB) {
+    return jsonResponse({ error: "Comments are not configured on this deployment" }, 503);
+  }
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+
+  const ip = request.headers.get("CF-Connecting-IP") || "";
+
+  // Bot gate. Same fall-open behaviour as /api/session: forks without a
+  // Turnstile secret still work, they just lean on the rate limit.
+  if (env.TURNSTILE_SECRET_KEY) {
+    const ok = await verifyTurnstileToken(env, payload?.turnstileToken, ip);
+    if (!ok) {
+      return jsonResponse({ error: "Bot check failed — please try again." }, 403);
+    }
+  } else {
+    console.warn("TURNSTILE_SECRET_KEY missing — /api/comments has no bot gate");
+  }
+
+  const name = sanitizeCommentField(payload?.name, COMMENT_MAX_NAME) || "Anonymous";
+  const body = sanitizeCommentField(payload?.body, COMMENT_MAX_BODY);
+
+  if (body.length < COMMENT_MIN_BODY) {
+    return jsonResponse({ error: "Please write a comment first." }, 400);
+  }
+
+  // A reply is an ordinary comment hung off another one, and it comes through
+  // this handler rather than a route of its own precisely so it meets the same
+  // bot gate, rate limit and abuse screen above. Anyone may write one.
+  let parentId = null;
+  if (payload?.parentId != null && payload.parentId !== "") {
+    const n = Number(payload.parentId);
+    if (!Number.isInteger(n) || n <= 0) {
+      return jsonResponse({ error: "Invalid parentId" }, 400);
+    }
+    parentId = n;
+  }
+
+  let rating = null;
+  if (payload?.rating != null && payload.rating !== "") {
+    const n = Number(payload.rating);
+    if (!Number.isInteger(n) || n < 1 || n > 5) {
+      return jsonResponse({ error: "Rating must be between 1 and 5." }, 400);
+    }
+    rating = n;
+  }
+  // A rating is feedback on the player, not on the comment being answered —
+  // counting one from a reply would move the average for the wrong reason.
+  if (parentId) rating = null;
+
+  // Fail closed: with no blocklist there is no abuse gate, so refuse the
+  // comment rather than publish it unscreened. Costs nothing in practice —
+  // the same D1 outage would fail the INSERT a few lines below anyway.
+  let filter;
+  try {
+    filter = await loadProfanityFilter(env);
+  } catch (err) {
+    console.error("Could not load profanity_terms", err);
+    return jsonResponse({ error: "Comments are temporarily unavailable" }, 503);
+  }
+
+  for (const [value, field] of [[name, "name"], [body, "comment"]]) {
+    const blocked = screenCommentText(value, field, filter);
+    if (blocked) {
+      return jsonResponse({ error: blocked.message, reason: blocked.reason }, 422);
+    }
+  }
+
+  const now = Date.now();
+  const ipHash = await hashCommentIp(env, ip);
+
+  try {
+    const recent = await env.COMMENTS_DB.prepare(
+      "SELECT COUNT(*) AS n, MAX(created_at) AS last FROM comments " +
+        "WHERE ip_hash = ? AND created_at > ?",
+    ).bind(ipHash, now - COMMENT_RATE_WINDOW_MS).first();
+
+    if ((recent?.n ?? 0) >= COMMENT_RATE_MAX) {
+      return jsonResponse(
+        { error: "You've posted a few already — try again in a bit." },
+        429,
+      );
+    }
+    if (recent?.last && now - recent.last < COMMENT_COOLDOWN_MS) {
+      const wait = Math.ceil((COMMENT_COOLDOWN_MS - (now - recent.last)) / 1000);
+      return jsonResponse({ error: `Please wait ${wait}s before posting again.` }, 429);
+    }
+
+    // The parent has to exist, be visible, and itself be top-level. Without
+    // the last check a reply could hang off another reply, and the wall only
+    // ever draws one level deep — the thread would simply not appear.
+    if (parentId) {
+      const parent = await env.COMMENTS_DB.prepare(
+        "SELECT id FROM comments WHERE id = ? AND hidden = 0 AND parent_id IS NULL",
+      ).bind(parentId).first();
+      if (!parent) {
+        return jsonResponse({ error: "That comment is no longer available." }, 404);
+      }
+    }
+
+    const inserted = await env.COMMENTS_DB.prepare(
+      "INSERT INTO comments (name, body, rating, ip_hash, created_at, parent_id) " +
+        "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+    ).bind(name, body, rating, ipHash, now, parentId).first();
+
+    return jsonResponse({
+      ok: true,
+      comment: {
+        id: inserted?.id,
+        name,
+        body,
+        rating,
+        createdAt: now,
+        parentId,
+        role: "visitor",
+      },
+    }, 201);
+  } catch (err) {
+    console.error("Comment insert failed", err);
+    return jsonResponse({ error: "Could not save your comment" }, 500);
+  }
+}
+
+/**
+ * DELETE /api/comments?id=N — soft-hide a comment. Requires
+ * `Authorization: Bearer <COMMENTS_ADMIN_TOKEN>`. Without the secret set
+ * the route stays closed rather than falling open; an unauthenticated
+ * delete endpoint would be worse than no delete endpoint.
+ */
+async function handleCommentDelete(request, env, url) {
+  if (!env.COMMENTS_DB) {
+    return jsonResponse({ error: "Comments are not configured on this deployment" }, 503);
+  }
+  if (!env.COMMENTS_ADMIN_TOKEN) {
+    return jsonResponse({ error: "Admin token not configured" }, 503);
+  }
+
+  const auth = request.headers.get("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!timingSafeEqualStr(token, env.COMMENTS_ADMIN_TOKEN)) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+
+  const id = Number(url.searchParams.get("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return jsonResponse({ error: "Missing or invalid id" }, 400);
+  }
+
+  try {
+    const res = await env.COMMENTS_DB.prepare(
+      "UPDATE comments SET hidden = 1 WHERE id = ?",
+    ).bind(id).run();
+    return jsonResponse({ ok: true, changed: res.meta?.changes ?? 0 });
+  } catch (err) {
+    console.error("Comment delete failed", err);
+    return jsonResponse({ error: "Could not delete comment" }, 500);
+  }
+}
+
+/** Constant-time string compare, so token checks don't leak length/prefix. */
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }

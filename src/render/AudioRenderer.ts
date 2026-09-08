@@ -13,6 +13,42 @@ import type { PCMFrame } from "../decode/SoftwareAudioDecoder";
 
 const TAG = "AudioRenderer";
 
+// Session-wide AudioContext, shared across every AudioRenderer instance (i.e.
+// across source/quality/video switches). Safari grants autoplay-with-sound per
+// AudioContext via a user gesture; a brand-new context per video lands its
+// resume() outside the click's activation window and gets blocked, so the
+// "tap to unmute" pill reappears on every switch. Reusing ONE context means
+// that once the user unmutes, it stays "running" and later videos start audible
+// with no gesture — matching how native <audio> inherited media engagement.
+// Created lazily on first init(); never closed (a renderer destroy() only
+// disconnects its own nodes), so it survives player teardown.
+let sharedAudioContext: AudioContext | null = null;
+// True once the shared context has been resumed to "running" via a user gesture
+// (unmute/play). A player's pause() (e.g. when a video ends) suspends the shared
+// context, so the next auto-advanced / switched video would inherit a suspended
+// context and re-show the "tap to unmute" pill. Once activated, a suspended
+// shared context can be resumed WITHOUT a fresh gesture — so a new renderer
+// wakes it during init(), before autoplay's block-check runs. Stays false until
+// the first real gesture so a brand-new page's poster-seek can't leak audio.
+let sharedContextActivated = false;
+/**
+ * "Somebody suspended this context on purpose."
+ *
+ * Module scope, because the context is module scope. This was an instance
+ * field, and on a shared context that made every renderer's watchdog judge a
+ * suspension by whether IT had asked for one. Two renderers overlap routinely
+ * — a quality switch builds the next before retiring the last — and the older
+ * one is not paused, it is simply superseded, so it still reads as playing.
+ * The live renderer would suspend for a user's pause and the stale one's
+ * watchdog would call that unexplained and resume the context: the sound
+ * carried on after the button, then stopped again once something else caught
+ * up. The logs showed it plainly — ten "suspended unexpectedly" warnings and
+ * twenty-one "recovered to running", two handlers answering every transition.
+ *
+ * The intent belongs to the context, so it is stored where the context is.
+ */
+let contextSuspendIntent = false;
+
 export class AudioRenderer {
   private audioContext: AudioContext | null = null;
   // Fixed fan-in bus: every decoded source connects here. Keeping the input
@@ -37,13 +73,42 @@ export class AudioRenderer {
     numberOfFrames: number;
     chunks: Float32Array<ArrayBuffer>[][];
   } | null = null;
+  // Set while frames are being thrown away because the context is suspended
+  // and we are muted (autoplay-blocked). Tells the recovery path that the
+  // clock anchor describes dropped audio and has to be rebuilt.
+  private droppedWhileSuspended = false;
 
   // Audio clock tracking for A/V sync
   private firstBufferScheduledAt: number = 0;
   private firstBufferMediaTime: number = 0;
   private hasFirstBuffer: boolean = false;
+  // performance.now() of the last buffer underrun (a hole we patched with
+  // silence). Sustained underruns mean packets aren't reaching the renderer in
+  // realtime — see isUnderrunning().
   private lastUnderrunAt: number = 0;
-  private underrunDucked: boolean = false;
+  // True while the input is faded out to cover a run of underruns — EITHER
+  // duckForUnderrun's own trigger OR silenceForResync's. The two share this
+  // one flag (rather than each tracking its own) so forceUnduck(),
+  // releaseResyncSilence() and releaseUnderrunDuckIfClean() all agree on
+  // whether the gain is actually held down; two independent flags is exactly
+  // how forceUnduck() ends up a no-op while duckForUnderrun() is holding the
+  // input at 0. Stitched output across underruns is audibly broken — clicks
+  // and chopped syllables — and chopped audio reads as "this player is
+  // broken" where silence just reads as "it's loading". So we fade out for
+  // the whole stuttery stretch and fade back in only once packets have
+  // flowed cleanly again. The player's buffering spinner covers the same
+  // window, so the silence is explained on screen.
+  private _ducked: boolean = false;
+  /** Output held silent across the unmute re-read — see silenceForResync. */
+  private _resyncSilenced: boolean = false;
+  private static readonly DUCK_FADE_OUT = 0.01; // 10ms: beats the glitch, still too slow to click
+  private static readonly DUCK_FADE_IN = 0.04; // 40ms: audibly smooth on the way back
+  // performance.now() before which ducking is suppressed. The player sets this
+  // around a background→foreground recovery: the recovery flushes the video
+  // decoder and re-seeks, which briefly starves audio — a transient underrun,
+  // not glitchy playback. Ducking there would mute audio the instant the user
+  // returns, which reads as "the audio stopped".
+  private _suppressDuckUntil: number = 0;
   private currentMediaTime: number = 0;
   private maxScheduledMediaTime: number = 0; // Track the furthest media time we've scheduled
 
@@ -64,7 +129,19 @@ export class AudioRenderer {
   private signalsmithSampleRate: number = 0;
 
   // Stable audio: master toggle (off by default, opt-in via element attribute)
+  // Sample rate of the most recently decoded audio buffer. The stretcher is
+  // fixed-rate per instance and MUST be built at this rate — not the
+  // AudioContext's, which can differ (e.g. 48kHz media in a 44.1kHz context).
+  // Cached here so the pre-warm on the first rate change targets the right rate
+  // instead of building at the context rate and then throwing it away + lazily
+  // rebuilding on the first chunk (the ~1-2s opening-silence gap).
+  private _decodedSampleRate: number = 0;
+
   private _stableAudio: boolean = false;
+  /** The state the GRAPH is actually wired for, so a repeated request for the
+   *  state we are already in doesn't tear the chain apart to rebuild it
+   *  identically — see setStableAudio. */
+  private _wiredStableAudio: boolean = false;
 
   // Audio output device (AudioContext.setSinkId). "" = system default.
   // Remembered here so it survives AudioContext re-creation (init runs again
@@ -79,10 +156,20 @@ export class AudioRenderer {
   private static readonly PCM_COALESCE_GAP_TOLERANCE_US = 20000;
   private static readonly UNDERRUN_DUCK_OUT_SECONDS = 0.01;
   private static readonly UNDERRUN_DUCK_IN_SECONDS = 0.04;
+  // Hold the silence until this long without a fresh underrun. Must stay well
+  // clear of the gap cadence during a bad stretch, or we'd fade in and out
+  // between holes and turn a dropout into tremolo.
   private static readonly UNDERRUN_CLEAR_MS = 300;
 
   // Stable audio: AudioContext state monitoring & auto-recovery
   private contextStateHandler: (() => void) | null = null;
+  /**
+   * Latches sharedContextActivated the moment the context reaches "running".
+   * Separate from contextStateHandler on purpose: that one is stable audio's
+   * recovery monitor and is only wired when stable audio is on, while "audio
+   * got unlocked this session" is a fact every path needs — see init().
+   */
+  private contextActivationHandler: (() => void) | null = null;
   private recoveryAttempts: number = 0;
   private static readonly MAX_RECOVERY_ATTEMPTS = 3;
 
@@ -181,16 +268,66 @@ export class AudioRenderer {
    */
   async init(): Promise<boolean> {
     try {
-      this.audioContext = new AudioContext({
-        // "interactive" gives Chromium's audio thread a shorter read-ahead
-        // (~30–50ms vs ~150ms with "playback"). Without this, Chromium starves
-        // when setPlaybackRate stops active sources and resets scheduledTime
-        // to `now` — Safari/Firefox tolerate it because their read-ahead is
-        // already short. Trade-off is a smaller output buffer cushion against
-        // main-thread spikes; the audio decoder + Stable Audio gap-fill
-        // already handle that case.
-        latencyHint: "interactive",
-      });
+      // Reuse the session-wide context so a resumed (unmuted) state survives
+      // source/video switches — see sharedAudioContext above. Only mint a new
+      // one on first use or if a prior one somehow ended up closed.
+      if (!sharedAudioContext || sharedAudioContext.state === "closed") {
+        // Open at the SOURCE's sample rate when we know it. Every decoded
+        // packet becomes its own AudioBufferSourceNode, and a buffer whose rate
+        // differs from the context's is resampled PER NODE — each one resampled
+        // in isolation, so every buffer boundary carries a small discontinuity.
+        // At 1024 frames / 44.1kHz that is a click roughly 43 times a second:
+        // the "pit pit" heard on a Chrome/Android whose output runs at 48kHz,
+        // and silent on devices that happen to run at 44.1kHz, where no
+        // resampling took place. Matching the rate here moves the conversion to
+        // the output mix, where it is one continuous stream.
+        const opts: AudioContextOptions = {
+          // "interactive" gives Chromium's audio thread a shorter read-ahead
+          // (~30–50ms vs ~150ms with "playback"). Without this, Chromium starves
+          // when setPlaybackRate stops active sources and resets scheduledTime
+          // to `now` — Safari/Firefox tolerate it because their read-ahead is
+          // already short. Trade-off is a smaller output buffer cushion against
+          // main-thread spikes; the audio decoder + Stable Audio gap-fill
+          // already handle that case.
+          latencyHint: "interactive",
+        };
+        if (this._sourceSampleRate > 0) opts.sampleRate = this._sourceSampleRate;
+        try {
+          sharedAudioContext = new AudioContext(opts);
+        } catch {
+          // Some devices refuse a rate outright — the browser's own is fine,
+          // it just costs the per-buffer resampling described above.
+          sharedAudioContext = new AudioContext({ latencyHint: "interactive" });
+        }
+      }
+      this.audioContext = sharedAudioContext;
+      // A shared context minted for an earlier source keeps its rate. Worth
+      // knowing when a "pit pit" report comes back: this line says the
+      // per-buffer resampling is still in play for this source.
+      if (
+        this._sourceSampleRate > 0 &&
+        this.audioContext.sampleRate !== this._sourceSampleRate
+      ) {
+        Logger.debug(
+          TAG,
+          `Context runs at ${this.audioContext.sampleRate}Hz, source is ${this._sourceSampleRate}Hz — buffers will be resampled per node`,
+        );
+      }
+      // Inheriting an already-running shared context (a prior player kept it
+      // alive) is itself proof audio is unlocked — latch it so the next
+      // pause-suspended switch can wake without a gesture, even if the monitor
+      // below never sees a transition (no statechange fires for an already-
+      // running context).
+      if (this.audioContext.state === "running") sharedContextActivated = true;
+      // If the user already unlocked audio this session but a prior player's
+      // pause()/end left the shared context suspended, wake it here — early in
+      // load, well before autoplay's suspended-context check — so an
+      // auto-advanced or switched video starts audible with no "tap to unmute"
+      // pill. Skipped on the very first load (not yet activated) so the poster
+      // seek stays silent.
+      if (sharedContextActivated && this.audioContext.state === "suspended") {
+        this.audioContext.resume().catch(() => {});
+      }
       this.inputNode = this.audioContext.createGain();
       // Volume / mute / makeup gain — ALWAYS the last node before destination.
       // A >100% boost lives here, applied AFTER the limiter, so stable audio's
@@ -206,10 +343,23 @@ export class AudioRenderer {
       // content pass untouched and clamp only true peaks.
       this.compressorNode = this.audioContext.createDynamicsCompressor();
       this.compressorNode.threshold.value = -18;  // only peaks > -18dB engage
-      this.compressorNode.knee.value = 6;         // sharp transition, no mid-range squash
-      this.compressorNode.ratio.value = 20;       // near-limiter on peaks
-      this.compressorNode.attack.value = 0.001;   // 1ms — catch transients before they hit the ear
-      this.compressorNode.release.value = 0.15;   // 150ms — quick recovery, no pumping
+      // Softer than it was, and the reason is what a 1ms attack at 20:1
+      // actually does to music. That is a limiter, and it grabs every drum hit
+      // the instant it crosses the threshold — the gain steps down in a
+      // millisecond, holds, and walks back over 150ms, on every beat. The step
+      // is heard as a faint crackle riding the transients, which is what
+      // "stable volume on, very slight clicking" is.
+      //
+      // The intent stays: leave dialogue and mid-level content alone, clamp
+      // true peaks. It is reached with a wider knee (the transition is a curve
+      // rather than a corner), a firm-but-not-brickwall ratio, and an attack
+      // that lets the first few milliseconds of a transient through — the part
+      // that carries the punch and none of the level — before clamping the
+      // body behind it. A longer release then moves the gain less often.
+      this.compressorNode.knee.value = 12;
+      this.compressorNode.ratio.value = 12;
+      this.compressorNode.attack.value = 0.005;   // 5ms — the transient passes, its body does not
+      this.compressorNode.release.value = 0.25;
 
       this.wireGraph();
 
@@ -230,6 +380,23 @@ export class AudioRenderer {
       if (this._stableAudio) {
         this.setupContextStateMonitoring();
       }
+
+      // Always watch for the context reaching "running", whatever wakes it.
+      // This latch used to live ONLY inside the stable-audio recovery monitor
+      // above, so with stable audio off (the default) a context that woke on
+      // its own was never noticed: wasAudioContextActivated() stayed false for
+      // the whole session, and every track after the first re-ran the
+      // cold-start autoplay path as if audio had never been unlocked. Gecko
+      // makes that visible — it mints the context "suspended" and flips it to
+      // "running" a beat after resume(), with no gesture involved, and that
+      // transition arrives only as an event.
+      if (!this.contextActivationHandler) {
+        this.contextActivationHandler = () => {
+          if (this.audioContext?.state === "running") sharedContextActivated = true;
+        };
+      }
+      // Same (type, listener) pair — re-adding on a shared context is a no-op.
+      this.audioContext.addEventListener("statechange", this.contextActivationHandler);
 
       Logger.info(
         TAG,
@@ -293,7 +460,13 @@ export class AudioRenderer {
   /**
    * Configure audio format (logs only, format is taken from AudioData)
    */
+  /** Decoded source sample rate, from configure(). 0 until the decoder reports. */
+  private _sourceSampleRate = 0;
+
   configure(sampleRate: number, channels: number): void {
+    // Remembered for init(): opening the context at the SOURCE's rate is what
+    // keeps Web Audio from resampling every buffer separately. See init().
+    if (sampleRate > 0) this._sourceSampleRate = sampleRate;
     Logger.info(TAG, `Configured: ${sampleRate}Hz, ${channels}ch`);
   }
 
@@ -364,8 +537,18 @@ export class AudioRenderer {
     }
 
     // If muted and context is suspended (autoplay muted), just drop the audio
-    // Audio will start playing once user unmutes (which resumes the context)
-    if (this._muted && this.audioContext.state === "suspended") {
+    // Audio will start playing once user unmutes (which resumes the context).
+    // isDroppingAudio() — not a raw state check — so a prime's OWN suspend is
+    // excluded: primeForBuffering() suspends the context on purpose so decoded
+    // audio piles up against a frozen clock, and a raw check threw away exactly
+    // the audio it was told to accumulate. On a muted autoplay that made the
+    // cushion unreachable, so the prime dwelled its full 4s with video
+    // backpressure lifted (state === buffering) and the demux loop ran away ~30s
+    // into the file; when the context finally resumed, the clock re-anchored to
+    // that far-ahead audio and every decoded frame behind it was stale — the
+    // picture sat on frame 0 until decode caught up. That is the black start.
+    if (this.isDroppingAudio()) {
+      this.droppedWhileSuspended = true;
       audioData.close();
       return;
     }
@@ -412,8 +595,13 @@ export class AudioRenderer {
       this.discardPendingPCM();
       return;
     }
-    if (this._muted && this.audioContext.state === "suspended") {
+    // isDroppingAudio() (not a bare _muted+suspended check): an intentional
+    // suspend — a prime/buffering hold — must NOT be treated as a drop, only
+    // the autoplay-blocked case where nothing will resume the context on its
+    // own. See isDroppingAudio()'s doc comment.
+    if (this.isDroppingAudio()) {
       this.discardPendingPCM();
+      this.droppedWhileSuspended = true;
       return;
     }
 
@@ -589,7 +777,68 @@ export class AudioRenderer {
    * Schedule a populated AudioBuffer through the stretcher + A/V sync
    * pipeline. Shared by render() and renderPCM().
    */
+  /**
+   * Decode as far ahead as the pipeline likes; keep the graph narrow anyway.
+   *
+   * Every scheduled buffer is a live AudioBufferSourceNode, and WebAudio pulls
+   * every connected node once per render quantum whether it has started or
+   * not. Committing each buffer the moment it was decoded tied the width of
+   * the graph to the depth of the buffer: software audio runs a 5s lead, AAC
+   * frames are 23ms, so ~215 nodes. A desktop shrugs. A phone's audio thread
+   * misses its deadline, and a missed deadline is a click — measured on mobile
+   * Chrome as cushion=4199ms sources=181 with the context's own outputLatency
+   * wandering between 600 and 770ms, and with no underrun and no late
+   * schedule: the data was there, on time, and the graph was simply too wide
+   * to render.
+   *
+   * So the two are separated. Buffers wait here as plain data, costing
+   * nothing, and become nodes only once their turn is within LOOKAHEAD. The
+   * lead is unchanged — getBufferedDuration counts what is waiting — so the
+   * decode headroom the deep buffer was for is still there.
+   */
   private scheduleAudioBuffer(audioBuffer: AudioBuffer, audioTime: number): void {
+    this._pending.push({ buffer: audioBuffer, audioTime });
+    this._pendingDuration += audioBuffer.duration;
+    this.pumpSchedule();
+  }
+
+  /**
+   * Hand over every buffer whose turn has come.
+   *
+   * Driven both by arriving audio and by a timer, because the queue has to
+   * keep draining when nothing is arriving — which is exactly what happens
+   * once the player hits its buffer cap and stops feeding.
+   */
+  private pumpSchedule(): void {
+    const ctx = this.audioContext;
+    if (!ctx) return;
+    while (this._pending.length > 0) {
+      const lead = this.scheduledTime - ctx.currentTime;
+      // First buffer of a run has nothing scheduled to measure against — let
+      // it through, or nothing ever starts.
+      if (this.hasFirstBuffer && lead >= AudioRenderer.SCHEDULE_LOOKAHEAD) break;
+      const next = this._pending.shift();
+      if (!next) break;
+      this._pendingDuration = Math.max(
+        0,
+        this._pendingDuration - next.buffer.duration,
+      );
+      this.commitAudioBuffer(next.buffer, next.audioTime);
+    }
+    if (this._pending.length > 0) {
+      if (this._pumpTimer === null) {
+        this._pumpTimer = setInterval(
+          () => this.pumpSchedule(),
+          AudioRenderer.PUMP_INTERVAL_MS,
+        ) as unknown as number;
+      }
+    } else if (this._pumpTimer !== null) {
+      clearInterval(this._pumpTimer);
+      this._pumpTimer = null;
+    }
+  }
+
+  private commitAudioBuffer(audioBuffer: AudioBuffer, audioTime: number): void {
     if (!this.audioContext || !this.gainNode) return;
 
     // Track when we receive decoded audio
@@ -604,6 +853,7 @@ export class AudioRenderer {
 
     const numberOfChannels = audioBuffer.numberOfChannels;
     const sampleRate = audioBuffer.sampleRate;
+    this._decodedSampleRate = sampleRate;
 
     // Clear rebuffering flag as soon as audio data arrives (decoder is producing).
     // Don't wait for successful scheduling — the stretcher may swallow a few
@@ -643,7 +893,35 @@ export class AudioRenderer {
     source.playbackRate.value = usedStretcher ? 1.0 : this._playbackRate;
 
     const now = this.audioContext.currentTime;
-    const minTime = now + 0.005; // Small buffer to prevent glitches
+    // The floor a buffer may be scheduled at.
+    //
+    // 5ms is right once playback is running: by then `scheduledTime` is seconds
+    // ahead and this only guards against handing the audio thread something it
+    // has already passed.
+    //
+    // It is wrong for the FIRST buffer of a run, and that is where a start-of-
+    // track click was coming from. A run begins with nothing written ahead at
+    // all, so this buffer IS the cushion — and 5ms of cushion against an output
+    // device that is 168ms deep (measured on Chrome/Android; a desktop reports
+    // 24ms, which is why this was never audible there) starves the very first
+    // moment of playback. The log said it plainly: `cushion=28ms queued=0ms
+    // sources=1 latency=168.0ms` in the health line immediately after the first
+    // buffer, followed by a `late schedule` seam — one buffer, no queue, and a
+    // device expecting six times more than it was given.
+    //
+    // So the first buffer is placed a full output-latency ahead instead. It
+    // costs that much delay before sound starts — inaudible against the decode
+    // and the fetch that precede it — and buys the scheduler the same window to
+    // queue the buffers behind it, which is what the device is actually asking
+    // for. Every buffer after it takes the 5ms floor as before.
+    const ctx = this.audioContext as AudioContext & {
+      outputLatency?: number;
+      baseLatency?: number;
+    };
+    const deviceLead = this.hasFirstBuffer
+      ? 0
+      : Math.min(0.5, ctx.outputLatency ?? ctx.baseLatency ?? 0);
+    const minTime = now + 0.005 + deviceLead;
 
     // Detect buffer underrun
     if (this.scheduledTime < now) {
@@ -685,7 +963,13 @@ export class AudioRenderer {
 
     this.releaseUnderrunDuckIfClean();
 
-    // Calculate expected playback time based on timestamp
+    // Where this buffer should start.
+    //
+    // Two things can pull it away from where the last one ended, and both used
+    // to do it silently — which is what a click IS: a seam with nothing across
+    // it. Neither trips the underrun test above, because that only asks
+    // whether we are already late; these happen while the schedule is still in
+    // the future, so they were invisible in every log.
     let targetScheduleTime = this.scheduledTime;
 
     if (this.hasFirstBuffer) {
@@ -694,13 +978,46 @@ export class AudioRenderer {
         (audioTime - this.firstBufferMediaTime) / this._playbackRate;
 
       const drift = expectedTime - this.scheduledTime;
-      // Tighter drift tolerance (20ms) for better sync
-      if (Math.abs(drift) > 0.02) {
+      // 1. Re-anchoring to the media timeline. A 20ms disagreement between
+      //    where the PTS says this buffer belongs and where the previous one
+      //    ended was corrected by jumping straight to the PTS — tearing a 20ms
+      //    hole, or overlapping 20ms of two buffers, on every correction. On a
+      //    source whose PTS grid does not divide evenly into its frame
+      //    duration that correction fires over and over, which is a click
+      //    every few hundred milliseconds and nothing in the log.
+      //
+      //    Forward is now filled rather than jumped. Backward is not honoured
+      //    at all: playing two buffers over each other is worse than being
+      //    20ms early, and the clock's own sync corrects the offset without
+      //    touching the audio.
+      if (drift > 0.02) {
+        this.fillSeam(
+          this.scheduledTime,
+          drift,
+          numberOfChannels,
+          sampleRate,
+          "re-anchor",
+        );
         targetScheduleTime = expectedTime;
       }
     }
 
+    // 2. The floor. Scheduling that lands inside the 5ms guard gets pushed to
+    //    it, and that push is a hole of exactly the same kind. It is the one
+    //    that shows up on a phone: the guard is a fixed 5ms while the main
+    //    thread there is slower and less predictable, so the schedule arrives
+    //    late often enough to be heard, without ever falling behind `now` and
+    //    registering as an underrun.
     const when = Math.max(targetScheduleTime, minTime);
+    if (when > targetScheduleTime + 0.0005) {
+      this.fillSeam(
+        targetScheduleTime,
+        when - targetScheduleTime,
+        numberOfChannels,
+        sampleRate,
+        "late schedule",
+      );
+    }
     source.start(when);
 
     if (!this.hasFirstBuffer) {
@@ -717,6 +1034,38 @@ export class AudioRenderer {
     this.scheduledTime = when + (usedStretcher
       ? processedBuffer.duration
       : audioBuffer.duration / this._playbackRate);
+
+    // Once a second, what the output actually has in hand.
+    //
+    // Three rounds of chasing a mobile-only click have ruled out the rate, the
+    // lifecycle and the schedule — every log came back clean because nothing
+    // reports the state the clicking would show up in. These four numbers do:
+    // the cushion (how far ahead of the hardware we have written), how many
+    // sources are alive, whether the context is still running, and what it
+    // thinks its own latency is. A cushion collapsing towards zero, a source
+    // count that climbs across a track change, or an output latency that moves
+    // are three different bugs, and this tells them apart.
+    if (
+      this.audioContext &&
+      now - this._lastHealthLogAt > 1
+    ) {
+      this._lastHealthLogAt = now;
+      const ctx = this.audioContext as AudioContext & {
+        outputLatency?: number;
+        baseLatency?: number;
+      };
+      Logger.debug(
+        TAG,
+        `Output: cushion=${((this.scheduledTime - now) * 1000).toFixed(0)}ms ` +
+          `queued=${(this._pendingDuration * 1000).toFixed(0)}ms ` +
+          `sources=${this.activeSources.length} state=${ctx.state} ` +
+          (this._stableAudio && this.compressorNode
+            ? `gr=${this.compressorNode.reduction.toFixed(1)}dB `
+            : "") +
+          `latency=${(((ctx.outputLatency ?? ctx.baseLatency ?? 0)) * 1000).toFixed(1)}ms ` +
+          `rate=${ctx.sampleRate}`,
+      );
+    }
     this.currentMediaTime = audioTime;
     this.scheduledCount++;
 
@@ -744,6 +1093,7 @@ export class AudioRenderer {
   renderSamples(samples: Float32Array[], sampleRate: number): void {
     if (!this.audioContext || !this.gainNode) return;
     if (!this.isPlaying) return;
+    this._decodedSampleRate = sampleRate;
 
     try {
       const numberOfChannels = samples.length;
@@ -793,7 +1143,7 @@ export class AudioRenderer {
     // flag synchronously here lets those early frames schedule; they sit in
     // the AudioContext queue and play once it resumes.
     this.isPlaying = true;
-    this.intentionalSuspend = false;
+    contextSuspendIntent = false;
 
     // Don't initialize AudioContext during muted autoplay (browser policy)
     // It will be initialized when user unmutes (user gesture)
@@ -805,13 +1155,18 @@ export class AudioRenderer {
     // (saved preference, or rate set while paused). Kicks WASM construction
     // off now so it's ready before the first decoded chunk needs stretching,
     // avoiding the opening silence gap the chunk-time lazy init would leave.
+    // Build at the decoded media rate when known (falls back to the context
+    // rate before the first chunk) so we don't build the wrong-rate instance
+    // and pay a destroy+rebuild when audio arrives at a different rate.
     if (
       this.preservePitch &&
       this.audioContext &&
       !this.signalsmith &&
       Math.abs(this._playbackRate - 1.0) > 0.01
     ) {
-      this.maybeInitSignalsmith(this.audioContext.sampleRate);
+      this.maybeInitSignalsmith(
+        this._decodedSampleRate || this.audioContext.sampleRate,
+      );
     }
 
     // Resume the AudioContext when either (a) we're not muted so audio
@@ -827,10 +1182,15 @@ export class AudioRenderer {
     // though the Clock keeps ticking via fallback time.
     if (
       this.audioContext?.state === "suspended" &&
-      (!this._muted || this.intentionalSuspend)
+      (!this._muted || contextSuspendIntent)
     ) {
       try {
         await this.audioContext.resume();
+        // Remember that this session's shared context is unlocked, so future
+        // auto-advanced / switched videos can wake it without a fresh gesture.
+        if ((this.audioContext.state as string) === "running") {
+          sharedContextActivated = true;
+        }
       } catch (err) {
         Logger.warn(
           TAG,
@@ -983,7 +1343,7 @@ export class AudioRenderer {
    * Pause playback
    */
   // Flag to prevent auto-recovery when we intentionally suspend during buffering
-  private intentionalSuspend: boolean = false;
+
 
   pause(): void {
     this.flushPendingPCM();
@@ -1005,7 +1365,7 @@ export class AudioRenderer {
     // If we clear sources, we lose the buffered audio (e.g. 2 seconds worth), causing the
     // player to jump forward by that amount on resume.
     if (this.audioContext && this.audioContext.state === "running") {
-      this.intentionalSuspend = true;
+      contextSuspendIntent = true;
       this.audioContext.suspend().catch((err) => {
         Logger.error(TAG, "Failed to suspend audio context", err);
       });
@@ -1024,7 +1384,7 @@ export class AudioRenderer {
    * Suppresses auto-recovery so the context stays suspended until resumeFromBuffering().
    */
   suspendForBuffering(): void {
-    this.intentionalSuspend = true;
+    contextSuspendIntent = true;
     if (this.audioContext && this.audioContext.state === "running") {
       this.audioContext.suspend().catch((err) => {
         Logger.error(TAG, "Failed to suspend audio context for buffering", err);
@@ -1050,7 +1410,7 @@ export class AudioRenderer {
    */
   primeForBuffering(): void {
     this.isPlaying = true;
-    this.intentionalSuspend = true;
+    contextSuspendIntent = true;
     if (!this.audioContext && !this._muted) {
       // Context deferred (never created yet) — bring it up, then hold it
       // suspended. Any audio decoded before init resolves has nowhere to
@@ -1059,7 +1419,7 @@ export class AudioRenderer {
       // just a safety net.
       this.init()
         .then(() => {
-          if (this.intentionalSuspend && this.audioContext?.state === "running") {
+          if (contextSuspendIntent && this.audioContext?.state === "running") {
             this.audioContext.suspend().catch(() => {});
           }
         })
@@ -1077,7 +1437,7 @@ export class AudioRenderer {
    * Resume audio after buffering. Clears the intentional suspend flag.
    */
   resumeFromBuffering(): void {
-    this.intentionalSuspend = false;
+    contextSuspendIntent = false;
     if (this.audioContext && this.audioContext.state === "suspended") {
       this.audioContext.resume().catch((err) => {
         Logger.error(TAG, "Failed to resume audio context from buffering", err);
@@ -1135,9 +1495,18 @@ export class AudioRenderer {
       // first chunk, leaving the opening ~1s with no stretcher — which falls
       // through to the silence path (no chipmunk, but a brief audio gap).
       // Warming it ahead of the chunks closes that gap in the common case.
-      // sampleRate matches the AudioContext; processStretch rebuilds the
-      // instance if a decoded chunk ever arrives at a different rate.
-      this.maybeInitSignalsmith(this.audioContext.sampleRate);
+      //
+      // Build at the DECODED media rate (cached from the audio already
+      // playing), NOT the AudioContext rate — they differ when e.g. 48kHz
+      // media plays in a 44.1kHz context. Building at the context rate made
+      // processStretch destroy it and lazily rebuild at the real rate on the
+      // first chunk, which reintroduced the very ~1-2s silence this warmup
+      // exists to prevent (only on the FIRST rate change; later ones reused the
+      // now-correct instance). Fall back to the context rate only before any
+      // audio has decoded.
+      this.maybeInitSignalsmith(
+        this._decodedSampleRate || this.audioContext.sampleRate,
+      );
     }
 
     // Re-anchor the audio→media clock at the CURRENT play position, then drop
@@ -1282,16 +1651,31 @@ export class AudioRenderer {
       }
     }
 
-    // Resume AudioContext on unmute (user gesture) if it was suspended
-    if (this.audioContext && this.audioContext.state === "suspended") {
-      this.audioContext
-        .resume()
-        .then(() => {
-          Logger.debug(TAG, "AudioContext resumed on unmute");
-        })
-        .catch((err) => {
-          Logger.warn(TAG, "Failed to resume AudioContext on unmute", err);
-        });
+    // Resume AudioContext on unmute (user gesture) if it was suspended.
+    // Awaited, so callers can sequence work behind a context that is actually
+    // running: the "running" statechange drops the stale clock anchor (see
+    // contextStateHandler), and anything scheduled before that lands on an
+    // anchor about to be thrown away — audio for those seconds is discarded
+    // as late while the wall clock walks the picture forward without it.
+    //
+    // …but only while playback is actually running. pause() suspends the
+    // context and deliberately KEEPS its scheduled nodes, so that resuming
+    // continues exactly where it stopped — which means a resume() here starts
+    // them. Unmuting a paused player played it: pause, mute, unmute, and the
+    // audio ran on over a still picture. Nothing is lost by waiting; play()
+    // resumes the context itself, and that press is a user gesture too, so the
+    // first unmute still gets its unlock.
+    if (
+      this.isPlaying &&
+      this.audioContext &&
+      this.audioContext.state === "suspended"
+    ) {
+      try {
+        await this.audioContext.resume();
+        Logger.debug(TAG, "AudioContext resumed on unmute");
+      } catch (err) {
+        Logger.warn(TAG, "Failed to resume AudioContext on unmute", err);
+      }
     }
 
     Logger.debug(TAG, "Unmuted");
@@ -1303,30 +1687,70 @@ export class AudioRenderer {
   reset(): void {
     this.discardPendingPCM();
 
-    // Stable audio: fade out before stopping to prevent clicks
-    if (this._stableAudio && this.audioContext && this.gainNode && this.activeSources.length > 0) {
+    // Silence first, always — not only under stable audio.
+    //
+    // Stopping a source ends it mid-waveform, which is a click, and it does
+    // nothing at all about audio that has already been RENDERED. WebAudio
+    // hands the output device a stretch of finished samples ahead of time —
+    // 600 to 770ms of it on the phone this was reported from — and no node
+    // teardown can recall those. That is the sliver of the previous track
+    // still playing after the source changes.
+    //
+    // A gain of zero cannot recall them either, but it applies to everything
+    // not yet rendered, which is most of that stretch. Over a few
+    // milliseconds rather than instantly, because a hard cut to zero is its
+    // own click.
+    if (this.audioContext && this.gainNode && this.activeSources.length > 0) {
       try {
         const now = this.audioContext.currentTime;
+        // Stable audio was already doing this and getting the quiet handover
+        // for free; everyone else got the tail and the click. The fade is
+        // longer there because that path is also covering compressor release.
+        const fade = this._stableAudio ? AudioRenderer.FADE_OUT_TIME : 0.008;
         this.gainNode.gain.cancelScheduledValues(now);
         this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
-        this.gainNode.gain.linearRampToValueAtTime(0, now + AudioRenderer.FADE_OUT_TIME);
+        this.gainNode.gain.linearRampToValueAtTime(0, now + fade);
       } catch {
         // Ignore ramp errors
       }
     }
 
+    // Waiting buffers belong to the stretch being thrown away. Left queued,
+    // a seek would play the old position's audio a moment later.
+    this._pending = [];
+    this._pendingDuration = 0;
+    if (this._pumpTimer !== null) {
+      clearInterval(this._pumpTimer);
+      this._pumpTimer = null;
+    }
+
+    // Stop AFTER the fade above has had time to run, not before it.
+    //
+    // The ramp was being written and then made pointless in the same breath:
+    // the sources were stopped immediately, so there was nothing left to fade
+    // and the output ended on a cut — which is a click of its own. Handing the
+    // stop to the ramp's own end time lets the last few milliseconds actually
+    // fade, and costs nothing: a source told to stop at a time in the near
+    // future stops itself, with no timer to keep alive.
+    const stopAt =
+      this.audioContext && this.gainNode && this.activeSources.length > 0
+        ? this.audioContext.currentTime +
+          (this._stableAudio ? AudioRenderer.FADE_OUT_TIME : 0.008)
+        : 0;
     for (const source of this.activeSources) {
       try {
-        source.stop();
-        source.disconnect();
+        if (stopAt > 0) source.stop(stopAt);
+        else source.stop();
       } catch {
         // Ignore
       }
     }
+    // Disconnect on their own ended event, so the fade is not cut short by
+    // pulling the node out of the graph underneath it.
     this.activeSources = [];
     this.scheduledTime = this.audioContext?.currentTime ?? 0;
 
-    this.underrunDucked = false;
+    this._ducked = false;
     this.lastUnderrunAt = 0;
     if (this.inputNode && this.audioContext) {
       try {
@@ -1352,10 +1776,13 @@ export class AudioRenderer {
     // Clear stretcher state
     if (this.signalsmith) this.signalsmith.clear();
 
-    // Restore gain after fade-out (for next playback)
-    if (this._stableAudio && this.gainNode && this.audioContext) {
+    // Bring the gain back, on the same terms the fade went out on. Guarding
+    // this on stable audio while the fade above is unconditional would leave
+    // every other setup silent from the first seek onwards.
+    if (this.gainNode && this.audioContext) {
       try {
-        const restoreTime = this.audioContext.currentTime + AudioRenderer.FADE_OUT_TIME + 0.005;
+        const fade = this._stableAudio ? AudioRenderer.FADE_OUT_TIME : 0.008;
+        const restoreTime = this.audioContext.currentTime + fade + 0.005;
         this.gainNode.gain.linearRampToValueAtTime(
           this._muted ? 0 : this.perceptualGain(this.volume),
           restoreTime
@@ -1453,8 +1880,21 @@ export class AudioRenderer {
       !!this.audioContext &&
       this.audioContext.state === "suspended" &&
       !this._muted &&
-      !this.intentionalSuspend
+      !contextSuspendIntent
     );
+  }
+
+  /**
+   * True once the shared AudioContext has run (been unlocked by a gesture) at
+   * any point this session — see the module-level sharedContextActivated latch.
+   * After that, a gesture-free resume() will succeed on its own, so a suspended
+   * state seen right after init() is just the async resume still in flight and
+   * WILL recover. Callers use this to wait it out instead of falling back to
+   * muted autoplay (which would flash the "tap to unmute" pill on every
+   * auto-advanced track).
+   */
+  wasEverActivated(): boolean {
+    return sharedContextActivated;
   }
 
   /**
@@ -1470,12 +1910,29 @@ export class AudioRenderer {
     // Stable audio: if starved, buffer is not healthy
     if (this._stableAudio && this.isStarved) return false;
 
-    // Check if decoder has stopped outputting
-    const timeSinceLastDecode = performance.now() - this.lastDecodeTime;
-    if (this.lastDecodeTime > 0 && timeSinceLastDecode > 500) return false;
-
     // Compute buffer ahead time
     const realBufferAhead = this.scheduledTime - this.audioContext.currentTime;
+
+    // Check if decoder has stopped outputting — but only when the scheduled
+    // buffer is genuinely thin. The demux loop refills audio in BURSTS: it
+    // fills to maxAudioBuffered, then backpressure parks the loop for a second
+    // or more before the next burst. So a >500ms decode gap while seconds of
+    // audio are still scheduled is the normal steady state, not a stall — and
+    // reading it as "unhealthy" made this flicker false for roughly half of
+    // every burst cycle. Callers that ask an instantaneous question (the
+    // rate-change corrective-seek guard, the clock's audio-drift sync) then
+    // saw a healthy pipeline as broken: a rate change landing in a quiet
+    // window took the full flush + decoder-recreate seek path and froze the
+    // picture for over a second. With a real cushion ahead, audio can keep
+    // anchoring regardless of when the last chunk decoded.
+    const timeSinceLastDecode = performance.now() - this.lastDecodeTime;
+    if (
+      this.lastDecodeTime > 0 &&
+      timeSinceLastDecode > 500 &&
+      realBufferAhead < 0.5
+    ) {
+      return false;
+    }
     const hasScheduledAudio =
       this.activeSources.length > 0 || realBufferAhead > 0;
 
@@ -1500,9 +1957,35 @@ export class AudioRenderer {
   /**
    * Get filtered buffered duration (seconds ahead of current time)
    */
+  /**
+   * True when audio frames are being thrown away rather than scheduled: muted
+   * with a context the browser won't let us start (the autoplay-blocked state,
+   * before any gesture). Only then is audio genuinely absent from the pipeline
+   * — a muted context that IS running still schedules everything, at gain 0,
+   * and still drives the clock.
+   *
+   * An intentional suspend (a prime / buffering hold) is explicitly NOT this
+   * state: we suspended the context ourselves precisely so decoded audio
+   * accumulates against a frozen clock, and it resumes on our own call.
+   */
+  isDroppingAudio(): boolean {
+    return (
+      this._muted &&
+      !contextSuspendIntent &&
+      this.audioContext?.state === "suspended"
+    );
+  }
+
   getBufferedDuration(): number {
     if (!this.audioContext) return 0;
-    return Math.max(0, this.scheduledTime - this.audioContext.currentTime);
+    // Scheduled AND waiting. The player gates decode on this, and audio held
+    // back by the lookahead is every bit as decoded as audio already handed to
+    // the graph — leaving it out would make the pipeline think it was starving
+    // and race ahead.
+    return (
+      Math.max(0, this.scheduledTime - this.audioContext.currentTime) +
+      this._pendingDuration
+    );
   }
 
   /** True while decoded audio has recently arrived too late for its slot. */
@@ -1513,9 +1996,103 @@ export class AudioRenderer {
     );
   }
 
+  /**
+   * Suppress ducking for the next `ms` and release any current duck. Called by
+   * the player around a background→foreground recovery, whose decoder flush +
+   * re-seek briefly starves audio — a transient underrun that must not mute.
+   */
+  suppressDuckFor(ms: number): void {
+    this._suppressDuckUntil = performance.now() + ms;
+    this.forceUnduck();
+  }
+
+  /** Immediately restore the input gain and clear the duck (no fade). */
+  private forceUnduck(): void {
+    if (!this._ducked || !this.inputNode || !this.audioContext) return;
+    this._ducked = false;
+    try {
+      const param = this.inputNode.gain;
+      const now = this.audioContext.currentTime;
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(1, now);
+    } catch {
+      // Ignore ramp errors
+    }
+  }
+
+  /**
+   * Put silence across a gap in the schedule, so the seam is joined rather
+   * than torn.
+   *
+   * WebAudio does not play "nothing" between two buffer sources — it plays
+   * whatever the graph last had, then the next buffer starts abruptly. That
+   * step is the click. A silent buffer laid over the gap gives the output
+   * something continuous to run through, which is what the underrun path has
+   * always done; these two callers are the seams that were missing it.
+   *
+   * Logged, because a click that leaves no trace is a bug nobody can find
+   * twice: the reason mobile-only clicking survived several rounds of looking
+   * is that neither of these paths said anything at all.
+   */
+  private fillSeam(
+    at: number,
+    duration: number,
+    channels: number,
+    sampleRate: number,
+    reason: string,
+  ): void {
+    const target = this.inputNode ?? this.gainNode;
+    if (!this.audioContext || !target || duration <= 0 || duration > 1) return;
+    try {
+      const frames = Math.ceil(duration * sampleRate);
+      const buffer = this.audioContext.createBuffer(channels, frames, sampleRate);
+      const filler = this.audioContext.createBufferSource();
+      filler.buffer = buffer;
+      filler.connect(target);
+      filler.start(at);
+      filler.onended = () => {
+        try { filler.disconnect(); } catch { /* ignore */ }
+      };
+      Logger.debug(
+        TAG,
+        `Seam filled: ${(duration * 1000).toFixed(1)}ms (${reason})`,
+      );
+    } catch {
+      // A seam we could not fill is the old behaviour, not a new failure.
+    }
+  }
+
+  /** Throttle for the once-a-second output line above. */
+  private _lastHealthLogAt = 0;
+
+  /** Decoded audio waiting for its turn to become a node — see
+   *  scheduleAudioBuffer. Plain data; costs nothing until committed. */
+  private _pending: Array<{ buffer: AudioBuffer; audioTime: number }> = [];
+  private _pendingDuration = 0;
+  private _pumpTimer: number | null = null;
+  /** How far ahead of the output a buffer may be turned into a node. Wide
+   *  enough that jank cannot starve the graph, narrow enough that the node
+   *  count stays in the dozens rather than the hundreds. */
+  private static readonly SCHEDULE_LOOKAHEAD = 1.0;
+  /** How often the queue drains itself while no audio is arriving. */
+  private static readonly PUMP_INTERVAL_MS = 50;
+
+  /**
+   * Fade the input out to cover a run of underruns.
+   * Rides on inputNode, never gainNode: gainNode carries the user's volume and
+   * boost, and stomping it here would fight setVolume() and leave the ducked
+   * level behind as the user's own setting.
+   */
   private duckForUnderrun(): void {
-    if (this.underrunDucked || !this.inputNode || !this.audioContext) return;
-    this.underrunDucked = true;
+    if (
+      this._ducked ||
+      !this.inputNode ||
+      !this.audioContext ||
+      performance.now() < this._suppressDuckUntil
+    ) {
+      return;
+    }
+    this._ducked = true;
     try {
       const now = this.audioContext.currentTime;
       const gain = this.inputNode.gain;
@@ -1530,16 +2107,70 @@ export class AudioRenderer {
     }
   }
 
+  /**
+   * Hold the output silent WITHOUT touching the mute flag.
+   *
+   * Tap-to-unmute has to resume the AudioContext inside the tap — the browser
+   * won't allow it a task later — but the audio that resume makes audible is
+   * whatever the decoder holds, which is not where the picture is. So the
+   * viewer heard a second of the wrong moment, then a seek, then the right one.
+   * Resuming stays on the tap; this keeps it inaudible until the re-read lands.
+   *
+   * Same gain node the underrun duck uses, and the same _ducked flag — see
+   * releaseUnderrunDuckIfClean, which won't lift it while this is held.
+   */
+  silenceForResync(): void {
+    if (this._resyncSilenced || !this.inputNode || !this.audioContext) return;
+    this._resyncSilenced = true;
+    try {
+      const param = this.inputNode.gain;
+      const now = this.audioContext.currentTime;
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(0, now + AudioRenderer.DUCK_FADE_OUT);
+      Logger.debug(TAG, "Silenced for resync");
+    } catch {
+      /* ignore ramp errors */
+    }
+  }
+
+  /** Fade back in once the re-read has landed. Safe to call unconditionally. */
+  releaseResyncSilence(): void {
+    if (!this._resyncSilenced) return;
+    this._resyncSilenced = false;
+    // An underrun duck may legitimately be holding the output down as well;
+    // leave that one alone and let its own recovery release it.
+    if (this._ducked || !this.inputNode || !this.audioContext) return;
+    try {
+      const param = this.inputNode.gain;
+      const now = this.audioContext.currentTime;
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(1, now + AudioRenderer.DUCK_FADE_IN);
+      Logger.debug(TAG, "Resync silence released");
+    } catch {
+      /* ignore ramp errors */
+    }
+  }
+
+  /**
+   * Fade back in, but only once no underrun has landed for UNDERRUN_CLEAR_MS.
+   * Called on every scheduled buffer, so recovery needs no external signal.
+   * The resync hold outranks this: letting the gain ramp back to 1 while a
+   * resync silence is active would make the pre-seek audio audible, which is
+   * the whole thing silenceForResync exists to avoid.
+   */
   private releaseUnderrunDuckIfClean(): void {
     if (
-      !this.underrunDucked ||
+      !this._ducked ||
+      this._resyncSilenced ||
       !this.inputNode ||
       !this.audioContext ||
       this.isUnderrunning(AudioRenderer.UNDERRUN_CLEAR_MS)
     ) {
       return;
     }
-    this.underrunDucked = false;
+    this._ducked = false;
     try {
       const now = this.audioContext.currentTime;
       const gain = this.inputNode.gain;
@@ -1605,6 +2236,14 @@ export class AudioRenderer {
    * Enable/disable stable audio mode (dynamic range compression / loudness normalization)
    */
   setStableAudio(enabled: boolean): void {
+    // Rewiring is not free: it disconnects a node that ~40 live sources are
+    // feeding and reconnects it, and the break between the two is a hole in
+    // the output. Doing that for a state we are already in is a click for
+    // nothing — and the logs show every toggle arriving TWICE (the property
+    // and the attribute reflecting back onto each other), so each flip cost
+    // two of them.
+    if (this._wiredStableAudio === enabled) return;
+    this._wiredStableAudio = enabled;
     this._stableAudio = enabled;
     Logger.info(TAG, `Stable audio: ${enabled ? "enabled" : "disabled"}`);
 
@@ -1684,13 +2323,40 @@ export class AudioRenderer {
       if (!this.audioContext) return;
       const state = this.audioContext.state;
 
-      if (state === "interrupted" || (state === "suspended" && this.isPlaying && !this._muted && !this.intentionalSuspend)) {
+      if (state === "interrupted" || (state === "suspended" && this.isPlaying && !this._muted && !contextSuspendIntent)) {
         Logger.warn(TAG, `AudioContext ${state} unexpectedly during playback, attempting recovery`);
         this.attemptContextRecovery();
       } else if (state === "running") {
         // Successfully recovered
         this.recoveryAttempts = 0;
+        // The context reaching "running" — via play(), the tap-to-unmute
+        // resume(), a recovery, anything — means audio is unlocked this session.
+        // Latch it so an auto-advanced / switched video's init() can wake the
+        // (pause-suspended) shared context without a fresh gesture. Previously
+        // only play() set this, so a first unlock via tap-to-unmute left it
+        // false and the NEXT video re-showed "tap to unmute".
+        sharedContextActivated = true;
         Logger.debug(TAG, "AudioContext recovered to running state");
+        // Audio frames that arrived while the context was suspended were
+        // dropped, so the clock mapping (first-buffer anchor + the
+        // max-scheduled clamp) describes a moment that never played. Left
+        // alone, getAudioClock() then reports a time pinned near where the
+        // drop began — and since video presentation follows the audio clock,
+        // the picture freezes on its first frame. That is the black start on
+        // a muted autoplay: unmuting and seeking rebuilt the mapping, which
+        // is why it "fixed itself".
+        //
+        // Drop the anchor instead: the next buffer scheduled after recovery
+        // re-establishes it, and until then getAudioClock() returns -1 and the
+        // wall clock drives the video.
+        if (this.droppedWhileSuspended) {
+          this.droppedWhileSuspended = false;
+          this.hasFirstBuffer = false;
+          this.firstBufferScheduledAt = 0;
+          this.firstBufferMediaTime = 0;
+          this.maxScheduledMediaTime = 0;
+          Logger.debug(TAG, "Audio clock anchor reset after suspended drop");
+        }
       }
     };
 
@@ -1763,6 +2429,24 @@ export class AudioRenderer {
     this.isPlaying = false;
     this.reset();
 
+    // reset() ends by ramping the gain back up, which is right for a seek —
+    // it is the same renderer and it is about to play again — and wrong here.
+    // This renderer is going away, and the ramp was undoing its own fade about
+    // 13ms in: the fade started, the restore cancelled it, and the audio still
+    // in flight left at full level. That is the sliver of the previous track
+    // heard after a source change. Hold it down instead.
+    if (this.audioContext && this.gainNode) {
+      try {
+        const now = this.audioContext.currentTime;
+        const fade = this._stableAudio ? AudioRenderer.FADE_OUT_TIME : 0.008;
+        this.gainNode.gain.cancelScheduledValues(now);
+        this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
+        this.gainNode.gain.linearRampToValueAtTime(0, now + fade);
+      } catch {
+        /* a context that will not take a ramp is already past caring */
+      }
+    }
+
     // Tear down BT keepalive
     this.stopKeepalive();
     if (this.keepaliveEl) {
@@ -1783,11 +2467,51 @@ export class AudioRenderer {
       this.audioContext.removeEventListener("statechange", this.contextStateHandler);
       this.contextStateHandler = null;
     }
-
-    if (this.audioContext) {
-      await this.audioContext.close();
-      this.audioContext = null;
+    // The activation latch comes off too — the context is shared and outlives
+    // this renderer, so a listener left behind would accumulate one per source.
+    if (this.audioContext && this.contextActivationHandler) {
+      this.audioContext.removeEventListener(
+        "statechange",
+        this.contextActivationHandler,
+      );
+      this.contextActivationHandler = null;
     }
+
+    // The AudioContext is shared session-wide (see sharedAudioContext) and is
+    // NOT closed here. Only this instance's nodes come off it; the singleton
+    // outlives the renderer for the next source to inherit.
+    //
+    // Retiring it was tried, to cut the stretch of the previous track that the
+    // output device has already been handed and that no gain, stop or
+    // disconnect can recall. It works — a closed context's queue goes with it —
+    // and it costs the one thing the sharing exists for: a fresh context is
+    // suspended, and waking it is what re-triggers the autoplay block and puts
+    // the "tap to unmute" pill back on every switch. Sound that starts is worth
+    // more than a tail that ends, so the context stays.
+    //
+    // What silences this renderer is the fade held down above plus the sources
+    // reset() stopped — everything still IN the graph. A host that wants the
+    // device queue gone as well has the blunt instrument available to it:
+    // clearing the source tears the whole player down at the moment of the
+    // decision, rather than a second later.
+
+    // …after the fade reset() started has had time to run. Disconnecting these
+    // synchronously pulled the graph out from under it: the ramp was written
+    // and discarded in the same turn, and what was already in flight left at
+    // full level. The nodes cost nothing while they wait, and the reference is
+    // dropped here either way so nothing new can reach them.
+    const doomed = [this.inputNode, this.compressorNode, this.gainNode];
+    const linger = (this._stableAudio ? AudioRenderer.FADE_OUT_TIME : 0.008) * 1000 + 20;
+    setTimeout(() => {
+      for (const node of doomed) {
+        try {
+          node?.disconnect();
+        } catch {
+          /* already disconnected */
+        }
+      }
+    }, linger);
+    this.audioContext = null;
 
     this.inputNode = null;
     this.gainNode = null;

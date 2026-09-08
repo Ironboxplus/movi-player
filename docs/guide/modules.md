@@ -9,6 +9,7 @@ Movi-Player is designed with modularity in mind. Use only what you need.
 | **Demuxer** | `movi-player/demuxer` | ~45KB  | 2.31 MB | 1.74 MB | Metadata, HDR detection, packet reading |
 | **Player**  | `movi-player/player`  | ~180KB | 2.52 MB | 1.91 MB | Playback control, custom UI             |
 | **Element** | `movi-player` / `movi-player/element` | ~410KB | 2.57 MB | 1.95 MB | Full UI player (drop-in)                |
+| **Element (slim)** | `movi-player/element/slim` | ~410KB | 1.00 MB + WASM | 750 KB + WASM | Same player, WASM as a separate file |
 
 > Module sizes (first column) exclude the embedded WASM binary. Gzip/Brotli columns show the total transfer size including WASM. Enable Brotli compression on your server for optimal delivery.
 
@@ -199,6 +200,81 @@ Registers the `<movi-player>` custom element. Includes everything from `player` 
 ></movi-player>
 ```
 
+## Slim Element Module
+
+The same `<movi-player>` element and the exact same API as `movi-player/element` —
+only how the WASM ships differs. The default build embeds the FFmpeg WASM inside
+the JS (11.4 MB of JS); the slim build keeps it as a separate `movi.wasm`
+(4.2 MB JS + 5.6 MB WASM), so the engine streams and compiles as a cacheable
+asset instead of a base64 blob, and the JS parses far faster.
+
+```typescript
+import "movi-player/element/slim";
+```
+
+Two things to know:
+
+1. **You must host `movi.wasm` yourself.** It ships in the package at
+   `movi-player/dist/movi.wasm`. Bundlers that understand
+   `new URL("movi.wasm", import.meta.url)` (Vite, webpack 5, Parcel 2) emit it
+   automatically; otherwise copy it next to your JS bundle, or point at it with
+   [`wasmurl`](/api/element#wasmurl).
+2. **Native fallback is automatic.** Because a consumer may not host the extra
+   `.wasm`, a source the WASM engine can't open falls through to the browser's
+   own `<video>` (wrapped in the player's controls) with no `fallback="native"`
+   attribute needed. HLS/DASH play via Shaka without the WASM regardless.
+
+```html
+<script type="module">
+  import "movi-player/element/slim";
+</script>
+
+<!-- movi.wasm hosted somewhere else? point at it -->
+<movi-player
+  src="video.mkv"
+  wasmurl="https://cdn.example.com/movi-player/movi.wasm"
+  controls
+></movi-player>
+```
+
+### With a framework wrapper
+
+Every wrapper has a `/slim` twin — same components, same props, same events:
+
+| Framework | Default | Slim |
+| --- | --- | --- |
+| React | `movi-player/react` | `movi-player/react/slim` |
+| Vue 3 | `movi-player/vue` | `movi-player/vue/slim` |
+| Svelte | `movi-player/svelte` | `movi-player/svelte/slim` |
+
+```jsx
+import { MoviPlayer } from "movi-player/react/slim";
+
+<MoviPlayer src="video.mkv" controls wasmurl="/movi.wasm" />;
+```
+
+```vue
+<script setup>
+import { MoviPlayer } from "movi-player/vue/slim";
+</script>
+
+<template>
+  <MoviPlayer src="video.mkv" controls wasmurl="/movi.wasm" />
+</template>
+```
+
+```svelte
+<script>
+  import MoviPlayer from "movi-player/svelte/slim";
+</script>
+
+<MoviPlayer src="video.mkv" controls wasmurl="/movi.wasm" />
+```
+
+Import one or the other, not both: whichever loads second finds `<movi-player>`
+already defined, so it registers nothing while still shipping its own copy of
+the engine.
+
 ## Module Composition
 
 ```
@@ -256,6 +332,11 @@ Use specific modules via CDN:
 <!-- Full element (recommended for quick start) -->
 <script type="module">
   import "https://unpkg.com/movi-player@latest/dist/element.js";
+</script>
+
+<!-- Slim element: WASM streams from movi.wasm next to the JS -->
+<script type="module">
+  import "https://unpkg.com/movi-player@latest/dist/element.slim.js";
 </script>
 
 <!-- Player only (for custom UI) -->

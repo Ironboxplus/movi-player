@@ -5,8 +5,47 @@
 
 import { Logger } from "../utils/Logger";
 import type { SubtitleCue } from "../types";
+import { KARAOKE_GHOST_DELIM } from "./sanitizeVttHtml";
 
 const TAG = "CanvasRenderer";
+
+/**
+ * What the renderer can draw. The WebCodecs path hands over decoded
+ * VideoFrames; the MSE wrappers (Shaka/hls.js/DASH) hand over their <video>
+ * element directly.
+ *
+ * They used to wrap it — `new VideoFrame(videoElement)` — and that construction
+ * succeeds on Firefox Android while the upload behind it does not: the element
+ * holds a hardware surface Firefox can't read back for a CPU texture upload, so
+ * every frame arrived as "tex(Sub)Image[23]D: Failed to retrieve source bytes
+ * for CPU upload" and the canvas stayed black through perfectly good playback.
+ * gl.getError() reports NO_ERROR for it, so none of the fallbacks below fire.
+ * Uploading the element itself takes the browser's accelerated video-texture
+ * path instead, which is the one every WebGL video site depends on.
+ */
+export type RenderSource = VideoFrame | HTMLVideoElement;
+
+/** Narrow a RenderSource to the <video>-element case. */
+export function isVideoElementSource(
+  source: RenderSource,
+): source is HTMLVideoElement {
+  return (
+    typeof HTMLVideoElement !== "undefined" &&
+    source instanceof HTMLVideoElement
+  );
+}
+
+/** Presented width of either source, in content pixels. */
+function sourceWidth(source: RenderSource): number {
+  return isVideoElementSource(source) ? source.videoWidth : source.displayWidth;
+}
+
+/** Presented height of either source, in content pixels. */
+function sourceHeight(source: RenderSource): number {
+  return isVideoElementSource(source)
+    ? source.videoHeight
+    : source.displayHeight;
+}
 
 /**
  * A snapshot of the live 360° camera + projection, enough to reproject an
@@ -94,15 +133,55 @@ export class CanvasRenderer {
   // source, mirroring adaptive DPR — no oscillation.
   private _presentFpsCap: number = 0; // 0 = uncapped
   private _perfDegradeChecked: boolean = false;
+  // Latched once the decode-bound catastrophe fires: this device cannot decode
+  // the current rung at all. Read by the element's frozen-video watchdog, whose
+  // "clock moving, no new frames" trigger this condition satisfies permanently
+  // — without it that watchdog reads a slow decoder as a stuck pipeline and
+  // keeps issuing corrective seeks that cannot help. Cleared by configure().
+  private _decodeBound: boolean = false;
+  private _videoBacklog: (() => number) | null = null;
+  // Whether the decoder held any queued work at ANY point in the current
+  // window. Sampling it once per window would miss it: the queue drains and
+  // refills within a window even on a decoder that is genuinely behind (an 8K
+  // trace showed 0-30 packets oscillating every few hundred ms), so a single
+  // unlucky read would excuse a device that really can't keep up.
+  private _backlogSeenStuck: boolean = false;
+  private _backlogSeenDeficit: boolean = false;
   private _perfWindowStart: number = 0; // performance.now() of the current window, 0 = not started
   private _perfWindowBaseCount: number = 0; // framesPresented at window start
   private _perfDeficitWindows: number = 0; // consecutive struggling windows
+  // Decode-bound (STUCK) detector — a separate, TIME-based window so it works
+  // even when the frame-warmup gate never clears: a near-frozen decoder barely
+  // advances framesPresented, so it would sit under PERF_WARMUP_FRAMES forever
+  // and the slow-path deficit check would never run. Audio-gated so a network
+  // stall (audio starves too) isn't blamed on the video pipeline.
+  private _perfStuckWindows: number = 0;
+  private _stuckWindowStart: number = 0;
+  private _stuckBaseCount: number = 0;
+  // performance.now() when the perf detectors were (re)armed by configure().
+  // The startup grace is measured from here.
+  private _perfArmedAt: number = 0;
   private _onPerformanceDegrade: ((targetFps: number) => void) | null = null;
   private static readonly PERF_WINDOW_MS = 1000;
   private static readonly PERF_DEFICIT_RATIO = 0.7; // achieved < 70% of source rate = struggling
-  private static readonly PERF_DEFICIT_WINDOWS = 2; // consecutive bad windows before engaging
+  private static readonly PERF_DEFICIT_WINDOWS = 4; // consecutive bad windows before engaging
+  // Startup/rendition-switch grace. For the first few seconds after a source
+  // (or rung) is configured, decode FPS is NATURALLY low and unrepresentative:
+  // the decoder is warming up, the buffer is still filling, the thumbnail
+  // pipeline is initialising (a second decoder competing for the GPU), and a
+  // heavy 4K/HDR rung needs a moment to reach steady state. Capping quality in
+  // that window is the "dropped 4K in the first seconds even though the device
+  // could hold it once buffered" case. The detectors still ACCUMULATE during
+  // the grace — they just don't ENGAGE a cap/downshift until it passes.
+  private static readonly PERF_STARTUP_GRACE_MS = 12000;
+  // ~4s of near-zero video with healthy audio = decode-bound, not transient
+  // recovery (a keyframe hunt restores frames within ~1-2s).
+  private static readonly PERF_STUCK_WINDOWS = 4;
   private static readonly PERF_WARMUP_FRAMES = 60; // skip startup / post-seek ramp
   private static readonly PERF_MIN_CAP_FPS = 24; // never cap below this
+  // Below this share of the target rate the frame-rate lever cannot close the
+  // gap, so don't spend windows proving it — go straight to the ABR.
+  private static readonly PERF_SEVERE_RATIO = 0.4;
   // Below this achieved rate the pipeline is STUCK (decoder error / recovering /
   // EOF / starved), not merely slow — capping the present rate or dropping
   // frames can't help, and it must not turn on disposable-frame skipping while
@@ -113,6 +192,7 @@ export class CanvasRenderer {
   // Audio time provider for A/V sync
   private getAudioTime: (() => number) | null = null;
   private _isAudioHealthy: (() => boolean) | null = null;
+  private _shouldMeasurePerf: (() => boolean) | null = null;
 
   // Presentation timing
   private presentationStartTime: number = 0;
@@ -122,6 +202,18 @@ export class CanvasRenderer {
   private lastKnownAudioTime: number = -1;
   private playbackRate: number = 1.0;
   private justSeeked: boolean = false; // Track if we just seeked (for post-seek frame handling)
+  /** When a frame last went up, or when the queue was last cleared. Only used
+   *  to bound how long the picture may be held while pre-roll is dropped. */
+  private _lastPresentAt = 0;
+  private framesDropped: number = 0;
+  /** Frames presented and dropped since this renderer was built, for
+   *  getVideoPlaybackQuality() on the element. */
+  getFrameStats(): { presented: number; dropped: number } {
+    return { presented: this.framesPresented, dropped: this.framesDropped };
+  }
+  /** Called for every frame that reaches the screen — drives the element's
+   *  requestVideoFrameCallback. */
+  onFramePresented: ((mediaTime: number) => void) | null = null;
   private framesPresented: number = 0; // Track number of frames presented (for initial sync)
 
   // Current time tracking
@@ -222,6 +314,14 @@ export class CanvasRenderer {
   // delta of the next karaoke cue so only the new word fades in, instead
   // of the whole line re-animating each tick.
   private _lastRenderedSubtitlePlain: string = "";
+  // Rendered line count of the previous subtitle paint. A growth in this while
+  // the same sentence is still building is what triggers the scroll-up.
+  private _lastSubtitleLineCount: number = 0;
+  // The encoded PGS/DVB bitmap currently in the overlay, and which cue it came
+  // from. A resize or a controls toggle re-lays out the same cue, and encoding
+  // the PNG again for it is pure cost.
+  private _lastImageCueKey: string = "";
+  private _lastImageDataUrl: string = "";
   // Canvas + cached font string used to measure a karaoke cue's full
   // final-sentence width so the line can hold a stable min-width
   // anchor. The font cache is keyed by viewport width because the
@@ -237,6 +337,11 @@ export class CanvasRenderer {
   private _subtitleRerenderRafId: number | null = null;
   private subtitleCues: SubtitleCue[] = [];
   private subtitleOverlay: HTMLElement | null = null;
+  /** The subtitle overlay element — absolutely positioned over the visible video
+   *  (letterbox-aware). Handed to a host SubtitleRenderer as a mount point. */
+  getSubtitleOverlay(): HTMLElement | null {
+    return this.subtitleOverlay;
+  }
   private subtitleControlsPadding: number = 0; // Extra padding when controls visible
   // Subtitle delay in seconds. VLC/mpv convention: positive = subs appear
   // later, negative = earlier. Applied at the active-cue check so it works
@@ -245,6 +350,11 @@ export class CanvasRenderer {
   private subtitleDelay: number = 0;
 
   // Animation state for object-fit transitions
+  // Content dimensions the current scale was derived from. A change means the
+  // scale's frame of reference moved (a rendition switch), so interpolating
+  // from it would animate through sizes that never made sense — snap instead.
+  private _scaleContentW: number = 0;
+  private _scaleContentH: number = 0;
   private currentScaleX: number = 0;
   private currentScaleY: number = 0;
   private lastTargetScaleX: number = 0;
@@ -258,7 +368,7 @@ export class CanvasRenderer {
    * 2. if paused, frameQueue is likely empty, so we have nothing to redraw
    * 3. we need to redraw the *current* image to restore the view
    */
-  private lastRenderedFrame: VideoFrame | null = null;
+  private lastRenderedFrame: RenderSource | null = null;
 
   constructor(
     canvas: HTMLCanvasElement | OffscreenCanvas,
@@ -354,11 +464,18 @@ export class CanvasRenderer {
       this.videoFrameRate = 60;
     }
 
-    // Fresh source: re-arm the adaptive-FPS detector and clear any prior cap.
+    // Fresh source / rendition switch: re-arm the adaptive-FPS + decode-bound
+    // detectors and clear any prior cap so the new rung gets a fresh judgment.
     this._presentFpsCap = 0;
     this._perfDegradeChecked = false;
+    this._decodeBound = false;
+    this._backlogSeenStuck = false;
+    this._backlogSeenDeficit = false;
     this._perfWindowStart = 0;
     this._perfDeficitWindows = 0;
+    this._perfStuckWindows = 0;
+    this._stuckWindowStart = 0;
+    this._perfArmedAt = 0; // stamped on the first sample once playback is live
 
     // Set rotation from metadata
     if (rotation !== undefined) {
@@ -406,7 +523,11 @@ export class CanvasRenderer {
     // Initialize WebGL
     try {
       const contextOptions: WebGLContextAttributes = {
-        alpha: false,
+        // Transparent, so the corners the shader declines to draw show whatever
+        // is behind the player rather than black. Premultiplied, so the shader
+        // scales colour and alpha together when it feathers a corner.
+        alpha: true,
+        premultipliedAlpha: true,
         desynchronized: false, // Disabled to prevent flickering on low-end devices
         antialias: false,
         depth: false,
@@ -583,10 +704,40 @@ export class CanvasRenderer {
     const fsSource = `#version 300 es
     precision highp float;
     uniform sampler2D u_image;
+    // Rounded corners, cut in the shader.
+    //
+    // CSS cannot do this here: Firefox composites the canvas as its own layer
+    // and ignores both border-radius and clip-path on it until that layer is
+    // rebuilt, so a page that rounds the player got square corners over its own
+    // rounded frame. Pixels the shader refuses to draw are transparent whatever
+    // the compositor believes, so the rounding survives.
+    // x = radius in drawing-buffer pixels (0 disables), yz = buffer size.
+    uniform vec3 u_round;
+    // The part of the frame to actually show, in texture coordinates
+    // (x0,y0 → x1,y1). The whole frame by default; narrowed when the black bars
+    // baked INTO the picture are cropped away — see setBarCropEnabled.
+    uniform vec4 u_crop;
     in vec2 v_texCoord;
     out vec4 outColor;
     void main() {
-      outColor = texture(u_image, v_texCoord);
+      outColor = texture(u_image, mix(u_crop.xy, u_crop.zw, v_texCoord));
+      // The picture is opaque: the context is transparent only so a CUT corner
+      // can show the page through it. Trusting the texture's own alpha instead
+      // turned the whole canvas transparent on the paths that upload without
+      // one (10-bit HEVC lands in RGBA16F with alpha 0) — the video vanished
+      // and the page behind showed through as a black screen.
+      outColor.a = 1.0;
+      if (u_round.x > 0.0) {
+        vec2 halfSize = u_round.yz * 0.5;
+        vec2 q = abs(gl_FragCoord.xy - halfSize) - (halfSize - vec2(u_round.x));
+        float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - u_round.x;
+        // d is in pixels, and the centre of an edge pixel sits exactly 0.5
+        // inside the shape — so the falloff has to be one pixel wide and
+        // centred on the boundary. A wider band (this was -0.75..0.75) still
+        // takes ~7% off that last row, which reads as a thin dark line along
+        // every straight edge where the host's black shows through.
+        outColor *= 1.0 - smoothstep(-0.5, 0.5, d);
+      }
     }`;
 
     // Create Program
@@ -681,6 +832,15 @@ export class CanvasRenderer {
     precision highp float;
     uniform sampler2D u_image;
     uniform float u_hdrEnabled; // 0.0 = disabled, 1.0 = enabled
+    // The part of the frame to actually show, in texture coordinates
+    // (x0,y0 → x1,y1). The whole frame by default; narrowed when the black bars
+    // baked INTO the picture are cropped away — see setBarCropEnabled.
+    uniform vec4 u_crop;
+
+    // Rounded corners cut in the shader — see the passthrough program.
+    // x = radius in drawing-buffer pixels (0 disables), yz = buffer size.
+    uniform vec3 u_round;
+
     in vec2 v_texCoord;
     out vec4 outColor;
 
@@ -710,7 +870,7 @@ export class CanvasRenderer {
     }
 
     void main() {
-      vec4 color = texture(u_image, v_texCoord);
+      vec4 color = texture(u_image, mix(u_crop.xy, u_crop.zw, v_texCoord));
 
       // Apply PQ EOTF to get linear light
       vec3 linear = PQtoLinear(color.rgb);
@@ -736,7 +896,13 @@ export class CanvasRenderer {
       // Apply gamma (2.2 for accurate color reproduction)
       vec3 display = pow(sdr, vec3(1.0/2.2));
 
-      outColor = vec4(display, color.a);
+      outColor = vec4(display, 1.0); // opaque — see the passthrough program
+      if (u_round.x > 0.0) {
+        vec2 halfSizeR = u_round.yz * 0.5;
+        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(u_round.x));
+        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - u_round.x;
+        outColor *= 1.0 - smoothstep(-0.5, 0.5, dR);
+      }
     }`;
 
     // Create Program
@@ -827,6 +993,216 @@ export class CanvasRenderer {
    * NDC position + camera yaw/pitch/fov, then maps that direction to an
    * equirectangular (longitude/latitude) texture coordinate.
    */
+  /**
+   * The ambient wash, drawn by GL.
+   *
+   * The letterbox is where ambient light belongs, and in fullscreen those bars
+   * are the canvas's own pixels — measured: a bar pixel reads back opaque, so
+   * the element background carrying the wash sits behind them and is never
+   * seen. A flat clear colour DOES reach them, which is what ambient used to
+   * do, and flat is the thing being fixed: it reads as a coloured band stuck to
+   * the picture rather than light coming off it.
+   *
+   * So the wash is drawn: one full-canvas quad, two soft pools of the sampled
+   * colour over black, drifting. No texture, no blur pass, no keyframe
+   * animation running for the whole of playback — a handful of instructions
+   * per pixel on a quad that was already being drawn.
+   */
+  private initWashProgram(): boolean {
+    if (this.washProgram) return true;
+    if (!this.gl) return false;
+    const gl = this.gl;
+
+    const vsSource = `#version 300 es
+    layout(location = 0) in vec2 a_position;
+    out vec2 v_uv;
+    void main() {
+      v_uv = a_position * 0.5 + 0.5;
+      gl_Position = vec4(a_position, 0.0, 1.0);
+    }`;
+
+    const fsSource = `#version 300 es
+    precision highp float;
+    uniform vec3 u_colour;   // the sampled ambient colour, already held down
+    uniform vec3 u_phases;   // three slowly-walking phases, in radians
+    uniform vec3 u_round;    // same corner cut as the picture — see the passthrough program
+    in vec2 v_uv;
+    out vec4 outColor;
+
+    void main() {
+      // Three very slow waves laid over each other, not a blob. A blob has a
+      // centre, and a bar is a narrow window onto it: when the centre drifts
+      // toward the bar the visible slice brightens and widens in place, which
+      // reads as the light SWELLING rather than travelling — and on a portrait
+      // video, where the bars are wide, the circle itself becomes visible as a
+      // shape. These waves are under one cycle across the frame, so there is no
+      // repeating pattern and no edge anywhere, and every part of every bar has
+      // a gradient running along it that slides as the phases walk.
+      float f =
+          0.30 * sin(v_uv.x * 3.7 + u_phases.x)
+        + 0.28 * sin(v_uv.y * 2.9 + u_phases.y)
+        + 0.20 * sin((v_uv.x * 1.6 - v_uv.y * 2.2) + u_phases.z);
+      // Mapped, not clamped. Clamping flattened whole regions to zero, and a
+      // region at zero is a bar with no light in it at all — so the bottom
+      // could glow while the top was simply off. Dividing by the amplitudes
+      // instead keeps the wave intact from trough to crest.
+      float n = 0.5 + f / 1.56;
+      // The floor is the point: the trough still carries some light, so when one
+      // bar is at a crest the far one shows a trace of the same colour rather
+      // than going black. Both bars are always lit, one just far more than the
+      // other, and which one keeps changing as the waves walk.
+      float i = 0.55 + 0.45 * n;
+      // Cubed: the difference between trough and crest stays wide, so this reads
+      // as light with a direction to it rather than an even tint.
+      i = i * i * i;
+      vec3 lit = u_colour * i;
+      // Break the 8-bit staircase.
+      //
+      // What comes out of the waves above is smooth to many decimal places and
+      // then gets written into an 8-bit buffer, so a whole region of it rounds
+      // to one value and the next region to the next — and the boundary between
+      // them is a hard edge running across the bar. On a dim wash the steps are
+      // far apart (a dark colour spends most of its range on very few codes),
+      // which is why they read as distinct contour LINES rather than as
+      // roughness. Nothing about the gradient is wrong; the buffer cannot hold
+      // it.
+      //
+      // A dither smaller than one code, added before that rounding, makes the
+      // choice between the two neighbouring codes a per-pixel one instead of a
+      // per-region one. The edge becomes a mixture and the eye reads the
+      // average, which is the value the maths asked for in the first place.
+      //
+      // Two hashes subtracted, not one: a single uniform sample leaves the
+      // noise correlated with the signal (it biases where it is already near a
+      // boundary). The triangular distribution this makes is the standard
+      // answer and costs one extra hash.
+      //
+      // Keyed on gl_FragCoord ALONE, so it is fixed in screen space. Reseeding
+      // it per frame would turn a still gradient into crawling grain — the wash
+      // is nearly static and any moving noise on it is more visible than the
+      // banding was.
+      vec2 seed = gl_FragCoord.xy;
+      float d1 = fract(sin(dot(seed, vec2(12.9898, 78.233))) * 43758.5453);
+      float d2 = fract(sin(dot(seed, vec2(63.7264, 10.873))) * 32168.4127);
+      lit += (d1 + d2 - 1.0) / 255.0;
+      outColor = vec4(lit, 1.0);
+      if (u_round.x > 0.0) {
+        vec2 halfSizeR = u_round.yz * 0.5;
+        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(u_round.x));
+        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - u_round.x;
+        outColor *= 1.0 - smoothstep(-0.5, 0.5, dR);
+      }
+    }`;
+
+    const createShader = (type: number, source: string) => {
+      const shader = gl.createShader(type);
+      if (!shader) return null;
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        Logger.error(TAG, "Wash shader compile error:", gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    };
+    const vert = createShader(gl.VERTEX_SHADER, vsSource);
+    const frag = createShader(gl.FRAGMENT_SHADER, fsSource);
+    if (!vert || !frag) return false;
+    const program = gl.createProgram();
+    if (!program) return false;
+    gl.attachShader(program, vert);
+    gl.attachShader(program, frag);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      Logger.error(TAG, "Wash program link error:", gl.getProgramInfoLog(program));
+      gl.deleteProgram(program);
+      return false;
+    }
+    this.washProgram = program;
+    this.washLocs = {
+      colour: gl.getUniformLocation(program, "u_colour"),
+      phases: gl.getUniformLocation(program, "u_phases"),
+      round: gl.getUniformLocation(program, "u_round"),
+    };
+    Logger.info(TAG, "Ambient wash program compiled");
+    return true;
+  }
+
+  /** Colour for the wash above. Null turns it off. The movement is the
+   *  renderer's own — see advanceWash. */
+  setAmbientWash(rgb: [number, number, number] | null): void {
+    this._washRgb = rgb;
+  }
+  private _washRgb: [number, number, number] | null = null;
+  /** Where the three waves currently sit, and how fast each is walking on,
+   *  in radians per second. */
+  private _washPhases = [0.4, 2.1, 4.3];
+  private _washSpeeds = [0.075, -0.055, 0.04];
+  private _washLastT = 0;
+  private washProgram: WebGLProgram | null = null;
+  private washLocs: {
+    colour: WebGLUniformLocation | null;
+    phases: WebGLUniformLocation | null;
+    round: WebGLUniformLocation | null;
+  } = { colour: null, phases: null, round: null };
+
+  /**
+   * Walk the waves on. The movement lives here rather than with the colour
+   * sampler because that samples five times a second: motion driven off it
+   * arrives in visible steps, which is what made the light look parked. Here it
+   * advances once per drawn frame, and each speed takes a small random nudge so
+   * no wave keeps a heading long enough for the eye to predict it — including
+   * drifting through zero and reversing, which is what makes it wander rather
+   * than sweep.
+   */
+  private advanceWash(): void {
+    const now = performance.now();
+    const dt = this._washLastT ? Math.min(0.1, (now - this._washLastT) / 1000) : 0;
+    this._washLastT = now;
+    if (!dt) return;
+    for (let i = 0; i < 3; i++) {
+      const nudged = this._washSpeeds[i] * 0.999 + (Math.random() - 0.5) * 0.02 * dt;
+      // Magnitude is held off zero. A plain random walk parks: it spends long
+      // stretches near zero speed, and a wave that is not moving is the thing
+      // this is meant to avoid. Direction still reverses — when the walk
+      // crosses zero the sign flips and the speed picks straight back up.
+      const sign = nudged < 0 ? -1 : 1;
+      this._washSpeeds[i] = sign * Math.min(0.12, Math.max(0.035, Math.abs(nudged)));
+      this._washPhases[i] = (this._washPhases[i] + this._washSpeeds[i] * dt) % 6.2831853;
+    }
+  }
+
+  /** Paint the wash over the whole canvas, before the picture goes on top. */
+  private drawAmbientWash(gl: WebGL2RenderingContext): void {
+    const rgb = this._washRgb;
+    if (!rgb || !this.initWashProgram() || !this.washProgram) return;
+    this.advanceWash();
+    gl.useProgram(this.washProgram);
+    if (this.washLocs.colour) {
+      gl.uniform3f(this.washLocs.colour, rgb[0] / 255, rgb[1] / 255, rgb[2] / 255);
+    }
+    if (this.washLocs.phases) {
+      const [p0, p1, p2] = this._washPhases;
+      gl.uniform3f(this.washLocs.phases, p0, p1, p2);
+    }
+    if (this.washLocs.round) {
+      gl.uniform3f(
+        this.washLocs.round,
+        this.cornerRadiusBufferPx(),
+        this.canvas?.width || 0,
+        this.canvas?.height || 0,
+      );
+    }
+    gl.viewport(0, 0, this.width, this.height);
+    // The quad has to be bound HERE. The picture's own draw binds it further
+    // down, so on the way in there is no vertex array attached and a_position
+    // reads as a constant — measured as the wash appearing only as a sliver at
+    // the right edge while both bars stayed black.
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
   private initVRProgram(): boolean {
     if (this.vrProgram) return true;
     if (!this.gl) return false;
@@ -855,6 +1231,8 @@ export class CanvasRenderer {
     uniform float u_uOffset; // 0 = left eye, 0.5 = right eye
     uniform float u_planetScale; // stereographic: image radius of the horizon
     uniform float u_srcAspect;   // source frame width/height (keeps the disc round)
+    // Rounded corners cut in the shader — see the passthrough program.
+    uniform vec3 u_round;
     in vec2 v_ndc;
     out vec4 outColor;
 
@@ -906,6 +1284,13 @@ export class CanvasRenderer {
       // edge never shows a black void.
       vec2 uv = vec2(eye.x * u_uScale + u_uOffset, eye.y);
       outColor = texture(u_image, uv);
+      outColor.a = 1.0; // opaque — see the passthrough program
+      if (u_round.x > 0.0) {
+        vec2 halfSizeR = u_round.yz * 0.5;
+        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(u_round.x));
+        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - u_round.x;
+        outColor *= 1.0 - smoothstep(-0.5, 0.5, dR);
+      }
     }`;
 
     const createShader = (type: number, source: string) => {
@@ -965,7 +1350,7 @@ export class CanvasRenderer {
    * Full 360° wraps horizontally (WRAP_S = REPEAT for a seamless ±180° seam);
    * VR180 covers a single front hemisphere, so it clamps and clips to black.
    */
-  private drawVRFrame(gl: WebGL2RenderingContext, frame: VideoFrame): void {
+  private drawVRFrame(gl: WebGL2RenderingContext, frame: RenderSource): void {
     gl.viewport(0, 0, this.width, this.height);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -978,8 +1363,9 @@ export class CanvasRenderer {
       this.vrHalf || this.vrStereographic ? gl.CLAMP_TO_EDGE : gl.REPEAT,
     );
 
-    if (frame.displayHeight > 0) {
-      this.vrTexAspect = frame.displayWidth / frame.displayHeight;
+    const vrH = sourceHeight(frame);
+    if (vrH > 0) {
+      this.vrTexAspect = sourceWidth(frame) / vrH;
     }
     // For side-by-side stereo each eye is half the frame width, so the per-eye
     // aspect (what the projection maps) halves.
@@ -992,6 +1378,7 @@ export class CanvasRenderer {
     const latDiv = Math.min(Math.PI, lonDiv / eyeAspect);
 
     gl.useProgram(this.vrProgram);
+    this.applyRoundUniform(this.vrProgram);
     gl.bindVertexArray(this.vao);
     const locs = this.vrLocs!;
     if (locs.yaw) gl.uniform1f(locs.yaw, this.vrYaw);
@@ -1047,8 +1434,32 @@ export class CanvasRenderer {
    *  sustain the source frame rate and engages its adaptive cap. The player
    *  uses it to turn on decode-side non-reference skipping on the software
    *  path. `targetFps` is the capped rate. */
+  /** True once this device has been judged unable to decode the current rung at
+   *  all (see engageDecodeBound). */
+  isDecodeBound(): boolean {
+    return this._decodeBound;
+  }
+
+  /**
+   * How many packets are queued in the video decoder. The perf detectors use it
+   * to tell a decoder that is too SLOW (work piled up in front of it) from one
+   * that is merely STARVED (nothing arriving) — both look identical from the
+   * present side, which is all this renderer can otherwise see.
+   */
+  setVideoBacklogProvider(cb: () => number): void {
+    this._videoBacklog = cb;
+  }
+
   setOnPerformanceDegrade(cb: (targetFps: number) => void): void {
     this._onPerformanceDegrade = cb;
+  }
+
+  /** Gate perf sampling. The host passes false while the tab is backgrounded
+   *  (and not in PiP): rAF is throttled there, so framesPresented stalls even
+   *  though audio keeps flowing — which would false-fire the decode-bound
+   *  detector and needlessly cap resolution on a perfectly capable device. */
+  setShouldMeasurePerf(cb: () => boolean): void {
+    this._shouldMeasurePerf = cb;
   }
 
   /** Roll the achieved-present-rate window and engage the adaptive FPS cap on a
@@ -1056,14 +1467,99 @@ export class CanvasRenderer {
    *  empty-queue bail, so a starving (decode-bound) pipeline still advances the
    *  window clock and registers its low present count. */
   private samplePerformance(): void {
-    if (this._perfDegradeChecked || !this.isPlaying) return;
+    if (this._perfDegradeChecked) return;
+    if (!this.isPlaying) {
+      this._perfWindowStart = 0;
+      this._stuckWindowStart = 0;
+      this._perfStuckWindows = 0;
+      return;
+    }
+    // Skip while backgrounded (and not in PiP): the throttled rAF stalls
+    // framesPresented even though audio flows, which would false-fire the
+    // decode-bound detector and cap resolution on a capable device. Reset so
+    // returning to the foreground starts clean windows (no stale accumulation).
+    if (this._shouldMeasurePerf && !this._shouldMeasurePerf()) {
+      this._perfWindowStart = 0;
+      this._perfDeficitWindows = 0;
+      this._stuckWindowStart = 0;
+      this._perfStuckWindows = 0;
+      return;
+    }
     // Off-speed playback changes distinct-frames-per-wall-second on its own
     // (2x can't show every frame on a 60Hz panel; slow-mo shows fewer) — that's
     // not the device struggling. Only measure at normal speed.
     if (Math.abs(this.playbackRate - 1.0) > 0.05) {
       this._perfWindowStart = 0;
+      this._stuckWindowStart = 0;
       return;
     }
+
+    // Stamp the grace clock on the first live sample (playback actually running,
+    // foreground, normal speed) rather than at configure() — which can run
+    // seconds before the first frame while the source opens.
+    if (this._perfArmedAt === 0) this._perfArmedAt = performance.now();
+    // Within the startup grace the device hasn't had a fair chance yet: hold off
+    // ENGAGING a cap/downshift. Keep the window CLOCKS advancing below (so we're
+    // measuring), but zero the bad-window streaks so a startup deficit can't
+    // carry over and fire the instant the grace ends — the post-grace judgment
+    // starts from a clean slate on steady-state numbers.
+    const inGrace =
+      performance.now() - this._perfArmedAt < CanvasRenderer.PERF_STARTUP_GRACE_MS;
+    if (inGrace) {
+      this._perfDeficitWindows = 0;
+      this._perfStuckWindows = 0;
+    }
+
+    // Decode-bound (STUCK) detector — runs BEFORE the frame-warmup gate on its
+    // own time-based window, because a near-frozen decoder never advances
+    // framesPresented past the warmup count (so the slow-path check below would
+    // never even start). Audio healthy = playback is genuinely running, so
+    // sustained near-zero video = the device can't decode this rung → tell ABR
+    // to drop. A rendition switch re-arms us via configure().
+    // Roll the "did the decoder have anything to do?" latches for both windows.
+    if (this._videoBacklog ? this._videoBacklog() > 0 : true) {
+      this._backlogSeenStuck = true;
+      this._backlogSeenDeficit = true;
+    }
+
+    const nowStuck = performance.now();
+    if (this._stuckWindowStart === 0) {
+      this._stuckWindowStart = nowStuck;
+      this._stuckBaseCount = this.framesPresented;
+    } else if (nowStuck - this._stuckWindowStart >= CanvasRenderer.PERF_WINDOW_MS) {
+      const stuckFps =
+        (this.framesPresented - this._stuckBaseCount) /
+        ((nowStuck - this._stuckWindowStart) / 1000);
+      const audioFlowing = this._isAudioHealthy ? this._isAudioHealthy() : true;
+      // Audio flowing is NOT enough on its own to call this a device limit.
+      // Video outweighs audio by two orders of magnitude (an 8K60 rung runs
+      // ~36 Mbit/s against ~200 kbit/s of Opus), so a link that cannot carry
+      // the video keeps audio perfectly healthy while no frames arrive — which
+      // is indistinguishable from a decoder that can't keep up, from here. The
+      // decoder's own backlog separates them: work piled up in front of it
+      // means slow, nothing queued means starved. Measured on a Drive-hosted
+      // 8K60 AV1 file whose link tops out at 4.3 MB/s: the startup window read
+      // as decode-bound, which downshifts ABR and (until it was gated) sent the
+      // frozen-video watchdog seeking, even though the same file then sustained
+      // a full 60fps once data was ahead of the playhead.
+      if (
+        audioFlowing &&
+        this._backlogSeenStuck &&
+        stuckFps < CanvasRenderer.PERF_MIN_ACHIEVED_FPS
+      ) {
+        this._perfStuckWindows++;
+        if (this._perfStuckWindows >= CanvasRenderer.PERF_STUCK_WINDOWS && !inGrace) {
+          this.engageDecodeBound(stuckFps);
+          return;
+        }
+      } else {
+        this._perfStuckWindows = 0;
+      }
+      this._stuckWindowStart = nowStuck;
+      this._stuckBaseCount = this.framesPresented;
+      this._backlogSeenStuck = false;
+    }
+
     // framesPresented resets to 0 on start/seek, so a low count during the
     // ramp is expected — not a deficit. Reset the window and wait it out.
     if (this.framesPresented <= CanvasRenderer.PERF_WARMUP_FRAMES) {
@@ -1082,7 +1578,14 @@ export class CanvasRenderer {
 
     const achieved = this.framesPresented - this._perfWindowBaseCount;
     const achievedFps = achieved / (elapsed / 1000);
-    const expected = this.videoFrameRate * (elapsed / 1000);
+    // Judge against the CAPPED rate once a present cap is active, so a source
+    // holding steady at the cap (e.g. 4K sustaining 30 of its 60fps) reads as
+    // healthy instead of a deficit that would needlessly drop resolution.
+    const targetFps =
+      this._presentFpsCap > 0
+        ? Math.min(this.videoFrameRate, this._presentFpsCap)
+        : this.videoFrameRate;
+    const expected = targetFps * (elapsed / 1000);
     // A network stall starves audio too — don't blame the video pipeline for
     // it. Only count a window when audio is flowing.
     const audioHealthy = this._isAudioHealthy ? this._isAudioHealthy() : true;
@@ -1091,14 +1594,19 @@ export class CanvasRenderer {
     // decoder recovery. Genuine decode-bound playback stays well above the floor.
     const producing = achievedFps >= CanvasRenderer.PERF_MIN_ACHIEVED_FPS;
 
+    // Same discriminator as the stuck detector above: only a decoder with work
+    // queued can be "too slow". An empty backlog across the whole window means
+    // the frames simply aren't arriving, and capping the present rate (or
+    // dropping a rung) does nothing about that.
     if (
       audioHealthy &&
+      this._backlogSeenDeficit &&
       producing &&
       expected > 0 &&
       achieved < expected * CanvasRenderer.PERF_DEFICIT_RATIO
     ) {
       this._perfDeficitWindows++;
-      if (this._perfDeficitWindows >= CanvasRenderer.PERF_DEFICIT_WINDOWS) {
+      if (this._perfDeficitWindows >= CanvasRenderer.PERF_DEFICIT_WINDOWS && !inGrace) {
         this.engagePresentCap(achieved / (elapsed / 1000));
       }
     } else {
@@ -1106,24 +1614,74 @@ export class CanvasRenderer {
     }
     this._perfWindowStart = now;
     this._perfWindowBaseCount = this.framesPresented;
+    this._backlogSeenDeficit = false;
   }
 
   private engagePresentCap(achievedFps: number): void {
-    this._perfDegradeChecked = true; // one-way: decide once per source
+    // A SEVERE shortfall skips the frame-rate stage. Capping to half rate is a
+    // fair trade when a rung is a little too heavy — the resolution survives —
+    // but when the pipeline is managing a quarter of the frames, half rate is
+    // still far out of reach, and trying it first costs another four windows
+    // before the ABR is even told. That wait is why coming back down off a rung
+    // the device cannot handle takes so long.
+    const targetFps =
+      this._presentFpsCap > 0
+        ? Math.min(this.videoFrameRate, this._presentFpsCap)
+        : this.videoFrameRate;
+    if (targetFps > 0 && achievedFps < targetFps * CanvasRenderer.PERF_SEVERE_RATIO) {
+      Logger.warn(
+        TAG,
+        `Decode-bound (severe): ~${achievedFps.toFixed(1)}/${targetFps}fps — skipping the frame-rate cap and asking for a lower rung now`,
+      );
+      this.engageDecodeBound(achievedFps);
+      return;
+    }
     const cap = Math.max(
       CanvasRenderer.PERF_MIN_CAP_FPS,
       Math.round(this.videoFrameRate / 2),
     );
-    // Already low enough that halving would drop under the floor — nothing to
-    // gain, and dropping a 30fps source to 24 isn't worth the judder.
-    if (cap >= this.videoFrameRate) return;
-    this._presentFpsCap = cap;
+    // Can't cap any lower (source already ≤2× the floor) → the frame-rate lever
+    // is spent; resolution downshift is all that's left.
+    if (cap >= this.videoFrameRate) {
+      this.engageDecodeBound(achievedFps);
+      return;
+    }
+    if (this._presentFpsCap === 0) {
+      // FIRST sign of trouble: cap the present rate and RE-ARM to re-judge
+      // against the cap. Give the rung a chance to hold at the reduced frame
+      // rate before dropping resolution — a 4K/1440p source the GPU can do at
+      // 30 but not 60 keeps its resolution instead of stepping down (which is
+      // what made it flap: it never got to try the current rung at half rate).
+      this._presentFpsCap = cap;
+      this._perfDeficitWindows = 0;
+      this._perfWindowStart = 0;
+      Logger.info(
+        TAG,
+        `Adaptive FPS: sustained ~${achievedFps.toFixed(0)}/${this.videoFrameRate}fps — capping presentation to ${cap}fps before any resolution drop`,
+      );
+      return;
+    }
+    // Already capped and STILL short of the cap → the rung is too heavy even at
+    // the reduced rate. Now drop resolution.
     Logger.info(
       TAG,
-      `Adaptive FPS: sustained ~${achievedFps.toFixed(0)}/${this.videoFrameRate}fps — capping presentation to ${cap}fps`,
+      `Adaptive FPS: still ~${achievedFps.toFixed(0)}/${this._presentFpsCap}fps after the cap — dropping resolution`,
+    );
+    this.engageDecodeBound(achievedFps);
+  }
+
+  /** Decode-bound catastrophe: the decoder can't produce frames at all (near
+   *  zero) while audio flows. Present-capping can't help a decoder that isn't
+   *  producing — signal ABR to drop a rung instead (pass 0, no cap). */
+  private engageDecodeBound(achievedFps: number): void {
+    this._perfDegradeChecked = true; // one-way until configure() re-arms on the switch
+    this._decodeBound = true;
+    Logger.warn(
+      TAG,
+      `Decode-bound: only ~${achievedFps.toFixed(1)}/${this.videoFrameRate}fps presented with healthy audio — signalling ABR to drop a rung`,
     );
     try {
-      this._onPerformanceDegrade?.(cap);
+      this._onPerformanceDegrade?.(0);
     } catch {
       /* ignore */
     }
@@ -1167,13 +1725,24 @@ export class CanvasRenderer {
   }
 
   /**
-   * The currently-displayed decoded VideoFrame (or null). Used as a fallback
-   * capture source when reading the WebGL canvas back via toDataURL comes out
-   * blank — some GPUs return an all-black buffer for hardware-decoded frames
-   * even with preserveDrawingBuffer. The frame is owned by the renderer and may
-   * be closed on the next present, so consume it synchronously.
+   * The currently-displayed picture (or null) — a decoded VideoFrame, or the
+   * <video> element itself on the MSE paths. Used as a fallback capture source
+   * when reading the WebGL canvas back via toDataURL comes out blank — some
+   * GPUs return an all-black buffer for hardware-decoded frames even with
+   * preserveDrawingBuffer. Both types are valid drawImage sources. A VideoFrame
+   * is owned by the renderer and may be closed on the next present, so consume
+   * it synchronously.
    */
-  getCurrentFrame(): VideoFrame | null {
+  /**
+   * Presentation rate the renderer has deliberately capped itself to, or 0 when
+   * uncapped. A cap is a DECISION, not a failure — the source's own fps stops
+   * being the number to judge against the moment one is set.
+   */
+  get presentFpsCap(): number {
+    return this._presentFpsCap || 0;
+  }
+
+  getCurrentFrame(): RenderSource | null {
     return this.lastRenderedFrame;
   }
 
@@ -1658,7 +2227,7 @@ export class CanvasRenderer {
       // WebGL contexts are robust to resize usually.
       if (!this.gl) {
         // Try to init if missing
-        const opts = { alpha: false, desynchronized: false };
+        const opts = { alpha: true, premultipliedAlpha: true, desynchronized: false };
         this.gl = this.canvas.getContext(
           "webgl2",
           opts,
@@ -1678,6 +2247,8 @@ export class CanvasRenderer {
           // Reset smoothing state so it doesn't interpolate from old dimensions
           this.currentScaleX = 0;
           this.currentScaleY = 0;
+          this._scaleContentW = 0;
+          this._scaleContentH = 0;
 
           if (this.frameQueue.length > 0) {
             this.drawFrame(this.frameQueue[0], true);
@@ -1704,7 +2275,7 @@ export class CanvasRenderer {
         // Responsive bottom padding is relative to the video's visual height
         // in its own frame (overlayHeight), not the container.
         const bottomPadding =
-          CanvasRenderer.computeSubtitleBottomPadding(overlayHeight);
+          this.subtitleBottomPadding(overlayHeight);
 
         // Reset overlay positioning to ensure it stays aligned with canvas
         this.subtitleOverlay.style.position = "absolute";
@@ -1857,18 +2428,42 @@ export class CanvasRenderer {
   /**
    * Render a VideoFrame immediately (for simple cases)
    */
-  render(frame: VideoFrame): void {
+  render(frame: RenderSource): void {
     this.drawFrame(frame);
+    // A <video> source is not ours to clone or close — it stays on screen
+    // holding its own current picture, so retain the element itself and let
+    // the paused-redraw paths re-upload from it.
+    if (isVideoElementSource(frame)) {
+      this.releaseRetainedFrame();
+      this.lastRenderedFrame = frame;
+      return;
+    }
     // Retain a clone so paused redraws (resize, fit-mode change via
     // startFitAnimation) have a frame to lerp against. The presentation-
     // loop path stores this on every present; this direct-render path
     // (used by HLSPlayerWrapper) was missing the clone, leaving the
     // fit-mode animation as a hard snap on HLS streams.
-    if (this.lastRenderedFrame) this.lastRenderedFrame.close();
+    this.releaseRetainedFrame();
     try {
       this.lastRenderedFrame = frame.clone();
     } catch {
       this.lastRenderedFrame = null;
+    }
+  }
+
+  /**
+   * Drop the retained frame. Only a VideoFrame is ours to close — a retained
+   * <video> element belongs to the MSE wrapper that owns it.
+   */
+  private releaseRetainedFrame(): void {
+    const retained = this.lastRenderedFrame;
+    this.lastRenderedFrame = null;
+    if (retained && !isVideoElementSource(retained)) {
+      try {
+        retained.close();
+      } catch {
+        /* already closed */
+      }
     }
   }
 
@@ -1883,18 +2478,29 @@ export class CanvasRenderer {
     if (this.rafId !== null) return;
 
     this.isPlaying = true;
-    this.presentationStartTime = performance.now();
 
     // Only reset timing if we don't have frames (fresh start/seek)
     // If we have queue, we are resuming, so keep last known PTS to avoid jumps
     if (this.frameQueue.length === 0) {
       this.lastPresentedPts = -1;
       this.framesPresented = 0; // Reset frame counter for fresh start
-      // Keep presentationStartPts as-is when frameQueue is empty
-      // It will sync to audio or first frame time when available
       this.syncedToAudio = false;
+      // Do NOT anchor the wall clock yet on a fresh start. If we set
+      // presentationStartTime here — before the first frame has decoded or
+      // audio has begun (8K/AV1 decode warmup can take ~1s) — getVideoTime
+      // accrues that elapsed against a stream that isn't playing, so the video
+      // clock races ahead. That surfaced as a ~1s startup "drift" that then
+      // hard-resets to audio, and in timing variants where a frame is already
+      // queued during the wait it presents frames at high speed (a startup
+      // fast-forward flash). Leave it at 0 so getVideoTime reports "not
+      // started" until the first frame / first audio sample anchors it cleanly
+      // (getVideoTime's videoTime<0 reset, or the first-frame present path).
+      this.presentationStartTime = 0;
+      this.presentationStartPts = 0;
     } else {
-      // Resuming with frames: reset anchor to last presented time to prevent restart from 0
+      // Resuming with frames: the stream is already playing, so start the wall
+      // clock now and anchor it to the last presented time to prevent a jump.
+      this.presentationStartTime = performance.now();
       if (this.lastPresentedPts >= 0) {
         this.presentationStartPts = this.lastPresentedPts;
       } else {
@@ -1995,7 +2601,7 @@ export class CanvasRenderer {
         this.drawFrame(firstFrame);
 
         // Retain for resize redraws
-        if (this.lastRenderedFrame) this.lastRenderedFrame.close();
+        this.releaseRetainedFrame();
         try {
           this.lastRenderedFrame = firstFrame.clone();
         } catch (e) {
@@ -2008,6 +2614,9 @@ export class CanvasRenderer {
         this.lastPresentedPts = frameTime;
         this.currentTime = frameTime;
         this.framesPresented++;
+        this.onFramePresented?.(this.currentTime);
+        this.onFramePresented?.(this.currentTime);
+        this._lastPresentAt = performance.now();
         return;
       }
     }
@@ -2017,7 +2626,7 @@ export class CanvasRenderer {
       this.drawFrame(frameToPresent);
 
       // Retain for resize redraws
-      if (this.lastRenderedFrame) this.lastRenderedFrame.close();
+      this.releaseRetainedFrame();
       try {
         this.lastRenderedFrame = frameToPresent.clone();
       } catch (e) {
@@ -2180,6 +2789,7 @@ export class CanvasRenderer {
       this.lastPresentedPts = firstFrame.timestamp / 1_000_000;
       this.currentTime = this.lastPresentedPts;
       this.framesPresented = 1; // First frame presented
+      this._lastPresentAt = performance.now();
 
       // Initialize presentation timing
       this.presentationStartTime = performance.now();
@@ -2268,6 +2878,28 @@ export class CanvasRenderer {
       }
     }
 
+    // Pre-roll after a seek is not playback.
+    //
+    // A resync restarts the decoder at the keyframe BEFORE the target, so the
+    // frames that arrive first sit behind the clock. Presenting them plays that
+    // gap at whatever rate the decoder can manage — measured at 3.3x on a 4K60
+    // source, which is the picture visibly racing for a moment before settling.
+    // Dropping them instead holds the last frame a fraction longer and then
+    // resumes at 1x, already in sync. It shows at 60fps first because the same
+    // gap in seconds holds two and a half times the frames.
+    if (bestFrame && this.justSeeked) {
+      const behind = currentTime - bestFrame.timestamp / 1_000_000;
+      const tolerance = Math.max(0.12, frameInterval * 4);
+      // …but never hold for long. A machine that cannot reach the clock at all
+      // would otherwise show a frozen picture over playing audio, which is
+      // worse than a late one — so past this the stale frame goes up anyway.
+      const held = performance.now() - this._lastPresentAt;
+      if (behind > tolerance && held < 500) {
+        for (const f of this.frameQueue.splice(0, bestIndex + 1)) f.close();
+        return null;
+      }
+    }
+
     // Clear justSeeked flag after we've found a frame
     if (bestFrame) {
       this.justSeeked = false;
@@ -2304,6 +2936,8 @@ export class CanvasRenderer {
       this.lastPresentedPts = bestFrame.timestamp / 1_000_000;
       this.currentTime = this.lastPresentedPts;
       this.framesPresented++;
+      this.onFramePresented?.(this.currentTime);
+      this._lastPresentAt = performance.now();
 
       return bestFrame;
     }
@@ -2318,7 +2952,10 @@ export class CanvasRenderer {
    * RGBA16F for high bit-depth content and falls back to RGBA8 on GL error or
    * exception. Shared by the flat and 360° draw paths.
    */
-  private uploadFrameTexture(gl: WebGL2RenderingContext, frame: VideoFrame): void {
+  private uploadFrameTexture(
+    gl: WebGL2RenderingContext,
+    frame: RenderSource,
+  ): void {
     try {
       if (this.isHighBitDepth) {
         gl.texImage2D(
@@ -2350,24 +2987,32 @@ export class CanvasRenderer {
   /**
    * Draw a frame to the canvas
    */
-  private drawFrame(frame: VideoFrame, force: boolean = false): void {
+  private drawFrame(frame: RenderSource, force: boolean = false): void {
     if (!this.gl || !this.program || !this.texture) return;
     const gl = this.gl;
     const paintStart = this._adaptDprChecked ? 0 : performance.now();
 
     try {
-      // Update current time
-      this.currentTime = frame.timestamp / 1_000_000;
+      // Update current time. A <video> source carries its own playhead;
+      // a VideoFrame carries a microsecond PTS.
+      this.currentTime = isVideoElementSource(frame)
+        ? frame.currentTime
+        : frame.timestamp / 1_000_000;
 
       // Check if frame is valid (width/height > 0)
       // Attempting to draw a closed frame causes "WebGL: INVALID_OPERATION: texImage2D: can't texture a closed VideoFrame"
       // Explicitly check display dimensions which are 0 on closed frames
-      if (frame.displayWidth === 0 || frame.displayHeight === 0) {
+      // (and on a <video> that has no metadata yet).
+      // The CROPPED size, so contain/cover/zoom/aspect all reason about the
+      // picture rather than the padded frame it arrived in. With no crop these
+      // are the frame's own dimensions.
+      const cropW = this.cropRect.x1 - this.cropRect.x0;
+      const cropH = this.cropRect.y1 - this.cropRect.y0;
+      const contentWidth = Math.round(sourceWidth(frame) * cropW);
+      const contentHeight = Math.round(sourceHeight(frame) * cropH);
+      if (contentWidth === 0 || contentHeight === 0) {
         return; // Silently skip closed/invalid frames (normal at EOF)
       }
-
-      const contentWidth = frame.displayWidth;
-      const contentHeight = frame.displayHeight;
 
       // 360° VR fast-path: bind + upload the frame, then render it as a
       // viewed sphere instead of the flat fit/letterbox quad. Compile the VR
@@ -2428,7 +3073,28 @@ export class CanvasRenderer {
       this.lastTargetScaleX = targetScaleX;
       this.lastTargetScaleY = targetScaleY;
 
-      if (this.currentScaleX === 0 || this.currentScaleY === 0 || force) {
+      // The scale maps CONTENT pixels to display pixels, so it only means the
+      // same thing while the content size holds. A rendition switch changes it
+      // (3840x2160 → 1920x1080 doubles the scale for an identical picture on
+      // screen), which made the interpolation below animate from the outgoing
+      // rung's scale to the incoming one — the video visibly grew or shrank
+      // into place over ~30 frames, each of them a full re-draw of a 4K/8K
+      // texture at a size that was simply wrong. Snap instead: there is nothing
+      // to animate between two renditions of the same picture. Genuine fit-mode
+      // and container changes keep their animation, since the content size is
+      // unchanged across those.
+      const contentChanged =
+        this._scaleContentW !== contentWidth ||
+        this._scaleContentH !== contentHeight;
+      this._scaleContentW = contentWidth;
+      this._scaleContentH = contentHeight;
+
+      if (
+        this.currentScaleX === 0 ||
+        this.currentScaleY === 0 ||
+        force ||
+        contentChanged
+      ) {
         this.currentScaleX = targetScaleX;
         this.currentScaleY = targetScaleY;
       } else {
@@ -2455,8 +3121,37 @@ export class CanvasRenderer {
       this.letterboxColor[0] += (this.letterboxTarget[0] - this.letterboxColor[0]) * f;
       this.letterboxColor[1] += (this.letterboxTarget[1] - this.letterboxColor[1]) * f;
       this.letterboxColor[2] += (this.letterboxTarget[2] - this.letterboxColor[2]) * f;
-      gl.clearColor(this.letterboxColor[0] / 255, this.letterboxColor[1] / 255, this.letterboxColor[2] / 255, 1);
+      // Clear TRANSPARENT and let the canvas ELEMENT's own background carry the
+      // letterbox colour. A clear is a rectangle: it fills the drawing buffer
+      // corner to corner, and the corner cut in the shader only touches what the
+      // shader draws — the video quad. So a letterboxed picture came out as a
+      // rounded frame inside a square opaque slab. Chrome hides that behind the
+      // clip-path on the canvas; Firefox composites the canvas as its own layer
+      // and honours neither that clip nor an ancestor's overflow, so the player
+      // showed square corners there (measured in Firefox 153 over geckodriver —
+      // Playwright's bundled Firefox rounds them and does NOT reproduce it).
+      // As the element's background the same colour is painted by the browser,
+      // which means border-radius applies to it, in every engine, with no clip.
+      // Clear TRANSPARENT and let the canvas element's own background carry the
+      // letterbox — see syncLetterboxBackground and the rounded corners it is
+      // there for. A flat tint HERE was tried to guarantee ambient reached the
+      // bars in fullscreen, and it does, but flat is exactly what ambient was
+      // moved off: it put the old solid band back.
+      // …and SAY transparent, rather than trusting whatever was set last. The
+      // ambient mirror pass below sets an opaque clear colour for its 16x16
+      // buffer and never puts it back, so with ambient on the next frame
+      // cleared the whole canvas to opaque black — corners included. The
+      // shader's corner cut only governs what the SHADER draws, so the cut
+      // pixels showed that slab instead of the element's rounded background.
+      // Chrome hides it behind the canvas clip; Firefox composites the canvas
+      // as its own layer and honours neither that clip nor an ancestor's
+      // overflow, so the corners went square there.
+      gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
+      this.syncLetterboxBackground();
+      // Ambient light goes down first; the picture is drawn over it below.
+      this.drawAmbientWash(gl);
+      gl.useProgram(this.program);
 
       // WebGL viewport needs y from bottom
       // CSS y is from top.
@@ -2468,7 +3163,11 @@ export class CanvasRenderer {
       gl.bindTexture(gl.TEXTURE_2D, this.texture);
 
       // Log frame format once to diagnose high bit-depth rendering issues
-      if (this.isHighBitDepth && !this._loggedFrameFormat) {
+      if (
+        this.isHighBitDepth &&
+        !this._loggedFrameFormat &&
+        !isVideoElementSource(frame)
+      ) {
         this._loggedFrameFormat = true;
         Logger.info(TAG, `VideoFrame format: ${frame.format}, ${frame.codedWidth}x${frame.codedHeight}, colorSpace: ${JSON.stringify(frame.colorSpace)}`);
 
@@ -2489,6 +3188,8 @@ export class CanvasRenderer {
       this.uploadFrameTexture(gl, frame);
 
       gl.useProgram(this.program);
+      this.applyRoundUniform(this.program);
+      this.applyCropUniform(this.program);
       gl.bindVertexArray(this.vao);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
@@ -2497,6 +3198,9 @@ export class CanvasRenderer {
       // sync readback is deferred until MoviElement asks via readAmbientPixels().
       if (this.ambientEnabled) {
         this._renderAmbientThumbnail();
+        // Reads the mirror that was just written. Rate-limited inside, and a
+        // no-op unless the host asked for bar cropping.
+        this.detectBars(performance.now());
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === "InvalidStateError") {
@@ -2597,10 +3301,21 @@ export class CanvasRenderer {
     // texture are still bound from the main drawArrays above this call.
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.ambientFbo);
     gl.viewport(0, 0, size, size);
+    // No corner cut on this pass. The rounding uniform measures in the main
+    // canvas's pixels, and this draws the same quad into a 16x16 buffer — every
+    // fragment would fall outside the rounded rect and the ambient sample would
+    // come back empty. Restored right after.
+    this.setRoundUniformOff();
+    // …and no crop either. This mirror is what bar detection reads, and a
+    // cropped mirror would show it a frame with the bars already gone: it could
+    // never tell that the crop had become wrong, and never widen back.
+    this.applyCropUniform(this.program, true);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.applyRoundUniform(this.program);
+    this.applyCropUniform(this.program);
     // Restore main viewport for any subsequent GL work this tick.
     gl.viewport(0, 0, this.width, this.height);
   }
@@ -2693,7 +3408,7 @@ export class CanvasRenderer {
         // backbuffer and would inflate the padding 2× on retina.
         const h = this.containerHeight || 672;
         this.subtitleOverlay.style.paddingBottom =
-          `${CanvasRenderer.computeSubtitleBottomPadding(h)}px`;
+          `${this.subtitleBottomPadding(h)}px`;
       }
     }
   }
@@ -2810,26 +3525,6 @@ export class CanvasRenderer {
     }
 
     try {
-      // Create a temporary canvas to convert ImageBitmap to data URL
-      const tempCanvas = document.createElement("canvas");
-      tempCanvas.width = cue.image.width;
-      tempCanvas.height = cue.image.height;
-      const tempCtx = tempCanvas.getContext("2d");
-
-      if (!tempCtx) {
-        Logger.warn(
-          TAG,
-          "Failed to create temporary canvas context for image subtitle",
-        );
-        return;
-      }
-
-      // Draw ImageBitmap to temporary canvas
-      tempCtx.drawImage(cue.image, 0, 0);
-
-      // Convert to data URL
-      const dataUrl = tempCanvas.toDataURL("image/png");
-
       // Use CSS-pixel dimensions of the visible canvas, not the dpr-scaled
       // backbuffer. this.width/height live in buffer space (target × dpr) and
       // sizing the overlay with those values blows it up to 2× on retina,
@@ -2881,7 +3576,21 @@ export class CanvasRenderer {
       // baseScale, so the cue still lands where the author put it.
       const IMAGE_SUB_DISPLAY_SHRINK = 0.85;
       const baseScale = Math.min(scaleX, scaleY);
-      const uniformScale = baseScale * userSizeMult * IMAGE_SUB_DISPLAY_SHRINK;
+      // …with the floor the TEXT path has. A text cue is sized by CSS as
+      // clamp(20px, width * 0.032, 40px), so it stops shrinking at 20px; an
+      // image cue scaled straight off the canvas has no such floor and keeps
+      // going. In a Picture-in-Picture window a few hundred pixels wide that is
+      // a fifth of full size next to text that is still 20px — the same track,
+      // one line readable and the next a smudge.
+      //
+      // Expressed as the same curve: what the text size would be here, over
+      // what it is at the reference width. Only ever used to RAISE the scale —
+      // above 1920 the geometric mapping is larger and stays in charge, so a
+      // big screen looks exactly as it did.
+      const textPx = Math.min(40, Math.max(20, canvasWidth * 0.032));
+      const textScale = textPx / 40;
+      const displayScale = Math.max(baseScale, textScale);
+      const uniformScale = displayScale * userSizeMult * IMAGE_SUB_DISPLAY_SHRINK;
 
       // Calculate scaled dimensions preserving aspect ratio
       const scaledWidth = cue.image.width * uniformScale;
@@ -2901,7 +3610,7 @@ export class CanvasRenderer {
         (canvasHeight - subtitleVideoHeight * baseScale) / 2;
 
       const bottomPadding =
-        CanvasRenderer.computeSubtitleBottomPadding(canvasHeight);
+        this.subtitleBottomPadding(canvasHeight);
 
       // Position at bottom center (above controls), similar to text subtitles
       // For image subtitles, always position at bottom if no explicit position.
@@ -2954,6 +3663,52 @@ export class CanvasRenderer {
       // so it maps back onto the video once rotated.
       const rotImg = (((this.rotation ?? 0) % 360) + 360) % 360;
       const swappedImg = rotImg === 90 || rotImg === 270;
+
+      // The presentation loop calls this ~60x/s, and until now every one of
+      // those ticks re-encoded the bitmap, re-assigned the img's src and
+      // re-asserted a padding-bottom the overlay was still easing toward. The
+      // 0.3s transition therefore never landed: it was retargeted before it
+      // finished, so an image cue crept up from the bottom of the frame for as
+      // long as it was on screen instead of simply appearing where it belongs.
+      //
+      // The text path has carried this guard since the same bug bit it there
+      // (see the renderKey bail below it) — the image half never got one.
+      // Everything the rendered result depends on is in the key, so a resize, a
+      // rotation, the controls sliding in or a size-multiplier change all still
+      // re-render; only an identical repeat is skipped.
+      const imgKey = [
+        "img",
+        cue.start.toFixed(3),
+        cue.end.toFixed(3),
+        Math.round(canvasWidth),
+        Math.round(canvasHeight),
+        Math.round(this.subtitleControlsPadding),
+        userSizeMult,
+        rotImg,
+      ].join("|");
+      if (imgKey === this._lastRenderedSubtitleKey) return;
+
+      // The bitmap only changes with the cue, so a resize or a controls toggle
+      // reuses the PNG rather than paying for toDataURL again.
+      const cueKey = `${cue.start.toFixed(3)}|${cue.end.toFixed(3)}`;
+      if (cueKey !== this._lastImageCueKey || !this._lastImageDataUrl) {
+        const tempCanvas = document.createElement("canvas");
+        tempCanvas.width = cue.image.width;
+        tempCanvas.height = cue.image.height;
+        const tempCtx = tempCanvas.getContext("2d");
+        if (!tempCtx) {
+          Logger.warn(
+            TAG,
+            "Failed to create temporary canvas context for image subtitle",
+          );
+          return;
+        }
+        tempCtx.drawImage(cue.image, 0, 0);
+        this._lastImageDataUrl = tempCanvas.toDataURL("image/png");
+        this._lastImageCueKey = cueKey;
+      }
+      const dataUrl = this._lastImageDataUrl;
+
       const ovW = swappedImg ? canvasHeight : canvasWidth;
       const ovH = swappedImg ? canvasWidth : canvasHeight;
       this.subtitleOverlay.style.position = "absolute";
@@ -2972,10 +3727,18 @@ export class CanvasRenderer {
       this.subtitleOverlay.style.justifyContent = "flex-end";
       this.subtitleOverlay.style.alignItems = "center";
       this.subtitleOverlay.style.overflow = "hidden"; // Prevent overflow outside canvas
-      this.subtitleOverlay.style.padding = "0";
-      const bottomPaddingImg =
-        CanvasRenderer.computeSubtitleBottomPadding(ovH);
+      // Worked out BEFORE the shorthand below resets the sides, and that order
+      // is the whole point rather than tidiness. subtitleBottomPadding reads
+      // getComputedStyle, which forces a style flush; sitting between the reset
+      // and the real value, that flush committed padding-bottom: 0 as a
+      // rendered state, and the overlay's `transition: padding-bottom 0.3s`
+      // then had a start value to animate FROM. Every cue that arrived after a
+      // gap rose ~50px off the bottom of the frame over a third of a second.
+      // The text path has always computed its padding first, which is exactly
+      // why text cues never did this.
+      const bottomPaddingImg = this.subtitleBottomPadding(ovH);
       const effectivePaddingImg = this.subtitleControlsPadding > 0 ? this.subtitleControlsPadding : bottomPaddingImg;
+      this.subtitleOverlay.style.padding = "0";
       this.subtitleOverlay.style.paddingBottom = `${effectivePaddingImg}px`;
       this.subtitleOverlay.style.textAlign = "center";
       this.subtitleOverlay.style.boxSizing = "border-box";
@@ -3030,6 +3793,11 @@ export class CanvasRenderer {
       imgElement.style.visibility = "visible";
       imgElement.style.opacity = "1";
 
+      // Only once it is actually on screen: a bail above (no 2D context) has to
+      // be free to try again on the next tick rather than being remembered as
+      // done.
+      this._lastRenderedSubtitleKey = imgKey;
+
       Logger.debug(
         TAG,
         `Image subtitle rendered: src set, dimensions=${(cue.image.width * scaleX).toFixed(0)}x${(cue.image.height * scaleY).toFixed(0)}, position=(${x.toFixed(0)}, ${y.toFixed(0)})`,
@@ -3050,6 +3818,10 @@ export class CanvasRenderer {
     this.activeSubtitleCue = null;
     this._lastRenderedSubtitleKey = "";
     this._lastRenderedSubtitlePlain = "";
+    this._lastSubtitleLineCount = 0;
+    // A different track (or file) — the cached bitmap belongs to neither.
+    this._lastImageCueKey = "";
+    this._lastImageDataUrl = "";
     // Clear all subtitle elements from overlay if it exists
     if (this.subtitleOverlay) {
       this.subtitleOverlay.innerHTML = "";
@@ -3069,6 +3841,36 @@ export class CanvasRenderer {
   private static computeSubtitleBottomPadding(overlayHeight: number): number {
     if (!Number.isFinite(overlayHeight) || overlayHeight <= 0) return 24;
     return Math.max(Math.min(80, overlayHeight * 0.08), 24);
+  }
+
+  /**
+   * How far the caption sits off the bottom of the video.
+   *
+   * The default above is 8% of the picture's height, clamped to 24-80px, which
+   * reads well on a wide player. It does not travel: on a 9:16 reel the same 8%
+   * is a much shorter distance in a much taller frame, and the caption lands on
+   * whatever the page has put along the bottom.
+   *
+   * `--movi-sub-bottom` on the element says otherwise - a percentage of the
+   * picture's height, or a plain px value. The clamp is deliberately NOT
+   * applied to it: a host that names a distance has asked for that distance.
+   * The overlay's CSS rule carries the same variable for the non-canvas path;
+   * this is the one that matters on the canvas path, where the overlay is
+   * positioned by inline style and the CSS `bottom` never applies.
+   */
+  private subtitleBottomPadding(overlayHeight: number): number {
+    const raw = this.subtitleOverlay
+      ? getComputedStyle(this.subtitleOverlay)
+          .getPropertyValue("--movi-sub-bottom")
+          .trim()
+      : "";
+    if (raw && Number.isFinite(overlayHeight) && overlayHeight > 0) {
+      const pct = /^([\d.]+)%$/.exec(raw);
+      if (pct) return (overlayHeight * parseFloat(pct[1])) / 100;
+      const px = /^([\d.]+)px$/.exec(raw);
+      if (px) return parseFloat(px[1]);
+    }
+    return CanvasRenderer.computeSubtitleBottomPadding(overlayHeight);
   }
 
   /**
@@ -3199,6 +4001,7 @@ export class CanvasRenderer {
           this.subtitleOverlay.innerHTML = ""; // Clear any image elements too
           this._lastRenderedSubtitleKey = "";
           this._lastRenderedSubtitlePlain = "";
+          this._lastSubtitleLineCount = 0;
         }
         this.subtitleOverlay.style.display = "none";
       }
@@ -3248,7 +4051,7 @@ export class CanvasRenderer {
       const ovTxtW = swappedTxt ? overlayH : overlayW;
       const ovTxtH = swappedTxt ? overlayW : overlayH;
       const bottomPadding =
-        CanvasRenderer.computeSubtitleBottomPadding(ovTxtH);
+        this.subtitleBottomPadding(ovTxtH);
 
       this.subtitleOverlay.style.position = "absolute";
       this.subtitleOverlay.style.right = "auto";
@@ -3295,7 +4098,7 @@ export class CanvasRenderer {
       // 2D canvas and applied as `min-width` on the line. This anchors
       // the box at full-sentence width from cue #1 without putting any
       // ghost text into the DOM where it could leak through.
-      const KARAOKE_DELIM = "⟨⟨GHOST⟩⟩";
+      const KARAOKE_DELIM = KARAOKE_GHOST_DELIM;
       const delimIdx = cue.text.indexOf(KARAOKE_DELIM);
       const visibleText =
         delimIdx >= 0 ? cue.text.slice(0, delimIdx) : cue.text;
@@ -3624,6 +4427,30 @@ export class CanvasRenderer {
         `<div class="movi-subtitle-block">${linesHtml}</div>` +
         `</div>`;
 
+      // A karaoke cue that just wrapped onto another line has pushed whatever
+      // was showing upward. Left alone that is a jump; sliding the block up
+      // from where it sat a moment ago turns it into the scroll YouTube's
+      // rolling captions do. Only on the render where the count actually grew —
+      // the innerHTML above is rebuilt on every word, so an unconditional
+      // animation would re-run on each karaoke tick — and only while the same
+      // sentence is growing, so a brand-new cue simply appears.
+      const lineCountGrew =
+        isCumulativeGrowth && lines.length > this._lastSubtitleLineCount;
+      this._lastSubtitleLineCount = lines.length;
+      if (lineCountGrew) {
+        const blockEl = this.subtitleOverlay.querySelector(
+          ".movi-subtitle-block",
+        ) as HTMLElement | null;
+        // Measure rather than assume a line box: font size, the user's size
+        // multiplier and the per-line padding all feed into it.
+        const firstLine = blockEl?.firstElementChild as HTMLElement | null;
+        const advance = firstLine?.offsetHeight ?? 0;
+        if (blockEl && advance > 0) {
+          blockEl.style.setProperty("--movi-sub-adv", `${advance}px`);
+          blockEl.classList.add("movi-subtitle-advance");
+        }
+      }
+
       return;
     }
 
@@ -3712,6 +4539,7 @@ export class CanvasRenderer {
         frame.close();
         this.frameQueue.shift();
         dropped++;
+        this.framesDropped++;
       } else {
         break;
       }
@@ -3735,6 +4563,432 @@ export class CanvasRenderer {
    * Clear frame queue (useful for seek operations)
    * Resets all presentation timing to prevent stuttering after seek
    */
+  private cornerRadiusCss = 0;
+  private roundLocs = new Map<WebGLProgram, WebGLUniformLocation | null>();
+
+  /**
+   * Corner radius (CSS pixels) for the picture itself.
+   *
+   * Firefox composites the canvas as its own layer and ignores border-radius
+   * and clip-path on it until that layer is rebuilt, so a rounded page frame
+   * ended up with square video inside it. Pixels the shader declines to draw
+   * are transparent whatever the compositor thinks, so this holds everywhere.
+   * 0 turns it off.
+   */
+  setCornerRadius(cssPx: number): void {
+    const r = Math.max(0, cssPx || 0);
+    if (r === this.cornerRadiusCss) return;
+    this.cornerRadiusCss = r;
+    // A paused player never draws again on its own; repaint so the change shows.
+    // (Same retained frame the VR camera nudges and resizes repaint from.)
+    if (this.lastRenderedFrame) {
+      try {
+        this.drawFrame(this.lastRenderedFrame, true);
+      } catch {
+        /* the next real frame will carry it */
+      }
+    }
+  }
+
+  /**
+   * Frames put on screen since the queue was last cleared — a seek, or a
+   * rendition swap. 0 means nothing from the new pipeline has been painted yet,
+   * which is what "the picture has actually changed over" means to a caller
+   * that wants to hold a loading indicator until it has.
+   */
+  presentedSinceClear(): number {
+    return this.framesPresented;
+  }
+
+  /** Push the letterbox colour onto the canvas ELEMENT, so the browser paints
+   *  the bars and rounds them with the element's own corner. Written only when
+   *  it changes — the colour lerps every frame and most frames land on the same
+   *  8-bit triplet. */
+  private syncLetterboxBackground(): void {
+    const el = this.canvas as HTMLCanvasElement | null;
+    if (!el || !el.style) return;
+    const rgb = `rgb(${Math.round(this.letterboxColor[0])}, ${Math.round(
+      this.letterboxColor[1],
+    )}, ${Math.round(this.letterboxColor[2])})`;
+    if (this._letterboxBgCss === rgb) return;
+    this._letterboxBgCss = rgb;
+    el.style.backgroundColor = rgb;
+  }
+  private _letterboxBgCss = "";
+
+  /** Radius in DRAWING-BUFFER pixels, which is what the shader measures in. */
+  private cornerRadiusBufferPx(): number {
+    if (!this.cornerRadiusCss || !this.canvas) return 0;
+    const cssW =
+      (this.canvas as HTMLCanvasElement).clientWidth || this.canvas.width;
+    const scale = cssW > 0 ? this.canvas.width / cssW : 1;
+    return this.cornerRadiusCss * scale;
+  }
+
+  // ── Bar cropping ────────────────────────────────────────
+  /** On only when the host asks for it. Off, nothing here runs and the crop
+   *  stays the whole frame. */
+  private barCropEnabled = false;
+  private barCropOwnsMirror = false;
+  /** What the last few checks agreed on, and since when. */
+  private barCropCandidate: {
+    top: number;
+    bottom: number;
+    left: number;
+    right: number;
+  } | null = null;
+  private barCropStableSince = 0;
+  private barCropLastCheck = 0;
+  private onCropChange:
+    | ((crop: {
+        top: number;
+        bottom: number;
+        left: number;
+        right: number;
+      }) => void)
+    | null = null;
+
+  /** How dark a row has to be to count as bar, and how much brighter the row
+   *  just inside it must be for that edge to be a real one. */
+  private static readonly BAR_DARK = 18;
+  private static readonly BAR_EDGE = 34;
+  /** What a REAL bar reads. Black bars come out of a decoder at essentially
+   *  zero; BAR_DARK is deliberately looser than that so compression noise and
+   *  banding still count as bar. The gap between the two is the ambiguous
+   *  band — see the walk-back in detectBars. */
+  private static readonly BAR_BLACK = 6;
+  /** A bar this thick is not a bar. Nothing legitimate takes a quarter of the
+   *  frame off each end. */
+  private static readonly BAR_MAX = 0.25;
+  /** How long the same answer has to hold before it is acted on. A fade to
+   *  black is a dark frame for a moment; a letterbox is dark for the film. */
+  private static readonly BAR_SETTLE_MS = 1200;
+  private static readonly BAR_CHECK_MS = 250;
+
+  /**
+   * Crop the black bars that are part of the PICTURE.
+   *
+   * A 2.39:1 film delivered in a 16:9 frame carries its bars as pixels, so
+   * "fill" and "zoom" scale the padding along with the image and the viewer
+   * ends up with the same letterbox, larger. Cropping is done in the shader —
+   * the sampled region narrows, nothing is decoded twice — and the fit maths
+   * read the cropped size, which is what makes those modes mean anything.
+   */
+  setBarCropEnabled(
+    on: boolean,
+    onChange?: (crop: {
+      top: number;
+      bottom: number;
+      left: number;
+      right: number;
+    }) => void,
+  ): void {
+    if (onChange !== undefined) this.onCropChange = onChange;
+    if (on === this.barCropEnabled) return;
+    this.barCropEnabled = on;
+    if (on) {
+      // Detection reads the ambient mirror. If ambient is not using it, this
+      // turns it on and remembers that it was ours to turn off.
+      if (!this.ambientEnabled) {
+        this.enableAmbientMirror();
+        this.barCropOwnsMirror = this.ambientEnabled;
+      }
+      this.barCropCandidate = null;
+      this.barCropStableSince = 0;
+      this.barCropLastCheck = 0;
+    } else {
+      if (this.barCropOwnsMirror) {
+        this.disableAmbientMirror();
+        this.barCropOwnsMirror = false;
+      }
+      this.setCropRect(0, 0, 0, 0);
+    }
+  }
+
+  /** The crop in force, as the fraction taken off each edge. */
+  getBarCrop(): { top: number; bottom: number; left: number; right: number } {
+    return {
+      top: this.cropRect.y0,
+      bottom: 1 - this.cropRect.y1,
+      left: this.cropRect.x0,
+      right: 1 - this.cropRect.x1,
+    };
+  }
+
+  private setCropRect(
+    top: number,
+    bottom: number,
+    left: number,
+    right: number,
+  ): void {
+    const y0 = Math.max(0, Math.min(0.45, top));
+    const y1 = 1 - Math.max(0, Math.min(0.45, bottom));
+    const x0 = Math.max(0, Math.min(0.45, left));
+    const x1 = 1 - Math.max(0, Math.min(0.45, right));
+    if (y1 - y0 < 0.3 || x1 - x0 < 0.3) return; // never leave a sliver
+    if (
+      this.cropRect.y0 === y0 &&
+      this.cropRect.y1 === y1 &&
+      this.cropRect.x0 === x0 &&
+      this.cropRect.x1 === x1
+    ) {
+      return;
+    }
+    this.cropRect.y0 = y0;
+    this.cropRect.y1 = y1;
+    this.cropRect.x0 = x0;
+    this.cropRect.x1 = x1;
+    // The fit maths run off the cropped size, and they only run on a draw —
+    // so a still frame would keep the old geometry until something moved.
+    if (this.lastRenderedFrame) this.drawFrame(this.lastRenderedFrame, true);
+    Logger.info(
+      TAG,
+      `Bar crop: top=${(y0 * 100).toFixed(1)}% bottom=${((1 - y1) * 100).toFixed(1)}% ` +
+        `left=${(x0 * 100).toFixed(1)}% right=${((1 - x1) * 100).toFixed(1)}%`,
+    );
+    try {
+      this.onCropChange?.(this.getBarCrop());
+    } catch (e) {
+      Logger.warn(TAG, "crop change handler threw", e);
+    }
+  }
+
+  /**
+   * Look for letterbox bars in the mirrored frame.
+   *
+   * Cheap by construction: the mirror is already drawn for ambient, and this
+   * reads it a few times a second. Everything expensive about the idea is in
+   * being SURE — a fade to black, a night scene and a title card are all dark
+   * frames, and cropping one of them would eat the picture.
+   */
+  private detectBars(now: number): void {
+    if (!this.barCropEnabled) return;
+    if (now - this.barCropLastCheck < CanvasRenderer.BAR_CHECK_MS) return;
+    this.barCropLastCheck = now;
+    const px = this.readAmbientPixels();
+    if (!px) return;
+    const size = CanvasRenderer.AMBIENT_SIZE;
+
+    // readPixels is bottom-up and the quad maps the texture's first row to the
+    // TOP of the image, so the image's top rows land at the END of the buffer.
+    const lum = (x: number, y: number) => {
+      const i = (y * size + x) * 4;
+      return 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
+    };
+    // Eight samples across a line is plenty to know whether it is black, and
+    // stepping in from the extreme edge skips a scaler's ringing.
+    const rowMax = (y: number) => {
+      let m = 0;
+      for (let i = 0; i < 8; i++) {
+        m = Math.max(m, lum(Math.round(((i + 0.5) / 8) * (size - 1)), y));
+      }
+      return m;
+    };
+    const colMax = (x: number) => {
+      let m = 0;
+      for (let i = 0; i < 8; i++) {
+        m = Math.max(m, lum(x, Math.round(((i + 0.5) / 8) * (size - 1))));
+      }
+      return m;
+    };
+
+    const limit = Math.floor(size * CanvasRenderer.BAR_MAX);
+    // Rows are read from the far end for the image's top — readPixels is
+    // bottom-up. Columns need no such flip.
+    let top = 0;
+    while (top < limit && rowMax(size - 1 - top) <= CanvasRenderer.BAR_DARK) top++;
+    let bottom = 0;
+    while (bottom < limit && rowMax(bottom) <= CanvasRenderer.BAR_DARK) bottom++;
+    let left = 0;
+    while (left < limit && colMax(left) <= CanvasRenderer.BAR_DARK) left++;
+    let right = 0;
+    while (right < limit && colMax(size - 1 - right) <= CanvasRenderer.BAR_DARK) {
+      right++;
+    }
+
+    // A real bar ENDS somewhere: the first line of picture is much brighter
+    // than the bar. A dark scene fades instead, and that is the test that tells
+    // them apart — without it, the first night shot would crop the film.
+    if (!(top > 0 && rowMax(size - 1 - top) > CanvasRenderer.BAR_EDGE)) top = 0;
+    if (!(bottom > 0 && rowMax(bottom) > CanvasRenderer.BAR_EDGE)) bottom = 0;
+    if (!(left > 0 && colMax(left) > CanvasRenderer.BAR_EDGE)) left = 0;
+    if (!(right > 0 && colMax(size - 1 - right) > CanvasRenderer.BAR_EDGE)) {
+      right = 0;
+    }
+
+    // …and now give back the lines that were only DARK, not black.
+    //
+    // The mirror is 16 rows, so one row is a sixteenth of the frame — and the
+    // row the bar ends inside is a blend of bar and picture. Where the picture
+    // is dark at that edge (a night scene, a fade, a shot that opens on black)
+    // the blend still comes in under BAR_DARK and the whole row is taken as
+    // bar: 6% of the frame, 65 lines on a 1080p file, cut off a picture that
+    // was there. Worse, the bad measurement moves the computed aspect out of
+    // the snapping window below, so the one thing that would have corrected it
+    // never runs.
+    //
+    // A real bar is not dark, it is black. Walking back over the merely-dark
+    // lines costs at most one line of bar left on screen, and that is the
+    // right way round: a sliver of black nobody notices, instead of a strip of
+    // film nobody gets back.
+    //
+    // AFTER the test above, not before. That test asks whether the line just
+    // past the bar is bright, which is how a bar is told from a fade — and the
+    // line this walk-back hands over is the dim one, so testing against it
+    // answers "no bar at all" and crops nothing.
+    while (top > 0 && rowMax(size - 1 - (top - 1)) > CanvasRenderer.BAR_BLACK) {
+      top--;
+    }
+    while (bottom > 0 && rowMax(bottom - 1) > CanvasRenderer.BAR_BLACK) bottom--;
+    while (left > 0 && colMax(left - 1) > CanvasRenderer.BAR_BLACK) left--;
+    while (right > 0 && colMax(size - right) > CanvasRenderer.BAR_BLACK) right--;
+
+    const found = {
+      top: top / size,
+      bottom: bottom / size,
+      left: left / size,
+      right: right / size,
+    };
+    const c = this.barCropCandidate;
+    const same =
+      c &&
+      Math.abs(c.top - found.top) < 1 / size &&
+      Math.abs(c.bottom - found.bottom) < 1 / size &&
+      Math.abs(c.left - found.left) < 1 / size &&
+      Math.abs(c.right - found.right) < 1 / size;
+    if (!same) {
+      this.barCropCandidate = found;
+      this.barCropStableSince = now;
+      return;
+    }
+    if (now - this.barCropStableSince < CanvasRenderer.BAR_SETTLE_MS) return;
+
+    const current = this.getBarCrop();
+    if (
+      Math.abs(current.top - found.top) < 1 / size &&
+      Math.abs(current.bottom - found.bottom) < 1 / size &&
+      Math.abs(current.left - found.left) < 1 / size &&
+      Math.abs(current.right - found.right) < 1 / size
+    ) {
+      return; // already there
+    }
+    this.setCropRect(...this.snapToKnownAspect(found));
+  }
+
+  /**
+   * Nudge a crop onto a real aspect ratio.
+   *
+   * The mirror is 64 rows, so a measured bar is only ever a 64th of the frame —
+   * good enough to find it, one row out either way. Films are not one row out:
+   * they are 2.39, 1.85, 4:3. Landing exactly on the nearest of those keeps the
+   * cropped picture from being a fraction off, which is the difference between
+   * "cropped" and "cropped badly".
+   */
+  private snapToKnownAspect(found: {
+    top: number;
+    bottom: number;
+    left: number;
+    right: number;
+  }): [number, number, number, number] {
+    const w = this.lastRenderedFrame ? sourceWidth(this.lastRenderedFrame) : 0;
+    const h = this.lastRenderedFrame ? sourceHeight(this.lastRenderedFrame) : 0;
+    const vertical = found.top + found.bottom;
+    const horizontal = found.left + found.right;
+    // Both axes cropped is a window-boxed frame — a picture padded twice, by
+    // two different hands. There is no single ratio to snap that onto, so it is
+    // left exactly as measured.
+    if (!w || !h || (vertical > 0 && horizontal > 0)) {
+      return [found.top, found.bottom, found.left, found.right];
+    }
+    const visibleW = 1 - horizontal;
+    const visibleH = 1 - vertical;
+    if (visibleW <= 0 || visibleH <= 0) {
+      return [found.top, found.bottom, found.left, found.right];
+    }
+    const aspect = (w * visibleW) / (h * visibleH);
+    // Landscape ratios and their portrait twins. A phone video padded into a
+    // 4:3 frame is 3:4 visible, which is 4/3 upside down — leaving the
+    // reciprocals out meant a pillarboxed portrait clip matched nothing and
+    // kept the mirror's own two-column error instead of being centred.
+    const LANDSCAPE = [2.39, 2.35, 2.2, 2.0, 1.85, 16 / 9, 1.66, 1.5, 4 / 3];
+    const KNOWN = [1, ...LANDSCAPE, ...LANDSCAPE.map((k) => 1 / k)];
+    let best = 0;
+    let bestErr = Infinity;
+    for (const k of KNOWN) {
+      const err = Math.abs(aspect - k) / k;
+      if (err < bestErr) {
+        bestErr = err;
+        best = k;
+      }
+    }
+    if (bestErr > 0.03) {
+      return [found.top, found.bottom, found.left, found.right];
+    }
+    // Split it evenly. Matching a known ratio is the evidence that this is an
+    // ordinary pad, and ordinary pads are centred — where the two sides came
+    // out uneven, that is the 64-line mirror being one or two lines off on each
+    // side, not an off-centre picture. Measured on a 1440x1080 file holding a
+    // 810-wide image: 12 columns one side, 16 the other, when both are 14.
+    // (An unsnapped crop keeps exactly what was measured — see the early
+    // returns above.)
+    if (vertical > 0) {
+      const trim = Math.max(0, 1 - w / (h * best)) / 2;
+      return [trim, trim, 0, 0];
+    }
+    if (horizontal > 0) {
+      const trim = Math.max(0, 1 - (best * h) / w) / 2;
+      return [0, 0, trim, trim];
+    }
+    return [0, 0, 0, 0];
+  }
+
+  /** The visible part of the frame, in texture coordinates. Whole frame until
+   *  bar cropping finds something to take off. */
+  private cropRect = { x0: 0, y0: 0, x1: 1, y1: 1 };
+  private cropLocs = new WeakMap<WebGLProgram, WebGLUniformLocation | null>();
+
+  /** Feed the crop to whichever program is about to draw. */
+  private applyCropUniform(program: WebGLProgram | null, full = false): void {
+    const gl = this.gl;
+    if (!gl || !program) return;
+    let loc = this.cropLocs.get(program);
+    if (loc === undefined) {
+      loc = gl.getUniformLocation(program, "u_crop");
+      this.cropLocs.set(program, loc);
+    }
+    if (!loc) return;
+    const c = this.cropRect;
+    if (full) gl.uniform4f(loc, 0, 0, 1, 1);
+    else gl.uniform4f(loc, c.x0, c.y0, c.x1, c.y1);
+  }
+
+  /** Turn the corner cut off for a pass that draws somewhere else (see the
+   *  ambient thumbnail). */
+  private setRoundUniformOff(): void {
+    const gl = this.gl;
+    if (!gl || !this.program) return;
+    const loc = this.roundLocs.get(this.program);
+    if (loc) gl.uniform3f(loc, 0, 0, 0);
+  }
+
+  /** Feed the rounding uniform to whichever program is about to draw. */
+  private applyRoundUniform(program: WebGLProgram | null): void {
+    const gl = this.gl;
+    if (!gl || !program) return;
+    let loc = this.roundLocs.get(program);
+    if (loc === undefined) {
+      loc = gl.getUniformLocation(program, "u_round");
+      this.roundLocs.set(program, loc);
+    }
+    if (!loc) return;
+    gl.uniform3f(
+      loc,
+      this.cornerRadiusBufferPx(),
+      this.canvas?.width || 0,
+      this.canvas?.height || 0,
+    );
+  }
+
   clearQueue(): void {
     for (const frame of this.frameQueue) {
       frame.close();
@@ -3752,8 +5006,72 @@ export class CanvasRenderer {
 
     // Mark that we just seeked - this will make frame selection more forgiving
     this.justSeeked = true;
+    // …and restart the hold allowance. It bounds how long the picture may sit
+    // still while pre-roll is dropped, and the last present was before the
+    // seek — measuring from there would spend the whole allowance at once.
+    this._lastPresentAt = performance.now();
 
     Logger.debug(TAG, "Frame queue cleared and presentation timing reset");
+  }
+
+  /**
+   * Hand the queue over to a new rendition WITHOUT emptying it.
+   *
+   * clearQueue() is the seek primitive: throw everything away, the picture is
+   * about to jump anyway. A quality switch is the opposite case — the picture
+   * must not jump at all — so the frames already queued from the outgoing
+   * rendition are exactly what covers the changeover. Everything from
+   * `fromPtsMicros` on is replaced by the incoming rendition's frames and the
+   * older ones play out first, so the seam falls between two consecutive
+   * presentation times and reads as one continuous picture at a new size.
+   *
+   * Presentation timing is deliberately NOT reset: the clock never stopped, and
+   * re-anchoring it here is what makes a switch look like a seek. `justSeeked`
+   * stays untouched for the same reason.
+   *
+   * Returns the number of incoming frames adopted — zero means the splice point
+   * was already behind the queue and the caller should fall back to a hard
+   * switch rather than leave a gap.
+   */
+  spliceQueue(fromPtsMicros: number, frames: VideoFrame[]): number {
+    const kept: VideoFrame[] = [];
+    for (const frame of this.frameQueue) {
+      if (frame.timestamp >= fromPtsMicros) frame.close();
+      else kept.push(frame);
+    }
+    this.frameQueue = kept;
+    let adopted = 0;
+    for (const frame of frames) {
+      if (frame.timestamp < fromPtsMicros) {
+        frame.close();
+        continue;
+      }
+      this.queueFrame(frame);
+      adopted++;
+    }
+    // The perf detectors are judging a rung that is no longer playing, and the
+    // decode-bound verdict in particular would carry a 4K stall onto the 720p
+    // that replaced it. configure() re-arms them; this only makes sure the
+    // window between here and there isn't judged against the wrong rendition.
+    this._perfWindowStart = 0;
+    this._perfDeficitWindows = 0;
+    this._perfStuckWindows = 0;
+    Logger.debug(
+      TAG,
+      `Queue spliced at ${(fromPtsMicros / 1_000_000).toFixed(3)}s: ${kept.length} outgoing frames play out, ${adopted} incoming queued`,
+    );
+    return adopted;
+  }
+
+  /** Oldest and newest presentation times sitting in the queue, in SECONDS.
+   *  The switch path uses the newest to pick a splice point the outgoing
+   *  rendition can actually reach. */
+  get queuedPtsRange(): { first: number; last: number } | null {
+    if (this.frameQueue.length === 0) return null;
+    return {
+      first: this.frameQueue[0].timestamp / 1_000_000,
+      last: this.frameQueue[this.frameQueue.length - 1].timestamp / 1_000_000,
+    };
   }
 
   /**
@@ -3798,18 +5116,50 @@ export class CanvasRenderer {
     }
 
     // Clear retained frame on destroy
-    if (this.lastRenderedFrame) {
-      this.lastRenderedFrame.close();
-      this.lastRenderedFrame = null;
-    }
+    this.releaseRetainedFrame();
+
+    // …and everything still waiting to be presented. A VideoFrame holds a
+    // decoded buffer that only close() gives back; dropping the reference
+    // leaves it to garbage collection, which is what produces "A VideoFrame was
+    // garbage collected without being closed" and, until the collector runs,
+    // starves the decoder of the buffers it needs. The queue is tens of frames
+    // deep at 60fps, and every quality switch and error recovery destroys a
+    // renderer.
+    this.clearQueue();
 
     this.clear();
     if (this.gl) {
       if (this.texture) this.gl.deleteTexture(this.texture);
       if (this.program) this.gl.deleteProgram(this.program);
       if (this.vrProgram) this.gl.deleteProgram(this.vrProgram);
-      // Extensions etc
-      // WebGL2 contexts are garbage collected but good to delete resources
+      // Hand the GPU context back explicitly — but ONLY when the canvas is on
+      // its way out with us. Dropping the reference alone just queues it for
+      // garbage collection, and Chrome caps a page at ~16 live contexts, so a
+      // host that rebuilds the player per video walks into "Too many active
+      // WebGL contexts. Oldest context will be lost" and the context it kills
+      // may belong to the player on screen.
+      //
+      // A player REBUILD (quality recreate, error recovery) keeps the element's
+      // canvas and hands it to the replacement, and losing a context is
+      // permanent — getContext() on that canvas returns the same lost context
+      // forever. Worse, loseContext() fires webglcontextlost, which the element
+      // treats as the GPU dropping us and answers by tearing the player down:
+      // the brand-new player was destroyed microseconds after being built, and
+      // playback stopped dead at idle with nothing on screen.
+      //
+      // Still connected means the canvas outlives this renderer. Leave it be.
+      // An OffscreenCanvas is never in a document, so it always qualifies.
+      const attached =
+        typeof HTMLCanvasElement !== "undefined" &&
+        this.canvas instanceof HTMLCanvasElement &&
+        this.canvas.isConnected;
+      if (!attached) {
+        try {
+          this.gl.getExtension("WEBGL_lose_context")?.loseContext();
+        } catch {
+          /* extension unavailable — the context still goes with the canvas */
+        }
+      }
     }
     this.gl = null;
     Logger.debug(TAG, "Destroyed");

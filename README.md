@@ -14,7 +14,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/MrUjjwalG/movi-player?style=flat-square&color=yellow&logo=github)](https://github.com/MrUjjwalG/movi-player/stargazers)
 
-**[Web App](https://moviplayer.com)** &nbsp;·&nbsp; **[Documentation](https://mrujjwalg.github.io/movi-player/)** &nbsp;·&nbsp; **[Live Demo](https://movi-player-examples.vercel.app/element.html)** &nbsp;·&nbsp; **[Examples](https://github.com/MrUjjwalG/movi-player-examples)** &nbsp;·&nbsp; **[Changelog](CHANGELOG.md)**
+**[Web App](https://moviplayer.com)** &nbsp;·&nbsp; **[Documentation](https://moviplayer.com/docs/)** &nbsp;·&nbsp; **[Live Demo](https://movi-player-examples.vercel.app/element.html)** &nbsp;·&nbsp; **[Examples](https://moviplayer.com/examples)** &nbsp;·&nbsp; **[Changelog](CHANGELOG.md)**
 
 ![Movi Player](docs/images/element.gif)
 
@@ -24,50 +24,181 @@
 
 ---
 
+## Quickstart
+
+One script tag, one element — this plays an MKV (or HEVC, AV1, HDR, multi-audio…) file that a plain `<video>` cannot open:
+
+```html
+<script type="module" src="https://cdn.jsdelivr.net/npm/movi-player/dist/element.js"></script>
+
+<movi-player src="video.mkv" controls></movi-player>
+```
+
+Or with npm:
+
+```bash
+npm i movi-player
+```
+
+```html
+<script type="module">
+  import "movi-player";
+</script>
+
+<movi-player src="video.mkv" controls></movi-player>
+```
+
+> Prefer the official hosted build? Load it straight from **`https://moviplayer.com/dist/element.js`** — always the latest release, and a drop-in on any page (no COOP/COEP or isolation headers required).
+
+## Contents
+
+- [Why Movi Player?](#why-movi-player)
+- [What's New in 0.4.0](#whats-new-in-040)
+- [Getting Started](#getting-started)
+- [Common Use Cases](#common-use-cases)
+- [Advanced](#advanced)
+- [Reference](#reference)
+- [Server Requirements](#server-requirements)
+- [Browser Support](#browser-support)
+- [Development](#development)
+- [AI Assistants](#ai-assistants)
+
 ## Why Movi Player?
 
 **The browser can't play MKV, HEVC, or HDR videos.** You either transcode everything server-side or tell users "format not supported." Movi Player fixes this.
 
 - **Play anything** -- MKV, HEVC, AV1, 4K HDR, multi-audio, subtitles. Formats that `<video>` can't touch.
 - **Zero server cost** -- No FFmpeg on your server. No transcoding pipeline. Everything runs in the browser via WebAssembly.
-- **Drop-in replacement** -- `<movi-player src="video.mp4" controls>` works like `<video>` but plays everything.
+- **Drop-in replacement** -- `<movi-player src="video.mp4" controls>` works like `<video>` but plays everything — the full `HTMLMediaElement` API surface answers, so code written against a native `<video>` works unchanged.
 - **Content protection** -- Built-in encrypted playback with AES-256-GCM, token auth, HMAC signing. No DRM license server needed.
 - **HDR rendering** -- Detects and renders BT.2020/PQ/HLG content on supported displays. Other players can't.
 - **Canvas-based** -- No `<video>` element exposed. Right-click save disabled.
 - **Picture-in-Picture** -- Document PiP with controls (play/pause, seek, mute, progress). Chromium 116+.
 - **Ambient mode** -- Dynamic letterbox glow that samples video colors in real-time. Press `G` or use context menu.
-- **Split sources** -- Separate video, audio, and subtitle file URLs via `videosrc`, `audiosrc`, `subtitlesrc` attributes.
+- **Split sources** -- Separate video and audio files via child `<source kind="audio">` elements, external subtitles via `<track>` — standard `<video>`-style markup.
 - **Adaptive streaming** -- HLS (`.m3u8`), MPEG-DASH (`.mpd`), and Smooth Streaming (`.ism`) unified through Shaka Player, with a live-edge UI and DVR seeking.
 - **Custom request headers** -- Send auth tokens / signed headers across manifests, segments, progressive HTTP, and the encrypted source via the `headers` attribute.
 - **DRM ready** -- Optional Widevine/PlayReady/FairPlay support via `drm` + `licenseurl` attributes for adaptive streams.
 
+<details>
+<summary><b>Full feature overview</b> — everything in the box</summary>
+
+<br />
+
+**Playback** -- MP4, MKV, WebM, MOV, TS, AVI. H.264, HEVC, VP9, AV1. Hardware decode with software fallback. Pitch-preserving time-stretch via Signalsmith Stretch.
+
+**Adaptive Streaming** -- HLS (`.m3u8`), MPEG-DASH (`.mpd`), and Smooth Streaming (`.ism`) unified through Shaka Player (hls.js / dash.js fallbacks). Live-edge badge, DVR-window seeking, Auto-mode quality badge. Streams whose codec the browser can't decode escalate through the other MSE engine and finally the built-in FFmpeg-WASM demuxer, keeping quality switching and track menus working. Optional MPEG-5 LCEVC enhancement-layer decoding via `lcevc` + `lcevcurl`.
+
+**Adaptive Quality** -- An "Auto" mode measures the link's real throughput (past CDN pacing bursts), opens on the rung it can sustain, and switches renditions seamlessly in place — no reload, no dropped playhead. Works for HLS/DASH and plain multi-file quality ladders alike.
+
+**Custom Headers** -- Send auth tokens / signed headers across the whole media flow (manifest, segments, progressive HTTP, thumbnails, encrypted source) via the `headers` attribute (JSON) or property (object).
+
+**Audio** -- AAC, MP3, Opus, FLAC, AC-3, E-AC-3. Multi-track switching. **Output-device routing** (`audiooutput` attribute / `setAudioOutput()` / right-click "Audio Output" menu, via `AudioContext.setSinkId`). Stable volume (loudness normalization). First-class audio-only mode with cover art extraction and a dedicated strip UI. Data-saver `audioonly` mode skips the video decode (and fetches an audio-only stream rendition). Perceptual (log) volume curve. Muted-autoplay fallback with tap-to-unmute.
+
+**Non-Range Servers** -- Servers that ignore `Range` (respond `200`, not `206`) still play via a forward-only sliding-window "linear mode" with in-window seeking; the `linearmode` event lets your UI adapt.
+
+**Subtitles** -- SRT, ASS, WebVTT, PGS (image-based), DVB. Multi-track with on-the-fly switching. Per-source delay/offset (`Z` / `X` to nudge ±100ms), full transcript browser with search + click-to-seek, customizable size/color/background/edge (persisted), karaoke-aligned VTT. Pluggable `SubtitleRenderer` hook for full ASS/SSA styling via an external renderer (e.g. jassub).
+
+**HDR** -- BT.2020/PQ/HLG detection + Display-P3 rendering on supported browsers.
+
+**Immersive / VR** -- 360° equirectangular, 180° (VR180), fisheye, side-by-side stereo (3D), and stereographic "little planet" video via a WebGL2 raycast with a spring-animated look-around camera. Auto-enters from the source's spherical metadata (no toggle UI) or force a projection with the `vr` attribute (`vr="180 fisheye sbs"`, `vr="littleplanet"`); opt-in on-screen joystick via `vrpad`.
+
+**UI** -- Controls, context menu, keyboard shortcuts (`?` to view all), themes (dark/light), gestures, ambient mode. Settings live behind a single gear panel; the bar groups controls into capsules and cuts real chapter gaps through the progress track.
+
+**Custom Controls** -- `addControl()` adds host-defined buttons and context-menu rows that sit with the built-ins (toggles, hotkeys, nested submenus, per-surface anchors); `showOverlay()` puts host panels (end screens, up-next cards) over the picture, including in fullscreen.
+
+**Native `<video>` Parity** -- All `HTMLMediaElement` / `HTMLVideoElement` members answer — `buffered`/`seekable`/`played`, `textTracks`/`audioTracks`/`videoTracks`, `srcObject`, `canPlayType`, `captureStream`, `getVideoPlaybackQuality`, `requestVideoFrameCallback`, `setSinkId`, `fastSeek` — plus the standard event set (`seeking`/`seeked`, `durationchange`, `abort`, `suspend`, `cuechange`, …). Every documented attribute reflects as a JS property (`el.rotate = 90`).
+
+**Persistent Preferences** -- Volume, mute, playback rate, stable volume, ambient mode, and HDR toggles persist across reloads via OPFS. User choices override HTML attribute defaults. The `persist` attribute takes over that decision explicitly — an opt-in list of exactly which settings (including audio/subtitle language) are remembered, namespaced by `persistkey`.
+
+**Picture-in-Picture** -- Document PiP with play/pause, seek, mute, progress bar. Press `P`.
+
+**Aspect Ratio** -- Press `A` to cycle contain/cover/fill/zoom. Context menu sub-menu with icons.
+
+**Crop Bars** -- `cropbars` strips letterbox/pillarbox padding baked into the source pixels before applying `cover`/`fill`/`zoom`, detected automatically with a conservative check so dark scenes are never mistaken for bars.
+
+**Nerd Stats** -- Press `I` for codec, resolution, FPS, decoder type, buffer health, network graph. HLS-aware stats. 8K/16K resolutions labeled correctly.
+
+**Timeline** -- Press `T` for thumbnail strip. Chapter-aware. Keyboard navigation (arrows + enter).
+
+**Chapters** -- Auto-detected from video metadata; or supplied from outside the file via the `chapters` attribute/property. Markers on progress bar, titles in seek tooltip.
+
+**Rotation** -- Press `R` to rotate 90, or set the `rotate` attribute (`0`/`90`/`180`/`270`). Metadata rotation auto-applied. Thumbnails sync.
+
+**Resume** -- `<movi-player resume>` saves position to localStorage, shows resume dialog on reload. Keyboard navigable.
+
+**Poster from Timestamp** -- `postertime="10%"` (or `"5"`, `"1:30"`, `"0:01:30"`) generates a native-resolution poster frame from any timestamp. Runs on an isolated thumbnail pipeline, respects rotation metadata, and never paints stale frames after a `src` change.
+
+**Encrypted** -- AES-256-GCM chunked encryption with HMAC-signed token auth. See encrypted-server/.
+
+**Custom SourceAdapter** -- Plug any byte protocol (WebSocket, WebRTC, IndexedDB, custom encryption) directly into the element or player. Same `SourceAdapter` contract works across `<movi-player>`, `MoviPlayer`, and `Demuxer`; `registerSourceAdapter()` teaches the element custom `src` schemes (`s3://`, `ipfs://`, …) with no per-element wiring.
+
+**DRM** -- Optional Widevine/FairPlay for HLS streams via `drm` + `licenseurl` attributes. Uses native `<video>` + EME API.
+
+**Premuxed Quality Menu** -- Multiple `<source data-height="...">` children give you a YouTube-style quality picker for plain MP4/MKV files, no HLS manifest needed.
+
+**File Revoked Recovery** -- Mobile browsers silently revoke `File` handles after long backgrounding; the `filerevoked` event fires so playlist UIs can prompt for re-pick instead of hanging forever.
+
+**Host Fullscreen Handoff** -- Cancelable `movi-fullscreen-request` event + `setHostFullscreen()` so embedders (VS Code webview, custom apps) can take over fullscreen and keep the player's UI in sync. `exitFullscreen()` covers every fullscreen route.
+
+**Host Error Screen** -- Restyle the built-in error overlay via `::part()`, replace it outright with `slot="error"`, and read the exact on-screen wording from the `errordisplay` event.
+
+</details>
+
 ### vs. Other Players
 
-| | Movi Player | video.js | hls.js | Plyr |
-|---|---|---|---|---|
-| MKV / HEVC / AV1 | Yes | No | No | No |
-| HDR rendering | Yes | No | No | No |
-| No server transcoding | Yes | No | No | No |
-| Canvas rendering (no `<video>`) | Yes | No | No | No |
-| Encrypted playback | Yes | No | No | No |
-| Audio-only mode (cover art + strip UI) | Yes | No | No | No |
-| Built-in subtitle rendering | Yes | Plugin | No | No |
-| Multi-audio track switching | Yes | Plugin | Yes | No |
-| Chapters on progress bar | Yes | Plugin | No | No |
-| Picture-in-Picture | Document PiP | Basic | No | No |
-| DRM (Widevine/FairPlay) | Optional | Plugin | Yes | No |
-| Custom SourceAdapter (any protocol) | Yes | No | No | No |
-| Bundle size | 50-410KB | 500KB+ | 60KB | 25KB |
+|  | Movi Player | video.js | hls.js | dash.js | Shaka Player | Plyr |
+|---|---|---|---|---|---|---|
+| Raw MKV / HEVC / AV1 file | Yes | No | No | No | No | No |
+| HDR (BT.2020 / PQ / HLG) | Yes | No | No | No | Native | No |
+| Adaptive HLS / DASH | Yes | Plugin | HLS only | DASH only | Yes | No |
+| Canvas render (no `<video>`) | Yes | No | No | No | No | No |
+| Encrypted playback (built-in AES) | Yes | No | No | No | EME/DRM | No |
+| Multi-audio track switching | Yes | Plugin | Yes | Yes | Yes | No |
+| Built-in subtitle rendering | Yes | Plugin | No | No | Yes | No |
+| Chapters on progress bar | Yes | Plugin | No | No | No | No |
+| Document Picture-in-Picture | Yes | Basic | No | No | No | Basic |
+| Drop-in web component | Yes | No | No | No | No | No |
+| Bundle size (JS) | 50-410KB | 500KB+ | 60KB | 200KB+ | 400KB+ | 25KB |
 
-## Install
+### Alternatives
+
+Evaluating Movi Player against the ecosystem:
+
+- **[video.js](https://videojs.com/), [Plyr](https://plyr.io/), [Vidstack](https://vidstack.io/) and [Media Chrome](https://www.media-chrome.org/)** are UI players for browser-**native** formats (MP4/WebM) and HLS/DASH — they can't open a raw MKV, HEVC or AV1 file.
+- **[hls.js](https://github.com/video-dev/hls.js) and [dash.js](https://github.com/Dash-Industry-Forum/dash.js)** are streaming *engines* (no arbitrary-file playback); **[Shaka Player](https://github.com/shaka-project/shaka-player)** is the DASH/HLS heavyweight. All three need content pre-packaged into adaptive streams server-side.
+- For playing an **arbitrary file** (MKV / AV1 / HEVC / 4K HDR) with **zero server work**, the closest peers are **[ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm)** — a transcode/processing *library*, not a player, that CPU-decodes (heavy, no GPU) — and **[libmedia](https://github.com/zhaohappy/libmedia)**, a WASM + WebCodecs media SDK.
+
+Movi Player's niche is that same WebCodecs + FFmpeg-WASM playback, delivered as a **drop-in `<movi-player>` web component** with a batteries-included UI — HDR, chapters, multi-audio, built-in subtitles, ambient mode, Document PiP and encrypted playback — so it's a practical **alternative to video.js / hls.js / Shaka Player** when your files aren't browser-native, and a friendlier, GPU-accelerated **alternative to ffmpeg.wasm / libmedia** when you want a player, not a toolkit.
+
+## What's New in 0.4.0
+
+The headline changes — see the [full changelog](CHANGELOG.md) for everything:
+
+- **[Custom controls API](#custom-controls-and-overlays)** — `addControl()` puts your own buttons in the player's bar and context menu (toggles, hotkeys, nested submenus); `showOverlay()` layers your own panels (end screens, up-next) over the picture, including in fullscreen.
+- **[Engine selection](#engine-selection-and-native-fallback)** — the `engine` attribute picks which playback engine leads (`wasm`, `shaka`, `dashjs`, `hlsjs`, `native`) and what follows it; `fallback="native"` hands unplayable sources to a wrapped `<video>` instead of a dead end.
+- **Seamless quality switching + true Auto quality** — manual and adaptive rendition changes swap in place with no reload, no dropped playhead; Auto mode measures real link throughput and opens on the right rung, on HLS/DASH and plain multi-file ladders alike.
+- **Full native `<video>` parity** — all 78 `HTMLMediaElement`/`HTMLVideoElement` members answer, ten more standard events fire, and every documented attribute reflects as a JS property.
+- **[External chapters](#chapters)** — a `chapters` attribute/property for sources that keep chapters outside the container (CMS, watch page).
+- **`cropbars`** — strips letterbox/pillarbox padding baked into the source pixels before `cover`/`fill`/`zoom`.
+- **`titlemode` and granular `fastseek`** — control where the title bar appears (with an optional back arrow firing a cancelable `back` event), and which skip affordances (`buttons` / `keys` / `gestures`) are on.
+- **[Slim build](#slim-build)** — `movi-player/element/slim` ships the FFmpeg WASM as a separate cacheable `movi.wasm` (4.2MB JS vs. 11.4MB), with slim twins for the React/Vue/Svelte wrappers.
+- **Firefox extension** — the same player-in-a-tab experience as the Chrome extension, built from one shared codebase.
+- **Host-supplied error screen** — restyle via `::part()`, replace via `slot="error"`, observe via the `errordisplay` event.
+- **Pluggable `SubtitleRenderer`** — plug in a custom ASS/SSA renderer (e.g. jassub) for full styling.
+- **`registerSourceAdapter()`** — teach the player custom `src` schemes (`s3://`, `ipfs://`, `ws://`) globally.
+- **Settings-change events** — `aspectchange`, `loopchange`, `stablevolumechange`, `hdrchange`, `ambientchange`, `rotatechange`, `audioonlychange`.
+- **VS Code IntelliSense** — attribute/value completion with hover docs for `<movi-player>`, plus CSS completion for the `--movi-*` theme variables.
+
+## Getting Started
+
+### Install
 
 ```bash
 npm i movi-player
 ```
 
-Also available as a **desktop app** (Windows / macOS / Linux) for playing local files and URLs with native always-on-top Picture-in-Picture and a playlist — see [`desktop/`](desktop/). Browser and editor integrations live in [`chrome-extension/`](chrome-extension/) and [`vscode-extension/`](vscode-extension/).
-
-## Usage
+Or skip the install entirely and load from a CDN as in the [Quickstart](#quickstart). Browser and editor integrations live in [`chrome-extension/`](chrome-extension/), [`firefox-extension/`](firefox-extension/), and [`vscode-extension/`](vscode-extension/).
 
 ### HTML Element (simplest)
 
@@ -76,8 +207,6 @@ Also available as a **desktop app** (Windows / macOS / Linux) for playing local 
 
 <movi-player src="video.mp4" controls autoplay muted></movi-player>
 ```
-
-> Prefer the official hosted build? Load it straight from **`https://moviplayer.com/dist/element.js`** — always the latest release, and a drop-in on any page (no COOP/COEP or isolation headers required).
 
 Or with npm:
 
@@ -96,34 +225,33 @@ Or with npm:
 <input type="file" onchange="document.getElementById('player').src = this.files[0]" />
 ```
 
-### Programmatic
+### React / Vue / Svelte
 
-```typescript
-import { MoviPlayer } from "movi-player/player";
+Typed wrappers ship in the package — same attributes as the element, as props:
 
-const player = new MoviPlayer({
-  source: { type: "url", url: "video.mp4" },
-  canvas: document.getElementById("canvas"),
-});
+```tsx
+import { MoviPlayer } from "movi-player/react";
 
-await player.load();
-await player.play();
+<MoviPlayer src="video.mkv" controls />
 ```
 
-### Encrypted Playback
+- **Vue**: `import { MoviPlayer } from "movi-player/vue"`
+- **Svelte**: `import MoviPlayer from "movi-player/svelte"`
+- Typed `<source>` / `<track>` children via `MoviSource` / `MoviTrack` — named exports of `movi-player/react` and `movi-player/vue`; Svelte imports them per file, from `movi-player/svelte/MoviSource` and `movi-player/svelte/MoviTrack`.
+- Each wrapper has a [slim](#slim-build) twin: `movi-player/react/slim`, `movi-player/vue/slim`, `movi-player/svelte/slim`.
 
-```html
-<movi-player
-  encrypted
-  tokenurl="/api/token"
-  videourl="/api/video"
-  videoid="movie.mp4"
-  controls autoplay muted
-></movi-player>
-```
+### Modules
 
-AES-256-GCM encrypted, HMAC signed, 2s token expiry, IP + fingerprint binding.
-See [encrypted-server/](encrypted-server/) for the server example.
+| Module | Size | Gzip | Brotli | What you get |
+|---|---|---|---|---|
+| `movi-player` / `movi-player/element` | ~410KB | 3.13 MB | 2.37 MB | Full player with UI, controls, gestures |
+| `movi-player/element/slim` | ~410KB | 1.00 MB + WASM | 750 KB + WASM | Same player, WASM shipped as a separate `movi.wasm` |
+| `movi-player/player` | ~180KB | 3.15 MB | 2.38 MB | Programmatic playback, no UI |
+| `movi-player/demuxer` | ~50KB | 2.37 MB | 1.79 MB | Metadata extraction, decoding only |
+
+> **Note:** Module sizes (first column) exclude the embedded WASM binary. Gzip/Brotli columns show the total transfer size including WASM. Enable Brotli compression on your server for optimal delivery.
+
+## Common Use Cases
 
 ### Adaptive Streaming (HLS / DASH / Smooth)
 
@@ -138,7 +266,174 @@ See [encrypted-server/](encrypted-server/) for the server example.
 <movi-player src="https://example.com/manifest.ism/manifest" controls autoplay muted></movi-player>
 ```
 
-`.m3u8`, `.mpd`, and `.ism` are unified through Shaka Player (with hls.js / dash.js as automatic fallbacks) and drawn to the same canvas pipeline, so the quality menu, stats, and track switching work identically across all three. Live streams get a `LIVE` badge, jump-to-edge, DVR-window seeking, and an Auto-mode quality badge.
+`.m3u8`, `.mpd`, and `.ism` are unified through Shaka Player (with hls.js / dash.js as automatic fallbacks) and drawn to the same canvas pipeline, so the quality menu, stats, and track switching work identically across all three. Live streams get a `LIVE` badge, jump-to-edge, DVR-window seeking, and an Auto-mode quality badge. Streams whose codec the browser can't decode escalate to the built-in FFmpeg-WASM demuxer automatically, keeping quality and track switching intact.
+
+### External Subtitles (`<track>`)
+
+Standard `<video>`-style markup, no JS wiring needed. Treats `kind="subtitles"`, `kind="captions"`, or no `kind` as caption tracks. `data-format="srt"` to load SRT instead of the default VTT.
+
+```html
+<movi-player controls>
+  <source src="video.mp4" type="video/mp4">
+  <track src="subs-en.vtt" srclang="en" label="English" kind="subtitles" default>
+  <track src="subs-hi.vtt" srclang="hi" label="Hindi" kind="subtitles">
+  <track src="subs-jp.srt" srclang="ja" label="Japanese" kind="subtitles" data-format="srt">
+</movi-player>
+```
+
+### Split Video + Audio Sources
+
+Separate video and audio files via child `<source>` elements with `kind="audio"`:
+
+```html
+<movi-player controls>
+  <source src="video-only.mp4" type="video/mp4">
+  <source src="audio-only.m4a" type="audio/mp4" kind="audio">
+</movi-player>
+```
+
+### Multi-Language Audio
+
+Declare two or more `<source kind="audio">` tags with `srclang` (or `label`) and the player surfaces an audio-language menu. Default pick: explicit `default` / `data-default`, else the first match for the page locale, else the first one.
+
+```html
+<movi-player controls>
+  <source src="video.mp4" type="video/mp4">
+  <source src="audio-en.m4a" type="audio/mp4" kind="audio" srclang="en" label="English" default>
+  <source src="audio-hi.m4a" type="audio/mp4" kind="audio" srclang="hi" label="Hindi">
+  <source src="audio-ja.m4a" type="audio/mp4" kind="audio" srclang="ja" label="Japanese">
+</movi-player>
+```
+
+### Quality Menu from Plain Files
+
+Declare multiple video sources with `data-height` to get a YouTube-style quality picker without an HLS manifest — with seamless in-place switching and an Auto (adaptive) mode when bitrates are declared:
+
+```html
+<movi-player controls>
+  <source src="video-1080p.mp4" type="video/mp4" data-height="1080" data-label="1080p">
+  <source src="video-720p.mp4"  type="video/mp4" data-height="720"  data-label="720p">
+  <source src="video-480p.mp4"  type="video/mp4" data-height="480"  data-label="480p">
+</movi-player>
+```
+
+### Chapters
+
+Chapters embedded in MKV/MP4 containers are picked up automatically — markers on the progress bar, titles in the seek tooltip. For sources that keep chapters elsewhere (a CMS, a watch page), pass them in:
+
+```html
+<movi-player src="video.mp4" controls
+  chapters='[{"title":"Intro","start":0},{"title":"The Build","start":95},{"title":"Results","start":310}]'>
+</movi-player>
+```
+
+Or as a property: `player.chapters = [{ title, start, end? }]` (times in seconds). Supplied chapters win over the container's.
+
+Add `image` to a chapter and the timeline strip shows that artwork instead of decoding a frame at `start` — the picture you chose, and one less seek per chapter:
+
+```js
+player.chapters = [
+  { title: "Intro", start: 0, image: "/art/intro.jpg" },
+  { title: "The Build", start: 95 },   // no image → a frame from the video
+];
+```
+
+A URL that fails to load falls back to the same title-only tile a missing frame gets.
+
+### Remembering Viewer Settings
+
+By default the player remembers volume, mute, speed, and its toggles on its own. The `persist` attribute takes over that decision explicitly — an opt-in list of exactly what is remembered:
+
+```html
+<movi-player src="video.mp4" controls
+             persist="volume speed audiolang subtitlelang"
+             persistkey="my-app"></movi-player>
+```
+
+Settings: `loop`, `muted`, `volume`, `speed`, `ambient`, `stablevolume`, `hdr`, `aspect`, `cropbars`, `audiolang`, `subtitlelang`. Languages are remembered as a *language*, not a track number, and matched against each new file's tracks. `persistkey` namespaces the store so two players on a page don't share preferences. See [`persist`](https://moviplayer.com/docs/api/element#persist) in the docs.
+
+### Resume and Posters
+
+```html
+<movi-player src="video.mp4" controls resume postertime="10%"></movi-player>
+```
+
+`resume` saves the position to localStorage and shows a resume dialog on reload. `postertime` accepts `"5"`, `"1:30"`, `"0:01:30"`, or `"10%"` and renders a native-resolution frame — no pre-rendered thumbnail needed.
+
+## Advanced
+
+### Custom Controls and Overlays
+
+`addControl()` puts a control of your own in the player's chrome — the bottom bar, the right-click menu, or both — so it sits with the built-ins instead of beside them. Described once; the player builds the button and the menu row, keeps them in sync, and removes them together.
+
+```js
+player.addControl({
+  id: "autoplay-next",
+  label: "Autoplay",
+  icon: '<svg viewBox="0 0 24 24">…</svg>',
+  before: "cc",            // sits just left of the subtitles button
+  placement: "both",       // bar AND context menu, one shared state
+  toggle: true,
+  hotkey: "shift+a",       // appears in the shortcuts panel, flashes the OSD
+  onSelect: (on) => setAutoplay(on),
+});
+```
+
+Controls can open nested submenus (`items` / `onPick`, any depth), persist their toggle state (`persist: true`), group into a bar capsule of their own (`group`), anchor differently per surface (`anchors: { bar, menu }` — an anchor can be a list for a neighbour that only sometimes exists), and declare `media: "video" | "audio" | "both"` to hide themselves for content they don't apply to. `updateControl(id, patch)` and `removeControl(id)` manage them afterwards.
+
+Host overlays put your own panel over the picture — including in fullscreen:
+
+```js
+player.showOverlay({
+  id: "up-next",
+  content: upNextCard,           // markup or an Element
+  placement: "bottom-end",       // "fill" | "center" | "bottom-end"
+  dismissOn: ["play", "escape"],
+});
+// later: player.updateOverlay("up-next", { content }) / player.hideOverlay("up-next")
+```
+
+Full spec: [Custom Controls](https://moviplayer.com/docs/api/element#custom-controls) in the docs.
+
+### Engine Selection and Native Fallback
+
+Movi has multiple ways to play a source and a sensible built-in order: its own WASM demuxer + WebCodecs pipeline first, Shaka (then dash.js / hls.js) for adaptive manifests, the browser's `<video>` last. The `engine` attribute re-orders that — the first name leads, any others replace the built-in escalation:
+
+```html
+<!-- Play through the browser; fall back to Movi's pipeline only if it can't -->
+<movi-player src="video.mp4" engine="native wasm" controls></movi-player>
+
+<!-- Prefer dash.js over Shaka for manifests -->
+<movi-player src="manifest.mpd" engine="dashjs shaka" controls></movi-player>
+```
+
+Values: `wasm`, `shaka`, `dashjs`, `hlsjs`, `native`.
+
+`fallback="native"` handles the other direction — a source Movi itself can't read (a no-CORS cross-origin file, a transient network failure) is handed to the browser's own `<video>` wrapped in the player's controls instead of a dead end. The degraded surface keeps a `<source>` quality ladder switching in place, parses `<track>` subtitles into Movi's own overlay, and syncs a companion `<audio>` for split video+audio sources. The `nativefallback` event tells you it happened.
+
+```html
+<movi-player src="video.mkv" fallback="native" controls></movi-player>
+```
+
+### Slim Build
+
+`movi-player/element/slim` is the same `<movi-player>` element with the same API — only the WASM ships differently. The default build embeds the FFmpeg WASM inside the JS (11.4 MB of JS); the slim build keeps it as a separate `movi.wasm` (4.2 MB JS + 5.6 MB WASM), so the engine streams and compiles as a cacheable asset and the JS parses far faster. If the WASM can't be fetched, playback falls back to the browser's native `<video>` automatically — no `fallback="native"` needed.
+
+```typescript
+import "movi-player/element/slim";
+```
+
+You host `movi.wasm` yourself — it ships in the package at `movi-player/dist/movi.wasm`. Vite / webpack 5 / Parcel 2 emit it automatically; otherwise copy it next to your bundle or point at it with `wasmurl`:
+
+```html
+<movi-player
+  src="video.mkv"
+  wasmurl="https://cdn.example.com/movi-player/movi.wasm"
+  controls
+></movi-player>
+```
+
+The framework wrappers have slim twins too — `movi-player/react/slim`, `movi-player/vue/slim`, `movi-player/svelte/slim` — same components, same props. At runtime, `MoviElement.build` / `el.build` reports `"slim"` or `"full"`, and `MoviElement.version` / `el.version` the package version. See [Modules](https://moviplayer.com/docs/guide/modules) for details.
 
 ### Custom Request Headers
 
@@ -158,6 +453,21 @@ player.headers = { Authorization: `Bearer ${token}` };
 
 Headers ride along on every media request -- manifest + segments, progressive HTTP, thumbnails, and the encrypted source.
 
+### Encrypted Playback
+
+```html
+<movi-player
+  encrypted
+  tokenurl="/api/token"
+  videourl="/api/video"
+  videoid="movie.mp4"
+  controls autoplay muted
+></movi-player>
+```
+
+AES-256-GCM encrypted, HMAC signed, 2s token expiry, IP + fingerprint binding.
+See [encrypted-server/](encrypted-server/) for the server example.
+
 ### DRM (Widevine / PlayReady / FairPlay)
 
 ```html
@@ -169,7 +479,23 @@ Headers ride along on every media request -- manifest + segments, progressive HT
 ></movi-player>
 ```
 
-Requires a DRM license server (PallyCon, EZDRM, BuyDRM, etc.). Key systems are tried Widevine → PlayReady → FairPlay. In DRM mode, the native `<video>` element is used (canvas features like rotation are disabled).
+Requires a DRM license server (PallyCon, EZDRM, BuyDRM, etc.). Key systems are tried Widevine → PlayReady → FairPlay. Extra headers for the license request only (auth token, customer ID) go in `licenseheaders` (a JSON object string). In DRM mode, the native `<video>` element is used (canvas features like rotation are disabled).
+
+### Programmatic Playback (no UI)
+
+```typescript
+import { MoviPlayer } from "movi-player/player";
+
+const player = new MoviPlayer({
+  source: { type: "url", url: "video.mp4" },
+  canvas: document.getElementById("canvas"),
+});
+
+await player.load();
+await player.play();
+```
+
+See the [Programmatic API guide](https://moviplayer.com/docs/guide/programmatic-api).
 
 ### Demuxer Only (50KB)
 
@@ -203,166 +529,251 @@ demuxer.close();
 
 Use cases: video validators, asset management, HDR detection pipelines, search indexing, format analysis before transcoding.
 
-## Modules
+### Custom Source Adapters
 
-| Module | Size | Gzip | Brotli | What you get |
-|---|---|---|---|---|
-| `movi-player` / `movi-player/element` | ~410KB | 3.13 MB | 2.37 MB | Full player with UI, controls, gestures |
-| `movi-player/player` | ~180KB | 3.15 MB | 2.38 MB | Programmatic playback, no UI |
-| `movi-player/demuxer` | ~50KB | 2.37 MB | 1.79 MB | Metadata extraction, decoding only |
+Plug any byte protocol (WebSocket, WebRTC, IndexedDB, custom encryption) into the element, player, or demuxer via the `SourceAdapter` contract. `registerSourceAdapter()` teaches the player custom `src` schemes globally — no per-element wiring:
 
-> **Note:** Module sizes (first column) exclude the embedded WASM binary. Gzip/Brotli columns show the total transfer size including WASM. Enable Brotli compression on your server for optimal delivery.
+```typescript
+import { registerSourceAdapter } from "movi-player";
 
-## Features
-
-**Playback** -- MP4, MKV, WebM, MOV, TS, AVI. H.264, HEVC, VP9, AV1. Hardware decode with software fallback. Pitch-preserving time-stretch via Signalsmith Stretch.
-
-**Adaptive Streaming** -- HLS (`.m3u8`), MPEG-DASH (`.mpd`), and Smooth Streaming (`.ism`) unified through Shaka Player (hls.js / dash.js fallbacks). Live-edge badge, DVR-window seeking, Auto-mode quality badge. Optional MPEG-5 LCEVC enhancement-layer decoding via `lcevc` + `lcevcurl`.
-
-**Custom Headers** -- Send auth tokens / signed headers across the whole media flow (manifest, segments, progressive HTTP, thumbnails, encrypted source) via the `headers` attribute (JSON) or property (object).
-
-**Audio** -- AAC, MP3, Opus, FLAC, AC-3, E-AC-3. Multi-track switching. **Output-device routing** (`audiooutput` attribute / `setAudioOutput()` / right-click "Audio Output" menu, via `AudioContext.setSinkId`). Stable volume (loudness normalization). First-class audio-only mode with cover art extraction and a dedicated strip UI. Data-saver `audioonly` mode skips the video decode (and fetches an audio-only stream rendition). Perceptual (log) volume curve. Muted-autoplay fallback with tap-to-unmute.
-
-**Non-Range Servers** -- Servers that ignore `Range` (respond `200`, not `206`) still play via a forward-only sliding-window "linear mode" with in-window seeking; the `linearmode` event lets your UI adapt.
-
-**Subtitles** -- SRT, ASS, WebVTT, PGS (image-based), DVB. Multi-track with on-the-fly switching. Per-source delay/offset (`Z` / `X` to nudge ±100ms), full transcript browser with search + click-to-seek, customizable size/color/background/edge (persisted), karaoke-aligned VTT.
-
-**HDR** -- BT.2020/PQ/HLG detection + Display-P3 rendering on supported browsers.
-
-**Immersive / VR** -- 360° equirectangular, 180° (VR180), fisheye, side-by-side stereo (3D), and stereographic "little planet" video via a WebGL2 raycast with a spring-animated look-around camera. Auto-enters from the source's spherical metadata (no toggle UI) or force a projection with the `vr` attribute (`vr="180 fisheye sbs"`, `vr="littleplanet"`); opt-in on-screen joystick via `vrpad`.
-
-**UI** -- Controls, context menu, keyboard shortcuts (`?` to view all), themes (dark/light), gestures, ambient mode.
-
-**Persistent Preferences** -- Volume, mute, playback rate, stable volume, ambient mode, and HDR toggles persist across reloads via OPFS. User choices override HTML attribute defaults.
-
-**Picture-in-Picture** -- Document PiP with play/pause, seek, mute, progress bar. Press `P`.
-
-**Aspect Ratio** -- Press `A` to cycle contain/cover/fill/zoom. Context menu sub-menu with icons.
-
-**Nerd Stats** -- Press `I` for codec, resolution, FPS, decoder type, buffer health, network graph. HLS-aware stats. 8K/16K resolutions labeled correctly.
-
-**Timeline** -- Press `T` for thumbnail strip. Chapter-aware. Keyboard navigation (arrows + enter).
-
-**Chapters** -- Auto-detected from video metadata. Markers on progress bar, titles in seek tooltip.
-
-**Rotation** -- Press `R` to rotate 90. Metadata rotation auto-applied. Thumbnails sync.
-
-**Resume** -- `<movi-player resume>` saves position to localStorage, shows resume dialog on reload. Keyboard navigable.
-
-**Poster from Timestamp** -- `postertime="10%"` (or `"5"`, `"1:30"`, `"0:01:30"`) generates a native-resolution poster frame from any timestamp. Runs on an isolated thumbnail pipeline, respects rotation metadata, and never paints stale frames after a `src` change.
-
-**Encrypted** -- AES-256-GCM chunked encryption with HMAC-signed token auth. See encrypted-server/.
-
-**Custom SourceAdapter** -- Plug any byte protocol (WebSocket, WebRTC, IndexedDB, custom encryption) directly into the element or player. Same `SourceAdapter` contract works across `<movi-player>`, `MoviPlayer`, and `Demuxer`.
-
-**DRM** -- Optional Widevine/FairPlay for HLS streams via `drm` + `licenseurl` attributes. Uses native `<video>` + EME API.
-
-**Premuxed Quality Menu** -- Multiple `<source data-height="...">` children give you a YouTube-style quality picker for plain MP4/MKV files, no HLS manifest needed.
-
-**File Revoked Recovery** -- Mobile browsers silently revoke `File` handles after long backgrounding; the `filerevoked` event fires so playlist UIs can prompt for re-pick instead of hanging forever.
-
-**Host Fullscreen Handoff** -- Cancelable `movi-fullscreen-request` event + `setHostFullscreen()` so embedders (VS Code webview, custom apps) can take over fullscreen and keep the player's UI in sync.
-
-## Element Attributes
-
-```html
-<movi-player
-  src="video.mp4"           <!-- Video URL or set via JS: player.src = file -->
-  controls                  <!-- Show player controls -->
-  autoplay                  <!-- Auto-play on load -->
-  muted                     <!-- Start muted -->
-  loop                      <!-- Loop playback -->
-  volume="0.8"              <!-- Initial volume 0..1 -->
-  playbackrate="1.25"       <!-- Initial playback speed -->
-  poster="thumb.jpg"        <!-- Poster image -->
-  theme="dark"              <!-- dark | light -->
-  themecolor="#ff5722"      <!-- Custom primary color (hex/rgb) -->
-  objectfit="contain"       <!-- contain | cover | fill | zoom | control -->
-  hdr                       <!-- Enable HDR rendering -->
-  ambientmode               <!-- Ambient background glow -->
-  ambientwrapper="wrapper"  <!-- External element id for ambient glow -->
-  thumb                     <!-- Enable seek thumbnails -->
-  fastseek                  <!-- Enable skip buttons and gestures -->
-  doubletap="true"          <!-- Double-tap to seek ±10s -->
-  title="My Video"          <!-- Video title (in-player overlay only) -->
-  showtitle                 <!-- Show title overlay at top -->
-  startat="30"              <!-- Start at time (seconds) -->
-  postertime="10%"          <!-- Generate poster from timestamp ("5", "1:30", "10%") -->
-  subtitledelay="0.2"       <!-- Subtitle offset in seconds (positive = later, mpv/VLC sign) -->
-  subtitlesize="1.2"        <!-- Subtitle size multiplier (also persisted via UI) -->
-  subtitlecolor="#FFFF00"   <!-- Subtitle text color -->
-  subtitlebg="0.5"          <!-- Subtitle background opacity 0..1 -->
-  subtitleedge="outline"    <!-- none | shadow | outline | raised -->
-  resume                    <!-- Resume from last position -->
-  stablevolume              <!-- Loudness normalization -->
-  buffersize="200"          <!-- Max prefetch window in MB (HTTP + encrypted) -->
-  renderer="canvas"         <!-- canvas (HLS/DASH/DRM auto-pick their own pipeline) -->
-  headers='{"k":"v"}'       <!-- Custom request headers (JSON) for all media requests -->
-  audioonly                 <!-- Data-saver: play audio only, skip video decode -->
-  audiooutput="Headphones"  <!-- Route audio to a device (id or label substring; "" = default) -->
-  vr="180 fisheye sbs"      <!-- Immersive: 360 / 180 / fisheye / sbs(3d) / littleplanet -->
-  vrpad                     <!-- On-screen look-around joystick for vr mode -->
-  lcevc                     <!-- Enable MPEG-5 LCEVC enhancement decoding (adaptive streams) -->
-  lcevcurl="https://..."    <!-- URL to lazy-load the lcevc_dec.js decoder library -->
-  sw                        <!-- Force software decoding -->
-  fps="60"                  <!-- Override frame rate -->
-  playsinline               <!-- Play inline; on any touch device, suppress swipe/volume gestures while inline so they don't fight page scroll (fullscreen unaffected) -->
-  gesturefs                 <!-- DEPRECATED: use playsinline -->
-  nohotkeys                 <!-- Disable keyboard shortcuts -->
-  noerrorscreen             <!-- Suppress the built-in error overlays (host renders its own) -->
-  encrypted                 <!-- Encrypted playback mode -->
-  tokenurl="/api/token"     <!-- Token endpoint (encrypted) -->
-  videourl="/api/video"     <!-- Video endpoint (encrypted) -->
-  videoid="movie.mp4"       <!-- Video ID (encrypted) -->
-  drm                       <!-- DRM mode for adaptive streams (native video + EME) -->
-  licenseurl="https://..."  <!-- Widevine/PlayReady/FairPlay license server URL -->
-></movi-player>
+registerSourceAdapter("s3", (config) => new MyS3Source(config.url));
 ```
 
-**Split sources** (separate video + audio files) use child `<source>` elements with `kind="audio"`:
-
 ```html
-<movi-player controls>
-  <source src="video-only.mp4" type="video/mp4">
-  <source src="audio-only.m4a" type="audio/mp4" kind="audio">
-</movi-player>
+<movi-player src="s3://bucket/video.mkv" controls></movi-player>
 ```
 
-**Premuxed quality menu** -- declare multiple video sources with `data-height` to get a YouTube-style quality picker without an HLS manifest:
+See [Sources](https://moviplayer.com/docs/api/sources) in the docs.
 
-```html
-<movi-player controls>
-  <source src="video-1080p.mp4" type="video/mp4" data-height="1080" data-label="1080p">
-  <source src="video-720p.mp4"  type="video/mp4" data-height="720"  data-label="720p">
-  <source src="video-480p.mp4"  type="video/mp4" data-height="480"  data-label="480p">
-</movi-player>
-```
+### Embedding Hooks
 
-**Multi-language audio** -- declare two or more `<source kind="audio">` tags with `srclang` (or `label`) and the player surfaces an audio-language menu. Default pick: explicit `default` / `data-default`, else the first match for the page locale, else the first one.
+- **Host fullscreen handoff** — a cancelable `movi-fullscreen-request` event plus `setHostFullscreen()` let embedders (VS Code webview, custom apps) take over fullscreen and keep the player's UI in sync; `exitFullscreen()` covers all fullscreen routes.
+- **Host error screen** — every piece of the built-in error overlay carries a `part=` for `::part()` restyling; `slot="error"` replaces it outright; the `errordisplay` event (and `errorTitle` / `errorMessage` properties) carries the exact wording on screen, including format/codec failures that never raise a runtime `error`. See [Customizing the Error Screen](https://moviplayer.com/docs/api/element#customizing-the-error-screen).
+- **`noerrorscreen`** — suppress the built-in error overlays entirely and render your own.
 
-```html
-<movi-player controls>
-  <source src="video.mp4" type="video/mp4">
-  <source src="audio-en.m4a" type="audio/mp4" kind="audio" srclang="en" label="English" default>
-  <source src="audio-hi.m4a" type="audio/mp4" kind="audio" srclang="hi" label="Hindi">
-  <source src="audio-ja.m4a" type="audio/mp4" kind="audio" srclang="ja" label="Japanese">
-</movi-player>
-```
+## Reference
 
-**External subtitles via `<track>`** -- standard `<video>`-style markup, no JS wiring needed. Treats `kind="subtitles"`, `kind="captions"`, or no `kind` as caption tracks. `data-format="srt"` to load SRT instead of the default VTT.
+Full reference with every property, method, and event: **[API docs](https://moviplayer.com/docs/api/element)**.
 
-```html
-<movi-player controls>
-  <source src="video.mp4" type="video/mp4">
-  <track src="subs-en.vtt" srclang="en" label="English" kind="subtitles" default>
-  <track src="subs-hi.vtt" srclang="hi" label="Hindi" kind="subtitles">
-  <track src="subs-jp.srt" srclang="ja" label="Japanese" kind="subtitles" data-format="srt">
-</movi-player>
-```
+### Element Attributes
 
-## Keyboard Shortcuts
+Every attribute can also be read and set as a JS property (`el.rotate = 90`). Grouped by concern:
+
+<details>
+<summary><b>Source & network</b> — <code>src</code>, <code>preload</code>, <code>headers</code>, <code>buffersize</code>, …</summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `src` | `src="video.mkv"` | Video source URL — or assign a `File` from JS: `player.src = file` |
+| `preload` | `preload="metadata"` | `none` \| `metadata` \| `auto` — how much data to buffer initially |
+| `headers` | `headers='{"k":"v"}'` | Custom HTTP headers (JSON) applied to every media request — manifests, segments, progressive HTTP, thumbnails, encrypted source |
+| `crossorigin` | `crossorigin="anonymous"` | CORS mode: `anonymous` \| `use-credentials` |
+| `buffersize` | `buffersize="200"` | Target prefetch window in **MB** (HTTP + encrypted) |
+| `probesize` | `probesize="2mb"` | How far the demuxer may read before naming the streams — bytes, or `"512kb"` / `"2mb"` |
+| `probeduration` | `probeduration="5000"` | How much media it may analyse first, in milliseconds |
+| `backgroundplay` | `backgroundplay` | Let `autoplay` start while the tab is hidden (off by default) |
+| `bindav` | `bindav="false"` | Stall sound and picture together on a slow link. **On by default** — `"false"` opts out |
+
+</details>
+
+<details>
+<summary><b>Playback</b> — <code>controls</code>, <code>autoplay</code>, <code>loop</code>, <code>volume</code>, <code>resume</code>, …</summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `controls` | `controls` | Show the built-in UI controls |
+| `autoplay` | `autoplay` | Start playback automatically when loaded |
+| `muted` | `muted` | Start muted |
+| `loop` | `loop` | Restart playback when the video ends |
+| `volume` | `volume="0.8"` | Initial volume 0..1 (a persisted user choice overrides it) |
+| `playbackrate` | `playbackrate="1.25"` | Initial playback speed |
+| `startat` | `startat="30"` | Start playback at this time, in seconds |
+| `playsinline` | `playsinline` | Play inline (no auto-fullscreen on iOS); on touch devices, suppresses swipe/volume gestures while inline so they don't fight page scroll |
+| `resume` | `resume` | Save position to localStorage; show a resume dialog on reload |
+
+</details>
+
+<details>
+<summary><b>Appearance & layout</b> — <code>theme</code>, <code>objectfit</code>, <code>rotate</code>, <code>hdr</code>, <code>cropbars</code>, <code>title</code>, …</summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `poster` | `poster="thumb.jpg"` | Poster image before playback starts |
+| `posterfit` | `posterfit="cover"` | How the poster is fitted, when it should differ from the video's fit |
+| `postertime` | `postertime="10%"` | Generate a native-resolution poster frame from a timestamp (`"5"`, `"1:30"`, `"10%"`) |
+| `width` / `height` | `width="640"` | Element dimensions (CSS preferred) |
+| `theme` | `theme="dark"` | UI theme: `dark` \| `light` |
+| `themecolor` | `themecolor="#8B5CF6 #22D3EE"` | Accent colour — one or two, space-separated (secondary drives the centre play/pause flash) |
+| `objectfit` | `objectfit="contain"` | `contain` \| `cover` \| `fill` \| `zoom` \| `control` |
+| `rotate` | `rotate="90"` | Rotate the video: `0` \| `90` \| `180` \| `270` degrees |
+| `cropbars` | `cropbars` | Crop letterbox/pillarbox bars baked into the picture, so `cover`/`fill`/`zoom` size the image, not its padding |
+| `hdr` | `hdr` | Enable HDR rendering (Chromium + canvas renderer + HDR source) |
+| `renderer` | `renderer="canvas"` | Rendering backend (`canvas`; HLS/DASH/DRM auto-pick their own pipeline) |
+| `ambientmode` | `ambientmode` | Ambient background glow |
+| `ambientwrapper` | `ambientwrapper="#wrap"` | CSS selector for an external element to receive the ambient glow |
+| `title` | `title="My Video"` | Video title (in-player overlay only — no native tooltip) |
+| `showtitle` | `showtitle` | Show the title bar overlay at the top |
+| `titlemode` | `titlemode="fullscreen back"` | Where the title bar may show: `both` (default) \| `fullscreen` \| `windowed`; add `back` (or `back-mobile`, `back-fullscreen`, `back-mobile-fullscreen`) for a back arrow that fires a cancelable `back` event |
+
+</details>
+
+<details>
+<summary><b>Controls & input</b> — <code>fastseek</code>, <code>doubletap</code>, <code>nohotkeys</code>, <code>controlslist</code>, …</summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `fastseek` | `fastseek="keys gestures"` | ±10s skip affordances. Bare = all; or narrow to `buttons`, `keys`, `gestures` (aliases: `touch`, `nontouch`, `keyonly`, `controls`, `none`) |
+| `doubletap` | `doubletap="true"` | Double-tap to seek ±10s |
+| `thumb` | `thumb` | Generate on-demand thumbnails for seek-bar previews |
+| `nohotkeys` | `nohotkeys` | Disable all keyboard shortcuts |
+| `controlslist` | `controlslist="nofullscreen nopip nospeed"` | Switch built-in controls off, as `no<name>` tokens (`noplay`, `nocc`, `noquality`, `nosettings`, … or the `id` of an `addControl()` control) |
+| `noerrorscreen` | `noerrorscreen` | Suppress the built-in error overlays (host renders its own) |
+| `disablepictureinpicture` | `disablepictureinpicture` | Refuse Picture-in-Picture, like `<video disablepictureinpicture>` |
+| `disableremoteplayback` | `disableremoteplayback` | Turn off remote playback targets (AirPlay, Cast) |
+| `gesturefs` | — | **Deprecated** — use `playsinline` |
+
+</details>
+
+<details>
+<summary><b>Subtitles</b> — <code>subtitledelay</code>, <code>subtitlesize</code>, <code>subtitlecolor</code>, …</summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `subtitledelay` | `subtitledelay="0.2"` | Subtitle offset in seconds (positive = later; VLC/mpv sign) |
+| `subtitlesize` | `subtitlesize="1.2"` | Size multiplier (also persisted via UI) |
+| `subtitlecolor` | `subtitlecolor="#FFFF00"` | Text colour |
+| `subtitlebg` | `subtitlebg="0.5"` | Background opacity 0..1 |
+| `subtitleedge` | `subtitleedge="outline"` | `none` \| `shadow` \| `outline` \| `raised` |
+
+</details>
+
+<details>
+<summary><b>Audio</b> — <code>audioonly</code>, <code>audiooutput</code>, <code>stablevolume</code></summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `audioonly` | `audioonly` | Data-saver: play audio only, skip the video decode (toggleable live) |
+| `audiooutput` | `audiooutput="Headphones"` | Route audio to a device — a `deviceId` or a case-insensitive label substring; `""` = system default |
+| `stablevolume` | `stablevolume` | Loudness normalization (DynamicsCompressorNode) |
+
+</details>
+
+<details>
+<summary><b>Chapters & persistence</b> — <code>chapters</code>, <code>persist</code>, <code>persistkey</code></summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `chapters` | `chapters='[{"title":"Intro","start":0}]'` | Chapters from outside the media file — JSON array of `{title, start, end?, image?}` (seconds); `image` is artwork for the timeline tile, in place of a decoded frame. The property takes the array directly |
+| `persist` | `persist="volume speed audiolang"` | Which settings to remember across loads — space-separated, opt-in per setting; see [Remembering Viewer Settings](#remembering-viewer-settings) |
+| `persistkey` | `persistkey="my-app"` | Namespace for everything `persist` stores |
+
+</details>
+
+<details>
+<summary><b>Engine & decoding</b> — <code>engine</code>, <code>fallback</code>, <code>sw</code>, <code>wasmurl</code>, <code>lcevc</code>, …</summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `engine` | `engine="native wasm"` | Playback-engine priority, space-separated: `wasm` \| `shaka` \| `dashjs` \| `hlsjs` \| `native`. First name leads; the rest replace the built-in escalation |
+| `fallback` | `fallback="native"` | Hand a source Movi can't play to the browser's `<video>`, wrapped in the player's controls |
+| `sw` | `sw` | Force software decoding (FFmpeg WASM) instead of WebCodecs |
+| `fps` | `fps="60"` | Override the video frame rate (0 = use the source's own) |
+| `wasmurl` | `wasmurl="/movi.wasm"` | Slim build only: URL of the external `movi.wasm` |
+| `lcevc` | `lcevc` | MPEG-5 LCEVC enhancement-layer decoding for adaptive streams (needs `lcevc_dec.js`) |
+| `lcevcurl` | `lcevcurl="https://…"` | URL to lazy-load the `lcevc_dec.js` decoder library |
+
+</details>
+
+<details>
+<summary><b>Immersive / VR</b> — <code>vr</code>, <code>vrpad</code></summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `vr` | `vr="180 fisheye sbs"` | Force an immersive projection: `360` / `180` / `fisheye` / `sbs` (3D) / `littleplanet`. Sources with spherical metadata auto-enter without it |
+| `vrpad` | `vrpad` | Opt-in on-screen look-around joystick for `vr` mode |
+
+</details>
+
+<details>
+<summary><b>Encrypted playback & DRM</b> — <code>encrypted</code>, <code>drm</code>, <code>licenseurl</code>, …</summary>
+
+<br />
+
+| Attribute | Example | Description |
+|---|---|---|
+| `encrypted` | `encrypted` | Encrypted playback mode (requires `tokenurl` + `videourl`) |
+| `tokenurl` | `tokenurl="/api/token"` | Token endpoint — returns HMAC signing secret and file metadata |
+| `videourl` | `videourl="/api/video"` | Video endpoint — chunks served with token + HMAC validation |
+| `videoid` | `videoid="movie.mp4"` | Video identifier sent to the token server |
+| `drm` | `drm` | DRM mode for adaptive streams (native `<video>` + EME; canvas-only features disabled) |
+| `licenseurl` | `licenseurl="https://…"` | Widevine/PlayReady/FairPlay license server URL |
+| `licenseheaders` | `licenseheaders='{"k":"v"}'` | Extra HTTP headers for the DRM **license request only** (JSON object string) |
+
+</details>
+
+### Events
+
+The standard `HTMLMediaElement` events all fire (`loadedmetadata`, `canplay`, `play`, `pause`, `seeking`/`seeked`, `timeupdate`, `progress`, `durationchange`, `ended`, `error`, `volumechange`, `ratechange`, …), so `<video>`-oriented code works unchanged. Movi adds its own:
+
+<details>
+<summary><b>Player-specific events</b></summary>
+
+<br />
+
+| Event | Payload | Fires when |
+|---|---|---|
+| `statechange` | `PlayerState` | Underlying player state transitioned |
+| `errordisplay` | `{ title, message, canRetry, canTrySoftware }` | An error screen went up — the wording the viewer sees, including codec failures that raise no runtime `error` |
+| `trackschange` | `Track[]` | Available tracks list updated |
+| `audiotrackchange` / `subtitletrackchange` | — | Active audio / subtitle track switched |
+| `qualitychange` | `{ trackId }` | Active video quality / track switched |
+| `subtitledelaychange` | `{ subtitleDelay }` | Subtitle offset changed |
+| `aspectchange`, `loopchange`, `stablevolumechange`, `hdrchange`, `ambientchange`, `rotatechange`, `audioonlychange` | setting-specific | A viewer changed a setting — persist it host-side if you want |
+| `fullscreenchange` | `{ fullscreen }` | Entered/exited fullscreen |
+| `movi-fullscreen-request` | cancelable | Before `requestFullscreen()` — `preventDefault()` to take over via `setHostFullscreen()` |
+| `back` | cancelable | The `titlemode` back arrow was pressed |
+| `pipchange` (+ `enterpictureinpicture` / `leavepictureinpicture`) | `{ pip }` | PiP window opened/closed |
+| `titlechange` | `{ title }` | Displayed title changed |
+| `coverart` | `ImageBitmap \| null` | Embedded cover art extracted |
+| `audiooutputchange` | `{ deviceId }` | Audio routed to a different output device |
+| `audiostripchange` | `{ active }` | Audio-only strip layout entered/left |
+| `preloadcomplete` | — | Initial preload buffer filled |
+| `linearmode` | — | Server ignores `Range` — playback is forward-only; hide seek-dependent UI |
+| `nativefallback` | `{ src }` | Source handed to a native `<video>` (`fallback="native"`) |
+| `filerevoked` | `{ offset, length, reason }` | The browser revoked the underlying `File` handle — prompt a re-pick |
+| `movi-control` | control-specific | A custom control added via `addControl()` was used |
+| `movi-qoe` | QoE snapshot | Playback-quality telemetry sample |
+
+</details>
+
+Full list with payload types: [Events](https://moviplayer.com/docs/api/events).
+
+### Keyboard Shortcuts
 
 Press `?` during playback to toggle the shortcuts panel (also available from the right-click context menu).
+
+<details>
+<summary><b>Shortcut table</b></summary>
+
+<br />
 
 | Key | Action | Key | Action |
 |---|---|---|---|
@@ -377,6 +788,12 @@ Press `?` during playback to toggle the shortcuts panel (also available from the
 | `P` | Picture-in-Picture | Arrows | Seek / Volume |
 | `V` | Cycle subtitle track | `Z` / `X` | Subtitle delay -/+ 100ms |
 | `1` – `9` | Seek to 10%–90% | | |
+
+</details>
+
+### Theming
+
+The UI is themeable through `--movi-*` CSS custom properties (accent colours, radii, control sizes, shadows, transitions) — set them on the element or any ancestor. The full variable list ships in [`custom-elements.json`](custom-elements.json) and the [element docs](https://moviplayer.com/docs/api/element#theming), with IntelliSense in VS Code via the [extension](vscode-extension/).
 
 ## Server Requirements
 
@@ -414,7 +831,7 @@ npm run build:ts
 npm run dev
 ```
 
-## AI assistants
+## AI Assistants
 
 [AGENTS.md](./AGENTS.md) is a tour of the architecture, public API, and the
 non-obvious tradeoffs (4K rate cap, ambient-mode cost, `.ts` long-GOP handling,

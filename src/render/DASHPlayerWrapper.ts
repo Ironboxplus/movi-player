@@ -7,10 +7,13 @@ import {
   PlayerConfig,
   Track,
   VideoTrack,
+  AudioTrack,
+  SubtitleTrack,
 } from "../types";
 import { CanvasRenderer } from "./CanvasRenderer";
 import { TrackManager } from "../core/TrackManager";
 import { Logger } from "../utils/Logger";
+import { sanitizeVttHtml } from "./sanitizeVttHtml";
 
 const TAG = "DASHPlayerWrapper";
 
@@ -33,6 +36,10 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
   // Representations from the manifest, indexed to match the VideoTrack ids we
   // hand the TrackManager (track id === array index; -1 is Auto/ABR).
   private representations: Representation[] = [];
+  // Subtitle rendering: dash.js schedules cue timing itself (cueEnter/cueExit)
+  // when dispatchForManualRendering is set — we just paint the given text into
+  // our own overlay, keyed by cue id so cueExit can remove the right element.
+  private textContainer: HTMLDivElement | null = null;
 
   constructor(config: PlayerConfig) {
     super();
@@ -53,6 +60,7 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
     // access DRM-protected frames (browser blocks VideoFrame copy).
     if (!config.drm && config.renderer === "canvas" && config.canvas) {
       this.canvasRenderer = new CanvasRenderer(config.canvas);
+      this.createTextContainer();
     }
 
     this.setupEventHandlers();
@@ -87,6 +95,98 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
       );
       Logger.info(TAG, `Requesting representation ${rep.id} (${rep.height}p)`);
     });
+
+    this.trackManager.on("subtitleTrackChange", (track: SubtitleTrack | null) => {
+      if (!this.dash) return;
+      // Drop the previous track's on-screen cue on EVERY change. dash.js keeps
+      // per-track cueData and only runs CUE_EXIT for the active track, so after
+      // a language switch the old track's active cue never gets its exit — its
+      // text would linger. The new track's currently-active cue re-fires
+      // CUE_ENTER once it's active, so this only clears the stale line.
+      if (this.textContainer) this.textContainer.textContent = "";
+      // setTextTrack is the correct switch API: it sets the chosen track's
+      // manualMode to SHOWING (and the rest to HIDDEN), which is exactly what
+      // dash.js's manual cue processing keys on to decide whose cues to
+      // dispatch. setCurrentTrack only re-picks the ABR text adaptation and
+      // leaves manualMode untouched, so the newly-selected track's cues never
+      // fire — the display stays stuck on the previous language. -1 disables.
+      // track.id is the index into getTracksFor("text"), matching setTextTrack.
+      this.dash.setTextTrack(track ? track.id : -1);
+      Logger.info(
+        TAG,
+        track
+          ? `Selected subtitle track ${track.id} (${track.language || track.label || ""})`
+          : "Subtitles disabled",
+      );
+    });
+
+    // Audio-language switch. dash.js runs bitrate ABR within each language;
+    // switching the current audio MediaInfo changes the language. id is the
+    // index into getTracksFor("audio") (see updateTracks).
+    this.trackManager.on("audioTrackChange", (track: AudioTrack | null) => {
+      if (!this.dash || !track) return;
+      const audioTracks = this.dash.getTracksFor("audio") ?? [];
+      const target = audioTracks[track.id];
+      if (!target) return;
+      const current = this.dash.getCurrentTrackFor("audio");
+      if (current && current.index === target.index) return; // already active
+      this.dash.setCurrentTrack(target);
+      Logger.info(
+        TAG,
+        `Selected audio track ${track.id} (${track.language || track.label || ""})`,
+      );
+    });
+  }
+
+  /**
+   * Own caption-rendering overlay, a sibling of the shared canvas (mirrors
+   * ShakaPlayerWrapper's textContainer). Registered with the SAME
+   * CanvasRenderer instance via setSubtitleOverlay() so its existing
+   * rotation-aware resize() logic (dimension swap for 90/270°, centering,
+   * rotate transform) sizes/positions/rotates it automatically — cueEnter/
+   * cueExit just add/remove text nodes into it.
+   */
+  private createTextContainer(): void {
+    if (this.textContainer || !this.config.canvas) return;
+    const canvas = this.config.canvas as HTMLCanvasElement;
+    const root = canvas.parentNode;
+    if (!root) return;
+    const tc = document.createElement("div");
+    tc.className = "movi-dash-text-container";
+    tc.style.position = "absolute";
+    tc.style.inset = "0";
+    tc.style.pointerEvents = "none";
+    tc.style.zIndex = "2"; // above the canvas, below the controls bar
+    tc.style.textAlign = "center";
+    tc.style.color = "#fff";
+    tc.style.textShadow = "0 1px 3px rgba(0,0,0,0.9), 0 0 2px rgba(0,0,0,0.9)";
+    tc.style.fontFamily = "sans-serif";
+    tc.style.fontSize =
+      "calc(clamp(20px, calc(var(--movi-player-width, 100vw) * 0.032), 40px) * var(--movi-sub-size-mult, 1))";
+    root.appendChild(tc);
+    this.textContainer = tc;
+    this.canvasRenderer?.setSubtitleOverlay(tc);
+  }
+
+  /**
+   * Flatten an imsc ISD (dash.js's parsed TTML cue) to plain text with line
+   * breaks. Leaf spans carry `.text`; `br` is a newline; `p` blocks are lines;
+   * everything else is a container to recurse into. Styling and region
+   * positioning are dropped — rendering those faithfully needs the imsc
+   * renderer, which we don't bundle.
+   */
+  private static isdToText(node: any): string {
+    if (!node) return "";
+    if (node.kind === "br") return "\n";
+    if (node.kind === "span" && typeof node.text === "string") return node.text;
+    if (Array.isArray(node.contents)) {
+      let out = node.contents
+        .map((c: any) => DASHPlayerWrapper.isdToText(c))
+        .join("");
+      if (node.kind === "p") out += "\n";
+      return out;
+    }
+    return "";
   }
 
   private setupEventHandlers(): void {
@@ -171,12 +271,12 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
     if (!this.canvasRenderer) return;
 
     try {
-      const frame = new VideoFrame(this.videoElement);
-      this.canvasRenderer.render(frame);
-      frame.close();
+      // Element straight to the renderer — a VideoFrame wrapper around it
+      // uploads nothing on Firefox Android (see RenderSource in CanvasRenderer).
+      this.canvasRenderer.render(this.videoElement);
       this._framesRendered++;
     } catch (e) {
-      Logger.warn(TAG, "Failed to create VideoFrame", e);
+      Logger.warn(TAG, "Failed to render video frame", e);
     }
   }
 
@@ -198,6 +298,14 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
     }
 
     this.dash = MediaPlayer().create();
+
+    // Text tracks off by default (Movi's UI controls selection) and dispatched
+    // to us as cueEnter/cueExit events instead of being rendered by dash.js's
+    // own (native-video-anchored) caption box — our <video> is hidden, canvas
+    // draws frames, so dash.js's default caption rendering would never be seen.
+    this.dash.updateSettings({
+      streaming: { text: { defaultEnabled: false, dispatchForManualRendering: true } },
+    });
 
     // Custom media headers on every request dash.js makes (manifest + segments).
     // Must be registered before initialize() so the manifest fetch carries them.
@@ -222,6 +330,46 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
         this.emit("loadEnd", undefined);
         settled = true;
         resolve();
+      });
+
+      // dash.js schedules cue timing itself and dispatches enter/exit — we
+      // paint the cue into our own overlay, keyed by dash.js's cueID. The cue
+      // shape differs by subtitle format:
+      //   • WebVTT / plain text → `text` is the caption string (sanitize + paint)
+      //   • WebVTT-as-HTML       → `cueHTMLElement` is a pre-rendered node
+      //   • TTML (imsc)          → `text` is "", content lives in the `isd`
+      //     (Intermediate Synchronic Document); no pre-rendered element, so we
+      //     extract plain text from the ISD (styling/positioning would need the
+      //     imsc renderer, which we don't bundle — words beat nothing).
+      this.dash!.on(MediaPlayer.events.CUE_ENTER, (e: any) => {
+        if (!this.textContainer) return;
+        const el = document.createElement("div");
+        el.dataset.cueId = String(e.cueID ?? e.id ?? "");
+        if (typeof e.text === "string" && e.text.length > 0) {
+          // Plain string from a remote manifest, not a trusted VTTCue —
+          // sanitize (whitelisted b/i/u/span/ruby/etc.) so <b>/<i> still
+          // render without an XSS hole.
+          el.appendChild(sanitizeVttHtml(e.text));
+        } else if (e.cueHTMLElement instanceof HTMLElement) {
+          el.appendChild(e.cueHTMLElement);
+        } else if (e.isd) {
+          const txt = DASHPlayerWrapper.isdToText(e.isd);
+          if (!txt) return;
+          txt.split("\n").forEach((line, i) => {
+            if (i > 0) el.appendChild(document.createElement("br"));
+            el.appendChild(document.createTextNode(line));
+          });
+        } else {
+          return;
+        }
+        this.textContainer.appendChild(el);
+      });
+      this.dash!.on(MediaPlayer.events.CUE_EXIT, (e: any) => {
+        if (!this.textContainer) return;
+        const el = this.textContainer.querySelector(
+          `[data-cue-id="${CSS.escape(String(e.cueID ?? e.id ?? ""))}"]`,
+        );
+        el?.remove();
       });
 
       // ABR / quality switches change the active rendition without changing
@@ -299,8 +447,52 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
       tracks.push(videoTrack);
     });
 
+    // Subtitle/text tracks. id is the index into getTracksFor("text") — the
+    // subtitleTrackChange handler looks the MediaInfo back up by that index.
+    const textTracks = this.dash.getTracksFor("text") ?? [];
+    textTracks.forEach((t, index) => {
+      const lang = t.lang && t.lang !== "und" ? t.lang : "";
+      const label = t.labels?.[0]?.text || lang || `Subtitle ${index + 1}`;
+      tracks.push({
+        id: index,
+        type: "subtitle",
+        codec: "",
+        language: lang,
+        label,
+        subtitleType: "text",
+      } as SubtitleTrack);
+    });
+
+    // Audio tracks — one per language / AdaptationSet (dash.js runs bitrate ABR
+    // within each). id is the index into getTracksFor("audio"), used by the
+    // audioTrackChange handler to switch language. Surfacing them makes the
+    // audio selector appear when there's more than one language.
+    const audioMediaInfos = this.dash.getTracksFor("audio") ?? [];
+    audioMediaInfos.forEach((t, index) => {
+      const lang = t.lang && t.lang !== "und" ? t.lang : "";
+      const label = t.labels?.[0]?.text || lang || `Audio ${index + 1}`;
+      tracks.push({
+        id: index,
+        type: "audio",
+        codec: (t.codec || "").replace(/^audio\//, ""),
+        language: lang,
+        label,
+        channels: (t as any).channelsCount || 0,
+        sampleRate: 0,
+      } as AudioTrack);
+    });
+
     this.trackManager.setTracks(tracks);
     this.trackManager.selectVideoTrack(-1); // default Auto
+
+    // Reflect dash.js's currently-selected audio language as the active track.
+    const currentAudio = this.dash.getCurrentTrackFor("audio");
+    if (currentAudio && audioMediaInfos.length > 1) {
+      const activeIdx = audioMediaInfos.findIndex(
+        (t) => t.index === currentAudio.index,
+      );
+      if (activeIdx >= 0) this.trackManager.selectAudioTrack(activeIdx);
+    }
 
     if (this.canvasRenderer && reps.length > 0) {
       // Size the canvas from the highest rendition; fall back to the <video>
@@ -442,6 +634,7 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
         const session = keys.createSession();
         session.addEventListener("message", async (e) => {
           const response = await fetch(licenseUrl, {
+          signal: this.lifetimeAbort.signal,
             method: "POST",
             body: e.message,
             headers: {
@@ -500,17 +693,35 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
     this.trackManager.selectVideoTrack(id);
   }
 
-  getAudioTracks() {
-    return [];
+  getAudioTracks(): AudioTrack[] {
+    return this.trackManager
+      .getTracks()
+      .filter((t) => t.type === "audio") as AudioTrack[];
   }
-  selectAudioTrack(_id: number): boolean {
-    return false;
+  selectAudioTrack(id: number): boolean {
+    // Drives the trackManager audioTrackChange handler, which performs the
+    // dash.js setCurrentTrack("audio") switch.
+    return this.trackManager.selectAudioTrack(id);
   }
-  getSubtitleTracks() {
-    return [];
+  getSubtitleTracks(): SubtitleTrack[] {
+    return this.trackManager
+      .getTracks()
+      .filter((t) => t.type === "subtitle") as SubtitleTrack[];
   }
-  selectSubtitleTrack(_id: number | null): Promise<boolean> {
-    return Promise.resolve(false);
+  async selectSubtitleTrack(id: number | null): Promise<boolean> {
+    return this.trackManager.selectSubtitleTrack(id);
+  }
+
+  setVideoRotation(deg: number): void {
+    this.canvasRenderer?.setManualRotation(deg);
+  }
+
+  rotateVideo(): number {
+    return this.canvasRenderer?.rotate90() ?? 0;
+  }
+
+  getVideoRotation(): number {
+    return this.canvasRenderer?.getRotation() ?? 0;
   }
 
   setFitMode(mode: any) {
@@ -608,7 +819,11 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
     return false;
   }
 
+  /** Aborted by destroy(), so a DRM licence request can't outlive the wrapper. */
+  private readonly lifetimeAbort = new AbortController();
+
   destroy(): void {
+    this.lifetimeAbort.abort();
     this.stopFrameLoop();
 
     if (this.dash) {
@@ -619,6 +834,12 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
       }
       this.dash = null;
     }
+
+    this.canvasRenderer?.setSubtitleOverlay(null);
+    if (this.textContainer?.parentNode) {
+      this.textContainer.parentNode.removeChild(this.textContainer);
+    }
+    this.textContainer = null;
 
     this.videoElement.removeAttribute("src");
     this.videoElement.load();

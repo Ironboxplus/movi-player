@@ -2,10 +2,11 @@
 /**
  * Unified release orchestrator for movi-player.
  *
- * The player bundle (dist/element.js) ships into four surfaces that each used to
+ * The player bundle (dist/element.js) ships into five surfaces that each used to
  * need their own build run:
  *   - web app        (Cloudflare Worker + R2)
  *   - chrome-extension
+ *   - firefox-extension
  *   - vscode-extension
  *   - desktop app    (Electron)
  * This script bumps the version everywhere, builds element.js ONCE, and fans it
@@ -18,8 +19,8 @@
  *
  * Flags:
  *   --wasm            also rebuild the WASM (docker); default reuses dist/wasm
- *   --targets=a,b     limit sync to a subset of: chrome,vscode,desktop  (default: all)
- *   --package         build distributables: .vsix (vscode) + versioned .zip (chrome)
+ *   --targets=a,b     limit sync to a subset of: chrome,firefox,vscode,desktop  (default: all)
+ *   --package         build distributables: .vsix (vscode) + versioned .zip (chrome, firefox)
  *   --dist            build desktop installers (electron-builder — slow)
  *   --deploy          deploy the web app (harden + R2 upload + worker deploy) — OUTWARD
  *   --commit          git add + commit locally (no push). Off by default.
@@ -45,7 +46,7 @@ const DRY = flags.has("--dry");
 const targetsArg = args.find((a) => a.startsWith("--targets="));
 const TARGETS = targetsArg
   ? targetsArg.slice("--targets=".length).split(",").map((s) => s.trim())
-  : ["chrome", "vscode", "desktop"];
+  : ["chrome", "firefox", "vscode", "desktop"];
 
 const C = {
   b: (s) => `\x1b[1m${s}\x1b[0m`,
@@ -92,16 +93,16 @@ ${C.b("Version")}  ${C.dim("(current: " + cur + ")")}
 ${C.b("Flags")}
   --dry              preview the plan + version changes; write nothing
   --wasm             also rebuild the WASM (docker); default reuses dist/wasm
-  --targets=a,b      limit sync to a subset of ${C.dim("chrome,vscode,desktop")} ${C.dim("(default: all)")}
-  --package          build distributables: .vsix (vscode) + versioned .zip (chrome)
+  --targets=a,b      limit sync to a subset of ${C.dim("chrome,firefox,vscode,desktop")} ${C.dim("(default: all)")}
+  --package          build distributables: .vsix (vscode) + versioned .zip (chrome, firefox)
   --dist             build desktop installers (electron-builder — slow)
   --deploy           deploy the web app (harden + R2 upload + worker) ${C.y("— OUTWARD")}
   --commit           git add + commit locally ${C.dim("(no push)")}. Off by default.
   -h, --help         show this help
 
-${C.b("Bumps")}     ${C.dim("package.json · desktop · vscode-extension · chrome-extension/manifest (+ locks)")}
+${C.b("Bumps")}     ${C.dim("package.json · desktop · vscode-extension · chrome/firefox-extension manifests (+ locks)")}
 ${C.b("Stamps")}    ${C.dim("CHANGELOG + docs/changelog ([Unreleased] → version) · VitePress nav · app JSON-LD")}
-${C.b("Builds")}    ${C.dim("element.js once → chrome-extension/dist · vscode webview/dist · desktop vendor")}
+${C.b("Builds")}    ${C.dim("element.js once → chrome/firefox-extension dist · vscode webview/dist · desktop vendor")}
 ${C.b("Safe")}      ${C.dim("never publishes/pushes/deploys unless you pass --deploy / --commit")}
 
 ${C.b("Examples")}
@@ -276,6 +277,7 @@ bumpJsonVersion("package.json");
 bumpJsonVersion("desktop/package.json");
 bumpJsonVersion("vscode-extension/package.json");
 bumpJsonVersion("chrome-extension/manifest.json");
+bumpJsonVersion("firefox-extension/manifest.json");
 bumpLockVersion("package-lock.json");
 bumpLockVersion("desktop/package-lock.json");
 bumpLockVersion("vscode-extension/package-lock.json");
@@ -301,6 +303,13 @@ if (TARGETS.includes("chrome")) {
   step("Sync → chrome-extension");
   run("bash chrome-extension/build.sh", { env: { ...process.env, SKIP_BUILD: "1" } });
 }
+if (TARGETS.includes("firefox")) {
+  // Copies the shared UI out of chrome-extension/, so it must run after that
+  // target — not that it depends on chrome's dist/, but a half-synced Chrome
+  // folder would fan a stale player page into Firefox too.
+  step("Sync → firefox-extension");
+  run("bash firefox-extension/build.sh", { env: { ...process.env, SKIP_BUILD: "1" } });
+}
 if (TARGETS.includes("vscode")) {
   step("Sync → vscode-extension (copy + compile)");
   run("bash vscode-extension/build.sh", { env: { ...process.env, SKIP_BUILD: "1" } });
@@ -325,6 +334,20 @@ if (flags.has("--package")) {
         `zip -r -q movi-player-${next}.zip . ` +
         `-x "*.zip" "node_modules/*" "*.DS_Store" && ` +
         `echo "  zipped movi-player-${next}.zip ($(du -h movi-player-${next}.zip | cut -f1))"'`,
+    );
+  }
+  if (TARGETS.includes("firefox")) {
+    step(`Package firefox-extension → movi-player-firefox-${next}.zip`);
+    // Same shape as the Chrome zip — the whole loadable folder. AMO takes a
+    // plain .zip; the copied-in shared files are gitignored but must ship.
+    // build.sh/README/.gitignore are excluded: addons-linter raises
+    // FLAGGED_FILE_EXTENSION on a shipped .sh, and none of them are used at
+    // runtime anyway.
+    run(
+      `bash -c 'cd firefox-extension && rm -f movi-player-firefox-${next}.zip && ` +
+        `zip -r -q movi-player-firefox-${next}.zip . ` +
+        `-x "*.zip" "node_modules/*" "*.DS_Store" "build.sh" "README.md" ".gitignore" && ` +
+        `echo "  zipped movi-player-firefox-${next}.zip ($(du -h movi-player-firefox-${next}.zip | cut -f1))"'`,
     );
   }
 }
@@ -357,7 +380,7 @@ if (!flags.has("--package"))
 todo.push("write the release notes under ## [Unreleased] BEFORE bumping (the script stamps them)");
 if (!flags.has("--commit")) todo.push('commit:  git add -A && git commit -m "chore(release): ' + next + '"');
 if (!flags.has("--deploy")) todo.push("deploy web:  npm run app:release   (outward)");
-todo.push("publish vsix / chrome zip manually (outward)");
+todo.push("publish vsix / chrome zip / firefox zip (AMO) manually (outward)");
 console.log(C.dim("\nnext steps:"));
 todo.forEach((t) => console.log(C.dim("  • " + t)));
 console.log("");

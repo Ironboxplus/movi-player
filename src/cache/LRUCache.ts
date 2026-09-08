@@ -161,6 +161,28 @@ export class LRUCache {
   }
 
   /**
+   * When somebody last read bytes they were BLOCKED on, across every source
+   * sharing this cache.
+   *
+   * It lives here rather than on a source because the readers that have to give
+   * way are not the same object as the reader they give way to: playback and
+   * the thumbnail pipeline are two FileSources over one file, sharing this
+   * cache, and the thumbnail one has no other way to learn that a seek is
+   * waiting on the disk. See FileSource.waitForDemandReads.
+   */
+  private _lastDemandReadAt: number = 0;
+
+  markDemandRead(): void {
+    this._lastDemandReadAt = performance.now();
+  }
+
+  msSinceDemandRead(): number {
+    return this._lastDemandReadAt === 0
+      ? Number.POSITIVE_INFINITY
+      : performance.now() - this._lastDemandReadAt;
+  }
+
+  /**
    * Get cache utilization percentage
    */
   getUtilization(): number {

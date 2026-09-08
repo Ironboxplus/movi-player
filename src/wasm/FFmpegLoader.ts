@@ -17,9 +17,48 @@ let loadedModule: MoviWasmModule | null = null;
 // Embedded WASM binary (will be set if WASM is bundled)
 let embeddedWasmBinary: Uint8Array | null = null;
 
+// Override URL for the external `movi.wasm` (slim build only). null → the glue's
+// own `new URL("movi.wasm", import.meta.url)` default, i.e. next to the JS
+// bundle. Set via the `wasmurl` attribute / `MoviElement.setWasmUrl()` when a
+// consumer hosts the .wasm somewhere else (a CDN, a versioned path). No effect
+// on the embedded (default) build, whose WASM lives inside the JS.
+let wasmUrlOverride: string | null = null;
+
+/**
+ * Point the loader at a specific `movi.wasm` URL. Only meaningful for the slim
+ * build; must be called before the engine first loads (the element does this
+ * from its `wasmurl` attribute on connect).
+ */
+export function setWasmUrl(url: string | null): void {
+  wasmUrlOverride = url && url.trim() ? url.trim() : null;
+}
+
+/** Build a `locateFile` that redirects the .wasm request to the override URL. */
+function wasmLocateFile(): ((path: string, prefix: string) => string) | undefined {
+  if (!wasmUrlOverride) return undefined;
+  const url = wasmUrlOverride;
+  return (path: string, prefix: string) =>
+    path.endsWith(".wasm") ? url : prefix + path;
+}
+
 export interface LoaderOptions {
   wasmBinary?: Uint8Array; // Embedded WASM binary data (required if embeddedWasmBinary not set)
   workerPath?: string;
+}
+
+/**
+ * Discard the cached main-playback module so the next loadWasmModule() builds a
+ * fresh one. Emscripten's abort() (a WASM trap / OOB in an FFmpeg call) leaves
+ * the module PERMANENTLY dead: every later avformat_open_input on it fails with
+ * "File is corrupted or in an unsupported format". Because the main demuxer uses
+ * this cached singleton, that error then repeats for EVERY source — a new video,
+ * a quality switch, anything — until a full page reload rebuilds the JS context.
+ * Calling this on a fatal WASM error makes the next load recover in-page, exactly
+ * as a reload would.
+ */
+export function resetWasmModule(): void {
+  loadedModule = null;
+  modulePromise = null;
 }
 
 /**
@@ -57,10 +96,23 @@ export async function loadWasmModule(options: LoaderOptions = {}): Promise<MoviW
             // Map to debug to avoid flooding console with "errors"
             Logger.debug('WASM', text);
           }
-        }
+        },
+        // Emscripten calls this the instant the module traps (abort()). This is
+        // the CACHED singleton the main demuxer reuses, so once it's dead every
+        // later open fails "File is corrupted" until a page reload — drop it from
+        // the cache here so the next loadWasmModule() rebuilds a live one in-page.
+        onAbort: (what: unknown) => {
+          Logger.error(TAG, `WASM aborted — discarding dead cached module: ${what}`);
+          resetWasmModule();
+        },
       };
       if (wasmBinary) {
         moduleOptions.wasmBinary = wasmBinary;
+      }
+      const locateFile = wasmLocateFile();
+      if (locateFile) {
+        // Slim build with a custom wasmurl — tell Emscripten where movi.wasm is.
+        moduleOptions.locateFile = locateFile;
       }
       const module: MoviWasmModule = await createModule(moduleOptions);
       
@@ -112,10 +164,15 @@ export async function loadWasmModuleNew(options: LoaderOptions = {}): Promise<Mo
     if (wasmBinary) {
       moduleOptions.wasmBinary = wasmBinary;
     }
-    
+    const locateFile = wasmLocateFile();
+    if (locateFile) {
+      // Slim build with a custom wasmurl — tell Emscripten where movi.wasm is.
+      moduleOptions.locateFile = locateFile;
+    }
+
     // Always create fresh instance - no caching
     const module: MoviWasmModule = await createModule(moduleOptions);
-    
+
     Logger.info(TAG, 'NEW WASM module instance loaded');
     return module;
   } catch (error) {

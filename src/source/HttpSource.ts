@@ -14,7 +14,43 @@ const TAG = "HttpSource";
 const MIN_BUFFER_SIZE = 2 * 1024 * 1024; // 2MB minimum
 const DEFAULT_MAX_BUFFER_SIZE_MB = 250; // ~250MB cap (YouTube-like: Chrome gives ~150-300MB per tab for video)
 const BUFFER_PERCENTAGE = 0.08; // 8% of file size — covers ~60-90s of content for large files
-const MAX_STREAM_BUFFER_SIZE = 512 * 1024 * 1024; // Cap on the forward-download window per fill. Bounds RAM + per-slide memmove cost, but sits well above the 250MB default so a larger configured `buffersize` (e.g. 115's 1024MB) actually enlarges the cushion instead of being silently capped at 250MB.
+// Cap on the forward-download WINDOW per fill. Bounds RAM + per-slide memmove
+// cost, but sits well above the old 250MB so a larger configured `buffersize`
+// (e.g. 115's 1024MB) actually enlarges the cushion instead of being silently
+// capped. This is a different quantity from the per-request chunk sizes below:
+// the window is how far ahead we are willing to hold, the chunk is how much we
+// ask for at a time while getting there.
+const MAX_STREAM_BUFFER_SIZE = 512 * 1024 * 1024;
+// Largest bytes= range asked for in ONE request. The window a stream fills is
+// still MAX_STREAM_BUFFER_SIZE / the whole file; this only splits it into
+// chunks, which the loop fetches back to back.
+//
+// Reason: CDNs that pace a long-lived response serve a SHORT range at full
+// link speed and then throttle to roughly the stream's own bitrate. Measured
+// against googlevideo on a 28MB audio track: 4MB in 0.42s (~10 MB/s), 8MB in
+// 2.0s, and 12MB+ delivered 377KB in 12s — parked at ~30 KB/s. Asking for the
+// whole file (which a small one did, since it fits the buffer) therefore made
+// the demuxer's open wait ~18s for bytes it should have had in under a second;
+// that was the entire startup delay on a split-audio YouTube source.
+//
+// Two sizes, because the two chunks are asked for different reasons:
+//
+//   OPEN — the first one. Small, so the demuxer's first read is answered in a
+//   fraction of a second. That is the case above.
+//
+//   FILL — every one after it. Those exist to build a buffer, and 4MB is the
+//   wrong size for that on a heavy rung: at 8K (~60 Mbps) it is barely half a
+//   second of video per request, so the stream spends its time paying TTFB
+//   (measured 30-500ms each) instead of filling. The buffer then never gets
+//   ahead, which is what a switch to a high rung feels like. 8MB is the
+//   largest the CDN still served whole in the measurement above, so take it.
+// 4MB, and NOT smaller — tried. Shrinking this to 512KB on the theory that the
+// open chunk was the wait made it seventeen times worse: `loadedmetadata` went
+// from 1646ms to 28807ms on the same warm click. Whatever the demuxer needs to
+// open, it is not answered by one small range, and the fill loop taking over
+// from there is nowhere near as fast as one big request.
+const FIRST_RANGE_CHUNK_SIZE = 4 * 1024 * 1024;
+const MAX_RANGE_CHUNK_SIZE = 8 * 1024 * 1024;
 const CORS_DETECTION_THRESHOLD = 3; // Only treat "Failed to fetch" as CORS after N consecutive failures while online
 // A single reader.read() that yields no chunk within this window means the
 // connection went silent mid-stream — socket still open, zero bytes, no error,
@@ -69,6 +105,39 @@ export class HttpSource implements SourceAdapter {
   // Persistent Cache
   private headBuffer: Uint8Array | null = null;
 
+  /**
+   * Opening bytes handed over by whoever fetched them first, keyed by URL.
+   *
+   * The pre-play probe used to download ~3MB purely to time the link and throw
+   * every byte away — then this source downloaded the same opening bytes again.
+   * Now the probe reads the head of the rung it is measuring and leaves it
+   * here; `read()` already checks headBuffer before touching the network, so
+   * the demuxer's first reads are served without a request.
+   *
+   * One entry, replaced on each offer: only the rung about to open matters.
+   */
+  private static warmHead: { url: string; bytes: Uint8Array } | null = null;
+
+  /** Hand over opening bytes for a URL that is about to be opened. */
+  static offerWarmHead(url: string, bytes: Uint8Array): void {
+    if (!url || bytes.byteLength === 0) return;
+    HttpSource.warmHead = { url, bytes };
+  }
+
+  /**
+   * Size of the FIRST range request, overridable per source.
+   *
+   * 4MB is right for video — it covers the moov and the opening GOP. For a
+   * separate audio stream it is four minutes of AAC nobody needs yet, and it
+   * is fetched during startup where it costs seconds directly. The split-audio
+   * path asks for a smaller opening; the streaming loop after it is unchanged.
+   */
+  private firstRangeBytes = FIRST_RANGE_CHUNK_SIZE;
+
+  setFirstRangeBytes(bytes: number): void {
+    if (bytes > 0) this.firstRangeBytes = bytes;
+  }
+
   // Metadata LRU (see top-of-file comment). Keyed by absolute file offset
   // → the cached bytes. JS Map preserves insertion order; on hit we
   // delete+re-insert to bump to most-recent. Only small reads enter.
@@ -107,7 +176,31 @@ export class HttpSource implements SourceAdapter {
   // Stream state
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private abortController: AbortController | null = null;
-  private streamError: Error | null = null; // Store fatal errors from background stream
+  /**
+   * Aborted once on close(), killing every request this source has in flight.
+   *
+   * `abortController` above only covers the sequential stream (it's recycled on
+   * every stream restart), so the ranged reads went out with no signal at all —
+   * a player torn down mid-read (a quality switch, a source error recreate) left
+   * multi-megabyte range requests downloading to nobody, competing for the link
+   * with the replacement that just started.
+   */
+  private lifetimeAbort = new AbortController();
+  private streamError: Error | null = null;
+  /**
+   * A failure this URL will not recover from, remembered for the life of the
+   * source rather than for the life of one stream attempt.
+   *
+   * `streamError` is cleared by startStream(), which is correct for it — each
+   * attempt starts clean. But read() answers a window it cannot cover by
+   * calling startStream(), so a URL that had begun refusing produced: fetch,
+   * fail, set streamError, stop; read; startStream; CLEAR the error; fetch;
+   * fail… Measured against a signed URL expiring mid-playback, that ran 1131
+   * requests in five seconds, the state stayed "playing", and no error ever
+   * survived long enough for a reader to see one. The viewer got a picture
+   * that had quietly stopped and no reason for it.
+   */
+  private fatalError: Error | null = null; // Store fatal errors from background stream
 
   // Track maximum buffered position (independent of sliding window)
   private maxBufferedEnd: number = 0;
@@ -166,7 +259,13 @@ export class HttpSource implements SourceAdapter {
   private streamStartTime: number = 0;
   private lastSpeedBytes: number = 0;
   private lastSpeedTime: number = 0;
-  private currentSpeed: number = 0; // bytes per second
+  private currentSpeed: number = 0; // bytes per second (0 when idle — for UI)
+  // Last measured active download rate (bytes/s), NOT zeroed when idle. The ABR
+  // needs the link's capability even after a small file finishes caching; a
+  // fully-downloaded source reporting currentSpeed 0 was why Auto sat stuck at a
+  // low rung. Captured on the sub-1s path too (currentSpeed's 0.5s window misses
+  // a file that downloads in a few hundred ms).
+  private lastSpeed: number = 0;
   private lastProgressAt: number = 0;
   private rangeOpenEndedSwitches: number = 0;
   private readStalls: number = 0;
@@ -183,6 +282,18 @@ export class HttpSource implements SourceAdapter {
     this.url = url;
     this.headers = headers;
     this.maxBufferSizeMB = maxBufferSizeMB ?? DEFAULT_MAX_BUFFER_SIZE_MB;
+    // Claim the opening bytes if the probe fetched this exact URL. Consumed
+    // (not just read) so a later source for a different rung can't inherit
+    // another rung's head — that would hand the demuxer the wrong file.
+    const warm = HttpSource.warmHead;
+    if (warm && warm.url === url) {
+      this.headBuffer = warm.bytes;
+      HttpSource.warmHead = null;
+      Logger.info(
+        TAG,
+        `Opening ${(warm.bytes.byteLength / 1024 / 1024).toFixed(1)}MB served from the pre-play probe — no re-fetch`,
+      );
+    }
     this.initBuffer();
   }
 
@@ -398,6 +509,35 @@ export class HttpSource implements SourceAdapter {
     }
   }
 
+  // Prefetch throttle. When a separate split-audio track is bandwidth-starved
+  // (it cannot buffer because the video stream is saturating the connection),
+  // MoviPlayer flips this on so the video read loop stops pulling bytes — HTTP
+  // backpressure then frees the pipe for the audio to buffer. The video already
+  // runs a large lead buffer, so briefly pausing prefetch is safe. MoviPlayer
+  // auto-releases it (on audio-ready or a timeout), so a permanently stuck
+  // audio track can never freeze video prefetch.
+  //
+  // Orthogonal to the supersede mechanism (reader identity + generation): this
+  // one yields bandwidth on purpose while the SAME stream stays current, that
+  // one retires a stream a newer one has replaced. Both are live.
+  private _prefetchThrottled = false;
+
+  setPrefetchThrottle(throttled: boolean): void {
+    this._prefetchThrottled = throttled;
+  }
+
+  /**
+   * Park while the gate is closed. Callers must park BEFORE arming the
+   * read-stall watchdog — time spent here is a deliberate yield, not a silent
+   * connection, and it is also excluded from the speed measurement (see
+   * gateMsWindow) so giving way does not read as a slow link to the ABR.
+   */
+  private async awaitPrefetchGate(): Promise<void> {
+    while (this._prefetchThrottled && this.atomicIsStreaming()) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
   private atomicIsStreaming(): boolean {
     if (this.useSharedBuffer && this.headerView) {
       return Atomics.load(this.headerView, HEADER.STREAM_ACTIVE) === 1;
@@ -476,6 +616,7 @@ export class HttpSource implements SourceAdapter {
         const response = await fetch(this.url, {
           method: "HEAD",
           headers: await this.buildRequestHeaders(),
+          signal: this.lifetimeAbort.signal,
         });
 
         if (!response.ok) {
@@ -559,6 +700,7 @@ export class HttpSource implements SourceAdapter {
       res = await fetch(this.url, {
         method: "GET",
         headers: await this.buildRequestHeaders({ offset: 0, length: 1 }),
+        signal: this.lifetimeAbort.signal,
       });
     } catch {
       return null;
@@ -594,6 +736,7 @@ export class HttpSource implements SourceAdapter {
       res = await fetch(this.url, {
         method: "GET",
         headers: await this.buildRequestHeaders(),
+        signal: this.lifetimeAbort.signal,
       });
     } catch {
       return null;
@@ -859,6 +1002,10 @@ export class HttpSource implements SourceAdapter {
 
     Logger.info(TAG, `Starting stream from ${fromOffset}`);
 
+    // A URL that has already refused for good is not worth asking again — and
+    // asking is exactly what turns one refusal into a retry storm.
+    if (this.fatalError) throw this.fatalError;
+
     // Clear any previous stream error
     this.streamError = null;
 
@@ -1055,6 +1202,15 @@ export class HttpSource implements SourceAdapter {
     let rangeRetryCount = 0;
     let consecutiveOnlineFetchFailures = 0;
     let consecutiveReadStalls = 0; // watchdog: silent-connection reconnects with no progress
+    // A 4xx is usually the truth — an expired signature, a revoked link — but
+    // not always the FINAL truth: a CDN edge can hand back a 403 for a moment
+    // during a re-auth, and a 404 can be a node that has not caught up. So it
+    // is asked again, a few times, with a widening gap. Only the same answer
+    // every time is treated as the answer.
+    let fatalAttempts = 0;
+    const MAX_FATAL_ATTEMPTS = 3;
+    const FATAL_RETRY_DELAY = 700;
+    let lastFatalMessage = "";
     let streamBaseOffset = startOffset;
     // Set once a bounded range fetch is rejected with 403 by a server that only
     // accepts open-ended ranges; from then on this stream requests `bytes=N-`.
@@ -1087,9 +1243,25 @@ export class HttpSource implements SourceAdapter {
         // files. When the file fits entirely in the buffer, request the full
         // remainder so we don't leave a gap at the end that forces a second fetch.
         const fileCanFit = this.size > 0 && this.bufferSize >= this.size;
-        const maxDownload = fileCanFit
-          ? this.size  // Full file — no limit needed
+        // Two independent limits, applied in order.
+        //
+        // The WINDOW is how far ahead this source is willing to hold, and it is
+        // streamWindowBytes() — the one place that answer lives, so a raised
+        // `buffersize` widens the cushion instead of being re-derived (and
+        // re-capped) here. Everything else that reasons about the window
+        // (slideStreamWindow's 0.5 threshold) reads the same function; a second
+        // copy of the expression is how the two drift apart.
+        const windowLimit = fileCanFit
+          ? this.size  // Full file — the window is the whole thing
           : this.streamWindowBytes();
+        // …but never ask for the window in one request — see
+        // MAX_RANGE_CHUNK_SIZE. The loop below continues from where the chunk
+        // ended, so the window still fills; it just fills at link speed
+        // instead of whatever pace the CDN puts a long range on.
+        const maxDownload = Math.min(
+          windowLimit,
+          windowInitialized ? MAX_RANGE_CHUNK_SIZE : this.firstRangeBytes,
+        );
         const rangeEnd = this.size > 0
           ? Math.min(resumeOffset + maxDownload - 1, this.size - 1)
           : resumeOffset + maxDownload - 1;
@@ -1165,6 +1337,11 @@ export class HttpSource implements SourceAdapter {
 
         // Reset range retry counter on successful 206
         rangeRetryCount = 0;
+        // …and the fatal streak: the URL answered, so whatever it was is over.
+        if (response.ok || response.status === 206) {
+          fatalAttempts = 0;
+          lastFatalMessage = "";
+        }
 
         if (!response.ok && response.status !== 206) {
           // If 4xx error (client error), maybe don't retry indefinitely
@@ -1181,6 +1358,10 @@ export class HttpSource implements SourceAdapter {
         }
 
         this.reader = response.body!.getReader();
+        // Hold this fetch's reader locally so the loop can tell "still mine"
+        // from "a newer stream took over" — the supersede check below compares
+        // identity, and this.reader is null for a moment mid-swap.
+        const reader = this.reader;
         retryCount = 0; // Reset retry on success
         consecutiveOnlineFetchFailures = 0; // Successful fetch — not a CORS issue
 
@@ -1194,6 +1375,16 @@ export class HttpSource implements SourceAdapter {
         let downloadedBytes = 0;
         let lastLogBytes = 0;
         const startTime = Date.now();
+        // Time this loop spends PARKED at the prefetch gate, which is our own
+        // throttle rather than anything the link did. It has to come out of the
+        // throughput windows below: with it in, a stream that is deliberately
+        // paced reads as a slow link. That is how a connection delivering
+        // ~4 MB/s reported 0.07 MB/s once the buffer was ahead — and the ABR,
+        // which sizes rungs off exactly this number, then crawled up the ladder
+        // one step at a time instead of settling on the quality the link
+        // actually carries.
+        let gateMsWindow = 0; // parked since the last speed sample
+        let gateMsTotal = 0; // parked across this whole stream
 
         // Initialize network stats timing
         if (this.streamStartTime === 0) {
@@ -1203,6 +1394,20 @@ export class HttpSource implements SourceAdapter {
 
         // Read Loop
         while (this.atomicIsStreaming()) {
+          // Yield the network to a bandwidth-starved split-audio track. This is
+          // a deliberate park, so it happens BEFORE the stall watchdog starts
+          // timing — otherwise giving way would read as a silent connection and
+          // the watchdog would tear down a stream that is behaving exactly as
+          // asked.
+          const parkedAt = Date.now();
+          await this.awaitPrefetchGate();
+          const parkedMs = Date.now() - parkedAt;
+          gateMsWindow += parkedMs;
+          gateMsTotal += parkedMs;
+          // Bail if the stream stopped OR was superseded while we were parked
+          // (this.reader swapped to a new stream's reader — reading it here would
+          // corrupt the new stream and can be null mid-swap).
+          if (!this.atomicIsStreaming() || this.reader !== reader) break;
           const chunk = await this.readChunkWithStallTimeout();
           if (chunk === null) {
             // Connection went silent mid-stream (see READ_STALL_TIMEOUT_MS).
@@ -1231,7 +1436,18 @@ export class HttpSource implements SourceAdapter {
           }
           const { done, value } = chunk;
           if (done) {
-            this.atomicSetStreaming(false);
+            // A body that ends short of the file is normally OUR range cap
+            // (MAX_RANGE_CHUNK_SIZE), not the end of the data. Stay streaming
+            // and let the outer loop fetch the next chunk from where this one
+            // stopped — tearing the stream down here would make the next read
+            // miss and pay a full restart every few MB. `downloadedBytes > 0`
+            // keeps a server that answers with an empty body from spinning
+            // the loop.
+            const nextOffset =
+              this.atomicGetBufferStart() + this.atomicGetWritePos();
+            const moreToFetch =
+              this.size > 0 && nextOffset < this.size && downloadedBytes > 0;
+            if (!moreToFetch) this.atomicSetStreaming(false);
             break;
           }
 
@@ -1244,17 +1460,24 @@ export class HttpSource implements SourceAdapter {
             // Track global network stats
             this.totalBytesDownloaded += value.length;
             const now = Date.now();
-            const speedElapsed = (now - this.lastSpeedTime) / 1000;
+            // Active (unparked) time only — see gateMsWindow above.
+            const speedElapsed = (now - this.lastSpeedTime - gateMsWindow) / 1000;
             if (speedElapsed >= 0.5) {
               const bytesSinceLast = this.totalBytesDownloaded - this.lastSpeedBytes;
               this.currentSpeed = bytesSinceLast / speedElapsed;
+              this.lastSpeed = this.currentSpeed;
               this.lastSpeedBytes = this.totalBytesDownloaded;
               this.lastSpeedTime = now;
+              gateMsWindow = 0;
             }
 
             if (downloadedBytes - lastLogBytes > 1024 * 1024) {
               // Log every 1MB
-              const elapsed = (Date.now() - startTime) / 1000;
+              const elapsed = (Date.now() - startTime - gateMsTotal) / 1000;
+              // Per-1MB active rate (bytes/s) — captured even for a sub-0.5s
+              // download that the window above never gets to measure. Parked
+              // time is excluded here for the same reason as the window.
+              if (elapsed > 0) this.lastSpeed = downloadedBytes / elapsed;
               const speed =
                 elapsed > 0 ? downloadedBytes / 1024 / 1024 / elapsed : 0;
               Logger.debug(
@@ -1385,6 +1608,7 @@ export class HttpSource implements SourceAdapter {
               );
               this.atomicSetStreaming(false);
               this.streamError = corsError;
+              this.fatalError = corsError;
               throw corsError;
             }
             Logger.warn(TAG, `Fetch failed while online (${consecutiveOnlineFetchFailures}/${CORS_DETECTION_THRESHOLD}), may be transient network issue`);
@@ -1410,9 +1634,34 @@ export class HttpSource implements SourceAdapter {
         // surface the real reason to the user.
         const errMsgForFatal = (error as any)?.message || "";
         if (errMsgForFatal.includes("(Fatal)")) {
-          Logger.error(TAG, `Fatal HTTP error, not retrying: ${errMsgForFatal}`);
+          // Same failure as last time? Then it is a fact about the URL, not a
+          // moment. A DIFFERENT one starts the count again — something is still
+          // changing, and that is worth another ask.
+          if (errMsgForFatal !== lastFatalMessage) {
+            lastFatalMessage = errMsgForFatal;
+            fatalAttempts = 0;
+          }
+          fatalAttempts++;
+          if (fatalAttempts < MAX_FATAL_ATTEMPTS && this.atomicIsStreaming()) {
+            const wait = FATAL_RETRY_DELAY * fatalAttempts;
+            Logger.warn(
+              TAG,
+              `${errMsgForFatal} (attempt ${fatalAttempts}/${MAX_FATAL_ATTEMPTS}) — retrying in ${wait}ms`,
+            );
+            try {
+              if (this.reader) await this.reader.cancel();
+            } catch {}
+            this.reader = null;
+            await new Promise((r) => setTimeout(r, wait));
+            continue;
+          }
+          Logger.error(
+            TAG,
+            `Fatal HTTP error after ${fatalAttempts} attempts, giving up: ${errMsgForFatal}`,
+          );
           this.atomicSetStreaming(false);
           this.streamError = error instanceof Error ? error : new Error(errMsgForFatal);
+          this.fatalError = this.streamError;
           break;
         }
 
@@ -1471,6 +1720,9 @@ export class HttpSource implements SourceAdapter {
           this.streamError = (error instanceof Error)
             ? error
             : new Error(typeof error === "string" ? error : "Stream failed after maximum retries");
+          // Ten attempts with backoff have been spent. Whatever this is, one
+          // more startStream() will not fix it — and read() would call one.
+          this.fatalError = this.streamError;
           break;
         }
         // Backoff — listen for online event or abort signal to exit early
@@ -1576,6 +1828,9 @@ export class HttpSource implements SourceAdapter {
 
     try {
       while (this.atomicIsStreaming()) {
+        // Yield the network to a bandwidth-starved split-audio track.
+        await this.awaitPrefetchGate();
+        if (!this.atomicIsStreaming()) break;
         const { done, value } = await reader.read();
         if (done) break;
         if (!value || value.length === 0) continue;
@@ -1819,6 +2074,9 @@ export class HttpSource implements SourceAdapter {
   }
 
   async read(offset: number, length: number): Promise<ArrayBuffer> {
+    // Torn down mid-read. Say so plainly rather than restarting streams on a
+    // dead source — the caller (a demuxer being replaced) is on its way out.
+    if (this.closed) throw new Error("Source closed");
     // LRU peek first — metadata reads often repeat after the sliding window
     // has moved on. Cheap: single Map scan, bounded size.
     const cached = this.peekMetadata(offset, length);
@@ -2032,6 +2290,7 @@ export class HttpSource implements SourceAdapter {
         const rangeLen = rangeEnd - offset + 1;
         const response = await fetch(this.url, {
           headers: await this.buildRequestHeaders({ offset, length: rangeLen }),
+          signal: this.lifetimeAbort.signal,
         });
         if (response.status === 206 || response.ok) {
           // Guard against a server that ignores the Range header and streams
@@ -2079,6 +2338,11 @@ export class HttpSource implements SourceAdapter {
       }
     }
 
+    // A URL that has already failed for good answers every read the same way.
+    // Checked here as well as in startStream() so the one-off range path above
+    // cannot spin on it either.
+    if (this.fatalError) throw this.fatalError;
+
     // Need new stream (Seeked outside window, or stream dead)
     Logger.debug(TAG, `Read: starting new stream from ${offset}`);
     await this.startStream(offset);
@@ -2103,6 +2367,26 @@ export class HttpSource implements SourceAdapter {
     const bufferStart = this.atomicGetBufferStart();
     const localOffset = offset - bufferStart;
     const available = Math.min(length, this.bufferEnd - offset);
+
+    // Never hand the demuxer a SHORT buffer for a read that isn't a genuine EOF
+    // tail. If the streaming window stopped at a 40MB-chunk boundary (or slid)
+    // just before the last bytes of this range landed, returning the partial
+    // slice makes the WASM demuxer parse a truncated packet and trap with
+    // RuntimeError: Aborted() — surfaced to the user as "corrupt data stream".
+    // Throw a retriable I/O error instead: the read loop restarts the stream and
+    // retries, and the demuxer treats it as a normal read failure (no crash). A
+    // real EOF tail (starts INSIDE the file but runs past its end) still returns
+    // short. A read that *starts* at/after the file end (offset >= size) is not a
+    // tail — it's an out-of-range read (e.g. a rendition swap left a byte cursor
+    // sized for the previous, larger file); treat it as incomplete so it throws
+    // rather than slicing a negative-length array or feeding garbage to the WASM.
+    const isEofTail =
+      this.size > 0 && offset < this.size && offset + length > this.size;
+    if ((available < length || localOffset < 0) && !isEofTail) {
+      throw new Error(
+        `Incomplete read at ${offset}: ${Math.max(0, available)}/${length} bytes buffered`,
+      );
+    }
 
     const result = new Uint8Array(available);
     result.set(buffer.subarray(localOffset, localOffset + available));
@@ -2159,9 +2443,21 @@ export class HttpSource implements SourceAdapter {
   }
 
   close(): void {
+    this.closed = true;
     this.stopStream();
+    // Kill anything still in flight (ranged reads, a size probe), not just the
+    // sequential stream — otherwise they keep downloading after teardown.
+    this.lifetimeAbort.abort();
+    // Anything parked waiting for bytes has to be let go, or it sits on a
+    // stream that will never write again until its own deadline expires.
+    this.wakeBufferWaiters(true);
     Logger.debug(TAG, "Source closed");
   }
+
+  /** True once close() has run. Reads stop trying to recover after that: their
+   *  data is not coming, and restarting a stream on a torn-down source only
+   *  produces failures that look like the link breaking. */
+  private closed = false;
 
   getKey(): string {
     return this.url;
@@ -2180,17 +2476,71 @@ export class HttpSource implements SourceAdapter {
   }
 
   /**
+   * The file size if it is already known, -1 before it has been resolved.
+   *
+   * getSize() is the way to ASK for it (it will go and fetch it); this is for
+   * callers on a synchronous path — a UI tick reading the buffered range — that
+   * want the answer only if it is already in hand.
+   */
+  getKnownSize(): number {
+    return this.size;
+  }
+
+  /**
    * Get the current buffered end position in bytes
    * This represents the furthest byte that has been buffered
    * Uses the maximum of current buffer window and historical max position,
    * but caps it to not exceed what's actually available
    */
+  /**
+   * The first byte the streaming window currently holds.
+   *
+   * The window slides, so "the end is EOF" does NOT mean the file is
+   * downloaded — a container whose index lives at the tail (Matroska cues, a
+   * trailing MP4 moov) sends the window there during open, and for that moment
+   * the window ends at the last byte of a 3.6GB file it has read 4MB of.
+   * Callers that want "everything from here to the end is in hand" have to ask
+   * where the window STARTS as well.
+   */
+  /**
+   * The failure this source will not come back from, if there has been one.
+   *
+   * Asked at EOF. The demuxer reads through a C callback that can only answer
+   * with a byte count, so a read that FAILED and a read that reached the end of
+   * the file arrive as the same thing: no bytes. FFmpeg calls that EOF, the
+   * packet loop ends the video, and a source that had been refused mid-file
+   * looked exactly like a file that had finished — the picture stopped, the
+   * clock jumped to the duration, and anything watching for "ended" (an
+   * autoplay-next, a playlist) moved on as though nothing had gone wrong.
+   */
+  getFatalError(): Error | null {
+    return this.fatalError;
+  }
+
+  getBufferedStart(): number {
+    if (this.fullyBuffered) return 0;
+    return this.atomicGetBufferStart();
+  }
+
   getBufferedEnd(): number {
     // Entire file is in memory — report full size
     if (this.fullyBuffered && this.size > 0) return this.size;
 
     const currentBufferEnd = this.bufferEnd;
     const bufferStart = this.atomicGetBufferStart();
+
+    // Reading inside the head cache. Those bytes are buffered — they are just
+    // not in the STREAMING window, which is still at zero because nothing has
+    // been fetched yet. Without this the clamp below returns `position`, so
+    // forward = end - position = 0, and callers conclude nothing is buffered:
+    // the freeze watchdog took a healthy 1080p down to 720p on that reading
+    // ("ABR emergency downshift (starved 0.0s at 5.0s)") while every read was
+    // being served from this very cache.
+    const headEnd = this.headBuffer?.length ?? 0;
+    if (headEnd > this.position) {
+      const end = Math.max(headEnd, currentBufferEnd);
+      return this.size > 0 ? Math.min(end, this.size) : end;
+    }
 
     // If the current read position is outside the buffer window, the buffer
     // doesn't cover us — there is nothing forward-buffered at the new spot
@@ -2239,6 +2589,7 @@ export class HttpSource implements SourceAdapter {
   getNetworkStats(): {
     totalBytes: number;
     currentSpeed: number;
+    lastSpeed: number;
     elapsed: number;
     streamGeneration: number;
     rangeOpenEndedSwitches: number;
@@ -2251,7 +2602,8 @@ export class HttpSource implements SourceAdapter {
     const speed = timeSinceLastRead > 1 ? 0 : this.currentSpeed;
     return {
       totalBytes: this.totalBytesDownloaded,
-      currentSpeed: speed,
+      currentSpeed: speed, // 0 when idle — UI graph / stats
+      lastSpeed: this.lastSpeed, // last measured rate, persists when idle — ABR
       elapsed: this.streamStartTime > 0 ? (Date.now() - this.streamStartTime) / 1000 : 0,
       streamGeneration: this.atomicGetVersion(),
       rangeOpenEndedSwitches: this.rangeOpenEndedSwitches,

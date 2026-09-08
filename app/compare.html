@@ -6,6 +6,26 @@
     <title>Native &lt;video&gt; vs MoviPlayer — Side-by-side comparison</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 
+    <!-- This page runs the SLIM build: element.slim.js carries no WASM (4MB vs
+         10.9MB), and the engine streams from a separate movi.wasm. Both are on
+         the critical path to the first frame, so start both downloads during
+         <head> — the module <script> at the bottom of <body> would otherwise
+         only kick them off once the parser reaches it. Same versioned URLs the
+         glue uses, so each is one cached request. -->
+    <link
+      rel="modulepreload"
+      href="/dist/__BUILD_VERSION__/element.slim.js"
+      fetchpriority="high"
+    />
+    <link
+      rel="preload"
+      href="/dist/__BUILD_VERSION__/movi.wasm"
+      as="fetch"
+      type="application/wasm"
+      crossorigin
+      fetchpriority="high"
+    />
+
     <meta name="description" content="Drop any MKV/HEVC/AV1 file. See exactly what your browser's native <video> tag silently ignores — multi-audio tracks, embedded subtitles, chapters — and what MoviPlayer surfaces." />
     <meta name="robots" content="index, follow" />
     <link rel="canonical" href="https://moviplayer.com/compare" />
@@ -21,6 +41,25 @@
     <meta name="twitter:description" content="Drop an MKV. See what the native <video> tag silently ignores." />
 
     <meta name="theme-color" content="#0f0f12" />
+
+    <!-- Debug: open /compare?movilog to route the player bundle's internal logs
+         to the DevTools console. The bundle calls window.__movilog (that name
+         survives minification; plain console.* is stripped by terser's
+         drop_console), so the sink MUST exist before the bundle script runs. -->
+    <script>
+      if (new URLSearchParams(location.search).has("movilog")) {
+        (function () {
+          var f = function (n) {
+            return function () {
+              console[n].apply(console, ["%c[movi]", "color:#6c5dd3"].concat([].slice.call(arguments)));
+            };
+          };
+          var m = f("log");
+          m.log = f("log"); m.info = f("info"); m.warn = f("warn"); m.error = f("error"); m.debug = f("debug");
+          window.__movilog = m;
+        })();
+      }
+    </script>
 
     <style>
       :root {
@@ -677,8 +716,9 @@
         </a>
         <ul class="nav-links">
           <li><a href="/">Player</a></li>
+          <li><a href="/examples">Examples</a></li>
           <li><a href="/compare" class="active">Compare</a></li>
-          <li><a href="https://mrujjwalg.github.io/movi-player/" target="_blank" rel="noopener">Docs</a></li>
+          <li><a href="/docs">Docs</a></li>
         </ul>
       </div>
       <div class="nav-right">
@@ -735,7 +775,7 @@
             <div class="pane-title">Native &lt;video&gt; <span class="badge native">Built into your browser</span></div>
           </div>
           <div class="pane-stage">
-            <video id="native-video" controls playsinline muted autoplay></video>
+            <video id="native-video" controls playsinline muted></video>
             <div class="pane-fallback" id="native-fallback" hidden></div>
           </div>
           <div class="pane-tracks" id="native-tracks">
@@ -785,13 +825,23 @@
 
       <section class="footer-cta">
         <p>Want this in your own site? <code>npm install movi-player</code> and drop a <code>&lt;movi-player&gt;</code> tag.</p>
-        <a class="btn btn-primary" href="https://mrujjwalg.github.io/movi-player/" target="_blank" rel="noopener">Read the docs</a>
+        <a class="btn btn-primary" href="/docs">Read the docs</a>
         <a class="btn btn-secondary" href="https://github.com/mrujjwalg/movi-player" target="_blank" rel="noopener">View on GitHub</a>
       </section>
     </main>
 
     <script type="module">
-      import "/dist/__BUILD_VERSION__/element.js";
+      // Slim build — same <movi-player>, WASM streamed from movi.wasm alongside.
+      import * as Movi from "/dist/__BUILD_VERSION__/element.slim.js";
+
+      // ?movilog → expose the namespace + raise the log level so debug/FFmpeg
+      // lines actually fire (the __movilog console sink is wired up in <head>,
+      // before this bundle loads).
+      if (new URLSearchParams(location.search).has("movilog")) {
+        window.Movi = Movi;
+        try { Movi.MoviPlayer.setLogLevel(Movi.LogLevel.TRACE); }
+        catch (e) { console.warn("[movilog] setLogLevel failed", e); }
+      }
 
       const DEFAULT_SAMPLE = {
         url: "/samples/sintel-2010-1080p.mkv",
@@ -1153,25 +1203,36 @@
         nativeFallback.hidden = true;
         moviFallback.hidden = true;
 
-        nativeVideo.src = nativeSrc;
-        nativeVideo.load();
-        // Race loadedmetadata / error / timeout. We don't trust the default
-        // value of nativeOk — Safari rejects MKV silently (no error event,
-        // no loadedmetadata), so the timeout would resolve with the default
-        // unchanged. Decide nativeOk authoritatively AFTER the race using
-        // the real element state (videoWidth + .error) below.
-        const nativeLoadOnce = new Promise((res) => {
-          nativeVideo.addEventListener("loadedmetadata", () => res(), { once: true });
-          nativeVideo.addEventListener("error", () => res(), { once: true });
-          setTimeout(res, 5000);
-        });
-
+        // Load MoviPlayer FIRST, native SECOND (below), rather than both at
+        // once. Both players fetch the same file independently — a true single
+        // fetch feeding both isn't possible, because the native <video> does its
+        // own range I/O and can't be handed a shared buffer for an MKV (MSE only
+        // accepts fragmented MP4). Firing both at t=0 makes them fight over the
+        // network for the same bytes, slowing both. Staggering removes that
+        // contention, and the synchronized start at the end (both begin together
+        // once each has its first frame) replaces the cache-dependent race —
+        // cold-cache favoured Movi's targeted range reads, warm-cache favoured
+        // the native tag's zero-JS start, so "who plays first" flip-flopped.
         moviPlayer.src = moviSrc;
 
         // Use the player's own demux/track parsing instead of spinning up a
         // second Demuxer. The player will fire trackschange / loadeddata
         // once its source is open; we then pull tracks via its public API.
         const moviResult = await waitForPlayerMetadata();
+
+        // Now bring the native pane up, after Movi already has its metadata.
+        nativeVideo.src = nativeSrc;
+        nativeVideo.load();
+        // Race canplay / error / timeout. We don't trust the default value of
+        // nativeOk — Safari rejects MKV silently (no error event, no metadata),
+        // so the timeout would resolve with the default unchanged. Decide
+        // nativeOk authoritatively AFTER the race using the real element state
+        // (videoWidth + .error) below.
+        const nativeLoadOnce = new Promise((res) => {
+          nativeVideo.addEventListener("canplay", () => res(), { once: true });
+          nativeVideo.addEventListener("error", () => res(), { once: true });
+          setTimeout(res, 5000);
+        });
         if (!moviResult.ok) {
           setFallback(
             moviFallback,
@@ -1214,6 +1275,21 @@
         }
 
         await nativeLoadOnce;
+
+        // MoviPlayer drives the pair. It has `autoplay muted`, so it starts on
+        // its own — and that autoplay path is what surfaces its "Tap to unmute"
+        // pill (the pill is gated on controls + autoplay + muted; without
+        // autoplay it never appears). Rather than race a second independent
+        // autoplay on the native pane, bring native up to Movi's current frame
+        // and play it from there: same frame, no cache-dependent "who's first"
+        // flip-flop, and no t=0 contention since native only started loading
+        // after Movi had its metadata. Muted, so play() needs no gesture; a
+        // native that rejected the file just no-ops.
+        try {
+          const t = Number(moviPlayer.currentTime);
+          if (Number.isFinite(t) && t > 0) nativeVideo.currentTime = t;
+          await nativeVideo.play?.();
+        } catch {}
 
         // Authoritative detection: the element either has decoded video
         // dimensions OR enough metadata to play (readyState >= HAVE_METADATA)

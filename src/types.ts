@@ -111,6 +111,12 @@ export interface AudioSourceEntry {
   type?: string;
   lang: string;       // BCP 47 language code (e.g., "en", "hi", "ja")
   label: string;      // Display name (e.g., "English", "Hindi")
+  /**
+   * Pre-built adapter for this track (e.g. an HLS audio rendition presented as
+   * a concatenated segment stream). Opened directly instead of `url` when set;
+   * `url` still serves as the display/cache key.
+   */
+  adapter?: import("./source/SourceAdapter").SourceAdapter;
 }
 
 /** External subtitle source (VTT/SRT) with language metadata */
@@ -118,7 +124,7 @@ export interface SubtitleSourceEntry {
   url: string;
   lang: string;       // BCP 47 language code
   label: string;      // Display name
-  format?: "vtt" | "srt"; // Auto-detected from URL extension if omitted
+  format?: "vtt" | "srt" | "ttml"; // Auto-detected from URL extension if omitted
 }
 
 export interface CacheConfig {
@@ -142,6 +148,26 @@ export interface PlayerConfig {
    * branch. The adapter's `getSize()` and `read()` are called directly.
    */
   sourceAdapter?: import("./source/SourceAdapter").SourceAdapter;
+  /**
+   * Skip the MSE stream engines (Shaka / hls.js / dash.js) for a DASH source
+   * and play its single-file Representation through the FFmpeg-WASM demuxer
+   * instead. Set after an MSE engine fails at RUNTIME on a codec the browser
+   * can't decode (e.g. Safari + HE-AAC): the demuxer decodes every codec.
+   */
+  forceStreamDemux?: boolean;
+  /**
+   * Skip Shaka and play a stream through a specific MSE engine (hls.js /
+   * dash.js) directly. Set when Shaka failed at runtime but the other engine
+   * is more lenient (e.g. a manifest/actual codec mismatch) — tried before the
+   * heavier WASM demuxer so hardware MSE playback is preferred when possible.
+   */
+  forceStreamEngine?: "dashjs" | "hlsjs";
+  /**
+   * When force-demuxing a DASH source, use this specific video Representation
+   * file instead of the best one — set when the user picks a quality in the
+   * demuxer-mode quality menu, so the re-load lands on the chosen rendition.
+   */
+  forceVideoRendition?: string;
   /** Separate audio source — single or multi-language */
   audioSource?: SourceConfig;
   /** Multiple audio tracks with language metadata */
@@ -172,6 +198,14 @@ export interface Chapter {
   title: string;
   start: number; // seconds
   end: number;   // seconds
+  /**
+   * Optional artwork for the chapter, supplied by the host alongside the list.
+   * Where it is set the timeline tile shows it instead of decoding a frame at
+   * `start` — which is both the picture the host wanted and one less seek.
+   * Container chapters never carry one; it is only ever set through the
+   * `chapters` attribute/property.
+   */
+  image?: string;
 }
 
 export interface MediaInfo {
@@ -237,6 +271,53 @@ export interface Packet {
   disposable: boolean;
 }
 
+/**
+ * Pluggable subtitle renderer. movi-player decodes video to its own WebGL canvas
+ * (no HTMLVideoElement), so a native `<track>` overlay can't be used — and full
+ * ASS/SSA styling (positioning, karaoke, embedded fonts) is beyond the built-in
+ * text/bitmap path. Register one of these via `player.setSubtitleRenderer()` (or
+ * `<movi-player>.setSubtitleRenderer()`) to take over an embedded subtitle track
+ * with your own renderer — e.g. jassub (libass-wasm) for pixel-accurate ASS —
+ * without the core taking that dependency.
+ *
+ * When a renderer is set, the player stops feeding the selected subtitle stream
+ * to its internal decoder and drives this instead: `configure` on track select,
+ * `pushPacket` for each demuxed subtitle packet, `render` every frame with the
+ * current media time and the video's native dimensions, `setDelay` on a subtitle
+ * offset change, `clear` on seek/track change, and `destroy` on teardown/swap.
+ * If `mount` is present the player calls it with an overlay element already sized
+ * and positioned over the visible video (letterbox-aware) for the renderer to
+ * draw into.
+ */
+export interface SubtitleRenderer {
+  /** Called on track selection. `extradata` is the codec header (the ASS
+   *  `[Script Info]`/`[V4+ Styles]` block for ass/ssa). `fonts` are embedded
+   *  font attachments when available (may be undefined). */
+  configure(
+    track: SubtitleTrack,
+    extradata?: Uint8Array,
+    fonts?: Uint8Array[],
+  ): Promise<void> | void;
+  /** One demuxed subtitle packet for the active track. */
+  pushPacket(packet: Packet): Promise<void> | void;
+  /** Draw the state for `mediaTime` (seconds). `videoWidth`/`videoHeight` are the
+   *  source frame dimensions the subtitle coordinates are authored against. */
+  render(
+    mediaTime: number,
+    videoWidth: number,
+    videoHeight: number,
+  ): Promise<void> | void;
+  /** Optional: receive the player's subtitle overlay element (absolutely
+   *  positioned over the visible video) to append a canvas/DOM into. */
+  mount?(container: HTMLElement): void;
+  /** Subtitle timing offset in seconds (positive = later). */
+  setDelay(seconds: number): void;
+  /** Drop all pending state — called on seek and track change. */
+  clear(): void;
+  /** Release resources — called on teardown or when swapped out. */
+  destroy(): Promise<void> | void;
+}
+
 // ============================================================================
 // Frame Types
 // ============================================================================
@@ -296,6 +377,14 @@ export interface PlayerEventMap {
   filerevoked: { offset: number; length: number; reason: string };
   loadStart: void;
   loadEnd: void;
+  /**
+   * An in-place rendition switch started (`active: true`) or finished. Playback
+   * continues throughout — audio never stops — but the picture is held for a
+   * second or two while the new rendition opens, and without a sign of life
+   * that pause reads as the player glitching. `label` names the rung being
+   * moved to, for a UI that wants to say so.
+   */
+  renditionSwitch: { active: boolean; label?: string };
   seeking: number;
   seeked: number;
   bufferUpdate: { start: number; end: number }[];
@@ -315,4 +404,12 @@ export interface PlayerEventMap {
    * to cache whole. The UI hides the timeline and disables seeking/thumbnails.
    */
   linearmode: void;
+  /**
+   * Autoplay-with-sound was refused, so playback started muted instead. The UI
+   * surfaces the "Tap to unmute" pill — the user's gesture is the only way back
+   * to audio. Emitted by the native fallback, whose muting happens inside the
+   * media element (the WASM path detects the same condition off its
+   * AudioContext, see maybeFallbackToMutedAutoplay).
+   */
+  autoplaymuted: void;
 }

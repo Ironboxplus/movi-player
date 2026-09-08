@@ -104,6 +104,10 @@ typedef struct {
   int64_t position;  // Current read position
   int64_t file_size; // Total file size
   int avio_buffer_size;
+  // How far FFmpeg may read, and how much media it may analyse, before it will
+  // name the streams. Zero means "use the default" — see movi_set_probe_limits.
+  int64_t probe_size;
+  int64_t max_analyze_us;
 
   // Decoding support
   AVCodecContext **decoders;

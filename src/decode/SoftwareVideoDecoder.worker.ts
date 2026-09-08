@@ -15,6 +15,8 @@ type ConfigureRequest = {
   height: number;
   frameRate: number;
   targetFps: number;
+  /** Adaptive load shedding state carried across a re-configure. */
+  nonRefSkip?: boolean;
   extradata?: Uint8Array;
   controlBuffer?: SharedArrayBuffer;
 };
@@ -33,6 +35,15 @@ type DecodeRequest = {
 type WorkerRequest =
   | ConfigureRequest
   | DecodeRequest
+  // Adaptive load shedding, mirroring SoftwareVideoDecoder.setNonRefSkip() on
+  // the main thread: AVDISCARD_NONREF drops non-reference frames so a device
+  // that can't sustain the source rate does far less decode work.
+  | {
+      type: "setSkipFrame";
+      generation: number;
+      trackId: number;
+      enabled: boolean;
+    }
   | { type: "reset"; generation: number; trackId: number }
   | { type: "close"; generation: number; trackId: number };
 
@@ -45,6 +56,20 @@ let trackId = -1;
 let queueDepth = 0;
 let inFlight = 0;
 let targetFps = 0;
+// Adaptive load shedding, latched across re-configures — see the setSkipFrame
+// request and WorkerSoftwareVideoDecoder.setNonRefSkip().
+let nonRefSkip = false;
+
+/**
+ * AVDISCARD level for the decoder. 1 = AVDISCARD_NONREF.
+ *
+ * Two independent reasons to shed, one knob: an explicit shed from the renderer
+ * (nonRefSkip), and a target frame rate so low that non-reference frames would
+ * be thrown away by the frame-rate gate anyway.
+ */
+function skipFrameLevel(): number {
+  return nonRefSkip || (targetFps > 0 && targetFps < 10) ? 1 : 0;
+}
 let lastProcessedTimestamp = -1;
 let cancelGeneration: Int32Array | null = null;
 
@@ -93,6 +118,7 @@ async function configure(message: ConfigureRequest): Promise<void> {
   queueDepth = 0;
   inFlight = 0;
   targetFps = message.targetFps;
+  nonRefSkip = message.nonRefSkip ?? false;
   lastProcessedTimestamp = -1;
   closeDecoder();
 
@@ -126,10 +152,7 @@ async function configure(message: ConfigureRequest): Promise<void> {
       return;
     }
 
-    moduleRef._movi_video_decoder_set_skip_frame(
-      decoderPtr,
-      targetFps > 0 && targetFps < 10 ? 1 : 0,
-    );
+    moduleRef._movi_video_decoder_set_skip_frame(decoderPtr, skipFrameLevel());
     post({
       type: "configured",
       requestId: message.requestId,
@@ -305,6 +328,18 @@ scope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
   }
   if (message.type === "decode") {
     decode(message);
+    return;
+  }
+  if (message.type === "setSkipFrame") {
+    // Latched so the configure() below re-applies it after a track switch, and
+    // applied immediately when a decoder already exists.
+    nonRefSkip = message.enabled;
+    if (moduleRef && decoderPtr) {
+      moduleRef._movi_video_decoder_set_skip_frame(
+        decoderPtr,
+        skipFrameLevel(),
+      );
+    }
     return;
   }
   if (message.type === "reset") {

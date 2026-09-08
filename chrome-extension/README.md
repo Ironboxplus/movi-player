@@ -2,6 +2,11 @@
 
 Play any video URL with Movi Player directly in Chrome.
 
+This folder is also the **source of truth for the Firefox add-on** — everything
+except `manifest.json` is copied into [`../firefox-extension/`](../firefox-extension/)
+by its `build.sh`. Keep changes here browser-agnostic (no bare `window.chrome`
+checks, no unconditional `chrome://` links); see `popup.js` for the pattern.
+
 ## Features
 
 - **Play button overlay** on video links detected on any page

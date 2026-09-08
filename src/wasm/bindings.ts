@@ -377,6 +377,12 @@ export class WasmBindings {
    * Set file size (required before open for proper seeking)
    * @param size File size in bytes
    */
+  /** Open budget the host asked for, in bytes / milliseconds. 0 = the C
+   *  default. Static because every demuxer in a page wants the same answer and
+   *  it is set from the element long before any of them exist. */
+  static probeBytes = 0;
+  static probeAnalyzeMs = 0;
+
   setFileSize(size: number): void {
     if (!this.contextPtr) {
       Logger.warn(TAG, "Cannot set file size: context not created");
@@ -461,6 +467,20 @@ export class WasmBindings {
     const sizeLow = Number(fileSizeBigInt & 0xffffffffn);
     const sizeHigh = Number(fileSizeBigInt >> 32n);
     this.module._movi_set_file_size(this.contextPtr, sizeLow, sizeHigh);
+
+    // How far FFmpeg may look before it names the streams. Only sent when the
+    // host asked for something narrower — unset leaves the C defaults, which
+    // are generous on purpose (a headerless stream is identified by watching
+    // packets, and cutting that blind finds no streams at all).
+    if (WasmBindings.probeBytes || WasmBindings.probeAnalyzeMs) {
+      // Guarded: an older movi.wasm on disk will not have the export, and a
+      // faster open is not worth failing to open at all.
+      this.module._movi_set_probe_limits?.(
+        this.contextPtr,
+        WasmBindings.probeBytes || 0,
+        WasmBindings.probeAnalyzeMs || 0,
+      );
+    }
 
     // Open (this will trigger async reads via AVIO callbacks)
     // IMPORTANT: Use ccall with async:true for Asyncify to work correctly

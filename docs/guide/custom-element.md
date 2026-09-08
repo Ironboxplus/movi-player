@@ -38,6 +38,7 @@ The `<movi-player>` custom element is a drop-in replacement for the native `<vid
 | Attribute     | Type                | Values                             | Description                                       |
 | ------------- | ------------------- | ---------------------------------- | ------------------------------------------------- |
 | `objectfit`   | `string`            | `contain`, `cover`, `fill`, `zoom` | Video scaling mode                                |
+| `rotate`      | `number`            | `0`, `90`, `180`, `270`            | Rotate video, in degrees (snaps to a quarter-turn) |
 | `theme`       | `string`            | `dark`, `light`                    | UI theme                                          |
 | `hdr`         | `boolean`           | -                                  | Enable HDR rendering                              |
 | `ambientmode` | `boolean`           | -                                  | Ambient background effects                        |
@@ -47,6 +48,8 @@ The `<movi-player>` custom element is a drop-in replacement for the native `<vid
 | `thumb`       | `boolean`           | -                                  | Enable seek preview thumbnails                    |
 | `fastseek`    | `boolean`           | -                                  | Enable skip buttons and gestures                  |
 | `showtitle`   | `boolean`           | -                                  | Show video title bar                              |
+| `titlemode`   | `string`            | `both`                             | Where the title bar shows — `both`, `fullscreen`, `windowed`; add `back` for a back arrow that fires a `back` event (scope it with `back-mobile`, `back-fullscreen`, `back-mobile-fullscreen`) |
+| `chapters`    | `string`            | -                                  | Chapters from outside the media, as JSON `[{title, start}]` (or set the `chapters` property) |
 | `resume`      | `boolean`           | -                                  | Resume from last position                         |
 | `stablevolume`| `boolean`           | -                                  | Loudness normalization                            |
 | `startat`     | `number`            | -                                  | Start at time (seconds)                           |

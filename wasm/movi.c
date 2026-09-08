@@ -169,6 +169,17 @@ void movi_set_file_size(MoviContext *ctx, int size_low, int size_high) {
   }
 }
 
+// Narrow the open budget, in BYTES and MILLISECONDS. Either at 0 keeps the
+// default. Must be called before movi_open — FFmpeg reads these while opening.
+EMSCRIPTEN_KEEPALIVE
+void movi_set_probe_limits(MoviContext *ctx, int probe_bytes, int analyze_ms) {
+  if (!ctx)
+    return;
+  ctx->probe_size = probe_bytes > 0 ? (int64_t)probe_bytes : 0;
+  ctx->max_analyze_us =
+      analyze_ms > 0 ? (int64_t)analyze_ms * (AV_TIME_BASE / 1000) : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void movi_destroy(MoviContext *ctx) {
   if (!ctx)
@@ -221,11 +232,11 @@ void movi_destroy(MoviContext *ctx) {
   free(ctx);
 }
 
-EMSCRIPTEN_KEEPALIVE
-int movi_open(MoviContext *ctx) {
-  if (!ctx)
-    return -1;
-  // Log level is set by bindings before opening, don't override it here
+// One attempt at opening, with a given budget. Leaves nothing behind on
+// failure, so the caller can simply try again with a bigger one.
+static int movi_try_open(MoviContext *ctx, int64_t probe, int64_t analyze,
+                         int quick) {
+  ctx->position = 0;
   ctx->avio_buffer = av_malloc(ctx->avio_buffer_size);
   if (!ctx->avio_buffer)
     return -2;
@@ -233,7 +244,7 @@ int movi_open(MoviContext *ctx) {
       avio_alloc_context(ctx->avio_buffer, ctx->avio_buffer_size, 0, ctx,
                          avio_read_callback, NULL, avio_seek_callback);
   if (!ctx->avio_ctx) {
-    av_free(ctx->avio_buffer);
+    av_freep(&ctx->avio_buffer);
     return -3;
   }
   ctx->avio_ctx->seekable = AVIO_SEEKABLE_NORMAL;
@@ -244,26 +255,125 @@ int movi_open(MoviContext *ctx) {
     return -4;
   }
   ctx->fmt_ctx->pb = ctx->avio_ctx;
-  ctx->fmt_ctx->probesize = 10 * 1024 * 1024;
-  ctx->fmt_ctx->max_analyze_duration = 5 * AV_TIME_BASE;
+  ctx->fmt_ctx->probesize = probe;
+  ctx->fmt_ctx->max_analyze_duration = analyze;
+  if (quick) {
+    // The part of stream_info nobody asks for. FFmpeg works out a frame rate by
+    // DECODING frames until it is confident — for a container that states its
+    // own rate (MP4, WebM do) that is pure cost, and it is usually the largest
+    // single piece of the open. 0 means "believe the container".
+    ctx->fmt_ctx->fps_probe_size = 0;
+    // And it will buffer up to 2500 packets while identifying a codec. A file
+    // that names its codecs in the header needs a tiny fraction of that.
+    ctx->fmt_ctx->max_probe_packets = 64;
+  }
 
   int ret = avformat_open_input(&ctx->fmt_ctx, NULL, NULL, NULL);
-  if (ret < 0)
+  if (ret < 0) {
+    // avformat_open_input frees fmt_ctx itself on failure; the avio is ours.
+    if (ctx->avio_ctx) {
+      av_freep(&ctx->avio_ctx->buffer);
+      avio_context_free(&ctx->avio_ctx);
+      ctx->avio_ctx = NULL;
+    }
+    ctx->avio_buffer = NULL;
+    ctx->fmt_ctx = NULL;
     return ret;
-  
-  // Try to find stream info, but don't fail hard if it returns error (e.g. no PTS found)
-  // This allows playing files where probing failed but streams might be usable
+  }
+
+  // Not fatal: a file with no PTS still plays, and this is the case the old
+  // code deliberately continued past.
   int info_ret = avformat_find_stream_info(ctx->fmt_ctx, NULL);
   if (info_ret < 0) {
-      av_log(NULL, AV_LOG_WARNING, "avformat_find_stream_info failed: %d, continuing anyway\n", info_ret);
+    av_log(NULL, AV_LOG_WARNING,
+           "avformat_find_stream_info failed: %d, continuing anyway\n",
+           info_ret);
   }
+  return (int)ctx->fmt_ctx->nb_streams;
+}
+
+// Did the cheap attempt actually learn what it needed? A budget that ran out
+// mid-probe does not fail loudly — it comes back with streams whose codec is
+// unknown, or a video whose size nobody worked out, and playback then breaks
+// somewhere further along where the cause is invisible.
+static int movi_open_is_complete(MoviContext *ctx) {
+  if (!ctx->fmt_ctx || ctx->fmt_ctx->nb_streams == 0)
+    return 0;
+  int usable = 0;
+  for (unsigned i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+    AVCodecParameters *par = ctx->fmt_ctx->streams[i]->codecpar;
+    if (!par || par->codec_id == AV_CODEC_ID_NONE)
+      return 0;
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+      if (par->width <= 0 || par->height <= 0)
+        return 0;
+      usable = 1;
+    } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+      if (par->sample_rate <= 0)
+        return 0;
+      usable = 1;
+    }
+  }
+  return usable;
+}
+
+static void movi_close_attempt(MoviContext *ctx) {
+  if (ctx->fmt_ctx)
+    avformat_close_input(&ctx->fmt_ctx);
+  if (ctx->avio_ctx) {
+    av_freep(&ctx->avio_ctx->buffer);
+    avio_context_free(&ctx->avio_ctx);
+    ctx->avio_ctx = NULL;
+  }
+  ctx->avio_buffer = NULL;
+  ctx->fmt_ctx = NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int movi_open(MoviContext *ctx) {
+  if (!ctx)
+    return -1;
+
+  const int64_t FULL_PROBE = 10 * 1024 * 1024;
+  const int64_t FULL_ANALYZE = 5 * AV_TIME_BASE;
+  // Enough for any file that describes itself up front, which is most of them:
+  // an MP4's moov and a WebM's header live in the first few hundred KB.
+  const int64_t QUICK_PROBE = 1024 * 1024;
+  const int64_t QUICK_ANALYZE = 1 * AV_TIME_BASE;
+
+  // A host that stated its own budget means it, either way.
+  if (ctx->probe_size > 0 || ctx->max_analyze_us > 0) {
+    return movi_try_open(ctx,
+                         ctx->probe_size > 0 ? ctx->probe_size : FULL_PROBE,
+                         ctx->max_analyze_us > 0 ? ctx->max_analyze_us
+                                                 : FULL_ANALYZE,
+                         0);
+  }
+
+  // Otherwise: ask for little, and only pay for more if little was not enough.
+  // The retry is close to free — the bytes it re-reads were just read, so they
+  // come from the source's buffer rather than the network — while the file that
+  // needed nothing more has already opened.
+  int ret = movi_try_open(ctx, QUICK_PROBE, QUICK_ANALYZE, 1);
+  if (ret > 0 && movi_open_is_complete(ctx))
+    goto opened;
+
+  av_log(NULL, AV_LOG_INFO,
+         "quick probe insufficient (ret %d), retrying with the full budget\n",
+         ret);
+  movi_close_attempt(ctx);
+  ret = movi_try_open(ctx, FULL_PROBE, FULL_ANALYZE, 0);
+  if (ret < 0)
+    return ret;
+
+opened:
   ctx->decoders = (AVCodecContext **)calloc(ctx->fmt_ctx->nb_streams,
                                             sizeof(AVCodecContext *));
   ctx->resamplers =
       (SwrContext **)calloc(ctx->fmt_ctx->nb_streams, sizeof(SwrContext *));
   ctx->frame = av_frame_alloc();
   ctx->resampled_frame = av_frame_alloc();
-  return ctx->fmt_ctx->nb_streams;
+  return (int)ctx->fmt_ctx->nb_streams;
 }
 
 EMSCRIPTEN_KEEPALIVE

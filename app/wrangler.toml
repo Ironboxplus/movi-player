@@ -24,6 +24,28 @@ DRIVE_APP_ID = "1051579256106"
 binding = "ASSETS"
 bucket_name = "movi-assets"
 
+# ─── Visitor feedback wall (/api/comments) ─────────────────────────────
+# D1 backs the comment list under the FAQ on the landing page. Comments go
+# live instantly — the abuse gate is server-side (profanity filter +
+# Turnstile + per-IP rate limit in worker.js), not an approval queue.
+#
+# One-time setup (the create command prints the database_id to paste below):
+#   wrangler d1 create movi-comments
+#   wrangler d1 execute movi-comments --file=./schema.sql --remote
+#
+# OPTIONAL for forks: with no COMMENTS_DB binding the worker returns 503
+# from /api/comments and the landing page hides the whole section, so the
+# rest of the site works untouched.
+#
+# To take a comment down (soft delete), set an admin token:
+#   wrangler secret put COMMENTS_ADMIN_TOKEN
+# then: curl -X DELETE "https://moviplayer.com/api/comments?id=42" \
+#         -H "Authorization: Bearer <token>"
+[[d1_databases]]
+binding = "COMMENTS_DB"
+database_name = "movi-comments"
+database_id = "ea838cee-312d-46ea-b2f5-94efb870bcd3"   # replace with the id from `wrangler d1 create`
+
 # Master HMAC secret for the URL-gated token proxy. Tokens embed the
 # client's chosen upstream URL in a signed payload, so the worker needs
 # this secret to verify incoming /api/video requests. Set with:

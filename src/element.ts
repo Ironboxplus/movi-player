@@ -23,6 +23,7 @@ export type {
   VideoTrack,
   AudioTrack,
   SubtitleTrack,
+  SubtitleRenderer,
   SubtitleCue,
   SourceConfig,
   CacheConfig,
@@ -58,6 +59,15 @@ export { FileSource, createFileSource } from './source/FileSource';
 export { ThumbnailHttpSource, createThumbnailHttpSource } from './source/ThumbnailHttpSource';
 export { EncryptedHttpSource } from './source/EncryptedHttpSource';
 export type { EncryptedSourceConfig } from './source/EncryptedHttpSource';
+export {
+  registerSourceAdapter,
+  unregisterSourceAdapter,
+  getRegisteredSchemes,
+} from './source/adapterRegistry';
+export type {
+  SourceAdapterFactory,
+  SourceAdapterFactoryConfig,
+} from './source/adapterRegistry';
 export { generateFingerprint } from './utils/Fingerprint';
 
 // Cache
@@ -86,7 +96,18 @@ export { MoviPlayer } from './core/MoviPlayer';
 
 // Main export: MoviElement (custom HTML element)
 export { MoviElement } from './render/MoviElement';
+// Host-supplied bar buttons / context-menu rows — see MoviElement.addControl.
+export type { MoviControlSpec, MoviControlItem } from './render/MoviElement';
 import type { MoviElement as MoviElementType } from './render/MoviElement';
+
+// Package version, baked in at build time. `import { VERSION } from
+// "movi-player/element"`, or read MoviElement.version / element.version.
+export { VERSION } from './version';
+
+// Which bundle this is — "slim" (separate movi.wasm) or "full" (embedded).
+// Separate from VERSION, which is identical across both. Also readable as
+// MoviElement.build / element.build.
+export { BUILD } from './build-flags';
 
 // QoE analytics — versioned event stream + pluggable sinks.
 export {
@@ -105,6 +126,7 @@ export type { QoEEvent, QoESink, QoESession } from './utils/QoE';
 export interface MoviPlayerAttributes {
   src?: string;
   poster?: string;
+  posterfit?: string;
   postertime?: string;
   controls?: boolean | "";
   autoplay?: boolean | "";
@@ -119,6 +141,8 @@ export interface MoviPlayerAttributes {
   volume?: number | string;
   playbackrate?: number | string;
   theme?: "dark" | "light";
+  /** One or two CSS colours, space-separated: primary, then optional
+   *  secondary (`"#8B5CF6 #22D3EE"`). */
   themecolor?: string;
   title?: string;
   headers?: string;
@@ -132,9 +156,170 @@ export interface MoviPlayerAttributes {
   resume?: boolean | "";
   drm?: string;
   licenseurl?: string;
+  /** Extra HTTP headers for the DRM license request only (JSON object string). */
+  licenseheaders?: string;
   encrypted?: boolean | "";
   lcevc?: boolean | "";
   lcevcurl?: string;
+  /** Token endpoint URL for encrypted playback. */
+  tokenurl?: string;
+  /** Video endpoint URL for encrypted playback. */
+  videourl?: string;
+  /** Video identifier sent to the token server. */
+  videoid?: string;
+
+  /** Element width in pixels (CSS sizing is preferred). */
+  width?: number | string;
+  /** Element height in pixels (CSS sizing is preferred). */
+  height?: number | string;
+  /** How the video fills the canvas. */
+  objectfit?: "contain" | "cover" | "fill" | "zoom" | "control";
+  /** Rotate the video, in degrees (snaps to a quarter-turn). */
+  rotate?: 0 | 90 | 180 | 270;
+  /** Rendering backend. */
+  renderer?: "canvas";
+  /** Show the title-bar overlay at the top of the player. */
+  showtitle?: boolean | "";
+  /** Where the title bar may show, plus an optional back arrow. Tokens:
+   *  `both` (default) / `fullscreen` / `windowed`, and `back` — scoped with
+   *  `back-mobile`, `back-fullscreen` or `back-mobile-fullscreen`. */
+  titlemode?: string;
+  /** Chapters from outside the media file, as a JSON array of
+   *  `{ title, start, end?, image? }` (seconds). `image` is a URL the timeline
+   *  tile shows instead of decoding a frame at `start`. Use the `chapters`
+   *  property to pass the array directly. */
+  chapters?: string;
+  /** Enable ±10s fast-seek. Bare = every affordance; a token list narrows it to
+   *  `buttons` (the bottom-bar pair), `keys` (arrow keys) and/or `gestures`
+   *  (double-tap and drag-to-seek) — e.g. `fastseek="keys gestures"`. Aliases:
+   *  `touch`, `nontouch`, `keyonly`, `controls`, `none`. */
+  fastseek?: boolean | "" | string;
+  /** Enable the double-tap-to-seek gesture. */
+  doubletap?: boolean | "";
+  /** Disable all keyboard shortcuts. */
+  nohotkeys?: boolean | "";
+  /** Start playback at this time, in seconds. */
+  startat?: number | string;
+  /** Target prefetch window, in megabytes. */
+  buffersize?: number | string;
+  /** Override the video frame rate (0 = use the source's own). */
+  fps?: number | string;
+  /** Force software decoding (FFmpeg WASM) instead of WebCodecs. `auto` (default) picks per source. */
+  sw?: boolean | "auto";
+  /** Enable HDR tone-mapping (Chromium + canvas renderer + HDR source). */
+  hdr?: boolean | "";
+  /** Generate on-demand thumbnails for seek-bar previews. */
+  thumb?: boolean | "";
+
+  /** Subtitle timing offset, in seconds (positive = later, VLC/mpv sign). */
+  subtitledelay?: number | string;
+  /** Subtitle font size — a multiplier, or a percentage above 5. */
+  subtitlesize?: number | string;
+  /** Subtitle text colour as a hex string (`#fff` / `#ffffff`). */
+  subtitlecolor?: string;
+  /** Subtitle background opacity — 0–1, or a percentage above 1. */
+  subtitlebg?: number | string;
+  /** Subtitle edge style. */
+  subtitleedge?: "none" | "shadow" | "outline" | "raised";
+
+  /** CSS selector for an external element to receive the ambient glow. */
+  ambientwrapper?: string;
+  /** Crop the black bars that are part of the picture, so `cover` / `fill` /
+   *  `zoom` size the image rather than its padding. */
+  /** How far the demuxer may read before naming the streams: bytes, or
+   *  "512kb" / "2mb". Omit for the built-in budget — see the docs, it is
+   *  generous on purpose. */
+  probesize?: string | number;
+  /** How much media it may analyse first, in milliseconds. Companion to
+   *  `probesize`. */
+  probeduration?: string | number;
+  cropbars?: boolean | "";
+  /** Let `autoplay` start while the tab is hidden. Off by default: a first play
+   *  in a background tab runs into a throttled rAF and can park in buffering. */
+  backgroundplay?: boolean | "";
+  /** Stall sound and picture together. ON by default, so this is an opt-OUT and
+   *  the value carries it: `bindav="false"` (or off/0/no) unbinds them. */
+  bindav?: boolean | "false" | "";
+  /** What to do with a source Movi can't play (`native` → hand to `<video>`). */
+  fallback?: "native";
+  /**
+   * Playback-engine priority, space-separated. The first name leads; any others
+   * replace the built-in escalation. `wasm` (Movi's demuxer + WebCodecs — for a
+   * manifest, its own DASH/HLS handling), `shaka`, `dashjs`, `hlsjs`, `native`.
+   */
+  engine?: string;
+  /** @deprecated Replaced by {@link playsinline}. */
+  gesturefs?: boolean | "";
+  /** URL of the external `movi.wasm` (slim build only; defaults to next to the JS bundle). */
+  wasmurl?: string;
+  /** Which settings to remember across loads — see the `persist` attribute. */
+  persist?: string;
+  /** Namespace for everything `persist` stores. */
+  persistkey?: string;
+  /** Built-in controls to switch off, as `no<name>` tokens. */
+  controlslist?: string;
+  /** Refuse Picture-in-Picture, as `<video disablepictureinpicture>` does. */
+  disablepictureinpicture?: boolean;
+  /** Turn off remote playback targets, as `<video disableremoteplayback>` does. */
+  disableremoteplayback?: boolean;
+}
+
+/**
+ * A `<source>` child of `<movi-player>`. Movi reads several non-standard
+ * attributes (`data-height`, `data-fps`, `data-badge`, `srclang`, `kind="audio"`)
+ * that a native `<source>` type rejects — this describes the wrapper components'
+ * friendly prop names, each mapping to the attribute the element parses.
+ */
+export interface MoviSourceProps {
+  /** URL of the video or audio file. */
+  src: string;
+  /** MIME type — `canPlayType` uses it to pick the first playable source. */
+  type?: string;
+  /** Mark this as an audio-only track (split source / multi-language). */
+  kind?: "audio";
+  /** BCP-47 language code — required for the language menu. → `srclang` */
+  srcLang?: string;
+  /** Human-readable label shown in the menu. */
+  label?: string;
+  /** Resolution height in pixels — populates the quality picker. → `data-height` */
+  height?: number;
+  /** Frame-rate hint shown in the quality picker. → `data-fps` */
+  fps?: number;
+  /** Free-form chip (e.g. `"HDR"`) shown next to the label. → `data-badge` */
+  badge?: string;
+  /** Bitrate hint in bits/sec for ABR. → `data-bandwidth` */
+  bandwidth?: number;
+  /**
+   * Codec of THIS rung — a WebCodecs string ("av01.0.13M.10") or just the
+   * family ("av01" / "avc1" / "vp9"). → `data-codec`
+   *
+   * Lets the player ask the device whether it can actually decode a rung
+   * before climbing into it. Without it, a mixed-codec ladder (H.264 low,
+   * AV1 high — what YouTube-style extractors produce) has to be judged by the
+   * codec currently playing, which answers the wrong question.
+   */
+  codec?: string;
+  /** Make this the initial pick. → `data-default` */
+  default?: boolean;
+}
+
+/**
+ * A `<track>` child of `<movi-player>` (subtitles / captions). `format` maps to
+ * the non-standard `data-format` the element reads.
+ */
+export interface MoviTrackProps {
+  /** URL of the subtitle file. */
+  src: string;
+  /** `subtitles` or `captions` (omit to default). */
+  kind?: "subtitles" | "captions";
+  /** BCP-47 language code. → `srclang` */
+  srcLang?: string;
+  /** Human-readable label shown in the menu. */
+  label?: string;
+  /** Subtitle format. → `data-format` */
+  format?: "vtt" | "srt";
+  /** Make this the initial pick. → `data-default` */
+  default?: boolean;
 }
 
 declare global {

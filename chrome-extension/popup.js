@@ -59,12 +59,24 @@ function flashProbeSub(text, color) {
 const flagBtn = document.getElementById("open-flags");
 const flagSub = document.getElementById("flags-sub");
 
+// `window.chrome` is NOT a Chromium test inside an extension page — Firefox
+// defines a `chrome` alias for the WebExtension APIs too, so the flags row
+// would offer a chrome://flags link that Firefox can't open. The extension
+// URL scheme is the honest signal: chrome-extension:// vs moz-extension://.
+const isChromium = (() => {
+  try {
+    return chrome.runtime.getURL("").startsWith("chrome-extension://");
+  } catch {
+    return false;
+  }
+})();
+
 // Same probe as app/compare.html — try to set WebGL2 drawingBufferColorSpace
 // to rec2100-pq. Only succeeds when the experimental web platform features
 // flag is on in Chromium. Returns false on Safari/Firefox (where the
 // property is undefined) or when the assignment is rejected.
 function detectExperimentalFlag() {
-  if (!window.chrome) return false;
+  if (!isChromium) return false;
   try {
     const c = document.createElement("canvas");
     const gl = c.getContext("webgl2");
@@ -82,7 +94,7 @@ if (detectExperimentalFlag()) {
   flagSub.textContent = "Enabled — HDR & codecs unlocked";
   flagSub.style.color = "#10b981";
   flagBtn.outerHTML = `<span class="setting-badge" title="Experimental features enabled">✓</span>`;
-} else if (!window.chrome) {
+} else if (!isChromium) {
   // Non-Chromium browsers can't toggle this flag — hide the action.
   flagBtn.style.display = "none";
   flagSub.textContent = "Chrome only";

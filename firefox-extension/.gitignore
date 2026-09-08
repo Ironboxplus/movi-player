@@ -1,0 +1,13 @@
+# Everything except manifest.json / build.sh / README.md is copied in from
+# chrome-extension/ by build.sh — see that script for why.
+dist/
+icons/
+background.js
+content.js
+content.css
+marker.js
+popup.html
+popup.js
+player.html
+player.js
+*.zip

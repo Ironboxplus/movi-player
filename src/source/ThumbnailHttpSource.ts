@@ -8,6 +8,7 @@
 
 import type { SourceAdapter } from "./SourceAdapter";
 import { Logger } from "../utils/Logger";
+import { childAbort } from "../utils/abort";
 
 const TAG = "ThumbnailHttpSource";
 
@@ -36,6 +37,15 @@ export class ThumbnailHttpSource implements SourceAdapter {
   private size: number = -1;
   private position: number = 0;
   private abortController: AbortController | null = null;
+  /**
+   * This source's own lifetime, aborted by close().
+   *
+   * `abortController` above only ever covered one path; the size probes and the
+   * ranged read each built their own local controller (the read's on a 10s
+   * timer), which close() could not see. So tearing the preview pipeline down
+   * mid-hover left a range request downloading to its own deadline.
+   */
+  private readonly lifetimeAbort = new AbortController();
   // Set once a fetch comes back 200 (server ignores Range). From then on we
   // never hit the network — thumbnails are served purely by borrowing bytes
   // the main source already has in its RAM window; a borrow miss just yields
@@ -82,6 +92,7 @@ export class ThumbnailHttpSource implements SourceAdapter {
     const response = await fetch(this.url, {
       method: "HEAD",
       headers: this.headers,
+      signal: this.lifetimeAbort.signal,
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
@@ -111,6 +122,7 @@ export class ThumbnailHttpSource implements SourceAdapter {
       res = await fetch(this.url, {
         method: "GET",
         headers: { ...this.headers, Range: "bytes=0-0" },
+        signal: this.lifetimeAbort.signal,
       });
     } catch {
       return null;
@@ -225,7 +237,9 @@ export class ThumbnailHttpSource implements SourceAdapter {
         attempt = 0; // Reset retries
       }
 
-      const controller = new AbortController();
+      // Its own 10s cap AND close(): a preview range is megabytes, and the
+      // pipeline it belongs to is torn down on every source change.
+      const controller = childAbort(this.lifetimeAbort.signal);
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
 
       try {
@@ -365,6 +379,8 @@ export class ThumbnailHttpSource implements SourceAdapter {
       this.abortController.abort();
       this.abortController = null;
     }
+    // …and everything else in flight: the size probes and any ranged read.
+    this.lifetimeAbort.abort();
     this.buffer = null;
     Logger.debug(TAG, "Source closed");
   }

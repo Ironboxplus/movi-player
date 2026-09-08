@@ -73,6 +73,18 @@ type WorkerResponse =
       error: string;
       queueDepth: number;
       inFlight: number;
+    }
+  | {
+      // Fired once when the consecutive-failure circuit-breaker trips (see
+      // MAX_CONSECUTIVE_FAILURES below). Distinct from "error": a per-packet
+      // "error" is expected noise on a misaligned stream, but this tells the
+      // main thread the decoder has gone permanently silent and it should
+      // re-align the source — mirrors SoftwareAudioDecoder.ts's onBroken.
+      type: "broken";
+      generation: number;
+      trackId: number;
+      queueDepth: number;
+      inFlight: number;
     };
 
 const scope = self as DedicatedWorkerGlobalScope;
@@ -86,6 +98,17 @@ let queueDepth = 0;
 let inFlight = 0;
 let cancelGeneration: Int32Array | null = null;
 const pcmTimestampClock = new PCMFrameTimestampClock();
+
+// Mirrors SoftwareAudioDecoder.ts's circuit-breaker (same threshold, same
+// intent): a file that rejects every packet — codec mismatch, corrupt
+// extradata, an FFmpeg allocator that won't recover — must not be retried
+// forever. After this many consecutive sendPacket failures the decoder stops
+// calling into WASM and tells the main thread it is broken so the player can
+// re-align the source. Cleared on configure/flush/reset (a fresh run, or the
+// re-align a caller does in response to "broken", deserves a clean slate).
+const MAX_CONSECUTIVE_FAILURES = 50;
+let consecutiveFailures = 0;
+let isBroken = false;
 
 function post(message: WorkerResponse, transfer: Transferable[] = []): void {
   scope.postMessage(message, transfer);
@@ -177,6 +200,8 @@ async function configure(
   queueDepth = 0;
   inFlight = 0;
   pcmTimestampClock.reset();
+  consecutiveFailures = 0;
+  isBroken = false;
   closeDecoder();
 
   if (!track.codecId) {
@@ -295,6 +320,23 @@ function emitFrames(message: Extract<WorkerRequest, { type: "decode" }>): void {
 function decode(message: Extract<WorkerRequest, { type: "decode" }>): void {
   if (isStale(message) || !moduleRef || !decoderPtr) return;
 
+  // Breaker already tripped for this track/generation: don't keep hammering
+  // WASM with packets that are certain to fail. Still resolve the request
+  // (as "decoded", not "error" — this isn't a new failure) so the main
+  // thread's queueDepth/inFlight bookkeeping, incremented optimistically in
+  // WorkerSoftwareAudioDecoder.decode(), doesn't drift upward forever.
+  if (isBroken) {
+    post({
+      type: "decoded",
+      requestId: message.requestId,
+      generation: message.generation,
+      trackId: message.trackId,
+      queueDepth,
+      inFlight,
+    });
+    return;
+  }
+
   queueDepth++;
   inFlight++;
   try {
@@ -310,6 +352,7 @@ function decode(message: Extract<WorkerRequest, { type: "decode" }>): void {
     );
 
     if (ret < 0) {
+      consecutiveFailures++;
       post({
         type: "error",
         requestId: message.requestId,
@@ -319,9 +362,20 @@ function decode(message: Extract<WorkerRequest, { type: "decode" }>): void {
         queueDepth,
         inFlight,
       });
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        isBroken = true;
+        post({
+          type: "broken",
+          generation: message.generation,
+          trackId: message.trackId,
+          queueDepth,
+          inFlight,
+        });
+      }
       return;
     }
 
+    consecutiveFailures = 0;
     emitFrames(message);
   } finally {
     queueDepth = Math.max(0, queueDepth - 1);
@@ -384,6 +438,11 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
         queueDepth = 0;
         inFlight = 0;
         pcmTimestampClock.reset();
+        // Clear the breaker: a flush is the re-align a "broken" caller was
+        // asked to do, and it deserves a clean slate rather than staying
+        // muted forever after the first trip.
+        consecutiveFailures = 0;
+        isBroken = false;
         if (moduleRef && decoderPtr) {
           moduleRef._movi_audio_decoder_flush(decoderPtr);
         }
@@ -395,6 +454,8 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
         queueDepth = 0;
         inFlight = 0;
         pcmTimestampClock.reset();
+        consecutiveFailures = 0;
+        isBroken = false;
         if (moduleRef && decoderPtr) {
           moduleRef._movi_audio_decoder_flush(decoderPtr);
         }

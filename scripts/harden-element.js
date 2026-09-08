@@ -21,7 +21,13 @@ import { minify } from "terser";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
-const target = resolve(root, "dist/element.js");
+// Harden both the default (embedded-WASM) bundle and the slim (external-WASM)
+// one. The slim glue is the same Emscripten output, and property mangling is
+// off, so the same reserved set applies. element.slim.js only exists after the
+// slim entry is built, so a missing one is skipped, not an error.
+const targets = ["dist/element.js", "dist/element.slim.js"].map((t) =>
+  resolve(root, t),
+);
 
 const RESERVED_IDENTIFIERS = [
   // Emscripten / WASM boundary
@@ -53,23 +59,32 @@ const RESERVED_PROP_NAMES = [
 ];
 
 async function harden() {
-  try {
-    statSync(target);
-  } catch {
-    console.error(`[harden-element] ${target} not found — run build first.`);
-    process.exit(1);
-  }
-
-  // Diagnostic bypass — set MOVI_NO_HARDEN=1 to ship dist/element.js
-  // untouched. Used when investigating whether the post-build terser
-  // pass is what changes runtime behaviour vs the dev server.
+  // Diagnostic bypass — set MOVI_NO_HARDEN=1 to ship the bundles untouched.
+  // Used when investigating whether the post-build terser pass is what changes
+  // runtime behaviour vs the dev server.
   if (process.env.MOVI_NO_HARDEN === "1") {
     console.log("[harden-element] MOVI_NO_HARDEN=1 — skipping minify pass");
     return;
   }
 
+  // dist/element.js must exist; dist/element.slim.js is optional (only present
+  // when the slim entry was built).
+  const present = targets.filter((t) => {
+    try { statSync(t); return true; } catch { return false; }
+  });
+  if (!present.some((t) => t.endsWith("element.js"))) {
+    console.error(`[harden-element] dist/element.js not found — run build first.`);
+    process.exit(1);
+  }
+
+  for (const target of present) {
+    await hardenFile(target);
+  }
+}
+
+async function hardenFile(target) {
   const src = readFileSync(target, "utf8");
-  console.log(`[harden-element] Input: ${src.length.toLocaleString()} bytes`);
+  console.log(`[harden-element] ${target}: input ${src.length.toLocaleString()} bytes`);
 
   const result = await minify(src, {
     compress: {

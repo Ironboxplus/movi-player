@@ -66,6 +66,8 @@ export class WorkerSoftwareVideoDecoder {
     WorkerSoftwareVideoDecoder.createCancelGeneration();
   private onFrame: ((frame: VideoFrame) => void) | null = null;
   private onError: ((error: Error) => void) | null = null;
+  /** Latched adaptive-load-shedding state — see setNonRefSkip. */
+  private nonRefSkip = false;
   private pending = new Map<number, PendingConfigure>();
   private pendingDecodes = new Set<number>();
   private nextRequestId = 1;
@@ -110,6 +112,26 @@ export class WorkerSoftwareVideoDecoder {
 
   setOnError(callback: (error: Error) => void): void {
     this.onError = callback;
+  }
+
+  /**
+   * Adaptive load shedding, same contract as SoftwareVideoDecoder.setNonRefSkip:
+   * drop non-reference frames (AVDISCARD_NONREF) so a device that can't sustain
+   * the source rate does roughly half the decode work on a typical GOP.
+   *
+   * Kept latched here as well as sent, because the worker applies its discard
+   * level at configure() time — a shed that was turned on before a track switch
+   * has to survive the re-configure, or the device quietly goes back to full
+   * decode cost the first time the source changes.
+   */
+  setNonRefSkip(enabled: boolean): void {
+    this.nonRefSkip = enabled;
+    this.worker.postMessage({
+      type: "setSkipFrame",
+      generation: this.generation,
+      trackId: this.trackId,
+      enabled,
+    });
   }
 
   configure(track: VideoTrack, targetFps: number = 0): Promise<boolean> {
@@ -169,6 +191,9 @@ export class WorkerSoftwareVideoDecoder {
           height: track.height,
           frameRate: track.frameRate,
           targetFps,
+          // Carry the current shed state across the re-configure — see
+          // setNonRefSkip.
+          nonRefSkip: this.nonRefSkip,
           extradata,
           controlBuffer: this.cancelGeneration?.buffer,
         },

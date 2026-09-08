@@ -753,6 +753,161 @@ describe("merge: SoftwareAudioDecoder flush/reset reconciliation", () => {
   });
 });
 
+describe("merge: A5 circuit-breaker must cover the worker path too (A2 x A5)", () => {
+  // A2 took upstream's setOnBroken()/isDisabled() circuit-breaker so a
+  // decoder that goes permanently silent can be reported and recovered
+  // instead of staying muted for the rest of playback. A5 made the worker
+  // path (WorkerSoftwareAudioDecoder) primary for every codec. Before this
+  // fix, the breaker only existed in the main-thread SoftwareAudioDecoder
+  // (SoftwareAudioDecoder.worker.ts had no failure counting at all), so any
+  // AAC/DTS/etc. stream that hit 50 consecutive worker decode failures never
+  // told the player — audio just went silent forever. These tests exercise
+  // the real worker message protocol (FakeWorker simulates only the
+  // postMessage transport, matching every other test in this file — the
+  // actual decode/circuit-breaker logic under test lives in
+  // SoftwareAudioDecoder.worker.ts and runs unmodified) up through
+  // WorkerSoftwareAudioDecoder to MoviAudioDecoder's public setOnBroken.
+
+  it("WorkerSoftwareAudioDecoder: trips isDisabled() and fires onBroken when the worker reports 'broken'", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const decoder = new WorkerSoftwareAudioDecoder();
+    const onBroken = vi.fn();
+    decoder.setOnBroken(onBroken);
+
+    const configured = decoder.configure(dtsTrack);
+    const worker = FakeWorker.instances[0]!;
+    worker.emit({
+      type: "configured",
+      requestId: 1,
+      generation: 1,
+      trackId: dtsTrack.id,
+      success: true,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+    await configured;
+
+    expect(decoder.isDisabled()).toBe(false);
+
+    worker.emit({
+      type: "broken",
+      generation: 1,
+      trackId: dtsTrack.id,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+
+    expect(onBroken).toHaveBeenCalledOnce();
+    expect(decoder.isDisabled()).toBe(true);
+  });
+
+  it("WorkerSoftwareAudioDecoder: ignores a 'broken' message from a stale generation", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const decoder = new WorkerSoftwareAudioDecoder();
+    const onBroken = vi.fn();
+    decoder.setOnBroken(onBroken);
+
+    const configured = decoder.configure(dtsTrack);
+    const worker = FakeWorker.instances[0]!;
+    worker.emit({
+      type: "configured",
+      requestId: 1,
+      generation: 1,
+      trackId: dtsTrack.id,
+      success: true,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+    await configured;
+
+    // A "broken" report for an already-superseded generation (e.g. the
+    // worker's in-flight decode raced a flush/seek) must be dropped like any
+    // other stale message, not mute a decoder that has already moved on.
+    worker.emit({
+      type: "broken",
+      generation: 0,
+      trackId: dtsTrack.id,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+
+    expect(onBroken).not.toHaveBeenCalled();
+    expect(decoder.isDisabled()).toBe(false);
+  });
+
+  it("WorkerSoftwareAudioDecoder: flush() clears isDisabled() so decoding can resume after a re-align", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const decoder = new WorkerSoftwareAudioDecoder();
+    decoder.setOnBroken(() => {});
+
+    const configured = decoder.configure(dtsTrack);
+    const worker = FakeWorker.instances[0]!;
+    worker.emit({
+      type: "configured",
+      requestId: 1,
+      generation: 1,
+      trackId: dtsTrack.id,
+      success: true,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+    await configured;
+
+    worker.emit({
+      type: "broken",
+      generation: 1,
+      trackId: dtsTrack.id,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+    expect(decoder.isDisabled()).toBe(true);
+
+    await decoder.flush();
+    expect(decoder.isDisabled()).toBe(false);
+  });
+
+  it("MoviAudioDecoder: propagates a worker circuit-breaker trip to the public setOnBroken hook", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const { bindings } = makeBindings();
+    const decoder = new MoviAudioDecoder();
+    decoder.setBindings(bindings);
+    const onBroken = vi.fn();
+    decoder.setOnBroken(onBroken);
+
+    const configured = decoder.configure(dtsTrack);
+    await Promise.resolve();
+    const worker = FakeWorker.instances[0]!;
+    worker.emit({
+      type: "configured",
+      requestId: 1,
+      generation: 1,
+      trackId: dtsTrack.id,
+      success: true,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+    await expect(configured).resolves.toBe(true);
+
+    // Real worker protocol: the worker posts "broken" once its own
+    // MAX_CONSECUTIVE_FAILURES trips (SoftwareAudioDecoder.worker.ts). This
+    // decoder never produced a frame, so handleSoftwareBroken() should also
+    // tear it down and build a fresh one (bounded by MAX_SW_REVERTS).
+    worker.emit({
+      type: "broken",
+      generation: 1,
+      trackId: dtsTrack.id,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+
+    expect(onBroken).toHaveBeenCalledOnce();
+    // handleSoftwareBroken's revert closed the old worker and asked
+    // createSoftwareDecoder() for a fresh one — a second FakeWorker instance
+    // should have been constructed.
+    expect(FakeWorker.instances.length).toBe(2);
+  });
+});
+
 describe("merge: worker-decoded DTS still engages cold-prime", () => {
   it("reports usesSoftware === true and the worker decoderType so prime engages", async () => {
     vi.useFakeTimers();

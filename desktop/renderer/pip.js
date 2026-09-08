@@ -4,11 +4,24 @@
  * so the main window can resume from there. Escape / the button / double-click
  * return to the main window.
  */
+import { applySettings, captureSettings } from "/handoff.js";
+
 const p = document.getElementById("pip-player");
 const params = new URLSearchParams(location.search);
 
 const baseName = (x) => String(x).split(/[?#]/)[0].split(/[\\/]/).pop() || String(x);
 const localSrc = (fp) => "/_local/" + encodeURIComponent(baseName(fp)) + "?p=" + encodeURIComponent(fp);
+
+// How the main window had this film set up. Held rather than used once: a file
+// opened from Finder while PiP is up replaces the source in this same window,
+// and the viewer's language and speed should survive that too.
+let settings = null;
+try {
+  settings = JSON.parse(params.get("s") || "null");
+} catch {
+  settings = null;
+}
+let stopApplying = () => {};
 
 function load(src, time, playing) {
   if (!src) return;
@@ -19,12 +32,43 @@ function load(src, time, playing) {
   if (time > 0) {
     try { p.currentTime = time; } catch {}
   }
+  stopApplying();
+  stopApplying = applySettings(p, settings);
   reportState();
+}
+
+/**
+ * Merged, not replaced. The read-back runs once a second from the moment the
+ * source is set, and for the first of those the file has not been opened yet —
+ * it reports no languages at all. Overwriting with that would throw away the
+ * pick that is still waiting for the track lists to exist, which is the one
+ * thing this whole path is for. A language only moves when a real one answers.
+ */
+function merge(prev, next) {
+  if (!next) return prev;
+  if (!prev) return next;
+  // Captions have a third state. "None active" is only an answer once the file
+  // has actually listed some — before that it is indistinguishable from a list
+  // that has not arrived, and taking it at face value would report captions off
+  // for a file that is about to turn them on.
+  const subsKnown = !!next.subtitle || next.subtitlesOff;
+  return {
+    // Audio is never off, so nothing here means nothing was known yet.
+    audio: next.audio || prev.audio,
+    subtitle: subsKnown ? next.subtitle : prev.subtitle,
+    subtitlesOff: subsKnown ? !!next.subtitlesOff : !!prev.subtitlesOff,
+    volume: typeof next.volume === "number" ? next.volume : prev.volume,
+    muted: typeof next.muted === "boolean" ? next.muted : prev.muted,
+    rate: typeof next.rate === "number" ? next.rate : prev.rate,
+  };
 }
 
 function reportState() {
   const src = typeof p.src === "string" ? p.src : null;
-  try { window.movi.pipReportState(src, p.currentTime || 0); } catch {}
+  // Read back rather than echo what arrived: the point of the return trip is
+  // whatever the viewer changed in HERE.
+  settings = merge(settings, captureSettings(p));
+  try { window.movi.pipReportState(src, p.currentTime || 0, settings); } catch {}
 }
 
 // Initial handoff from the main window.

@@ -21,6 +21,7 @@ export class SoftwareAudioDecoder {
   private bindings: WasmBindings;
   private onData: ((frame: PCMFrame) => void) | null = null;
   private onError: ((error: Error) => void) | null = null;
+  private onBroken: (() => void) | null = null;
   private isConfigured = false;
   private trackIndex = -1;
   // Default: downmix to stereo. AudioDecoder flips this off via
@@ -71,6 +72,23 @@ export class SoftwareAudioDecoder {
 
   setOnError(callback: (error: Error) => void): void {
     this.onError = callback;
+  }
+
+  /**
+   * Fires once when the failure circuit-breaker trips. Being broken is not
+   * necessarily terminal — the packet stream can be misaligned rather than the
+   * decoder being wrong (a mid-playback rendition swap, a demuxer replaced under
+   * the pump) — and re-aligning the source recovers it, which is exactly what a
+   * manual seek used to do by hand. Without this hook the player had no way to
+   * know it had gone silent, so it stayed silent for the rest of the video.
+   */
+  setOnBroken(callback: () => void): void {
+    this.onBroken = callback;
+  }
+
+  /** Whether the circuit-breaker has tripped (no packets are being decoded). */
+  isDisabled(): boolean {
+    return this.isBroken;
   }
 
   async configure(track: AudioTrack): Promise<boolean> {
@@ -168,8 +186,9 @@ export class SoftwareAudioDecoder {
         this.isBroken = true;
         Logger.error(
           TAG,
-          `Audio decoder disabled after ${this.consecutiveFailures} consecutive sendPacket failures (last: ${ret}). Playback continues without audio.`,
+          `Audio decoder disabled after ${this.consecutiveFailures} consecutive sendPacket failures (last: ${ret}). Attempting to re-align the audio source.`,
         );
+        this.onBroken?.();
       }
       return;
     }
@@ -216,8 +235,9 @@ export class SoftwareAudioDecoder {
         this.isBroken = true;
         Logger.error(
           TAG,
-          `Audio decoder disabled after ${this.consecutiveFailures} consecutive batch failures (last: ${consumed}). Playback continues without audio.`,
+          `Audio decoder disabled after ${this.consecutiveFailures} consecutive batch failures (last: ${consumed}). Attempting to re-align the audio source.`,
         );
+        this.onBroken?.();
       }
       return 0;
     }

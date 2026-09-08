@@ -71,9 +71,19 @@ export class PlayerStateManager extends EventEmitter<StateEvents> {
   
   /**
    * Check if can pause
+   *
+   * "seeking" counts: a seek in flight can take seconds (software decode on a
+   * phone, a keyframe hunt over a slow link), and dropping the user's pause for
+   * that whole window meant the tap did nothing AND playback auto-resumed the
+   * moment the seek landed. MoviPlayer.pause() honours it by clearing the
+   * resume intent so the seek settles into "paused" instead.
    */
   canPause(): boolean {
-    return this.state === 'playing' || this.state === 'buffering';
+    return (
+      this.state === 'playing' ||
+      this.state === 'buffering' ||
+      this.state === 'seeking'
+    );
   }
   
   /**

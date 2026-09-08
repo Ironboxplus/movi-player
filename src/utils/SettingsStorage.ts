@@ -6,6 +6,11 @@ interface PlayerSettings {
   stableVolume?: boolean;
   ambientMode?: boolean;
   hdr?: boolean;
+  cropBars?: boolean;
+  objectFit?: string;
+  /** Remembered as a LANGUAGE, not a track index — see MoviElement. */
+  audioLang?: string;
+  subtitleLang?: string;
 }
 
 const SETTINGS_FILE = 'movi_settings.json';

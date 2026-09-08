@@ -38,6 +38,7 @@ export interface MoviWasmModule {
   _movi_create: () => number;
   _movi_destroy: (ctx: number) => void;
   _movi_set_file_size: (ctx: number, sizeLow: number, sizeHigh: number) => void;
+  _movi_set_probe_limits: (ctx: number, probeBytes: number, analyzeMs: number) => void;
   _movi_open: (ctx: number) => Promise<number>; // Now async (no filename param)
   _movi_get_duration: (ctx: number) => number;
   _movi_get_start_time: (ctx: number) => number;

@@ -1,0 +1,1101 @@
+{
+  "version": 1.1,
+  "tags": [
+    {
+      "name": "movi-player",
+      "description": {
+        "kind": "markdown",
+        "value": "Movi Player — a WASM + WebCodecs video player custom element.\n\nPlays formats the browser cannot (MKV, HEVC, AV1, TrueHD/DTS, …) on a WebGL2 canvas, with adaptive quality, HDR, subtitles and a full built-in UI."
+      },
+      "attributes": [
+        {
+          "name": "src",
+          "description": {
+            "kind": "markdown",
+            "value": "Specifies the video source URL or File object."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#src"
+            }
+          ]
+        },
+        {
+          "name": "autoplay",
+          "description": {
+            "kind": "markdown",
+            "value": "Starts playback automatically when loaded."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#autoplay"
+            }
+          ]
+        },
+        {
+          "name": "controls",
+          "description": {
+            "kind": "markdown",
+            "value": "Shows/hides the built-in UI controls."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#controls"
+            }
+          ]
+        },
+        {
+          "name": "loop",
+          "description": {
+            "kind": "markdown",
+            "value": "Restarts playback when video ends."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#loop"
+            }
+          ]
+        },
+        {
+          "name": "muted",
+          "description": {
+            "kind": "markdown",
+            "value": "Mutes audio by default."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#muted"
+            }
+          ]
+        },
+        {
+          "name": "playsinline",
+          "description": {
+            "kind": "markdown",
+            "value": "Prevents auto-fullscreen on iOS (plays inline instead). It also — on **any touch"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#playsinline"
+            }
+          ]
+        },
+        {
+          "name": "preload",
+          "description": {
+            "kind": "markdown",
+            "value": "Hints how much data to buffer initially."
+          },
+          "values": [
+            {
+              "name": "none",
+              "description": {
+                "kind": "markdown",
+                "value": "Don't preload"
+              }
+            },
+            {
+              "name": "metadata",
+              "description": {
+                "kind": "markdown",
+                "value": "(default) - Load metadata only"
+              }
+            },
+            {
+              "name": "auto",
+              "description": {
+                "kind": "markdown",
+                "value": "Buffer as much as possible"
+              }
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#preload"
+            }
+          ]
+        },
+        {
+          "name": "probesize",
+          "description": {
+            "kind": "markdown",
+            "value": "How far the demuxer may read before it says what the streams are."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#probesize"
+            }
+          ]
+        },
+        {
+          "name": "probeduration",
+          "description": {
+            "kind": "markdown",
+            "value": "How much media the demuxer may analyse before it says what the streams are, in"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#probeduration"
+            }
+          ]
+        },
+        {
+          "name": "poster",
+          "description": {
+            "kind": "markdown",
+            "value": "Displays an image before playback starts."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#poster"
+            }
+          ]
+        },
+        {
+          "name": "posterfit",
+          "description": {
+            "kind": "markdown",
+            "value": "How the poster is fitted, when it should not be fitted the way the video is."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#posterfit"
+            }
+          ]
+        },
+        {
+          "name": "width",
+          "description": {
+            "kind": "markdown",
+            "value": "Sets element dimensions (CSS preferred)."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#width"
+            }
+          ]
+        },
+        {
+          "name": "height",
+          "description": {
+            "kind": "markdown",
+            "value": "Sets element dimensions (CSS preferred)."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#height"
+            }
+          ]
+        },
+        {
+          "name": "crossorigin",
+          "description": {
+            "kind": "markdown",
+            "value": "CORS mode for cross-origin videos."
+          },
+          "values": [
+            {
+              "name": "anonymous",
+              "description": {
+                "kind": "markdown",
+                "value": "No credentials"
+              }
+            },
+            {
+              "name": "use-credentials",
+              "description": {
+                "kind": "markdown",
+                "value": "Include credentials"
+              }
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#crossorigin"
+            }
+          ]
+        },
+        {
+          "name": "volume",
+          "description": {
+            "kind": "markdown",
+            "value": "Sets the initial audio volume (0.0 to 1.0). User preference persists across reloads via OPFS and overrides this default on subsequent loads."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#volume"
+            }
+          ]
+        },
+        {
+          "name": "playbackrate",
+          "description": {
+            "kind": "markdown",
+            "value": "Sets the initial playback speed. Persists across reloads like `volume`."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#playbackrate"
+            }
+          ]
+        },
+        {
+          "name": "subtitledelay",
+          "description": {
+            "kind": "markdown",
+            "value": "Shifts subtitle timing relative to video, in seconds. Sign matches VLC and mpv: **positive** values shift subtitles **later**, negative shifts them earlier."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#subtitledelay"
+            }
+          ]
+        },
+        {
+          "name": "subtitlesize",
+          "description": {
+            "kind": "markdown",
+            "value": "Subtitle size multiplier"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#subtitlesize"
+            }
+          ]
+        },
+        {
+          "name": "subtitlecolor",
+          "description": {
+            "kind": "markdown",
+            "value": "Subtitle text color"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#subtitlecolor"
+            }
+          ]
+        },
+        {
+          "name": "subtitlebg",
+          "description": {
+            "kind": "markdown",
+            "value": "Subtitle background opacity (0..1)"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#subtitlebg"
+            }
+          ]
+        },
+        {
+          "name": "subtitleedge",
+          "description": {
+            "kind": "markdown",
+            "value": "Subtitle edge style"
+          },
+          "values": [
+            {
+              "name": "none"
+            },
+            {
+              "name": "shadow"
+            },
+            {
+              "name": "outline"
+            },
+            {
+              "name": "raised"
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#subtitleedge"
+            }
+          ]
+        },
+        {
+          "name": "ambientmode",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables ambient background effects."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#ambientmode"
+            }
+          ]
+        },
+        {
+          "name": "ambientwrapper",
+          "description": {
+            "kind": "markdown",
+            "value": "Specifies external element for ambient effects."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#ambientwrapper"
+            }
+          ]
+        },
+        {
+          "name": "cropbars",
+          "description": {
+            "kind": "markdown",
+            "value": "Crops the black bars that are part of the **picture**."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#cropbars"
+            }
+          ]
+        },
+        {
+          "name": "backgroundplay",
+          "description": {
+            "kind": "markdown",
+            "value": "Lets [`autoplay`](#autoplay) start while the tab is **hidden**."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#backgroundplay"
+            }
+          ]
+        },
+        {
+          "name": "bindav",
+          "description": {
+            "kind": "markdown",
+            "value": "Stalls the sound and the picture **together**. On by default."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#bindav"
+            }
+          ]
+        },
+        {
+          "name": "renderer",
+          "description": {
+            "kind": "markdown",
+            "value": "Chooses the rendering backend."
+          },
+          "values": [
+            {
+              "name": "canvas",
+              "description": {
+                "kind": "markdown",
+                "value": "(default) — WebGL2 canvas rendering with full features (HDR, rotation, snapshots, ambient mode)"
+              }
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#renderer"
+            }
+          ]
+        },
+        {
+          "name": "objectfit",
+          "description": {
+            "kind": "markdown",
+            "value": "Controls how video fills the canvas."
+          },
+          "values": [
+            {
+              "name": "contain",
+              "description": {
+                "kind": "markdown",
+                "value": "(default) - Fit within bounds, maintain aspect ratio"
+              }
+            },
+            {
+              "name": "cover",
+              "description": {
+                "kind": "markdown",
+                "value": "Fill bounds, crop if necessary"
+              }
+            },
+            {
+              "name": "fill",
+              "description": {
+                "kind": "markdown",
+                "value": "Stretch to fill bounds (may distort)"
+              }
+            },
+            {
+              "name": "zoom",
+              "description": {
+                "kind": "markdown",
+                "value": "Slightly zoomed in (1.1x)"
+              }
+            },
+            {
+              "name": "control",
+              "description": {
+                "kind": "markdown",
+                "value": "User can pinch/zoom to adjust"
+              }
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#objectfit"
+            }
+          ]
+        },
+        {
+          "name": "rotate",
+          "description": {
+            "kind": "markdown",
+            "value": "Rotate video, in degrees (snaps to a quarter-turn)"
+          },
+          "values": [
+            {
+              "name": "0"
+            },
+            {
+              "name": "90"
+            },
+            {
+              "name": "180"
+            },
+            {
+              "name": "270"
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#rotate"
+            }
+          ]
+        },
+        {
+          "name": "thumb",
+          "description": {
+            "kind": "markdown",
+            "value": "Generates thumbnails on demand (used internally for preview)."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#thumb"
+            }
+          ]
+        },
+        {
+          "name": "hdr",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables/disables HDR rendering."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#hdr"
+            }
+          ]
+        },
+        {
+          "name": "theme",
+          "description": {
+            "kind": "markdown",
+            "value": "Sets the UI theme."
+          },
+          "values": [
+            {
+              "name": "dark",
+              "description": {
+                "kind": "markdown",
+                "value": "(default)"
+              }
+            },
+            {
+              "name": "light"
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#theme"
+            }
+          ]
+        },
+        {
+          "name": "sw",
+          "description": {
+            "kind": "markdown",
+            "value": "Forces software decoding (using FFmpeg WASM) instead of hardware-accelerated WebCodecs."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#sw"
+            }
+          ]
+        },
+        {
+          "name": "fps",
+          "description": {
+            "kind": "markdown",
+            "value": "Overrides the video frame rate with a custom value."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#fps"
+            }
+          ]
+        },
+        {
+          "name": "gesturefs",
+          "description": {
+            "kind": "markdown",
+            "value": "**Deprecated** — use `playsinline`"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#gesturefs"
+            }
+          ]
+        },
+        {
+          "name": "nohotkeys",
+          "description": {
+            "kind": "markdown",
+            "value": "Disables all keyboard shortcuts for playback control."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#nohotkeys"
+            }
+          ]
+        },
+        {
+          "name": "startat",
+          "description": {
+            "kind": "markdown",
+            "value": "Specifies the time (in seconds) where playback should start."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#startat"
+            }
+          ]
+        },
+        {
+          "name": "fastseek",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables fast seek controls for quick ±10s navigation."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#fastseek"
+            }
+          ]
+        },
+        {
+          "name": "doubletap",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables/disables double-tap to seek gesture."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#doubletap"
+            }
+          ]
+        },
+        {
+          "name": "themecolor",
+          "description": {
+            "kind": "markdown",
+            "value": "Sets the player's accent colors — one or two, separated by a space."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#themecolor"
+            }
+          ]
+        },
+        {
+          "name": "buffersize",
+          "description": {
+            "kind": "markdown",
+            "value": "Target prefetch window in **megabytes** — how far ahead of playback the source should try to keep buffered."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#buffersize"
+            }
+          ]
+        },
+        {
+          "name": "title",
+          "description": {
+            "kind": "markdown",
+            "value": "Sets the video title shown in the in-player overlay. Unlike the global HTML `title` attribute, this does **not** trigger a native browser tooltip on hover."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#title"
+            }
+          ]
+        },
+        {
+          "name": "showtitle",
+          "description": {
+            "kind": "markdown",
+            "value": "Shows the title bar overlay at the top of the player."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#showtitle"
+            }
+          ]
+        },
+        {
+          "name": "titlemode",
+          "description": {
+            "kind": "markdown",
+            "value": "Decides where the title bar is allowed to appear, and whether it carries a back arrow. Space- or comma-separated tokens, in any order:"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#titlemode"
+            }
+          ]
+        },
+        {
+          "name": "chapters",
+          "description": {
+            "kind": "markdown",
+            "value": "Chapters that aren't in the media file. The player already reads chapter atoms out of MKV/MP4 containers; this is for the sources that keep them somewhere else — YouTube in the watch page, a CMS in its own database. Each entry is `{title, start, end?, image?}`, where `image` is artwork the timeline tile shows in place of a frame decoded at `start`."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#chapters"
+            }
+          ]
+        },
+        {
+          "name": "resume",
+          "description": {
+            "kind": "markdown",
+            "value": "Saves playback position to localStorage and shows a resume dialog on reload."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#resume"
+            }
+          ]
+        },
+        {
+          "name": "stablevolume",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables loudness normalization (DynamicsCompressorNode). Reduces loud scenes and boosts quiet ones."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#stablevolume"
+            }
+          ]
+        },
+        {
+          "name": "encrypted",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables encrypted video playback. Requires `tokenurl` and `videourl` attributes."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#encrypted"
+            }
+          ]
+        },
+        {
+          "name": "tokenurl",
+          "description": {
+            "kind": "markdown",
+            "value": "Token endpoint URL for encrypted playback. Server returns HMAC signing secret and file metadata."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#tokenurl"
+            }
+          ]
+        },
+        {
+          "name": "videourl",
+          "description": {
+            "kind": "markdown",
+            "value": "Video endpoint URL for encrypted playback. Chunks are served with token + HMAC validation."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#videourl"
+            }
+          ]
+        },
+        {
+          "name": "videoid",
+          "description": {
+            "kind": "markdown",
+            "value": "Video identifier sent to the token server. Maps to a specific encrypted file on the server."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#videoid"
+            }
+          ]
+        },
+        {
+          "name": "drm",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables DRM playback mode for HLS streams. When set, the player switches to a native `<video>` element + EME API instead of the canvas pipeline. Canvas-only features (rotation, snapshots) are disabled in this mode."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#drm"
+            }
+          ]
+        },
+        {
+          "name": "licenseurl",
+          "description": {
+            "kind": "markdown",
+            "value": "Widevine/FairPlay license server URL for DRM playback. Required when `drm` is set."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#licenseurl"
+            }
+          ]
+        },
+        {
+          "name": "licenseheaders",
+          "description": {
+            "kind": "markdown",
+            "value": "Extra HTTP headers sent with the **DRM license request only** — the auth token, customer ID or provider-specific header your license server expects. A JSON object string; invalid JSON is ignored with a console warning."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#licenseheaders"
+            }
+          ]
+        },
+        {
+          "name": "headers",
+          "description": {
+            "kind": "markdown",
+            "value": "Custom HTTP headers applied to **every** media network request — adaptive-stream manifests *and* their segments (Shaka request filter, hls.js `xhrSetup`, dash.js request interceptor), progressive HTTP, thumbnails, and the encrypted source (stream GET + token refresh). Use it to carry auth tokens, signed-URL headers, or API keys."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#headers"
+            }
+          ]
+        },
+        {
+          "name": "audioonly",
+          "description": {
+            "kind": "markdown",
+            "value": "Data-saver mode — play only the audio and skip the video decode to save CPU and bandwidth. Toggleable live (no reload for muxed/file sources)."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#audioonly"
+            }
+          ]
+        },
+        {
+          "name": "lcevc",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables MPEG-5 Part 2 **LCEVC** enhancement-layer decoding for adaptive streams. Requires the external `lcevc_dec.js` library — point `lcevcurl` at it to lazy-load, or expose a global `LCEVCdec`."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#lcevc"
+            }
+          ]
+        },
+        {
+          "name": "lcevcurl",
+          "description": {
+            "kind": "markdown",
+            "value": "Enables MPEG-5 Part 2 **LCEVC** enhancement-layer decoding for adaptive streams. Requires the external `lcevc_dec.js` library — point `lcevcurl` at it to lazy-load, or expose a global `LCEVCdec`."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#lcevcurl"
+            }
+          ]
+        },
+        {
+          "name": "postertime",
+          "description": {
+            "kind": "markdown",
+            "value": "Generates a native-resolution poster frame from a timestamp instead of (or as a fallback for) `poster`. Useful when you don't have a pre-rendered thumbnail but want to show a representative frame."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#postertime"
+            }
+          ]
+        },
+        {
+          "name": "vr",
+          "description": {
+            "kind": "markdown",
+            "value": "Render immersive / spherical video. The player auto-enters the right projection from the source's spherical metadata, so for ordinary 360 clips you don't need this at all — `vr` is for forcing a projection or marking a source whose metadata is missing."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#vr"
+            }
+          ]
+        },
+        {
+          "name": "vrpad",
+          "description": {
+            "kind": "markdown",
+            "value": "Opt-in on-screen joystick for looking around in `vr` mode (handy on touch / without a mouse)."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#vrpad"
+            }
+          ]
+        },
+        {
+          "name": "audiooutput",
+          "description": {
+            "kind": "markdown",
+            "value": "Route audio to a specific output device (speakers, Bluetooth, a virtual device) via `AudioContext.setSinkId`. Accepts a concrete `deviceId` **or** a **label substring** (case-insensitive) — handy because device ids are session-salted, so a substring like `\"Headphones\"` reliably targets the same physical device across reloads. `\"\"` / `\"default\"` routes to the system default."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#audiooutput"
+            }
+          ]
+        },
+        {
+          "name": "fallback",
+          "description": {
+            "kind": "markdown",
+            "value": "What to do with a source Movi itself can't play."
+          },
+          "values": [
+            {
+              "name": "native",
+              "description": {
+                "kind": "markdown",
+                "value": "hand the source to the browser's own <video> and keep the Movi UI on top of it"
+              }
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#fallback"
+            }
+          ]
+        },
+        {
+          "name": "engine",
+          "description": {
+            "kind": "markdown",
+            "value": "Which playback engine leads, and what follows it. Movi has four ways to play a source and, by default, a fixed order: its own WASM demuxer + WebCodecs pipeline first; Shaka (then dash.js / hls.js) for adaptive manifests; the WASM demuxer again as the manifest fallback; the browser's `<video>` last. `engine` re-orders that — the first name listed is attempted first, and any others define what's tried when it fails, replacing the built-in escalation."
+          },
+          "values": [
+            {
+              "name": "wasm",
+              "description": {
+                "kind": "markdown",
+                "value": "Movi's own demuxer + WebCodecs pipeline. For a manifest this is Movi's own DASH/HLS handling, which the default order only reaches as a last resort. Aliases: demuxer, movi"
+              }
+            },
+            {
+              "name": "shaka",
+              "description": {
+                "kind": "markdown",
+                "value": "Shaka Player (the default engine for adaptive manifests)"
+              }
+            },
+            {
+              "name": "dashjs",
+              "description": {
+                "kind": "markdown",
+                "value": "dash.js"
+              }
+            },
+            {
+              "name": "hlsjs",
+              "description": {
+                "kind": "markdown",
+                "value": "hls.js"
+              }
+            },
+            {
+              "name": "native",
+              "description": {
+                "kind": "markdown",
+                "value": "the browser's own <video>, under Movi's UI"
+              }
+            }
+          ],
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#engine"
+            }
+          ]
+        },
+        {
+          "name": "wasmurl",
+          "description": {
+            "kind": "markdown",
+            "value": "URL of the external `movi.wasm`, used only by the **slim build**"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#wasmurl"
+            }
+          ]
+        },
+        {
+          "name": "persist",
+          "description": {
+            "kind": "markdown",
+            "value": "Which settings to remember across loads and sessions. Space-separated; nothing"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#persist"
+            }
+          ]
+        },
+        {
+          "name": "persistkey",
+          "description": {
+            "kind": "markdown",
+            "value": "Namespaces everything [`persist`](#persist) stores, so two players on a page —"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#persistkey"
+            }
+          ]
+        },
+        {
+          "name": "controlslist",
+          "description": {
+            "kind": "markdown",
+            "value": "Switches built-in controls off, as `no<name>` tokens — the same shape"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#controlslist"
+            }
+          ]
+        },
+        {
+          "name": "disablepictureinpicture",
+          "description": {
+            "kind": "markdown",
+            "value": "Boolean. Refuses Picture-in-Picture, the same as `<video disablepictureinpicture>`:"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#disablepictureinpicture"
+            }
+          ]
+        },
+        {
+          "name": "disableremoteplayback",
+          "description": {
+            "kind": "markdown",
+            "value": "Boolean. Turns off remote playback targets (AirPlay, Cast) for the element, the same"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#disableremoteplayback"
+            }
+          ]
+        }
+      ],
+      "references": [
+        {
+          "name": "Documentation",
+          "url": "https://moviplayer.com/docs/api/element"
+        }
+      ]
+    }
+  ]
+}

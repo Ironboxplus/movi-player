@@ -1,4 +1,9 @@
-import * as Movi from "./dist/element.js";
+// Slim bundle: the FFmpeg engine ships beside it as dist/movi.wasm rather than
+// embedded, which keeps the largest JS file under the 5MB AMO's linter will
+// parse (the full build is 11.8MB and fails Firefox validation outright). Same
+// element, same API. Firefox copies this file verbatim — see firefox-extension/
+// build.sh — so both add-ons load the same bundle.
+import * as Movi from "./dist/element.slim.js";
 
 const params = new URLSearchParams(window.location.search);
 const url = params.get("url");
@@ -29,7 +34,9 @@ const cacheClearBtn = document.getElementById("cacheClearBtn");
 
 let fileAccessEnabled = false;
 try {
-  chrome.extension.isAllowedFileSchemeAccess().then((a) => { fileAccessEnabled = !!a; });
+  // Chromium-only API — Firefox has no isAllowedFileSchemeAccess, so the flag
+  // stays false there and the drop handler takes the ordinary in-page path.
+  chrome.extension.isAllowedFileSchemeAccess?.().then((a) => { fileAccessEnabled = !!a; });
 } catch {}
 
 // ─── Loading overlay ──────────────────────────────────────
@@ -1085,14 +1092,29 @@ function showFileAccessError(fileUrl) {
   overlay.classList.remove("hidden");
   const dropText = overlay.querySelector(".drop-text");
   if (dropText) {
+    // The same page ships to Chrome and Firefox, and each grants file:// access
+    // from a different screen — send the user to the one their browser has.
+    const isChromium = (() => {
+      try {
+        return chrome.runtime.getURL("").startsWith("chrome-extension://");
+      } catch {
+        return true;
+      }
+    })();
+    const how = isChromium
+      ? `open <b style="color:#A78BFA">chrome://extensions</b>,
+        find <b style="color:#A78BFA">Movi Player</b>, click <b style="color:#A78BFA">Details</b>,
+        and enable <b style="color:#A78BFA">"Allow access to file URLs"</b>`
+      : `open <b style="color:#A78BFA">about:addons</b>,
+        select <b style="color:#A78BFA">Movi Player</b>, open the
+        <b style="color:#A78BFA">Permissions</b> tab, and allow
+        <b style="color:#A78BFA">"Access your data for sites in the file:// domain"</b>`;
     dropText.innerHTML = `
       <h2 style="color:#ef4444">File access not enabled</h2>
       <p style="color:#888;max-width:420px;margin:8px auto 0;line-height:1.5">
-        To play local files, open <b style="color:#A78BFA">chrome://extensions</b>,
-        find <b style="color:#A78BFA">Movi Player</b>, click <b style="color:#A78BFA">Details</b>,
-        and enable <b style="color:#A78BFA">"Allow access to file URLs"</b>. Then reopen this video.
+        To play local files, ${how}. Then reopen this video.
       </p>
-      <p style="color:#555;margin-top:12px;font-size:11px;word-break:break-all">${fileUrl}</p>
+      <p style="color:#555;margin-top:12px;font-size:11px;word-break:break-all">${escapeHtml(fileUrl)}</p>
     `;
   }
 }

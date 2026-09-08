@@ -25,6 +25,10 @@ const SECTIONS: StatsSectionSpec[] = [
   {
     title: "Playback",
     keys: [
+      // Upstream leads the panel with version+bundle ("Player") because a bug
+      // report from the slim build reads very differently from the embedded
+      // one. Grouping put it in "Other" at the bottom; pin it first instead.
+      "Player",
       "Playback State",
       "Master Clock",
       "Playback Invariant",
