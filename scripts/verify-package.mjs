@@ -55,6 +55,13 @@ const bundleFiles = [
   "dist/element.js",
   "dist/player.js",
   "dist/demuxer.js",
+  // The slim entry is built separately (different define/alias), so Vite gives
+  // its worker assets their own content hashes. Leaving it out of this list
+  // made every slim worker asset look unreferenced — "start from a clean dist/"
+  // for files that are not stale at all and that dist/element.slim.js needs.
+  // Both fork-side workers hit this, because upstream has no worker decoders
+  // and the fork has no slim build; only the merged tree ships both.
+  "dist/element.slim.js",
 ];
 const workerSpecs = [
   {
