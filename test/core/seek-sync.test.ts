@@ -421,7 +421,19 @@ describe("MoviPlayer seek sync", () => {
     expect(readPacket).toHaveBeenCalled();
   }, 20_000);
 
-  it("bounds rebuffer demuxing when audio has already overshot the software buffer target", async () => {
+  // This used to bound the rebuffer unlock on the AUDIO cushion: read on only
+  // while audio sat within 1s of its target. Real execution showed that bound
+  // cannot work — during a rebuffer the renderer is suspended and the clock is
+  // paused, so the cushion is frozen at whatever it held when the stall hit, and
+  // a player that stalls above the allowance never reads, never gets a frame,
+  // and never resumes. Measured on a real HEVC Main10 + FLAC source over
+  // OpenList: 8.6s buffered against the 5.0s target, `media clock rate 0.340`,
+  // stuck in "buffering" for the rest of the run.
+  //
+  // The bound that does hold is the VIDEO decoder's own queue — the only reason
+  // to read during this rebuffer is to get a frame out of it — so that is what
+  // this now pins. See test/core/rebuffer-unlock.test.ts for the unlock side.
+  it("bounds rebuffer demuxing once the video decoder already has packets to work with", async () => {
     stubBrowserGlobals();
     const { MoviPlayer } = await import("../../src/core/MoviPlayer");
     const player = new MoviPlayer({});
@@ -455,7 +467,10 @@ describe("MoviPlayer seek sync", () => {
       _playStartTime: performance.now() - 4000,
       videoDecoder: {
         isSoftware: false,
-        queueSize: 0,
+        // Past maxVideoQueue for a hardware decoder mid-seek (60): the decoder
+        // is holding more than enough to produce the frame this rebuffer is
+        // waiting for, so reading more would only race ahead of it.
+        queueSize: 61,
         isWaitingForKeyframe: false,
         isRecentlyRecovering: () => false,
         // How long the decoder has been holding out for a keyframe —

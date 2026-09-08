@@ -1084,7 +1084,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // the first frame normally arrives within ~1 GOP.
   private static readonly SEEK_MAX_DEMUX_AHEAD_SECONDS = 8;
   private static readonly SEEK_SYNC_HARD_TIMEOUT_MS = 12000;
-  private static readonly REBUFFER_VIDEO_UNLOCK_AUDIO_OVERSHOOT_SECONDS = 1;
   private pendingAudioPackets: Array<{
     data: Uint8Array;
     timestamp: number;
@@ -5638,15 +5637,29 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // ends when a frame arrives, and the frame only arrives if we read. Same
     // shape as catchingUpVideo below, different trigger (that one is the
     // background-return catch-up; this one is a stalled rebuffer).
+    //
+    // Deliberately NOT conditioned on how far ahead audio got. A rebuffer is
+    // precisely when the cushion cannot drain — the renderer is suspended and
+    // the clock is paused — so whatever `audioBuffered` read at the stall is
+    // what it reads forever. An overshoot allowance (this used to permit 1s
+    // past the target) therefore does not bound anything; it just decides,
+    // once, whether the player deadlocks: no reads, so no frame; no frame, so
+    // no resume; no resume, so no drain. Measured on a real HEVC Main10 + FLAC
+    // source over OpenList: 8.6s buffered against the 5.0s software-audio
+    // target, stuck in "buffering" with an empty video queue for the rest of
+    // the run (`media clock rate 0.340`).
+    //
+    // The read-ahead this opens is bounded by the VIDEO decoder's own queue
+    // ceiling in the first branch below — the right bound, since the only
+    // reason to be reading here is to get a frame out of that decoder — and it
+    // closes the instant one lands, because videoBuffered/queueSize stop being
+    // zero.
     const needsRebufferVideoFrame =
       currentState === "buffering" &&
       this.wasPlayingBeforeRebuffer &&
       !!activeVideo &&
       videoBuffered === 0 &&
-      this.videoDecoder.queueSize === 0 &&
-      audioBuffered <=
-        maxAudioBuffered +
-          MoviPlayer.REBUFFER_VIDEO_UNLOCK_AUDIO_OVERSHOOT_SECONDS;
+      this.videoDecoder.queueSize === 0;
 
     const catchingUpVideo = this._videoResumeTarget !== -1;
     if (
