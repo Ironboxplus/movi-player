@@ -63,6 +63,25 @@ export class Demuxer {
   private wasmBinary?: Uint8Array;
   private useNewWasmInstance: boolean = false;
 
+  // One Asyncify call at a time.
+  //
+  // movi_seek_to and movi_read_frame both suspend the module mid-call while
+  // their I/O goes out to JS. Entering it again while one of them is unwound
+  // corrupts the rewind state: the second seek reports success without moving
+  // the demuxer, every later seek either no-ops or never resolves, and it has
+  // also surfaced as `memory access out of bounds` inside av_read_frame. What
+  // made that reachable is the element's poster seek(0) at load — a seek issued
+  // before it settles (a deep link, or a test harness setting currentTime the
+  // moment metadata lands) raced it, and the player then read from the OLD
+  // position until the 12s seek hard-timeout gave up. Measured on a 30 GB MKV:
+  // seek to 1377.568s, first packet back at 19.69s.
+  //
+  // MoviPlayer guards read-vs-seek with demuxInFlight, but that wait gives up
+  // after 1s and calls in anyway, and nothing guarded seek-vs-seek at all.
+  // Serializing here makes the invariant hold for every caller instead of
+  // asking each one to remember it.
+  private opChain: Promise<unknown> = Promise.resolve();
+
   /**
    * @param source - Data source adapter
    * @param wasmBinary - Optional WASM binary
@@ -448,6 +467,20 @@ export class Demuxer {
   }
 
   /**
+   * Run `op` with the WASM module to itself — see `opChain`. A rejection is
+   * delivered to its own caller and does not poison the queue: the next waiter
+   * still runs.
+   */
+  private runExclusive<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.opChain.then(op, op);
+    this.opChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
    * Seek to timestamp (async due to Asyncify)
    */
   async seek(
@@ -459,7 +492,7 @@ export class Demuxer {
       throw new Error("Demuxer not opened");
     }
 
-    await this.bindings.seek(timestamp, streamIndex, flags);
+    await this.runExclusive(() => this.bindings!.seek(timestamp, streamIndex, flags));
   }
 
   /**
@@ -470,7 +503,7 @@ export class Demuxer {
       throw new Error("Demuxer not opened");
     }
 
-    const result = await this.bindings.readFrame();
+    const result = await this.runExclusive(() => this.bindings!.readFrame());
     if (!result) return null;
 
     return {

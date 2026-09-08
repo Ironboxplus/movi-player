@@ -9,7 +9,11 @@ vi.mock("../../dist/wasm/movi.js", () => ({ default: vi.fn(async () => ({})) }))
 import { Demuxer } from "../../src/demux/Demuxer";
 
 function createOpenedDemuxer() {
-  const demuxer = Object.create(Demuxer.prototype) as Demuxer & {
+  // A real instance, not Object.create(prototype): the constructor is what
+  // initialises the field that serializes WASM entry points, and a prototype-
+  // only object skips it. The constructor itself only stores its arguments, so
+  // the source below is never touched by seek().
+  const demuxer = new Demuxer({} as never) as Demuxer & {
     bindings: { seek: ReturnType<typeof vi.fn> };
     isOpened: boolean;
   };
