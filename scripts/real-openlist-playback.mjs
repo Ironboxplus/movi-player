@@ -956,9 +956,18 @@ async function runAudioTrackSwitch(page, label) {
     };
   }
 
+  // How far currentTime may move as a side effect of switching tracks. A
+  // track switch changes which decoder is producing sound, not where
+  // playback is — it is not a seek. Generous (seconds, not frames) because a
+  // legitimate flush/re-buffer can cost some ground, but an order-of-
+  // magnitude clock displacement is not that.
+  const AUDIO_SWITCH_MAX_DISPLACEMENT_S = 1;
+
   const switched = [];
+  let preSwitchTime = start.currentTime;
   for (const track of start.audioTracks) {
     if (track.id === start.activeAudioTrackId) continue;
+    const switchIssuedAt = Date.now();
     const accepted = await page.evaluate(
       (trackId) =>
         Boolean(
@@ -981,6 +990,12 @@ async function runAudioTrackSwitch(page, label) {
     if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
       await page.evaluate(() => document.querySelector("movi-player").play());
     }
+    // Same reasoning as a seek's arrival vs settling: the moment the active
+    // track flips, the clock can still be mid-resync (new decoder cold-
+    // priming, audio cushion refilling) — sampling right there reads that
+    // transition as a media rate, not a rate. Wait for two consecutive ~1x
+    // windows before opening the measurement window, exactly like seeks do.
+    await waitForStablePlayback(page, switchIssuedAt);
     const { before, after } = await sampleWindow(page, phaseSampleMs);
     const progress = assertHealthy(
       label,
@@ -989,6 +1004,18 @@ async function runAudioTrackSwitch(page, label) {
       `audio track ${track.id} (${track.codec})`,
       { generationBudget: numeric(before.network?.streamGeneration) + 2 },
     );
+    // A track switch is not a seek: require the playhead itself not to have
+    // jumped. If it has, waiting out the resync above does not explain it
+    // away — that is a real bug, not a measurement artifact, and this catches
+    // it even though the wait above would otherwise paper over a rate blip
+    // caused by exactly this kind of jump.
+    const displacement = Math.abs(before.currentTime - preSwitchTime);
+    if (displacement > AUDIO_SWITCH_MAX_DISPLACEMENT_S) {
+      throw new Error(
+        `${label} playhead moved ${displacement.toFixed(3)}s (from ${preSwitchTime.toFixed(3)}s to ${before.currentTime.toFixed(3)}s) ` +
+          `just from switching to audio track ${track.id} (${track.codec}); a track switch must not move the playhead`,
+      );
+    }
     if (after.audioWorkerStaleDrops > before.audioWorkerStaleDrops + 64) {
       throw new Error(
         `${label} dropped ${after.audioWorkerStaleDrops - before.audioWorkerStaleDrops} stale worker frames after switching to track ${track.id}; the generation gate is letting the old track's work through`,
@@ -998,8 +1025,10 @@ async function runAudioTrackSwitch(page, label) {
       trackId: track.id,
       codec: track.codec,
       audioDecoder: after.audioDecoder,
+      displacementS: Number(displacement.toFixed(3)),
       ...progress,
     });
+    preSwitchTime = after.currentTime;
   }
 
   return { status: "switched", tracks: start.audioTracks, switched };
