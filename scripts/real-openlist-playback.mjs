@@ -421,6 +421,33 @@ function compactSnapshot(sample) {
   };
 }
 
+/**
+ * Sample a window, retrying once if the renderer's frame counter was reset.
+ *
+ * `framesPresented` is per-renderer and starts again at zero when the video
+ * pipeline is rebuilt — which a hardware resurrection attempt does mid-window.
+ * The delta then comes out NEGATIVE, and "presented only -10 frames" is the
+ * harness reporting its own arithmetic, not a player fault. Take one more
+ * window in that case; a second reset inside the retry is itself the finding
+ * and is reported as such.
+ */
+async function sampleWindow(page, windowMs) {
+  let before = await snapshot(page);
+  await page.waitForTimeout(windowMs);
+  let after = await snapshot(page);
+  if (after.framesPresented < before.framesPresented) {
+    before = await snapshot(page);
+    await page.waitForTimeout(windowMs);
+    after = await snapshot(page);
+    if (after.framesPresented < before.framesPresented) {
+      throw new Error(
+        `the video renderer's frame counter reset twice in a row (${before.framesPresented} -> ${after.framesPresented}); the video pipeline is being rebuilt repeatedly`,
+      );
+    }
+  }
+  return { before, after };
+}
+
 async function assertPlaybackStillAdvances(page, label, phase) {
   const before = await snapshot(page);
   await page.waitForTimeout(1_500);
@@ -521,9 +548,7 @@ async function seekAndSample(page, label, target, phase, generationBudget) {
   await seekTo(page, target);
   const arrivedMs = Date.now() - issuedAt;
   const recoveryMs = await waitForStablePlayback(page, issuedAt);
-  const before = await snapshot(page);
-  await page.waitForTimeout(postSeekSampleMs);
-  const after = await snapshot(page);
+  const { before, after } = await sampleWindow(page, postSeekSampleMs);
   const progress = assertHealthy(label, before, after, phase, { generationBudget });
   return {
     phase,
@@ -578,8 +603,7 @@ async function runRapidSeeks(page, label, duration) {
   const recoveryMs = await waitForStablePlayback(page, burstEndedAt);
 
   const settled = await snapshot(page);
-  await page.waitForTimeout(postSeekSampleMs);
-  const after = await snapshot(page);
+  const { after } = await sampleWindow(page, postSeekSampleMs);
   const generationsUsed =
     numeric(after.network?.streamGeneration) - generationsBefore;
 
@@ -654,9 +678,7 @@ async function runPauseResume(page, label) {
     null,
     { timeout: 60_000 },
   );
-  const before = await snapshot(page);
-  await page.waitForTimeout(phaseSampleMs);
-  const after = await snapshot(page);
+  const { before, after } = await sampleWindow(page, phaseSampleMs);
   const progress = assertHealthy(label, before, after, "resume after pause", {
     generationBudget: numeric(before.network?.streamGeneration) + 2,
   });
@@ -713,9 +735,7 @@ async function runAudioTrackSwitch(page, label) {
     if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
       await page.evaluate(() => document.querySelector("movi-player").play());
     }
-    const before = await snapshot(page);
-    await page.waitForTimeout(phaseSampleMs);
-    const after = await snapshot(page);
+    const { before, after } = await sampleWindow(page, phaseSampleMs);
     const progress = assertHealthy(
       label,
       before,
@@ -783,8 +803,7 @@ async function runQualityProbe(page, label) {
   if (!enabled.autoQuality) {
     throw new Error(`${label} refused setAutoQuality(true)`);
   }
-  await page.waitForTimeout(phaseSampleMs);
-  const after = await snapshot(page);
+  const { after } = await sampleWindow(page, phaseSampleMs);
   const progress = assertHealthy(label, enabled, after, "ABR enabled", {
     generationBudget: numeric(enabled.network?.streamGeneration) + 2,
   });
@@ -862,9 +881,10 @@ async function runVisibilityCycle(page, label) {
   if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
     await page.evaluate(() => document.querySelector("movi-player").play());
   }
-  const visibleBefore = await snapshot(page);
-  await page.waitForTimeout(phaseSampleMs);
-  const visibleAfter = await snapshot(page);
+  const { before: visibleBefore, after: visibleAfter } = await sampleWindow(
+    page,
+    phaseSampleMs,
+  );
   const visibleProgress = assertHealthy(
     label,
     visibleBefore,
@@ -1186,9 +1206,10 @@ async function runOne(browser, token, mediaPath) {
   // seconds after play() include the clock's first sync to audio, which is a
   // jump, not a rate.
   const startupRecoveryMs = await waitForStablePlayback(page, Date.now());
-  const playBefore = await snapshot(page);
-  await page.waitForTimeout(sampleMs);
-  const playAfter = await snapshot(page);
+  const { before: playBefore, after: playAfter } = await sampleWindow(
+    page,
+    sampleMs,
+  );
   let playProgress;
   try {
     playProgress = assertHealthy(label, playBefore, playAfter, "steady playback");
@@ -1267,16 +1288,25 @@ async function runOne(browser, token, mediaPath) {
   // Everything past this point runs a phase and decorates any failure with the
   // snapshot and the console trail, so a failing gate says WHY rather than just
   // which assertion tripped.
+  // Phases that completed are kept even when a later one fails. Without this a
+  // failing sample reported only its error, so the seek matrix, the stream
+  // generations the consecutive-seek burst cost, and the byte budget — the
+  // numbers the run exists to produce — were all thrown away with it.
+  const completed = {};
   const runPhase = async (name, fn) => {
     try {
-      return await fn();
+      const value = await fn();
+      completed[name] = value;
+      return value;
     } catch (error) {
       const current = await snapshot(page).catch(() => null);
-      throw new Error(
+      const wrapped = new Error(
         `[${name}] ${error instanceof Error ? error.message : String(error)}; ` +
           `snapshot=${current ? JSON.stringify(compactSnapshot(current)) : "unavailable"}; ` +
           `diagnostics=${decoderDiagnostics.slice(-120).join(" | ")}`,
       );
+      wrapped.partial = { failedPhase: name, completed };
+      throw wrapped;
     }
   };
 
@@ -1437,6 +1467,9 @@ async function main() {
           status: "fail",
           elapsedSeconds: Number(((Date.now() - sampleStartedAt) / 1000).toFixed(1)),
           error: message,
+          // Whatever this sample DID prove before it stopped.
+          failedPhase: error?.partial?.failedPhase ?? null,
+          completedPhases: error?.partial?.completed ?? null,
         });
         console.log(`FAIL (${((Date.now() - sampleStartedAt) / 1000).toFixed(1)}s)`);
         process.stderr.write(`  ${label}: ${message}\n`);
