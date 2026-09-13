@@ -170,7 +170,7 @@ async function snapshot(page) {
       // ever going to succeed: "unmapped" means there was no WebCodecs codec
       // string for this stream at all, so every hardware resurrection
       // attempt against it is doomed before it starts.
-      _softwareReason: String(player?.videoDecoder?.softwareDecodeReason?.() ?? ""),
+      _softwareReason: String(player?.videoDecoder?.softwareReason ?? ""),
       autoQuality: Boolean(player?._autoQuality),
       dashRenditionCount: Number(player?._dashRenditions?.length ?? 0),
       qualityMenuVisible: Boolean(
