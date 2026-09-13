@@ -1477,7 +1477,7 @@ async function runOne(browser, token, mediaPath) {
     null,
     { timeout: 30_000 },
   );
-  await page.evaluate((rawUrl) => {
+  await page.evaluate(({ rawUrl, bufferSizeMb }) => {
     globalThis.__moviBlackboxErrors = [];
     globalThis.__moviBlackboxQoe = [];
     const element = document.querySelector("movi-player");
@@ -1493,6 +1493,12 @@ async function runOne(browser, token, mediaPath) {
     // does NOT force software — H.264 still takes the hardware path, so the
     // hardware-preferred assertion below is unaffected.
     element.setAttribute("sw", "auto");
+    // Diagnostic-only knob for the 2026-09-13 headful memmove-starvation
+    // investigation: without this the element never gets a `buffersize`
+    // attribute, so HttpSource keeps its own computed 3%-of-file default and
+    // there is no way to ask the harness for a specific stream window. Off
+    // (element default) unless MOVI_BLACKBOX_BUFFER_MB is set.
+    if (bufferSizeMb) element.setAttribute("buffersize", String(bufferSizeMb));
     element.addEventListener("error", (event) => {
       const value = event?.detail ?? event?.message ?? "player error";
       globalThis.__moviBlackboxErrors.push(String(value));
@@ -1505,7 +1511,7 @@ async function runOne(browser, token, mediaPath) {
       });
     });
     element.src = rawUrl;
-  }, media.raw_url);
+  }, { rawUrl: media.raw_url, bufferSizeMb: Number(process.env.MOVI_BLACKBOX_BUFFER_MB || 0) });
 
   await page.waitForFunction(
     () => {
