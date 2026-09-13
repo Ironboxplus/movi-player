@@ -250,6 +250,32 @@ export class HttpSource implements SourceAdapter {
   private seekHinted: boolean = false;
   private seekHintOffset: number | null = null;
 
+  /**
+   * Bumped by preemptPendingReads(). A read that entered before the bump gives
+   * up the moment it notices, so whoever asked for the preemption can get in.
+   *
+   * Reads are deliberately NOT bounded overall: waitForData extends its
+   * deadline for as long as bytes keep arriving, because a slow but steady link
+   * is a legitimate thing to wait out. That makes a read an unbounded wait, and
+   * the demuxer serializes seek against read — so without a way to cut a read
+   * short, a seek queued behind one inherits its unboundedness and the player
+   * freezes. This is the cut.
+   */
+  private preemptEpoch: number = 0;
+  /** In-flight one-off range fetches, so a preemption can abort their bodies. */
+  private oneOffFetches: Set<AbortController> = new Set();
+  /**
+   * Plain upper bound on a single one-off range fetch, headers AND body.
+   *
+   * The sequential stream has the stall watchdog; the one-off path had nothing
+   * at all — only `lifetimeAbort`, which lives as long as the source does. A
+   * server that completes the TCP handshake and then says nothing hung both the
+   * `fetch()` and the `arrayBuffer()` that follows it, forever. These requests
+   * are at most ONEOFF_RANGE_MAX_BYTES and serve metadata/index reads, so a
+   * fixed ceiling is appropriate here in a way it is not for the main stream.
+   */
+  private readonly ONEOFF_FETCH_TIMEOUT_MS = 15000;
+
   // Dynamic buffer size (3% of file size, clamped)
   // Start with minimum size, will be resized when file size is known
   private bufferSize: number = MIN_BUFFER_SIZE;
@@ -1982,6 +2008,7 @@ export class HttpSource implements SourceAdapter {
     if (offset >= needed && this.size > 0 && offset >= this.size) return true;
 
     const initialVersion = this.atomicGetVersion();
+    const initialPreemptEpoch = this.preemptEpoch;
 
     // Track progress to allow slow but steady streams
     let lastProgress = this.bufferEnd;
@@ -2033,6 +2060,14 @@ export class HttpSource implements SourceAdapter {
       // Check if stream was superseded by another startStream call
       if (this.atomicGetVersion() !== initialVersion) {
         Logger.warn(TAG, `Stream superseded while waiting for ${offset}`);
+        return false;
+      }
+
+      // A seek is queued behind this read. Stop waiting — see
+      // preemptPendingReads(); the bytes we're waiting for are about to stop
+      // being the bytes anyone wants.
+      if (this.isPreempted(initialPreemptEpoch)) {
+        Logger.warn(TAG, `Read at ${offset} preempted by a queued seek`);
         return false;
       }
 
@@ -2097,6 +2132,10 @@ export class HttpSource implements SourceAdapter {
   }
 
   private async _readInternal(offset: number, length: number): Promise<ArrayBuffer> {
+    // Anything that arrives later is compared against this. A preemption signal
+    // raised after we entered means a seek is queued behind us and this read
+    // must give up rather than make it wait (see preemptPendingReads).
+    const preemptEpochAtEntry = this.preemptEpoch;
     Logger.debug(
       TAG,
       `Read: offset=${offset}, length=${length}, bufferStart=${this.atomicGetBufferStart()}, bufferEnd=${this.bufferEnd}, streaming=${this.atomicIsStreaming()}`,
@@ -2179,6 +2218,9 @@ export class HttpSource implements SourceAdapter {
         } finally {
           this.pendingLinearReads.delete(pendingRead);
         }
+        if (this.isPreempted(preemptEpochAtEntry)) {
+          throw new Error(`Read at ${offset} preempted by a queued seek`);
+        }
       }
       if (this.isInBuffer(offset, length)) return this.readFromBuffer(offset, length);
       if (this.streamError) throw this.streamError;
@@ -2216,6 +2258,13 @@ export class HttpSource implements SourceAdapter {
         this.consecutiveOneOffFetches = 0;
         this.consumeSeekHintAt(offset);
         return this.readFromBuffer(offset, length);
+      }
+
+      // Preempted, not stalled. Restarting the stream here would spend another
+      // unbounded wait on bytes the queued seek is about to invalidate, so hand
+      // control back at once — the caller's read is expendable, the seek is not.
+      if (this.isPreempted(preemptEpochAtEntry)) {
+        throw new Error(`Read at ${offset} preempted by a queued seek`);
       }
 
       // If wait failed but stream is still theoretically active/valid,
@@ -2282,6 +2331,21 @@ export class HttpSource implements SourceAdapter {
           this.consecutiveOneOffFetches < this.MAX_ONEOFF_BEFORE_RESTART))
     ) {
       Logger.info(TAG, `Read: one-off range fetch for offset=${offset}, length=${length} (outside stream window, main stream continues)`);
+      // Its own signal, on top of the source-lifetime one: a server that
+      // accepts the connection and then goes quiet used to hang this fetch —
+      // and the arrayBuffer() after it — with nothing to stop either. The
+      // controller is also what preemptPendingReads() aborts.
+      const oneOffAbort = new AbortController();
+      this.oneOffFetches.add(oneOffAbort);
+      const abortOnLifetime = () => oneOffAbort.abort();
+      this.lifetimeAbort.signal.addEventListener("abort", abortOnLifetime);
+      const oneOffTimer = setTimeout(() => {
+        Logger.warn(
+          TAG,
+          `One-off range fetch at ${offset} exceeded ${this.ONEOFF_FETCH_TIMEOUT_MS}ms, aborting`,
+        );
+        oneOffAbort.abort();
+      }, this.ONEOFF_FETCH_TIMEOUT_MS);
       try {
         const rangeEnd =
           this.size > 0
@@ -2290,7 +2354,7 @@ export class HttpSource implements SourceAdapter {
         const rangeLen = rangeEnd - offset + 1;
         const response = await fetch(this.url, {
           headers: await this.buildRequestHeaders({ offset, length: rangeLen }),
-          signal: this.lifetimeAbort.signal,
+          signal: oneOffAbort.signal,
         });
         if (response.status === 206 || response.ok) {
           // Guard against a server that ignores the Range header and streams
@@ -2334,7 +2398,16 @@ export class HttpSource implements SourceAdapter {
           return result.buffer;
         }
       } catch (e) {
+        // A preemption aborted us on purpose; falling through to a stream
+        // restart would just be another unbounded wait in front of the seek.
+        if (this.isPreempted(preemptEpochAtEntry)) {
+          throw new Error(`Read at ${offset} preempted by a queued seek`);
+        }
         Logger.warn(TAG, `One-off range fetch failed, falling back to stream restart`, e);
+      } finally {
+        clearTimeout(oneOffTimer);
+        this.lifetimeAbort.signal.removeEventListener("abort", abortOnLifetime);
+        this.oneOffFetches.delete(oneOffAbort);
       }
     }
 
@@ -2349,7 +2422,12 @@ export class HttpSource implements SourceAdapter {
     Logger.debug(TAG, `Read: waiting for data...`);
     const success = await this.waitForData(offset, length);
     Logger.debug(TAG, `Read: waitForData returned ${success}`);
-    if (!success) throw new Error(`Timeout at ${offset}`);
+    if (!success) {
+      if (this.isPreempted(preemptEpochAtEntry)) {
+        throw new Error(`Read at ${offset} preempted by a queued seek`);
+      }
+      throw new Error(`Timeout at ${offset}`);
+    }
 
     // Reset force restart counter on successful read
     this.consecutiveForceRestarts = 0;
@@ -2407,6 +2485,37 @@ export class HttpSource implements SourceAdapter {
     this.seekHintOffset = Number.isFinite(expectedOffset)
       ? Math.max(0, expectedOffset!)
       : null;
+  }
+
+  /**
+   * Cut short every read currently waiting on this source.
+   *
+   * Called by the demuxer when a seek has queued behind an in-flight read. The
+   * read's result is about to be thrown away anyway — the seek moves the
+   * position out from under it — so there is nothing to lose by abandoning it,
+   * and everything to lose by waiting: the wait has no upper bound.
+   *
+   * Reads that start AFTER this call are unaffected; they snapshot the epoch on
+   * entry, so the seek's own reads are not preempted by the signal that let it
+   * through.
+   */
+  preemptPendingReads(): void {
+    this.preemptEpoch++;
+    // Abort the bodies of any one-off range fetches; the parked waiters are
+    // released by wakeBufferWaiters so they re-run their checks immediately
+    // instead of sitting out the rest of their poll interval.
+    for (const controller of this.oneOffFetches) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+    this.wakeBufferWaiters(true);
+    Logger.debug(TAG, `Preempting pending reads (epoch ${this.preemptEpoch})`);
+  }
+
+  /** True when `epoch` predates a preemption signal. */
+  private isPreempted(epoch: number): boolean {
+    return this.preemptEpoch !== epoch;
   }
 
   private isSeekHintedLanding(offset: number): boolean {

@@ -34,6 +34,19 @@ export interface SourceAdapter {
   hintSeek?(expectedOffset?: number): void;
 
   /**
+   * Optional. Abandon every read currently waiting on this source.
+   *
+   * The demuxer serializes its WASM entry points, so a seek cannot start while
+   * a read is still suspended inside the module. Reads on a streaming source
+   * are not bounded — they wait out a slow link for as long as it keeps
+   * delivering — so a seek queued behind one would inherit that unboundedness.
+   * Calling this lets the waiting read fail fast; its bytes were about to be
+   * made irrelevant by the seek anyway. Reads started after the call are
+   * unaffected.
+   */
+  preemptPendingReads?(): void;
+
+  /**
    * Get the current read position
    */
   getPosition(): number;

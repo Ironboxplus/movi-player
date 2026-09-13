@@ -63,6 +63,17 @@ export interface HttpFixtureOptions {
   stallForFirstGets?: number;
   /** Start stalling only from this GET onwards (1-based). Default 1. */
   stallFromGet?: number;
+  /**
+   * Stall only GETs whose Range starts at or after this offset.
+   *
+   * Lets a test single out one particular request — e.g. the one-off range
+   * fetch a far-out-of-window read issues — while the sequential stream from
+   * byte 0 keeps being served normally. GET ordinals are too brittle for that:
+   * size resolution, retries and the stream's own chunking all consume them.
+   */
+  stallRangeStartAtLeast?: number;
+  /** Stall only the first N GETs matching `stallRangeStartAtLeast`. */
+  stallMatchLimit?: number;
 }
 
 export interface HttpFixture {
@@ -98,6 +109,7 @@ export async function startHttpFixture(
   const requests: HttpFixture["requests"] = [];
 
   let getCount = 0;
+  let stallMatches = 0;
 
   const sendBody = (
     res: http.ServerResponse,
@@ -213,15 +225,30 @@ export async function startHttpFixture(
         getCount <= options.abortBodyForFirstGets)
         ? options.abortBodyAfterBytes
         : undefined;
+    const parsed = parseRange(rangeHeader, size);
+
+    let rangeStallMatches = true;
+    if (options.stallRangeStartAtLeast !== undefined) {
+      rangeStallMatches =
+        parsed !== null && parsed.start >= options.stallRangeStartAtLeast;
+      if (rangeStallMatches) {
+        stallMatches++;
+        if (
+          options.stallMatchLimit !== undefined &&
+          stallMatches > options.stallMatchLimit
+        ) {
+          rangeStallMatches = false;
+        }
+      }
+    }
     const stallAfter =
       options.stallAfterBytes !== undefined &&
+      rangeStallMatches &&
       getCount >= (options.stallFromGet ?? 1) &&
       (options.stallForFirstGets === undefined ||
         getCount <= options.stallForFirstGets)
         ? options.stallAfterBytes
         : undefined;
-
-    const parsed = parseRange(rangeHeader, size);
 
     if (options.strict416 && rangeHeader && !parsed) {
       // Only a start beyond EOF is unsatisfiable here; a malformed header would

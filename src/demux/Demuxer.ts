@@ -82,6 +82,27 @@ export class Demuxer {
   // asking each one to remember it.
   private opChain: Promise<unknown> = Promise.resolve();
 
+  // How many readPacket() calls are queued on or running inside opChain.
+  //
+  // Serializing made the chain strictly FIFO, which is correct for ordering but
+  // leaves a seek waiting however long the read in front of it takes — and a
+  // read on a streaming source has no upper bound by design (HttpSource extends
+  // its deadline for as long as bytes keep arriving, because a slow link is
+  // worth waiting out). A server that accepts the connection and then goes
+  // silent therefore froze the player: the read never returned, so the seek
+  // never ran. When a seek finds a read in front of it, it asks the source to
+  // drop what that read is waiting on; the read fails fast, the chain advances,
+  // and the seek runs. The read's bytes were about to be made irrelevant by the
+  // seek in any case.
+  //
+  // Deliberately counts reads only, not every queued op. Preempting the reads
+  // of an in-flight SEEK would make that seek reject, and MoviPlayer.seek()
+  // rethrows out of its caller — a different failure, not an improvement. A
+  // seek queued behind another seek still waits, but that wait is bounded:
+  // every read a seek performs now has a ceiling (the stall watchdog, the force
+  // restart limit, and the one-off fetch timeout added alongside this).
+  private readsPending: number = 0;
+
   /**
    * @param source - Data source adapter
    * @param wasmBinary - Optional WASM binary
@@ -492,6 +513,17 @@ export class Demuxer {
       throw new Error("Demuxer not opened");
     }
 
+    // A read is on the chain in front of us, waiting for bytes at a position
+    // this seek is about to abandon. Tell the source to stop waiting for them
+    // (see readsPending).
+    if (this.readsPending > 0) {
+      try {
+        this.source.preemptPendingReads?.();
+      } catch (e) {
+        Logger.warn(TAG, "Source refused the seek preemption signal", e);
+      }
+    }
+
     await this.runExclusive(() => this.bindings!.seek(timestamp, streamIndex, flags));
   }
 
@@ -503,7 +535,13 @@ export class Demuxer {
       throw new Error("Demuxer not opened");
     }
 
-    const result = await this.runExclusive(() => this.bindings!.readFrame());
+    this.readsPending++;
+    let result: Awaited<ReturnType<WasmBindings["readFrame"]>>;
+    try {
+      result = await this.runExclusive(() => this.bindings!.readFrame());
+    } finally {
+      this.readsPending--;
+    }
     if (!result) return null;
 
     return {
