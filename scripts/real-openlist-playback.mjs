@@ -533,6 +533,27 @@ function pictureChanged(a, b) {
   return diff / n > PICTURE_CHANGE_THRESHOLD;
 }
 
+// Where assertRealPicture drops a PNG the moment it is about to fail. The
+// full-matrix sweep that found the headless near-black/frozen H.264 samples
+// was decided by a NUMBER (luma spread=1.0) that could not by itself tell
+// "the picture is actually black" apart from "the picture is fine and the
+// capture path is broken" — that took a human looking at a saved screenshot
+// from a headful run to resolve. Saving the frame automatically means nobody
+// has to re-run headful just to look.
+const SCREENSHOT_DIR = resolve(".blackbox-results/screenshots");
+
+async function saveFailureScreenshot(page, label, phase) {
+  try {
+    await mkdir(SCREENSHOT_DIR, { recursive: true });
+    const safeName = `${label}-${phase}-${Date.now()}`.replace(/[^a-zA-Z0-9._-]+/g, "_");
+    const path = resolve(SCREENSHOT_DIR, `${safeName}.png`);
+    await page.screenshot({ path });
+    return path;
+  } catch (error) {
+    return `(failed to save screenshot: ${error instanceof Error ? error.message : String(error)})`;
+  }
+}
+
 /**
  * Require the canvas to show a real, changing image — not a solid colour, not
  * black, not the decode-failure green, and not a frozen frame repeated across
@@ -546,32 +567,42 @@ async function assertRealPicture(page, label, phase) {
     shots.push(await capturePicture(page));
     if (i < 2) await page.waitForTimeout(1_500);
   }
-  shots.forEach((shot, i) => {
+  for (let i = 0; i < shots.length; i++) {
+    const shot = shots[i];
     if (!shot) {
-      throw new Error(`${label} had no readable canvas frame (sample ${i}) during ${phase}`);
+      const shotPath = await saveFailureScreenshot(page, label, phase);
+      throw new Error(
+        `${label} had no readable canvas frame (sample ${i}) during ${phase}; screenshot=${shotPath}`,
+      );
     }
     if (shot.spread < PICTURE_FLAT_SPREAD) {
+      const shotPath = await saveFailureScreenshot(page, label, phase);
       throw new Error(
         `${label} canvas is near-uniform (luma spread=${shot.spread.toFixed(1)}, ` +
-          `uniqueColors=${shot.uniqueColors}) during ${phase} — looks like a solid-colour frame`,
+          `uniqueColors=${shot.uniqueColors}) during ${phase} — looks like a solid-colour frame; ` +
+          `screenshot=${shotPath}`,
       );
     }
     if (shot.max < PICTURE_BLACK_MAX_LUMA) {
+      const shotPath = await saveFailureScreenshot(page, label, phase);
       throw new Error(
-        `${label} canvas is near-black (max luma=${shot.max.toFixed(1)}) during ${phase}`,
+        `${label} canvas is near-black (max luma=${shot.max.toFixed(1)}) during ${phase}; screenshot=${shotPath}`,
       );
     }
     if (shot.avgG > shot.avgR * 3 && shot.avgG > shot.avgB * 3 && shot.avgG > 80) {
+      const shotPath = await saveFailureScreenshot(page, label, phase);
       throw new Error(
         `${label} canvas is dominated by green (avgR=${shot.avgR.toFixed(1)}, ` +
           `avgG=${shot.avgG.toFixed(1)}, avgB=${shot.avgB.toFixed(1)}) during ${phase} — ` +
-          `the typical decode-failure output`,
+          `the typical decode-failure output; screenshot=${shotPath}`,
       );
     }
-  });
+  }
   if (!pictureChanged(shots[0], shots[1]) && !pictureChanged(shots[1], shots[2])) {
+    const shotPath = await saveFailureScreenshot(page, label, phase);
     throw new Error(
-      `${label} canvas did not change across 3 samples over ~3s during ${phase} — looks like a frozen frame`,
+      `${label} canvas did not change across 3 samples over ~3s during ${phase} — looks like a frozen frame; ` +
+        `screenshot=${shotPath}`,
     );
   }
   return {
@@ -1518,7 +1549,12 @@ async function runOne(browser, token, mediaPath) {
   const pictureEvidence = steadyResult?.pictureEvidence;
   const audioEvidence = steadyResult?.audioEvidence;
 
-  await runPhase("hardware decode check", async () => {
+  // Named precisely: this checks that WebCodecs ACCEPTED the prefer-hardware
+  // config and did not fall back to the WASM software decoder — it does not
+  // and cannot prove the frames were actually produced by a hardware decode
+  // unit. `hardwareAcceleration: "prefer-hardware"` is a hint; a browser is
+  // free to honour the config string while still decoding on the CPU.
+  await runPhase("hardware-preferred config check", async () => {
   if (/h\.?264|avc/i.test(playAfter.videoCodec || label)) {
     if (/software|wasm/i.test(playAfter.videoDecoder)) {
       const supportProbe = await page.evaluate(async () => {
@@ -1583,6 +1619,46 @@ async function runOne(browser, token, mediaPath) {
   }
   return null;
   });
+
+  // Observation, not an assertion (team-lead call, 2026-09-13): `powerEfficient`
+  // from navigator.mediaCapabilities.decodingInfo() is the browser's own
+  // self-report of whether a config actually runs on the power-efficient
+  // (hardware) path — a real answer where `hardwareAcceleration:
+  // "prefer-hardware"` is only a request. Recorded here so a report can say
+  // something stronger than "the config was accepted" without yet gating on
+  // it; only implemented for H.264 so far (the codec the ambiguity was about).
+  const mediaCapabilities = await (async () => {
+    if (!/h\.?264|avc/i.test(playAfter.videoCodec || label)) {
+      return { probed: false, reason: "only implemented for h264/avc so far" };
+    }
+    try {
+      return await page.evaluate(async () => {
+        const element = document.querySelector("movi-player");
+        const track = element?.player?.trackManager?.getActiveVideoTrack?.();
+        if (!track || !navigator.mediaCapabilities?.decodingInfo) {
+          return { probed: false, reason: "no active track or no mediaCapabilities API" };
+        }
+        const info = await navigator.mediaCapabilities.decodingInfo({
+          type: "file",
+          video: {
+            contentType: 'video/mp4; codecs="avc1.640028"',
+            width: track.width,
+            height: track.height,
+            bitrate: 8_000_000,
+            framerate: 24,
+          },
+        });
+        return {
+          probed: true,
+          supported: Boolean(info.supported),
+          powerEfficient: Boolean(info.powerEfficient),
+          smooth: Boolean(info.smooth),
+        };
+      });
+    } catch (error) {
+      return { probed: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  })();
 
   const duration = playAfter.duration;
   // Head / middle / tail / near-keyframe. The near-keyframe target is the
@@ -1693,6 +1769,7 @@ async function runOne(browser, token, mediaPath) {
     decodePath: playAfter.decodePath,
     softwareDecoding: playAfter.softwareDecoding,
     softwareDecodeReason: playAfter.softwareDecodeReason,
+    mediaCapabilities,
     _softwareReason: playAfter._softwareReason,
     hardwareRetryCount: playAfter.hardwareRetryCount,
     hardwareResurrectionAttempts: finalSnapshot.hardwareRetryCount,
@@ -1740,20 +1817,71 @@ async function runOne(browser, token, mediaPath) {
   }
 }
 
+// Default stays OLD headless — an escalation was tried on 2026-09-13 and it
+// did NOT end at headful, despite a decisive single-metric experiment
+// pointing that way. In order:
+//   1. old headless (Chrome's default when Playwright drives an external
+//      Chrome binary): a WebCodecs hardware decode path fed a near-black/
+//      frozen frame back to assertRealPicture (luma spread ~1.0, 1 unique
+//      colour).
+//   2. "--headless=new" (keeps GPU compositing on paper): SAME sample, SAME
+//      real Chrome build — still black (spread 0.0). Screenshot saved by the
+//      failure-capture path this same investigation added:
+//      .blackbox-results/screenshots/Good.Will.Hunting...steady_playback-*.png.
+//   3. headful, as a narrow team-lead probe (one metric, one short window,
+//      script at .secrets/headful-picture-probe.mjs outside this repo): DID
+//      get a normal picture back (luma spread 176.1, 800 unique colours).
+//      But running the FULL harness (this file, not the probe) headful on
+//      the SAME sample got stuck in "buffering" and never reached 1x twice
+//      in a row within 90s, TWICE in a row (elapsedSeconds 88.4s and 119.3s,
+//      currentTime creeping to only 6.8s / 10.4s) — it never even reached the
+//      picture assertion to test whether the black-frame problem was fixed.
+// So headful is NOT a safe default for the full harness on this host as it
+// stands: it trades a known, narrow gap (no real picture evidence for
+// hardware-decode streams under headless) for an unknown, broader one
+// (playback not reliably reaching steady state at all). Staying on old
+// headless keeps the harness able to finish a full 7-sample sweep, which is
+// what it did on 2026-09-13. MOVI_BLACKBOX_HEADLESS=new or =false remain
+// available for a deliberate, isolated re-investigation — never
+// "swiftshader": that forces software GL and reintroduces the very
+// hardware/software confound this investigation exists to remove.
+const headlessMode = process.env.MOVI_BLACKBOX_HEADLESS ?? "old";
+
 async function main() {
   const login = await api("/api/auth/login", { username, password });
   const { chromium } = await import("playwright");
   const executablePath = process.env.MOVI_CHROME_EXECUTABLE || undefined;
   const browser = await chromium.launch({
-    headless: true,
+    headless: headlessMode !== "false",
     ...(executablePath ? { executablePath } : {}),
     args: [
       "--autoplay-policy=no-user-gesture-required",
       "--disable-background-timer-throttling",
       "--disable-renderer-backgrounding",
       "--enable-features=SharedArrayBuffer",
+      ...(headlessMode === "new" ? ["--headless=new"] : []),
     ],
   });
+  // Chrome version and GPU renderer string, once per run: hardware-decode
+  // evidence without a browser version and GPU attached is not reproducible —
+  // WebCodecs hardware support depends on both.
+  const chromeVersion = browser.version();
+  const gpuRenderer = await (async () => {
+    const probePage = await browser.newPage();
+    try {
+      return await probePage.evaluate(() => {
+        const canvas = document.createElement("canvas");
+        const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+        if (!gl) return "no-webgl-context";
+        const info = gl.getExtension("WEBGL_debug_renderer_info");
+        return info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "debug-info-unavailable";
+      });
+    } catch (error) {
+      return `probe-failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      await probePage.close();
+    }
+  })();
 
   const startedAt = new Date().toISOString();
   const results = [];
@@ -1815,7 +1943,13 @@ async function main() {
     startedAt,
     finishedAt: new Date().toISOString(),
     pageUrl,
-    headless: true,
+    headless: headlessMode !== "false",
+    headlessMode,
+    // Hardware-decode evidence is meaningless without knowing which browser
+    // build and GPU produced it — support and behaviour both move with these.
+    chromeVersion,
+    gpuRenderer,
+    executablePath: executablePath ?? "(playwright bundled chromium)",
     acceptanceMode: allowNoPreference ? "diagnostic-no-preference" : "strict-hardware",
     samples: mediaPaths.length,
     passed: results.filter((r) => r.status === "pass").length,
