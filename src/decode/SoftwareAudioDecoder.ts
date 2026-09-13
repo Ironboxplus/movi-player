@@ -268,7 +268,17 @@ export class SoftwareAudioDecoder {
         numberOfFrames,
         numberOfChannels,
         sampleRate,
-        timestamp: pts * 1_000_000, // micro-seconds
+        // A1's bug, still here on the batch path (docs/PLAN_MERGE.MD's "已备案
+        // 的潜在问题"): `pts` is the raw packet timestamp of wherever the batch
+        // started, not a continuous PCM timeline. Back-to-back decodeBatch()
+        // calls (this path only runs for TrueHD/MLP/DTS on the legacy
+        // main-thread decoder, canBatch()'s `swDecoder instanceof
+        // SoftwareAudioDecoder` gate) would otherwise repeat the exact
+        // "video races ahead of audio" symptom A1 already fixed for the
+        // per-packet path below (processDecodedFrame). Same clock instance —
+        // it's already reset at every flush/reset point (:113/:144/:159), so
+        // this needs no separate wiring.
+        timestamp: this.pcmTimestampClock.next(pts, numberOfFrames, sampleRate),
       });
     } catch (e) {
       Logger.error(TAG, "Batched PCM extraction failed", e);
