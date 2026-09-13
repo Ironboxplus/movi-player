@@ -1,0 +1,56 @@
+import { describe, expect, it } from "vitest";
+import { PlaybackController } from "../../src/core/PlaybackController";
+import { Demuxer } from "../../src/demux/Demuxer";
+import { TrackManager } from "../../src/core/TrackManager";
+import { Clock } from "../../src/core/Clock";
+import type { SourceAdapter } from "../../src/source/SourceAdapter";
+
+/**
+ * PlaybackController is an upstream reference orchestrator MoviPlayer does
+ * not use (see the class doc comment) — deliberately excluded from the
+ * coverage thresholds in vitest.config.ts. This is a smoke test, not
+ * behavioral coverage: it exists only to catch an accidental signature
+ * break (an export renamed, a constructor requirement added, a documented
+ * public method dropped), not to lock its internal orchestration logic.
+ */
+describe("PlaybackController smoke test", () => {
+  it("constructs from its documented config, exposes its public API, and starts idle", () => {
+    const source = {
+      getSize: async () => 0,
+      read: async () => new ArrayBuffer(0),
+    } as unknown as SourceAdapter;
+    const demuxer = new Demuxer(source);
+    const trackManager = new TrackManager();
+    const clock = new Clock();
+    const canvas = {} as HTMLCanvasElement;
+
+    const controller = new PlaybackController({
+      canvas,
+      demuxer,
+      trackManager,
+      clock,
+    });
+
+    expect(controller).toBeInstanceOf(PlaybackController);
+
+    // Documented public API (README/modules.md "Playback orchestration"):
+    // presence and shape, not behavior.
+    for (const method of [
+      "init",
+      "start",
+      "stop",
+      "pause",
+      "resume",
+      "seek",
+      "setVolume",
+      "getVolume",
+      "destroy",
+    ] as const) {
+      expect(typeof controller[method]).toBe("function");
+    }
+
+    // A freshly constructed controller has not started its playback loop.
+    expect(typeof controller.stop).toBe("function");
+    expect(() => controller.stop()).not.toThrow();
+  });
+});

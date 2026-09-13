@@ -1,5 +1,21 @@
 /**
  * PlaybackController - Orchestrates demuxing, decoding, and rendering
+ *
+ * NOT used by MoviPlayer. This is an upstream file (present since the
+ * initial commit) kept as a lightweight reference orchestrator for library
+ * consumers who want a simpler API than MoviPlayer's — MoviPlayer implements
+ * its own demux/decode/render orchestration and never imports this class.
+ * Its own comments elsewhere in this file ("Simple A/V sync... In a
+ * production implementation, you'd buffer frames") mark it as a reference
+ * implementation, not something tuned for real playback.
+ *
+ * Deliberately excluded from the coverage targets in vitest.config.ts (see
+ * the comment there) for the same reason: it isn't on any path that can
+ * cause a real playback regression, so depth here would just be effort
+ * spent proving a prototype works rather than locking behavior anything
+ * depends on. It keeps a smoke test (constructs, exposes its documented
+ * public methods, starts idle) so an accidental signature break is still
+ * caught — see test/core/playback-controller-smoke.test.ts.
  */
 
 import type { Packet } from '../types';

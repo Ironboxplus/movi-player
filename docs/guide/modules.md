@@ -108,7 +108,7 @@ Includes everything from `demuxer` module, plus:
 | `TrackManager`       | Class | Track management       |
 | `Clock`              | Class | A/V sync clock         |
 | `PlayerStateManager` | Class | State machine          |
-| `PlaybackController` | Class | Playback orchestration |
+| `PlaybackController` | Class | Playback orchestration (reference implementation — MoviPlayer does not use it; see the class doc comment) |
 
 ### Use Cases
 
