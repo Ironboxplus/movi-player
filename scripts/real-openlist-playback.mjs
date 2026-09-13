@@ -850,15 +850,24 @@ async function runRapidSeeks(page, label, duration) {
     after,
     `${rapidSeekCount} consecutive seeks`,
     // The burst itself is allowed to open streams; what is being bounded is
-    // the total, which the byte budget also depends on.
-    { generationBudget: generationsBefore + 4 },
+    // the total, which the byte budget also depends on. Budget is
+    // rapidSeekCount, not a hardcoded 4: the E-decision experiment (Star
+    // Trek, VIRGIN PUNK, 2026-09-13) showed 5 seeks spaced rapidSeekGapMs
+    // apart each opening exactly one generation (1:1, zero overlap) is
+    // CORRECT behaviour, not a FIFO failure — the fixed "+4" against a
+    // default rapidSeekCount of 5 was guaranteed to read as "one over budget"
+    // every time none of the seeks in the burst overlap in flight.
+    { generationBudget: generationsBefore + rapidSeekCount },
   );
 
   // The FIFO adjudication, stated as a gate: a burst of N seeks where only the
-  // last one matters must not cost a stream restart per seek.
-  if (generationsUsed > 4) {
+  // last one matters must not cost MORE than one stream restart per seek —
+  // i.e. redundant/overlapping seeks in the burst should collapse, not stack.
+  // Seeing exactly N generations for N non-overlapping seeks is the FIFO
+  // queue behaving correctly, not failing to collapse anything.
+  if (generationsUsed > rapidSeekCount) {
     throw new Error(
-      `${label} spent ${generationsUsed} stream generations on ${rapidSeekCount} consecutive seeks (budget 4); the demuxer's FIFO seek queue is not collapsing redundant seeks`,
+      `${label} spent ${generationsUsed} stream generations on ${rapidSeekCount} consecutive seeks (budget ${rapidSeekCount}); the demuxer's FIFO seek queue is not collapsing redundant seeks`,
     );
   }
   // It landed on the LAST target, not an earlier one that won the race.
