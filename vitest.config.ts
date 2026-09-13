@@ -34,13 +34,36 @@ export default mergeConfig(
           "src/core/PlaybackController.ts",
         ],
         thresholds: {
-          // Enforce the current real-TCP merge baseline so later batches cannot
-          // silently erase exercised behavior. This is a regression floor, not
-          // the final 90/80 acceptance target tracked in docs/PLAN.md.
-          lines: 67,
-          functions: 72,
-          statements: 65,
-          branches: 55,
+          // Regression FLOOR, not the target. The real acceptance target is
+          // tracked in docs/PLAN_MERGE.MD §4.11 (currently far above this).
+          //
+          // These numbers are the actual measured coverage as of 2026-09-13
+          // (stmts 27.8 / branch 19.82 / funcs 32.17 / lines 29.01), rounded
+          // down to the whole point with an extra 0.5-1pt margin so normal
+          // test-order/timing noise doesn't flip the gate red on an
+          // unrelated commit. They exist so a later batch can't silently
+          // delete or gut exercised coverage — not to describe where we
+          // want to be.
+          //
+          // The previous values here (67/72/65/55) were set back when
+          // `coverage.include` covered ONLY src/source/HttpSource.ts. When
+          // `include` was widened to src/core/**, src/decode/**,
+          // src/demux/**, src/source/** (commit 1fccdd8), the denominator
+          // grew by roughly 10x and these thresholds were never
+          // recalculated — so every `vitest run` with coverage enabled has
+          // been exiting 1 (all four thresholds failing) since that commit,
+          // silently, because nobody was checking exit code, only
+          // "N passed" in the test summary. Caught only when a later batch
+          // ran the full suite and actually inspected the exit code.
+          //
+          // Rule going forward: only ratchet UP as real coverage grows.
+          // Never lower these to make a batch pass — lower coverage instead
+          // means the batch removed exercised behavior and that's the bug
+          // to fix, not the threshold.
+          lines: 28,
+          functions: 31,
+          statements: 27,
+          branches: 19,
         },
       },
     },
