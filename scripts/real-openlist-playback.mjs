@@ -165,6 +165,12 @@ async function snapshot(page) {
       hardwareRetryCount: Number(player?.videoDecoder?.hardwareRetryCount ?? 0),
       softwareDecoding: Boolean(player?.isSoftwareDecoding?.()),
       softwareDecodeReason: String(player?.softwareDecodeReason?.() ?? ""),
+      // Read straight off VideoDecoder's own getter (not re-derived) so a
+      // failure snapshot can answer on its own whether hardware retry was
+      // ever going to succeed: "unmapped" means there was no WebCodecs codec
+      // string for this stream at all, so every hardware resurrection
+      // attempt against it is doomed before it starts.
+      _softwareReason: String(player?.videoDecoder?.softwareDecodeReason?.() ?? ""),
       autoQuality: Boolean(player?._autoQuality),
       dashRenditionCount: Number(player?._dashRenditions?.length ?? 0),
       qualityMenuVisible: Boolean(
@@ -388,6 +394,8 @@ function compactSnapshot(sample) {
     audioUnderrunning: sample.audioUnderrunning,
     videoDecoder: sample.videoDecoder,
     audioDecoder: sample.audioDecoder,
+    hardwareRetryCount: sample.hardwareRetryCount,
+    _softwareReason: sample._softwareReason,
     state: sample.state,
     masterClock: sample.masterClock,
     playbackInvariant: sample.playbackInvariant,
@@ -1361,6 +1369,39 @@ async function runOne(browser, token, mediaPath) {
       if (decoderDiagnostics.length > 240) decoderDiagnostics.shift();
     }
   });
+
+  // Every step below is recorded individually and does NOT abort the sample.
+  // A plain throw-on-first-failure loop meant one failing seek threw away
+  // every check queued after it — including, on the samples that matter most,
+  // the MPEG-2/AC3/PGS evidence that only a LATER step exercises (e.g. the
+  // "middle seek" phase's real-picture/real-audio assertions never ran if
+  // "head seek" failed first). A failed step is pushed to stepFailures with
+  // its own snapshot and the run moves on to the next one; the sample is
+  // judged failed at the end if stepFailures is non-empty, but every step
+  // that COULD run still did, and the report keeps its result.
+  const completed = {};
+  const stepFailures = [];
+  const runPhase = async (name, fn) => {
+    try {
+      const value = await fn();
+      completed[name] = value;
+      return value;
+    } catch (error) {
+      const current = await snapshot(page).catch(() => null);
+      const message = error instanceof Error ? error.message : String(error);
+      stepFailures.push({
+        step: name,
+        error: message,
+        snapshot: current ? compactSnapshot(current) : null,
+      });
+      process.stderr.write(
+        `  [${label}] step "${name}" failed, continuing to the next step: ${message}\n`,
+      );
+      return null;
+    }
+  };
+
+  try {
   await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
   await page.waitForFunction(
     () => customElements.get("movi-player") !== undefined,
@@ -1442,30 +1483,42 @@ async function runOne(browser, token, mediaPath) {
   // seconds after play() include the clock's first sync to audio, which is a
   // jump, not a rate.
   const startupRecoveryMs = await waitForStablePlayback(page, Date.now());
-  const { before: playBefore, after: playAfter } = await sampleWindow(
-    page,
-    sampleMs,
-  );
-  let playProgress;
-  let pictureEvidence;
-  let audioEvidence;
-  try {
-    playProgress = assertHealthy(label, playBefore, playAfter, "steady playback");
-    // Content, not just clocks. This is the fix for the blind spot: a black
-    // frame + silence passed everything above.
-    pictureEvidence = await assertRealPicture(page, label, "steady playback");
-    if (playAfter.audioCodec && playAfter.audioCodec !== "N/A") {
-      audioEvidence = await assertRealAudio(page, label, "steady playback");
-    }
-  } catch (error) {
-    throw new Error(
-      `${error instanceof Error ? error.message : String(error)}; ` +
-        `before=${JSON.stringify(compactSnapshot(playBefore))}; ` +
-        `after=${JSON.stringify(compactSnapshot(playAfter))}; ` +
-        `diagnostics=${decoderDiagnostics.slice(-100).join(" | ")}`,
-    );
-  }
 
+  // Content, not just clocks, gated behind runPhase like every other check
+  // below: a failure here (e.g. the real-picture assertion) used to abort the
+  // whole sample, which meant a codec whose steady-state picture assertion
+  // trips never got to the seek matrix that would otherwise have shown
+  // whether the SAME codec decodes correctly at a seek target.
+  const steadyResult = await runPhase("steady playback", async () => {
+    const { before: playBefore, after: playAfter } = await sampleWindow(page, sampleMs);
+    try {
+      const playProgress = assertHealthy(label, playBefore, playAfter, "steady playback");
+      const pictureEvidence = await assertRealPicture(page, label, "steady playback");
+      let audioEvidence;
+      if (playAfter.audioCodec && playAfter.audioCodec !== "N/A") {
+        audioEvidence = await assertRealAudio(page, label, "steady playback");
+      }
+      return { playAfter, playProgress, pictureEvidence, audioEvidence };
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; ` +
+          `before=${JSON.stringify(compactSnapshot(playBefore))}; ` +
+          `after=${JSON.stringify(compactSnapshot(playAfter))}; ` +
+          `diagnostics=${decoderDiagnostics.slice(-100).join(" | ")}`,
+      );
+    }
+  });
+
+  // Whatever the steady-playback step did or didn't prove, take a fresh
+  // snapshot to drive the rest of the session — the seek matrix needs
+  // `duration` whether or not the content assertion above passed.
+  const postStartupSnapshot = (await snapshot(page).catch(() => null)) ?? {};
+  const playAfter = steadyResult?.playAfter ?? postStartupSnapshot;
+  const playProgress = steadyResult?.playProgress;
+  const pictureEvidence = steadyResult?.pictureEvidence;
+  const audioEvidence = steadyResult?.audioEvidence;
+
+  await runPhase("hardware decode check", async () => {
   if (/h\.?264|avc/i.test(playAfter.videoCodec || label)) {
     if (/software|wasm/i.test(playAfter.videoDecoder)) {
       const supportProbe = await page.evaluate(async () => {
@@ -1528,31 +1581,8 @@ async function runOne(browser, token, mediaPath) {
       process.stderr.write(`DIAGNOSTIC-ONLY: ${message}\n`);
     }
   }
-
-  // Everything past this point runs a phase and decorates any failure with the
-  // snapshot and the console trail, so a failing gate says WHY rather than just
-  // which assertion tripped.
-  // Phases that completed are kept even when a later one fails. Without this a
-  // failing sample reported only its error, so the seek matrix, the stream
-  // generations the consecutive-seek burst cost, and the byte budget — the
-  // numbers the run exists to produce — were all thrown away with it.
-  const completed = {};
-  const runPhase = async (name, fn) => {
-    try {
-      const value = await fn();
-      completed[name] = value;
-      return value;
-    } catch (error) {
-      const current = await snapshot(page).catch(() => null);
-      const wrapped = new Error(
-        `[${name}] ${error instanceof Error ? error.message : String(error)}; ` +
-          `snapshot=${current ? JSON.stringify(compactSnapshot(current)) : "unavailable"}; ` +
-          `diagnostics=${decoderDiagnostics.slice(-120).join(" | ")}`,
-      );
-      wrapped.partial = { failedPhase: name, completed };
-      throw wrapped;
-    }
-  };
+  return null;
+  });
 
   const duration = playAfter.duration;
   // Head / middle / tail / near-keyframe. The near-keyframe target is the
@@ -1569,18 +1599,20 @@ async function runOne(browser, token, mediaPath) {
   const seeks = [];
   for (const [phase, rawTarget] of seekMatrix) {
     const target = Math.max(1, Math.min(duration - 5, rawTarget));
-    const pre = await snapshot(page);
-    seeks.push(
-      await runPhase(phase, () =>
-        seekAndSample(
-          page,
-          label,
-          target,
-          phase,
-          numeric(pre.network?.streamGeneration) + 2,
-        ),
+    const pre = await snapshot(page).catch(() => null);
+    const result = await runPhase(phase, () =>
+      seekAndSample(
+        page,
+        label,
+        target,
+        phase,
+        numeric(pre?.network?.streamGeneration) + 2,
       ),
     );
+    // A failed seek still needs to carry its phase/target so the report
+    // stays legible — a bare `null` in the seeks array loses which of the
+    // four targets it was.
+    seeks.push(result ?? { phase, target: Number(target.toFixed(2)), status: "failed" });
   }
 
   const rapidSeeks = await runPhase("consecutive seeks", () =>
@@ -1598,31 +1630,43 @@ async function runOne(browser, token, mediaPath) {
   );
 
   // Keep the single "post-seek playback" figure the old report carried, so the
-  // A/B against the fork baseline stays comparable.
-  const seekProgress = seeks.find((s) => s.phase === "middle seek") ?? seeks[0];
+  // A/B against the fork baseline stays comparable. Prefer a seek that
+  // actually succeeded over one recorded merely as failed.
+  const seekProgress =
+    seeks.find((s) => s.phase === "middle seek" && s.status !== "failed") ??
+    seeks.find((s) => s.status !== "failed") ??
+    seeks[0];
 
   const subtitles = await runPhase("subtitles", () =>
     validateSubtitles(page, label),
   );
-  const finalSnapshot = await snapshot(page);
-  if (finalSnapshot.state !== "playing" || !finalSnapshot.clockRunning) {
-    throw new Error(`${label} did not finish subtitle-integrated playback with a running clock`);
-  }
-  if (finalSnapshot.errors.length > 0) {
-    throw new Error(`${label} emitted player errors during subtitle-integrated playback`);
-  }
-  if (finalSnapshot.network) {
-    if (Number(finalSnapshot.network.readStalls ?? 0) !== 0) {
-      throw new Error(`${label} recorded HTTP source stalls after subtitle testing`);
+
+  await runPhase("final state check", async () => {
+    const check = await snapshot(page);
+    if (check.state !== "playing" || !check.clockRunning) {
+      throw new Error(`${label} did not finish subtitle-integrated playback with a running clock`);
     }
-    if (Number(finalSnapshot.network.bufferWaiters ?? 0) !== 0) {
-      throw new Error(`${label} left HTTP buffer waiters after subtitle testing`);
+    if (check.errors.length > 0) {
+      throw new Error(`${label} emitted player errors during subtitle-integrated playback`);
     }
-  }
+    if (check.network) {
+      if (Number(check.network.readStalls ?? 0) !== 0) {
+        throw new Error(`${label} recorded HTTP source stalls after subtitle testing`);
+      }
+      if (Number(check.network.bufferWaiters ?? 0) !== 0) {
+        throw new Error(`${label} left HTTP buffer waiters after subtitle testing`);
+      }
+    }
+    return null;
+  });
+
+  const finalSnapshot = (await snapshot(page).catch(() => null)) ?? postStartupSnapshot;
 
   // The byte budget is checked LAST, against the whole session: every seek,
   // every subtitle probe and every restart above has already been paid for by
-  // the time this runs.
+  // the time this runs. It runs even if earlier steps failed — the bytes were
+  // still spent either way, and are exactly what a stuck/thrashing failure
+  // mode would inflate.
   const budget = await runPhase("byte budget", async () =>
     assertByteBudget(label, {
       sizeBytes: media.size,
@@ -1632,9 +1676,10 @@ async function runOne(browser, token, mediaPath) {
     }),
   );
 
-  await context.close();
   return {
     label,
+    status: stepFailures.length > 0 ? "fail" : "pass",
+    stepFailures,
     size: media.size,
     duration: playAfter.duration,
     byteBudget: budget,
@@ -1648,6 +1693,8 @@ async function runOne(browser, token, mediaPath) {
     decodePath: playAfter.decodePath,
     softwareDecoding: playAfter.softwareDecoding,
     softwareDecodeReason: playAfter.softwareDecodeReason,
+    _softwareReason: playAfter._softwareReason,
+    hardwareRetryCount: playAfter.hardwareRetryCount,
     hardwareResurrectionAttempts: finalSnapshot.hardwareRetryCount,
     bufferMode: playAfter.sharedSourceBuffer ? "shared-array-buffer" : "plain-buffer",
     crossOriginIsolated: playAfter.crossOriginIsolated,
@@ -1673,6 +1720,24 @@ async function runOne(browser, token, mediaPath) {
     qoe: finalSnapshot.qoe,
     decoderDiagnostics,
   };
+  } catch (error) {
+    // A setup-level failure (login/page-load/element-mount, or anything else
+    // thrown OUTSIDE a runPhase-wrapped step) — nothing above produced a
+    // per-step record for this. Attach whatever diagnostics and network state
+    // exist so the failure entry in the report is not just a bare message;
+    // this is the gap the team lead flagged: failed samples had none of
+    // decoderDiagnostics/getNetworkStats() attached, which is exactly what
+    // triage needs most.
+    const current = await snapshot(page).catch(() => null);
+    if (error instanceof Error) {
+      error.decoderDiagnostics = decoderDiagnostics.slice(-120);
+      error.networkStats = current?.network ?? null;
+      error.partial = { failedPhase: "setup", completed };
+    }
+    throw error;
+  } finally {
+    await context.close().catch(() => {});
+  }
 }
 
 async function main() {
@@ -1702,9 +1767,25 @@ async function main() {
       process.stdout.write(`blackbox: ${label} ... `);
       const sampleStartedAt = Date.now();
       try {
+        // runOne no longer throws for a step that failed mid-sample — it
+        // keeps going and comes back with status:"fail" plus a stepFailures
+        // array covering every step that tripped, alongside every step that
+        // DID complete (seeks, evidence, byte budget, ...). Only a
+        // setup-level problem (login/page-load/element-mount) still throws.
         const result = await runOne(browser, login.token, mediaPath);
-        results.push({ ...result, status: "pass" });
-        console.log(`PASS (${((Date.now() - sampleStartedAt) / 1000).toFixed(1)}s)`);
+        results.push(result);
+        if (result.status === "fail") {
+          failures.push({
+            label,
+            message: result.stepFailures.map((f) => `[${f.step}] ${f.error}`).join(" | "),
+          });
+          console.log(`FAIL (${((Date.now() - sampleStartedAt) / 1000).toFixed(1)}s)`);
+          for (const f of result.stepFailures) {
+            process.stderr.write(`  ${label} [${f.step}]: ${f.error}\n`);
+          }
+        } else {
+          console.log(`PASS (${((Date.now() - sampleStartedAt) / 1000).toFixed(1)}s)`);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         failures.push({ label, message });
@@ -1713,9 +1794,14 @@ async function main() {
           status: "fail",
           elapsedSeconds: Number(((Date.now() - sampleStartedAt) / 1000).toFixed(1)),
           error: message,
-          // Whatever this sample DID prove before it stopped.
+          // Whatever this sample DID prove before it stopped, plus the
+          // diagnostics/network state runOne attaches to a setup-level throw
+          // (see the catch at the bottom of runOne) — a failed sample used to
+          // carry none of this, which is exactly what triage needs most.
           failedPhase: error?.partial?.failedPhase ?? null,
           completedPhases: error?.partial?.completed ?? null,
+          decoderDiagnostics: error?.decoderDiagnostics ?? null,
+          network: error?.networkStats ?? null,
         });
         console.log(`FAIL (${((Date.now() - sampleStartedAt) / 1000).toFixed(1)}s)`);
         process.stderr.write(`  ${label}: ${message}\n`);
