@@ -236,6 +236,19 @@ export class HttpSource implements SourceAdapter {
   private consecutiveForceRestarts: number = 0;
   private lastForceRestartTime: number = 0;
   private readonly MAX_FORCE_RESTARTS = 3; // Max consecutive force restarts before giving up
+  // Existing bug (pre-merge, not merge-caused): this used to be compared
+  // against a 5s "time since last restart" window to decide whether a new
+  // stall is a fresh episode or a continuation of the current cascade. But
+  // reaching this check at all requires waitForData() to have timed out
+  // first — PROGRESS_TIMEOUT below is 15s — so at least ~15s (plus backoff)
+  // always elapses between consecutive force-restart attempts. A 5s window
+  // is therefore always exceeded, `consecutiveForceRestarts` resets to 0
+  // every single time right before the MAX_FORCE_RESTARTS check runs, and a
+  // truly hung link retries forever instead of giving up after 3 attempts.
+  // Set well above the minimum ~15.1s cycle time (15s stall wait + up to
+  // 500ms backoff) so the reset only fires for a genuinely separate, later
+  // stall episode, not the very next iteration of the same one.
+  private readonly FORCE_RESTART_RESET_WINDOW_MS = 60000;
   // Consecutive one-off range fetches served while the read fell outside the
   // stream window. A lone spike (stray metadata/index read) shouldn't disturb
   // the sequential stream, but a run of them means the play position genuinely
@@ -2131,6 +2144,54 @@ export class HttpSource implements SourceAdapter {
     return result;
   }
 
+  /**
+   * Pure decision for one force-restart attempt against a stream that timed
+   * out but is still nominally active. No I/O, no timers — just the
+   * reset-window/cap arithmetic — so it can be unit-tested directly instead
+   * of only through the real-TCP path that reaches it (each real attempt
+   * costs a genuine ~15s progress-timeout wait, which makes driving the
+   * cap through several consecutive `read()` calls prohibitively slow and,
+   * worse, non-deterministic — which exact code path a given read takes
+   * next depends on window/offset state that shifts after every restart).
+   *
+   * Mutates `consecutiveForceRestarts`/`lastForceRestartTime` — the two
+   * fields this decision is entirely about — exactly as the inline version
+   * used to; the call site's `await new Promise(setTimeout)` for the actual
+   * backoff delay stays there since sleeping is the one impure part.
+   */
+  private registerForceRestartAttempt(
+    now: number,
+  ): { giveUp: true; attemptNumber: number } | {
+    giveUp: false;
+    attemptNumber: number;
+    backoffDelay: number;
+  } {
+    const timeSinceLastRestart = now - this.lastForceRestartTime;
+
+    // Reset counter only for a genuinely separate, later stall episode — see
+    // FORCE_RESTART_RESET_WINDOW_MS's declaration for why this can't be 5s.
+    if (timeSinceLastRestart > this.FORCE_RESTART_RESET_WINDOW_MS) {
+      this.consecutiveForceRestarts = 0;
+    }
+
+    if (this.consecutiveForceRestarts >= this.MAX_FORCE_RESTARTS) {
+      return { giveUp: true, attemptNumber: this.consecutiveForceRestarts };
+    }
+
+    // Exponential backoff before restarting: 100ms, 200ms, 400ms
+    const backoffDelay = Math.min(
+      100 * Math.pow(2, this.consecutiveForceRestarts),
+      500,
+    );
+    this.consecutiveForceRestarts++;
+    this.lastForceRestartTime = now;
+    return {
+      giveUp: false,
+      attemptNumber: this.consecutiveForceRestarts,
+      backoffDelay,
+    };
+  }
+
   private async _readInternal(offset: number, length: number): Promise<ArrayBuffer> {
     // Anything that arrives later is compared against this. A preemption signal
     // raised after we entered means a seek is queued behind us and this read
@@ -2275,37 +2336,28 @@ export class HttpSource implements SourceAdapter {
         if (this.isInBuffer(offset, length))
           return this.readFromBuffer(offset, length);
 
-        // Check if we're in a force restart loop
-        const now = Date.now();
-        const timeSinceLastRestart = now - this.lastForceRestartTime;
-
-        // Reset counter if it's been more than 5 seconds since last restart
-        if (timeSinceLastRestart > 5000) {
-          this.consecutiveForceRestarts = 0;
-        }
-
-        if (this.consecutiveForceRestarts >= this.MAX_FORCE_RESTARTS) {
+        // Check if we're in a force restart loop. Extracted to a pure method
+        // (no I/O) so the reset-window/cap arithmetic can be unit-tested
+        // directly rather than only through the ~15s-per-call real-TCP path
+        // that reaches it.
+        const decision = this.registerForceRestartAttempt(Date.now());
+        if (decision.giveUp) {
           Logger.error(
             TAG,
-            `Too many consecutive force restarts (${this.consecutiveForceRestarts}), giving up.`,
+            `Too many consecutive force restarts (${decision.attemptNumber}), giving up.`,
           );
           throw new Error(
-            `Stream failed after ${this.consecutiveForceRestarts} restart attempts`,
+            `Stream failed after ${decision.attemptNumber} restart attempts`,
           );
         }
 
-        // Exponential backoff before restarting: 100ms, 200ms, 400ms
-        const backoffDelay = Math.min(100 * Math.pow(2, this.consecutiveForceRestarts), 500);
         Logger.warn(
           TAG,
-          `Read timeout for ${offset} but stream is active. Force restarting after ${backoffDelay}ms (attempt ${this.consecutiveForceRestarts + 1}/${this.MAX_FORCE_RESTARTS}).`,
+          `Read timeout for ${offset} but stream is active. Force restarting after ${decision.backoffDelay}ms (attempt ${decision.attemptNumber}/${this.MAX_FORCE_RESTARTS}).`,
         );
 
         // Wait before restarting to avoid cascade
-        await new Promise((r) => setTimeout(r, backoffDelay));
-
-        this.consecutiveForceRestarts++;
-        this.lastForceRestartTime = now;
+        await new Promise((r) => setTimeout(r, decision.backoffDelay));
       }
     }
 

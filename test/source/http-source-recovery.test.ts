@@ -442,6 +442,136 @@ describe("HttpSource force restart", () => {
     expect(Date.now() - startedAt).toBeGreaterThan(14_000);
     expect(source.getFatalError()).toBeNull();
   }, 180_000);
+
+  /**
+   * M-series legacy defect (authorized fix, not merge-caused): a link that
+   * never delivers again after the opening chunk used to retry forever
+   * instead of giving up after MAX_FORCE_RESTARTS=3.
+   * `consecutiveForceRestarts` was reset to 0 by a 5s "time since last
+   * restart" check that always passed, because reaching that check at all
+   * requires a 15s `waitForData` timeout first — so the reset always won,
+   * right before the >=3 cap could ever see a nonzero counter.
+   *
+   * This proves the REAL end of that chain over real TCP: a genuinely
+   * stalled reconnect (server accepts the connection, sends headers, then
+   * nothing — the socket never errors) drives `consecutiveForceRestarts`
+   * from 0 to 1 through the actual `read()` path, in the real ~15s the fix
+   * depends on elapsing. The cap/reset arithmetic itself — what happens
+   * over the next two attempts, and that a >60s-later attempt correctly
+   * resets — is covered as a fast, deterministic unit test right below
+   * (`registerForceRestartAttempt`, extracted verbatim from this call site
+   * specifically so the boundary condition doesn't require driving three
+   * more real 15s+ timeouts through routing state that shifts after every
+   * restart).
+   */
+  it("counts a real stalled reconnect as one force-restart attempt, not a silent no-op", async () => {
+    const payload = makePayload(2 * 1024 * 1024);
+    const fixture = await openFixture({
+      body: payload,
+      rangePolicy: "normal",
+      stallAfterBytes: 0,
+      stallMs: 60_000,
+      stallFromGet: 2,
+      stallForFirstGets: 50,
+    });
+    const source = openSource(fixture.url);
+    source.setFirstRangeBytes(64 * 1024);
+
+    expect(await source.getSize()).toBe(payload.length);
+
+    // Establishes the stream (GET #1, served normally) and leaves it running.
+    const head = bytesOf(await source.read(0, 4096));
+    expect(Buffer.from(head).equals(payload.subarray(0, 4096))).toBe(true);
+
+    // Inside the running stream's window: GET #2 (the continuation) stalls
+    // silently past the 15s progress timeout, then the reader's own restart
+    // attempt (a fresh stream at this offset) stalls too — both real,
+    // neither an error, which is exactly the "hangs rather than resets"
+    // shape this bug needed.
+    await expect(source.read(100 * 1024, 4096)).rejects.toThrow(
+      /Timeout at 102400/,
+    );
+
+    expect((source as unknown as { consecutiveForceRestarts: number })
+      .consecutiveForceRestarts).toBe(1);
+  }, 60_000);
+});
+
+/**
+ * Fast, deterministic coverage of the cap/reset arithmetic extracted into
+ * `registerForceRestartAttempt()` — no network, no timers, real HttpSource
+ * instance with only the two fields this decision reads/writes seeded by
+ * hand (same Object.create + field-injection pattern used throughout this
+ * suite for CanvasRenderer/VideoDecoder). The real-TCP test above already
+ * proves the call site reaches this method with a genuinely stalled link;
+ * this is the boundary the fix is actually about.
+ */
+describe("HttpSource.registerForceRestartAttempt (M-series legacy defect fix)", () => {
+  function makeSource() {
+    // A REAL constructed instance (constructor is cheap: no network, just
+    // buffer allocation) rather than Object.create + field injection — so
+    // MAX_FORCE_RESTARTS and FORCE_RESTART_RESET_WINDOW_MS come from the
+    // real class-field defaults this fix is about, not a value the test
+    // asserts into existence.
+    return new HttpSource("http://127.0.0.1:1/unused", {}, 8) as unknown as {
+      consecutiveForceRestarts: number;
+      registerForceRestartAttempt(now: number):
+        | { giveUp: true; attemptNumber: number }
+        | { giveUp: false; attemptNumber: number; backoffDelay: number };
+    };
+  }
+
+  it("gives up once MAX_FORCE_RESTARTS (3) consecutive attempts land inside the reset window", () => {
+    const source = makeSource();
+
+    let now = 100_000;
+    const a1 = source.registerForceRestartAttempt(now);
+    expect(a1).toMatchObject({ giveUp: false, attemptNumber: 1 });
+
+    // Each subsequent attempt lands well inside the 60s reset window (this
+    // is the exact shape the bug got wrong: 15-16s apart, which used to be
+    // > the old 5s threshold and wrongly reset the counter every time).
+    now += 16_000;
+    const a2 = source.registerForceRestartAttempt(now);
+    expect(a2).toMatchObject({ giveUp: false, attemptNumber: 2 });
+
+    now += 16_000;
+    const a3 = source.registerForceRestartAttempt(now);
+    expect(a3).toMatchObject({ giveUp: false, attemptNumber: 3 });
+
+    now += 16_000;
+    const a4 = source.registerForceRestartAttempt(now);
+    expect(a4).toEqual({ giveUp: true, attemptNumber: 3 });
+    // The cap must not silently keep incrementing past MAX_FORCE_RESTARTS.
+    expect(source.consecutiveForceRestarts).toBe(3);
+  });
+
+  it("does reset the counter for a genuinely separate, later stall episode", () => {
+    const source = makeSource();
+
+    let now = 100_000;
+    source.registerForceRestartAttempt(now); // attempt 1
+    now += 16_000;
+    source.registerForceRestartAttempt(now); // attempt 2
+
+    // A full minute of healthy playback later, a brand new stall shows up.
+    // This must read as a fresh episode, not a continuation of the old one.
+    now += 61_000;
+    const fresh = source.registerForceRestartAttempt(now);
+    expect(fresh).toMatchObject({ giveUp: false, attemptNumber: 1 });
+  });
+
+  it("increases the backoff delay with each attempt, capped at 500ms", () => {
+    const source = makeSource();
+
+    const now = 100_000;
+    const a1 = source.registerForceRestartAttempt(now) as { backoffDelay: number };
+    const a2 = source.registerForceRestartAttempt(now) as { backoffDelay: number };
+    const a3 = source.registerForceRestartAttempt(now) as { backoffDelay: number };
+    expect(a1.backoffDelay).toBe(100);
+    expect(a2.backoffDelay).toBe(200);
+    expect(a3.backoffDelay).toBe(400);
+  });
 });
 
 // ─── Size resolution when the first attempts fail ──────────────────────────
