@@ -436,6 +436,203 @@ async function sampleWindow(page, windowMs) {
   return { before, after };
 }
 
+// ─── Real decode-effect assertions ─────────────────────────────────────────
+//
+// assertHealthy only ever looked at clocks, frame counts and canvas
+// dimensions — a decoder that outputs solid black or silence passes every one
+// of those checks. These three helpers look at CONTENT: actual pixels off the
+// canvas, actual samples off the audio graph, actual non-transparent pixels
+// off a bitmap subtitle overlay. None of them replace assertHealthy; they run
+// alongside it.
+
+const PICTURE_SAMPLE_WIDTH = 48;
+const PICTURE_SAMPLE_HEIGHT = 27;
+// Below this luma spread across the downscaled frame, call it a solid colour
+// rather than a picture. Real footage — even a mostly-dark scene — spans much
+// more than this; a black or flat-decode-failure frame does not.
+const PICTURE_FLAT_SPREAD = 8;
+// Below this max luma, call it black. A dim scene still has highlights above
+// this on a 0-255 scale; a genuinely undecoded frame does not.
+const PICTURE_BLACK_MAX_LUMA = 20;
+// Per-pixel RGB delta (summed) averaged over the sampled grid, above which two
+// captures count as "different pictures" rather than the same frozen frame
+// with capture noise.
+const PICTURE_CHANGE_THRESHOLD = 6;
+
+/** Downscale the live canvas onto a throwaway 2D context and read it back. */
+async function capturePicture(page) {
+  return page.evaluate(
+    ({ width, height }) => {
+      const element = document.querySelector("movi-player");
+      const canvas = element?.shadowRoot?.querySelector("canvas");
+      if (!canvas || !canvas.width || !canvas.height) return null;
+      const off = document.createElement("canvas");
+      off.width = width;
+      off.height = height;
+      const ctx = off.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return null;
+      try {
+        ctx.drawImage(canvas, 0, 0, width, height);
+      } catch {
+        return null; // tainted/lost GL context
+      }
+      const { data } = ctx.getImageData(0, 0, width, height);
+      let min = 255;
+      let max = 0;
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let n = 0;
+      const colorBuckets = new Set();
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        const lum = (r + g + b) / 3;
+        if (lum < min) min = lum;
+        if (lum > max) max = lum;
+        sumR += r;
+        sumG += g;
+        sumB += b;
+        n++;
+        colorBuckets.add(((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+      }
+      return {
+        min,
+        max,
+        spread: max - min,
+        avgR: sumR / n,
+        avgG: sumG / n,
+        avgB: sumB / n,
+        uniqueColors: colorBuckets.size,
+        pixels: Array.from(data),
+      };
+    },
+    { width: PICTURE_SAMPLE_WIDTH, height: PICTURE_SAMPLE_HEIGHT },
+  );
+}
+
+function pictureChanged(a, b) {
+  if (!a || !b) return false;
+  let diff = 0;
+  const n = a.pixels.length / 4;
+  for (let i = 0; i < a.pixels.length; i += 4) {
+    diff +=
+      Math.abs(a.pixels[i] - b.pixels[i]) +
+      Math.abs(a.pixels[i + 1] - b.pixels[i + 1]) +
+      Math.abs(a.pixels[i + 2] - b.pixels[i + 2]);
+  }
+  return diff / n > PICTURE_CHANGE_THRESHOLD;
+}
+
+/**
+ * Require the canvas to show a real, changing image — not a solid colour, not
+ * black, not the decode-failure green, and not a frozen frame repeated across
+ * three samples ~1.5s apart. Covers H.264 hardware (samples 1/2/3/5), HEVC
+ * Main10 (sample 6) and MPEG-2 software (sample 4) identically: it reads
+ * whatever codec is actually decoding at call time.
+ */
+async function assertRealPicture(page, label, phase) {
+  const shots = [];
+  for (let i = 0; i < 3; i++) {
+    shots.push(await capturePicture(page));
+    if (i < 2) await page.waitForTimeout(1_500);
+  }
+  shots.forEach((shot, i) => {
+    if (!shot) {
+      throw new Error(`${label} had no readable canvas frame (sample ${i}) during ${phase}`);
+    }
+    if (shot.spread < PICTURE_FLAT_SPREAD) {
+      throw new Error(
+        `${label} canvas is near-uniform (luma spread=${shot.spread.toFixed(1)}, ` +
+          `uniqueColors=${shot.uniqueColors}) during ${phase} — looks like a solid-colour frame`,
+      );
+    }
+    if (shot.max < PICTURE_BLACK_MAX_LUMA) {
+      throw new Error(
+        `${label} canvas is near-black (max luma=${shot.max.toFixed(1)}) during ${phase}`,
+      );
+    }
+    if (shot.avgG > shot.avgR * 3 && shot.avgG > shot.avgB * 3 && shot.avgG > 80) {
+      throw new Error(
+        `${label} canvas is dominated by green (avgR=${shot.avgR.toFixed(1)}, ` +
+          `avgG=${shot.avgG.toFixed(1)}, avgB=${shot.avgB.toFixed(1)}) during ${phase} — ` +
+          `the typical decode-failure output`,
+      );
+    }
+  });
+  if (!pictureChanged(shots[0], shots[1]) && !pictureChanged(shots[1], shots[2])) {
+    throw new Error(
+      `${label} canvas did not change across 3 samples over ~3s during ${phase} — looks like a frozen frame`,
+    );
+  }
+  return {
+    spreads: shots.map((s) => Number(s.spread.toFixed(1))),
+    uniqueColors: shots.map((s) => s.uniqueColors),
+  };
+}
+
+// RMS floor for "there is real audio here", on a [-1, 1] float sample scale.
+// True silence (or a decoder emitting zeroed PCM) reads ~0. Any actual mixed
+// program audio, even a quiet passage, sits comfortably above this.
+const AUDIO_SILENCE_RMS = 0.001;
+
+/**
+ * Tap an AnalyserNode onto the SAME node the audio graph already routes
+ * through (gainNode, the fixed last node before destination — see
+ * AudioRenderer's own comment on that), and read real RMS over a window. The
+ * clock advancing (`audioClock`) says nothing about what came out of the
+ * speakers; this does. Reused across DTS/TrueHD/DTS-HD MA/FLAC/AAC/AC3 and
+ * across an in-place track switch (sample 6: AAC+FLAC in one file).
+ */
+async function assertRealAudio(page, label, phase, windowMs = 3_000) {
+  const result = await page.evaluate(async (ms) => {
+    const player = document.querySelector("movi-player")?.player;
+    const audio = player?.audioRenderer;
+    const ctx = audio?.audioContext;
+    const gain = audio?.gainNode;
+    if (!ctx || !gain) return { supported: false };
+    let tap = globalThis.__moviBlackboxAudioTap;
+    if (!tap || tap.context !== ctx) {
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      // A tap: connecting gainNode to it does not change what the destination
+      // hears (Web Audio nodes can fan out to more than one destination), and
+      // an AnalyserNode processes its input whether or not it is itself
+      // connected onward.
+      gain.connect(analyser);
+      tap = { context: ctx, analyser };
+      globalThis.__moviBlackboxAudioTap = tap;
+    }
+    const buf = new Float32Array(tap.analyser.fftSize);
+    const samples = [];
+    const start = performance.now();
+    while (performance.now() - start < ms) {
+      tap.analyser.getFloatTimeDomainData(buf);
+      let sumSq = 0;
+      for (let i = 0; i < buf.length; i++) sumSq += buf[i] * buf[i];
+      samples.push(Math.sqrt(sumSq / buf.length));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return {
+      supported: true,
+      avgRms: samples.reduce((a, b) => a + b, 0) / samples.length,
+      maxRms: Math.max(...samples),
+      samples: samples.length,
+    };
+  }, windowMs);
+  if (!result.supported) {
+    throw new Error(`${label} has no AudioContext/gainNode to tap during ${phase}`);
+  }
+  if (result.maxRms < AUDIO_SILENCE_RMS) {
+    throw new Error(
+      `${label} audio output is silent (maxRms=${result.maxRms.toExponential(3)} over ` +
+        `${result.samples} samples) during ${phase}`,
+    );
+  }
+  return result;
+}
+
 async function assertPlaybackStillAdvances(page, label, phase) {
   const before = await snapshot(page);
   await page.waitForTimeout(1_500);
@@ -538,11 +735,24 @@ async function seekAndSample(page, label, target, phase, generationBudget) {
   const recoveryMs = await waitForStablePlayback(page, issuedAt);
   const { before, after } = await sampleWindow(page, postSeekSampleMs);
   const progress = assertHealthy(label, before, after, phase, { generationBudget });
+  // Real decode-effect evidence at a seek target, not just at startup. Bounded
+  // to the middle seek (every sample runs one) rather than all four, so the
+  // cost stays proportional to what the matrix already pays for seeking.
+  let picture;
+  let audio;
+  if (phase === "middle seek") {
+    picture = await assertRealPicture(page, label, phase);
+    if (after.audioCodec && after.audioCodec !== "N/A") {
+      audio = await assertRealAudio(page, label, phase);
+    }
+  }
   return {
     phase,
     target: Number(target.toFixed(2)),
     arrivedMs,
     recoveryMs,
+    picture,
+    audio,
     ...progress,
   };
 }
@@ -1054,6 +1264,43 @@ async function validateSubtitles(page, label) {
           null,
           { timeout: subtitleProbeMs },
         );
+        // The waitForFunction above only proves an <canvas>/<img> element
+        // exists in the overlay with display!=="none" — an all-transparent
+        // bitmap (empty PGS frame, or a decode failure that produces a
+        // correctly-sized but blank surface) satisfies that with zero
+        // rendered content. Read the alpha channel back and require some of
+        // it to be opaque.
+        const pixels = await page.evaluate(() => {
+          const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
+          const media = renderer?.subtitleOverlay?.querySelector("canvas, img");
+          if (!media) return { hasMedia: false, totalPixels: 0, opaquePixels: 0 };
+          const off = document.createElement("canvas");
+          off.width = media.tagName === "IMG" ? media.naturalWidth || media.width : media.width;
+          off.height = media.tagName === "IMG" ? media.naturalHeight || media.height : media.height;
+          if (!off.width || !off.height) {
+            return { hasMedia: true, totalPixels: 0, opaquePixels: 0 };
+          }
+          const ctx = off.getContext("2d", { willReadFrequently: true });
+          if (!ctx) return { hasMedia: true, totalPixels: 0, opaquePixels: 0 };
+          try {
+            ctx.drawImage(media, 0, 0, off.width, off.height);
+          } catch {
+            return { hasMedia: true, totalPixels: 0, opaquePixels: 0 };
+          }
+          const { data } = ctx.getImageData(0, 0, off.width, off.height);
+          let opaquePixels = 0;
+          let totalPixels = 0;
+          for (let i = 3; i < data.length; i += 4) {
+            totalPixels++;
+            if (data[i] > 10) opaquePixels++;
+          }
+          return { hasMedia: true, totalPixels, opaquePixels };
+        });
+        if (!pixels.hasMedia || pixels.totalPixels === 0 || pixels.opaquePixels === 0) {
+          throw new Error(
+            `bitmap subtitle overlay rendered with zero non-transparent pixels: ${JSON.stringify(pixels)}`,
+          );
+        }
         const postProbePlayback = await assertPlaybackStillAdvances(
           page,
           label,
@@ -1064,6 +1311,7 @@ async function validateSubtitles(page, label) {
           tracks,
           attempts,
           selectedTrack: track,
+          pixels,
           postProbePlayback,
         };
       } catch (error) {
@@ -1199,8 +1447,16 @@ async function runOne(browser, token, mediaPath) {
     sampleMs,
   );
   let playProgress;
+  let pictureEvidence;
+  let audioEvidence;
   try {
     playProgress = assertHealthy(label, playBefore, playAfter, "steady playback");
+    // Content, not just clocks. This is the fix for the blind spot: a black
+    // frame + silence passed everything above.
+    pictureEvidence = await assertRealPicture(page, label, "steady playback");
+    if (playAfter.audioCodec && playAfter.audioCodec !== "N/A") {
+      audioEvidence = await assertRealAudio(page, label, "steady playback");
+    }
   } catch (error) {
     throw new Error(
       `${error instanceof Error ? error.message : String(error)}; ` +
@@ -1400,6 +1656,8 @@ async function runOne(browser, token, mediaPath) {
     videoCodec: playAfter.videoCodec,
     audioCodec: playAfter.audioCodec,
     steady: playProgress,
+    pictureEvidence,
+    audioEvidence,
     postSeek: seekProgress,
     subtitles,
     finalState: finalSnapshot.state,
