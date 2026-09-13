@@ -564,39 +564,59 @@ async function saveFailureScreenshot(page, label, phase) {
 async function assertRealPicture(page, label, phase) {
   const shots = [];
   for (let i = 0; i < 3; i++) {
-    shots.push(await capturePicture(page));
-    if (i < 2) await page.waitForTimeout(1_500);
-  }
-  for (let i = 0; i < shots.length; i++) {
-    const shot = shots[i];
+    // Judge each sample the moment it is captured. The previous shape captured
+    // all three first and only then evaluated them, so the failure screenshot
+    // was taken >=3s after the frame that actually failed. On a sample whose
+    // first seconds are a fade-in (Good Will Hunting's 2.3s black lead-in), the
+    // saved PNG showed the Miramax logo that was up by then and flatly
+    // contradicted a reading that had been correct — three separate
+    // investigations drew three different wrong conclusions from that skew
+    // before anyone noticed the evidence and the measurement were not the same
+    // frame. Screenshot now lands within milliseconds of the failing sample.
+    const shot = await capturePicture(page);
+    shots.push(shot);
+    const at = await page
+      .evaluate(() => Number(document.querySelector("movi-player")?.currentTime ?? -1))
+      .catch(() => -1);
+    const where = `during ${phase} (sample ${i}, currentTime=${at.toFixed(2)}s)`;
     if (!shot) {
       const shotPath = await saveFailureScreenshot(page, label, phase);
       throw new Error(
-        `${label} had no readable canvas frame (sample ${i}) during ${phase}; screenshot=${shotPath}`,
+        `${label} had no readable canvas frame ${where}; screenshot=${shotPath}`,
       );
     }
-    if (shot.spread < PICTURE_FLAT_SPREAD) {
-      const shotPath = await saveFailureScreenshot(page, label, phase);
-      throw new Error(
-        `${label} canvas is near-uniform (luma spread=${shot.spread.toFixed(1)}, ` +
-          `uniqueColors=${shot.uniqueColors}) during ${phase} — looks like a solid-colour frame; ` +
-          `screenshot=${shotPath}`,
-      );
-    }
-    if (shot.max < PICTURE_BLACK_MAX_LUMA) {
-      const shotPath = await saveFailureScreenshot(page, label, phase);
-      throw new Error(
-        `${label} canvas is near-black (max luma=${shot.max.toFixed(1)}) during ${phase}; screenshot=${shotPath}`,
-      );
-    }
+    // A flat or black single sample is NOT evidence of a dead decoder: fades,
+    // transitions and letterboxed title cards are legitimate content, and a
+    // luma histogram cannot tell them apart from a broken decode. Judging each
+    // sample in isolation is what made this assertion fire on every sweep —
+    // Good Will Hunting is genuinely black at t=14.25s (aligned screenshot
+    // confirms it) one sample after showing the Miramax logo just fine at
+    // t=12.7s. Only "never showed content across the whole window" is a real
+    // decoder statement, so that verdict is deferred until all samples are in.
     if (shot.avgG > shot.avgR * 3 && shot.avgG > shot.avgB * 3 && shot.avgG > 80) {
       const shotPath = await saveFailureScreenshot(page, label, phase);
       throw new Error(
         `${label} canvas is dominated by green (avgR=${shot.avgR.toFixed(1)}, ` +
-          `avgG=${shot.avgG.toFixed(1)}, avgB=${shot.avgB.toFixed(1)}) during ${phase} — ` +
+          `avgG=${shot.avgG.toFixed(1)}, avgB=${shot.avgB.toFixed(1)}) ${where} — ` +
           `the typical decode-failure output; screenshot=${shotPath}`,
       );
     }
+    if (i < 2) await page.waitForTimeout(1_500);
+  }
+  // The real decoder verdict: did the canvas EVER carry a picture during this
+  // window? One content-bearing sample proves frames are reaching the canvas;
+  // zero across ~3s means nothing is being drawn.
+  const everShowedContent = shots.some(
+    (s) => s.spread >= PICTURE_FLAT_SPREAD && s.max >= PICTURE_BLACK_MAX_LUMA,
+  );
+  if (!everShowedContent) {
+    const shotPath = await saveFailureScreenshot(page, label, phase);
+    throw new Error(
+      `${label} canvas never showed a picture across 3 samples over ~3s during ${phase} ` +
+        `(spreads=${shots.map((s) => s.spread.toFixed(1)).join("/")}, ` +
+        `maxLuma=${shots.map((s) => s.max.toFixed(1)).join("/")}) — every sample was flat or black; ` +
+        `screenshot=${shotPath}`,
+    );
   }
   if (!pictureChanged(shots[0], shots[1]) && !pictureChanged(shots[1], shots[2])) {
     const shotPath = await saveFailureScreenshot(page, label, phase);
