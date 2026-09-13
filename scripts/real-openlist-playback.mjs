@@ -1549,6 +1549,28 @@ async function runOne(browser, token, mediaPath) {
   const pictureEvidence = steadyResult?.pictureEvidence;
   const audioEvidence = steadyResult?.audioEvidence;
 
+  // Diagnostic early-exit for a single, apples-to-apples question: does THIS
+  // harness's steady-playback picture assertion pass under a given headless
+  // mode, on a given sample, without paying for the rest of the matrix? Added
+  // for the 2026-09-13 headful-vs-headless investigation, where a hand-rolled
+  // probe script (different buffersize, different startup path) was ruled out
+  // as not equivalent to the real harness. Off by default.
+  if (process.env.MOVI_BLACKBOX_STOP_AFTER_STEADY === "1") {
+    return {
+      label,
+      status: stepFailures.length > 0 ? "fail" : "pass",
+      stepFailures,
+      stoppedAfterSteady: true,
+      videoDecoder: playAfter.videoDecoder,
+      videoCodec: playAfter.videoCodec,
+      softwareDecodeReason: playAfter.softwareDecodeReason,
+      steady: playProgress,
+      pictureEvidence,
+      audioEvidence,
+      decoderDiagnostics,
+    };
+  }
+
   // Named precisely: this checks that WebCodecs ACCEPTED the prefer-hardware
   // config and did not fall back to the WASM software decoder — it does not
   // and cannot prove the frames were actually produced by a hardware decode
