@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { byteBudget, isSteady, progression } from "./blackbox-metrics.mjs";
 
 const required = (name) => {
   const value = process.env[name];
@@ -185,27 +186,6 @@ async function snapshot(page) {
   });
 }
 
-function progression(before, after) {
-  const wallSeconds = Math.max(0.001, (after.wallMs - before.wallMs) / 1000);
-  // AudioRenderer.currentMediaTime is the latest frame submitted/scheduled,
-  // not the playout head; it can advance slowly while a healthy prebuffer is
-  // being consumed. The renderer clock is the user-heard position.
-  const audioBefore = before.audioClock >= 0
-    ? before.audioClock
-    : before.audioMediaTime;
-  const audioAfter = after.audioClock >= 0
-    ? after.audioClock
-    : after.audioMediaTime;
-  return {
-    wallSeconds,
-    mediaSeconds: after.currentTime - before.currentTime,
-    mediaRate: (after.currentTime - before.currentTime) / wallSeconds,
-    frames: after.framesPresented - before.framesPresented,
-    presentedFps: (after.framesPresented - before.framesPresented) / wallSeconds,
-    audioSeconds: audioAfter - audioBefore,
-  };
-}
-
 function assertHealthy(label, before, after, phase, options = {}) {
   const generationBudget = options.generationBudget ?? 4;
   const progress = progression(before, after);
@@ -226,7 +206,20 @@ function assertHealthy(label, before, after, phase, options = {}) {
   if (errors.length > 0) {
     throw new Error(`${label} emitted ${errors.length} player error(s) during ${phase}`);
   }
-  if (progress.frames < 5) {
+  if (progress.framesReset) {
+    // The renderer's frame counter restarted mid-window (a hardware
+    // resurrection attempt, or a seek that landed inside this window). The
+    // raw delta is negative and says nothing about whether picture actually
+    // advanced; rendererCurrentTime (the last presented PTS) is monotone
+    // across a reset that contains no seek and is the honest fallback. Judge
+    // health against that instead of a frame count that just went backwards.
+    if (progress.rendererSeconds < progress.wallSeconds * 0.45) {
+      throw new Error(
+        `${label} presented pipeline reset (framesPresented went backwards) and picture ` +
+          `only advanced ${progress.rendererSeconds.toFixed(3)}s of ${progress.wallSeconds.toFixed(3)}s during ${phase}`,
+      );
+    }
+  } else if (progress.frames < 5) {
     // Name the known cause rather than leaving the reader to infer it. A
     // software-decoding stream periodically tries to go back to hardware; the
     // gate for that only asks whether WebCodecs exists, not whether it can
@@ -329,25 +322,6 @@ function assertHealthy(label, before, after, phase, options = {}) {
 //
 // Paused time only reduces consumption, so wall-clock is a sound upper bound
 // for the streaming term.
-const FIRST_RANGE_CHUNK_BYTES = 4 * 1024 * 1024;
-const MAX_RANGE_CHUNK_BYTES = 8 * 1024 * 1024;
-const VBR_SLACK = 2.5;
-
-function byteBudget({ sizeBytes, durationSeconds, wallSeconds, generations, windowBytes }) {
-  const bitrate = durationSeconds > 0 ? sizeBytes / durationSeconds : 0;
-  const streamed = wallSeconds * bitrate * VBR_SLACK;
-  const perGeneration =
-    Math.max(1, generations) * (FIRST_RANGE_CHUNK_BYTES + MAX_RANGE_CHUNK_BYTES);
-  const total = streamed + perGeneration + windowBytes;
-  return {
-    bitrateBytesPerSecond: Math.round(bitrate),
-    streamedTerm: Math.round(streamed),
-    generationTerm: perGeneration,
-    windowTerm: windowBytes,
-    budgetBytes: Math.round(total),
-  };
-}
-
 function assertByteBudget(label, { sizeBytes, durationSeconds, wallSeconds, snapshot: final }) {
   const totalBytes = numeric(final.network?.totalBytes);
   const generations = numeric(final.network?.streamGeneration);
@@ -421,29 +395,43 @@ function compactSnapshot(sample) {
   };
 }
 
+// How long sampleWindow will wait for the player to return to a steady state
+// before giving up and handing assertHealthy a transitional snapshot anyway
+// (which will then fail loudly, correctly, on its own terms).
+const STEADY_SETTLE_TIMEOUT_MS = 5_000;
+const STEADY_SETTLE_POLL_MS = 250;
+
 /**
- * Sample a window, retrying once if the renderer's frame counter was reset.
+ * Sample a window, and never hand assertHealthy an "after" snapshot taken
+ * mid-transition.
  *
- * `framesPresented` is per-renderer and starts again at zero when the video
- * pipeline is rebuilt — which a hardware resurrection attempt does mid-window.
- * The delta then comes out NEGATIVE, and "presented only -10 frames" is the
- * harness reporting its own arithmetic, not a player fault. Take one more
- * window in that case; a second reset inside the retry is itself the finding
- * and is reported as such.
+ * Two bugs used to live here, and they compounded: a plain fixed-length
+ * window can land its closing snapshot while the player is mid-seek or
+ * mid-rebuffer (state !== "playing"), which is a transition, not steady
+ * playback; and on Grave of the Fireflies specifically, that transition was
+ * the player's own desync resync firing, which also rebuilds the video
+ * pipeline and resets framesPresented to zero — so the same bad sample also
+ * produced a negative frame delta ("presented only -10 frames during steady
+ * playback", which is a statement about when the sample was taken, not about
+ * the player). Fixing only the arithmetic (see progression()'s framesReset
+ * handling) without also fixing WHEN the sample is taken would still assert
+ * health from inside a transition.
+ *
+ * If the window closes on an unsteady state, keep polling (bounded by
+ * STEADY_SETTLE_TIMEOUT_MS) until it returns to steady, and use THAT as the
+ * "after" snapshot. If the deadline passes without settling, hand back the
+ * last (still unsteady) snapshot — assertHealthy's own state/clock checks
+ * will then report exactly what was unsteady about it, rather than the
+ * caller silently accepting a mid-transition read.
  */
 async function sampleWindow(page, windowMs) {
-  let before = await snapshot(page);
+  const before = await snapshot(page);
   await page.waitForTimeout(windowMs);
   let after = await snapshot(page);
-  if (after.framesPresented < before.framesPresented) {
-    before = await snapshot(page);
-    await page.waitForTimeout(windowMs);
+  const settleDeadline = Date.now() + STEADY_SETTLE_TIMEOUT_MS;
+  while (!isSteady(after) && Date.now() < settleDeadline) {
+    await page.waitForTimeout(STEADY_SETTLE_POLL_MS);
     after = await snapshot(page);
-    if (after.framesPresented < before.framesPresented) {
-      throw new Error(
-        `the video renderer's frame counter reset twice in a row (${before.framesPresented} -> ${after.framesPresented}); the video pipeline is being rebuilt repeatedly`,
-      );
-    }
   }
   return { before, after };
 }
