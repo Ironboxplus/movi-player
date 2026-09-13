@@ -1405,22 +1405,44 @@ async function validateSubtitles(page, label) {
           () => {
             const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
             const overlay = renderer?.subtitleOverlay;
-            return Boolean(
-              renderer?.activeSubtitleCue?.image &&
-                overlay &&
-                overlay.style.display !== "none" &&
-                overlay.querySelector("canvas, img"),
-            );
+            if (
+              !renderer?.activeSubtitleCue?.image ||
+              !overlay ||
+              overlay.style.display === "none"
+            ) {
+              return false;
+            }
+            const media = overlay.querySelector("canvas, img");
+            if (!media) return false;
+            // <img>.src is set fire-and-forget by CanvasRenderer (a data:
+            // URL PNG built from an already-decoded ImageBitmap — see
+            // docs/PLAN_MERGE.MD's PGS pixel-path hop table). DOM presence
+            // alone doesn't prove the browser has finished decoding that
+            // data URL yet, so a read landing in that window would draw an
+            // incomplete/blank image. This is a one-shot "not yet decoded
+            // -> decoded" transition (unlike the live WebGL video canvas
+            // this harness's picture check used to race against — that one
+            // is a continuously-redrawn surface with no "done" signal at
+            // all); requiring `complete && naturalWidth > 0` here is a
+            // narrow, theoretical window this closes, not a reproduced bug.
+            // The <canvas> branch (text-shaped bitmap subtitle renderers,
+            // if any) is left exactly as before — canvas has no decode
+            // step to wait for.
+            if (media.tagName === "IMG") {
+              return media.complete === true && media.naturalWidth > 0;
+            }
+            return true;
           },
           null,
           { timeout: subtitleProbeMs },
         );
-        // The waitForFunction above only proves an <canvas>/<img> element
-        // exists in the overlay with display!=="none" — an all-transparent
-        // bitmap (empty PGS frame, or a decode failure that produces a
-        // correctly-sized but blank surface) satisfies that with zero
-        // rendered content. Read the alpha channel back and require some of
-        // it to be opaque.
+        // The waitForFunction above proves the <canvas>/<img> element exists,
+        // is displayed, and (for <img>) has finished decoding — it does NOT
+        // prove the bitmap has any actual content. An all-transparent bitmap
+        // (empty PGS frame, or a decode failure that produces a correctly-
+        // sized but blank surface) satisfies all of that with zero rendered
+        // content. Read the alpha channel back and require some of it to be
+        // opaque.
         const pixels = await page.evaluate(() => {
           const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
           const media = renderer?.subtitleOverlay?.querySelector("canvas, img");
