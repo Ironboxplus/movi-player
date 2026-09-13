@@ -12,7 +12,14 @@ export default mergeConfig(
         provider: "v8",
         reportsDirectory: "./coverage",
         reporter: ["text", "text-summary", "html", "lcov"],
-        include: ["src/source/HttpSource.ts"],
+        include: [
+          "src/core/**",
+          "src/decode/**",
+          "src/demux/**",
+          "src/source/**",
+          "src/render/AudioRenderer.ts",
+          "src/render/CanvasRenderer.ts",
+        ],
         exclude: ["**/*.d.ts", "**/node_modules/**", "dist/**"],
         thresholds: {
           // Enforce the current real-TCP merge baseline so later batches cannot
