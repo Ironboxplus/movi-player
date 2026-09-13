@@ -506,3 +506,230 @@ describe("MoviPlayer seek sync", () => {
     expect(readPacket).not.toHaveBeenCalled();
   }, 20_000);
 });
+
+// ---------------------------------------------------------------------------
+// P3 restart barrier — concurrent seek/track-switch/quality-switch.
+//
+// Team lead's framing: this is the same class of problem as M1 (reentrancy/
+// races caught only by real-device black-box testing, because nothing in the
+// suite exercised the concurrent shape). The supersede branch in
+// notifySeekCompletion() (a newer seek/switch bumped seekSessionId while an
+// older one was still armed) and the abandonSupersededSeek() /
+// resumeAfterOrphanedSeek() backstop pair had ZERO coverage before this —
+// every existing seek-sync test above arms and completes a SINGLE session.
+// These lock the concurrency invariant: a superseded seek must release the
+// barrier it armed, must NOT run the winning operation's resume/paused
+// transition, and — if truly nobody else resolves "seeking" — the backstop
+// must, exactly once, whichever of the two racing paths gets there first.
+// ---------------------------------------------------------------------------
+describe("MoviPlayer P3: restart barrier under concurrent seek/switch", () => {
+  it("notifySeekCompletion releases the barrier for a superseded session without running the winner's resume", async () => {
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+    const seeked = vi.fn();
+    player.trackManager.setTracks([videoTrack]);
+    player.on("seeked", seeked);
+
+    const stateManager = (player as any).stateManager;
+    stateManager.setState("loading");
+    stateManager.setState("ready");
+    stateManager.setState("playing");
+    stateManager.setState("seeking");
+
+    Object.assign(player as any, {
+      // Session 1 armed the barrier; session 2 (a second seek, or a track/
+      // quality switch that bumps seekSessionId to invalidate the first)
+      // has since taken over.
+      seekSessionId: 2,
+      seekArmedSessionId: 1,
+      seekTargetTime: 42, // the superseding op's own target — must survive untouched
+      waitingForVideoSync: true,
+      seekingToKeyframe: true,
+      wasPlayingBeforeSeek: true,
+      videoRenderer: { getQueueSize: () => 1 }, // a frame WOULD complete session 1 if not stale
+    });
+
+    // A late frame callback from session 1's decoder pipeline arrives after
+    // session 2 has already taken over.
+    (player as any).notifySeekCompletion(1.0);
+
+    // The dead session's barrier is released — otherwise the pipeline sits
+    // in "seeking"/"buffering" forever, since only a completion for the
+    // (now impossible) old session would ever have cleared it.
+    expect((player as any).waitingForVideoSync).toBe(false);
+    expect((player as any).seekingToKeyframe).toBe(false);
+    // But session 1 does NOT own the resume — it must not fire "seeked", and
+    // must not touch the state the winner (session 2) is still using.
+    expect(seeked).not.toHaveBeenCalled();
+    expect((player as any).seekTargetTime).toBe(42);
+    expect((player as any).wasPlayingBeforeSeek).toBe(true);
+    expect(stateManager.getState()).toBe("seeking"); // untouched — session 2's to resolve
+  }, 20_000);
+
+  it("notifySeekCompletion for the CURRENT session still completes normally after an earlier session was superseded", async () => {
+    // The barrier must not be permanently wedged by handling a supersede —
+    // the very next real completion (for whichever session now owns it)
+    // has to go through the normal path.
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+    player.trackManager.setTracks([videoTrack]);
+
+    const stateManager = (player as any).stateManager;
+    stateManager.setState("loading");
+    stateManager.setState("ready");
+    stateManager.setState("playing");
+    stateManager.setState("seeking");
+
+    Object.assign(player as any, {
+      seekSessionId: 2,
+      seekArmedSessionId: 1,
+      seekTargetTime: 42,
+      waitingForVideoSync: true,
+      videoRenderer: { getQueueSize: () => 1 },
+    });
+    (player as any).notifySeekCompletion(1.0); // superseded — released, not completed
+    expect((player as any).waitingForVideoSync).toBe(false);
+
+    // Session 2 now arms its own completion.
+    Object.assign(player as any, {
+      seekArmedSessionId: 2,
+      seekTargetTime: 55,
+      waitingForVideoSync: true,
+      wasPlayingBeforeSeek: false,
+      wasPlayingBeforeRebuffer: false,
+    });
+    (player as any).notifySeekCompletion(55);
+
+    expect((player as any).waitingForVideoSync).toBe(false);
+    expect((player as any).seekTargetTime).toBe(-1); // real completion clears it
+  }, 20_000);
+
+  it("abandonSupersededSeek releases the barrier only if its own session still owns the arming", async () => {
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+
+    // Case 1: session 1's own arming is still in place when it discovers the
+    // session moved on — must release, since nothing else will.
+    Object.assign(player as any, {
+      seekSessionId: 2,
+      seekArmedSessionId: 1,
+      waitingForVideoSync: true,
+      seekingToKeyframe: true,
+    });
+    (player as any).abandonSupersededSeek(1);
+    expect((player as any).waitingForVideoSync).toBe(false);
+    expect((player as any).seekingToKeyframe).toBe(false);
+  }, 20_000);
+
+  it("abandonSupersededSeek does NOT stomp a barrier a later session has already re-armed", async () => {
+    // Session 1 discovers it was superseded, but by the time it checks,
+    // session 3 has already armed its OWN barrier (seekArmedSessionId=3).
+    // Session 1 releasing unconditionally would tear down session 3's live
+    // wait for a frame that hasn't arrived yet.
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+
+    Object.assign(player as any, {
+      seekSessionId: 3,
+      seekArmedSessionId: 3, // someone else already re-armed
+      waitingForVideoSync: true,
+      seekingToKeyframe: true,
+    });
+    (player as any).abandonSupersededSeek(1); // session 1's stale callback
+
+    expect((player as any).waitingForVideoSync).toBe(true);
+    expect((player as any).seekingToKeyframe).toBe(true);
+  }, 20_000);
+
+  it("resumeAfterOrphanedSeek backstop resolves 'seeking' to paused when nobody else owns the live session", async () => {
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+    const seeked = vi.fn();
+    player.on("seeked", seeked);
+
+    const stateManager = (player as any).stateManager;
+    stateManager.setState("loading");
+    stateManager.setState("ready");
+    stateManager.setState("playing");
+    stateManager.setState("seeking");
+
+    Object.assign(player as any, {
+      seekSessionId: 2,
+      _liveSeekSession: -1, // no seek() call is actively in flight for session 2
+      wasPlayingBeforeSeek: false,
+      wasPlayingBeforeRebuffer: false,
+      waitingForVideoSync: true,
+      seekingToKeyframe: true,
+    });
+
+    (player as any).resumeAfterOrphanedSeek("a non-seek operation");
+
+    expect(stateManager.getState()).toBe("paused");
+    expect((player as any).waitingForVideoSync).toBe(false);
+    expect((player as any).seekingToKeyframe).toBe(false);
+    expect(seeked).toHaveBeenCalledOnce();
+  }, 20_000);
+
+  it("resumeAfterOrphanedSeek backstop is a no-op when a live seek() call still owns the current session", async () => {
+    // The race this guards: the backstop timer and a live seek() for the
+    // SAME (new) session both reach their resolution around the same time.
+    // Whichever session is genuinely in flight must win; the backstop must
+    // not double-resolve behind its back.
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+    const seeked = vi.fn();
+    player.on("seeked", seeked);
+
+    const stateManager = (player as any).stateManager;
+    stateManager.setState("loading");
+    stateManager.setState("ready");
+    stateManager.setState("playing");
+    stateManager.setState("seeking");
+
+    Object.assign(player as any, {
+      seekSessionId: 2,
+      _liveSeekSession: 2, // seek() for session 2 IS still in flight
+      waitingForVideoSync: true,
+    });
+
+    (player as any).resumeAfterOrphanedSeek("a non-seek operation");
+
+    // Untouched — the live seek owns resolving this, not the backstop.
+    expect(stateManager.getState()).toBe("seeking");
+    expect((player as any).waitingForVideoSync).toBe(true);
+    expect(seeked).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("resumeAfterOrphanedSeek backstop is a no-op once the state has already left 'seeking'", async () => {
+    // The other half of the race: the winning operation (a rendition swap,
+    // a subtitle prefetch) already resolved the state by the time the
+    // backstop timer fires. Must not re-resolve an already-settled state.
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+    const seeked = vi.fn();
+    player.on("seeked", seeked);
+
+    const stateManager = (player as any).stateManager;
+    stateManager.setState("loading");
+    stateManager.setState("ready");
+    stateManager.setState("playing"); // already resolved — not "seeking"
+
+    Object.assign(player as any, {
+      seekSessionId: 2,
+      _liveSeekSession: -1,
+      waitingForVideoSync: false,
+    });
+
+    (player as any).resumeAfterOrphanedSeek("a non-seek operation");
+
+    expect(stateManager.getState()).toBe("playing");
+    expect(seeked).not.toHaveBeenCalled();
+  }, 20_000);
+});
