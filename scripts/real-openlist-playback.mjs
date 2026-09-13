@@ -467,56 +467,110 @@ const PICTURE_BLACK_MAX_LUMA = 20;
 // with capture noise.
 const PICTURE_CHANGE_THRESHOLD = 6;
 
-/** Downscale the live canvas onto a throwaway 2D context and read it back. */
+/**
+ * Downscale a screenshot of the video canvas and read it back.
+ *
+ * NOT `ctx.drawImage(liveCanvas, ...)` + `getImageData()` — that used to read
+ * the WebGL-backed canvas directly and was the thing that decided the
+ * "steady playback"/"middle seek" verdicts. Proven unreliable by direct A/B
+ * (`.secrets/pixel-readback-ab-repro.mjs`, 2026-09-13): sampled the SAME
+ * instant through both a live `drawImage(canvas)` read and a
+ * `page.screenshot()`, on Good Will Hunting's H.264/hardware-preferred path.
+ * The two disagreed by up to ~75 luma-spread points, in BOTH headless and
+ * headful Chrome (roughly 1-in-3 of 15 samples each mode crossed a 20-point
+ * threshold) — so this is a live-canvas-vs-compositor timing race, not a
+ * headless-only artifact, and not something a bigger threshold fixes.
+ *
+ * The `full-matrix-sweep`/`real-openlist` runs on 2026-09-13 reported
+ * "canvas is near-uniform (spread=1.0-7.7, uniqueColors=1-2)" for Good Will
+ * Hunting and Grave of the Fireflies during steady playback; the harness's
+ * own saved failure screenshots for those exact runs
+ * (`.blackbox-results/screenshots/`) show a fully rendered MIRAMAX logo and
+ * a clearly visible character portrait respectively. The live-canvas read
+ * was reporting a solid colour for a frame that plainly was not one.
+ *
+ * `page.screenshot()` goes through the browser's own compositor — the same
+ * pixels a human looking at the page would see — and does not race the
+ * WebGL render loop the way reading the canvas element directly does. The
+ * screenshot is clipped to the video canvas's own bounding rect so the
+ * player's control-bar UI (a fixed-colour button block) can't get folded
+ * into "the picture has content".
+ */
 async function capturePicture(page) {
+  const rect = await page.evaluate(() => {
+    const canvas = document
+      .querySelector("movi-player")
+      ?.shadowRoot?.querySelector("canvas");
+    if (!canvas || !canvas.width || !canvas.height) return null;
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    return {
+      x: Math.max(0, Math.round(r.x)),
+      y: Math.max(0, Math.round(r.y)),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    };
+  });
+  if (!rect) return null;
+
+  let shotBuffer;
+  try {
+    shotBuffer = await page.screenshot({ clip: rect, type: "png" });
+  } catch {
+    return null; // page/context gone, or the clip fell outside the viewport
+  }
+  const base64 = shotBuffer.toString("base64");
+
   return page.evaluate(
-    ({ width, height }) => {
-      const element = document.querySelector("movi-player");
-      const canvas = element?.shadowRoot?.querySelector("canvas");
-      if (!canvas || !canvas.width || !canvas.height) return null;
-      const off = document.createElement("canvas");
-      off.width = width;
-      off.height = height;
-      const ctx = off.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return null;
-      try {
-        ctx.drawImage(canvas, 0, 0, width, height);
-      } catch {
-        return null; // tainted/lost GL context
-      }
-      const { data } = ctx.getImageData(0, 0, width, height);
-      let min = 255;
-      let max = 0;
-      let sumR = 0;
-      let sumG = 0;
-      let sumB = 0;
-      let n = 0;
-      const colorBuckets = new Set();
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        const lum = (r + g + b) / 3;
-        if (lum < min) min = lum;
-        if (lum > max) max = lum;
-        sumR += r;
-        sumG += g;
-        sumB += b;
-        n++;
-        colorBuckets.add(((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
-      }
-      return {
-        min,
-        max,
-        spread: max - min,
-        avgR: sumR / n,
-        avgG: sumG / n,
-        avgB: sumB / n,
-        uniqueColors: colorBuckets.size,
-        pixels: Array.from(data),
-      };
-    },
-    { width: PICTURE_SAMPLE_WIDTH, height: PICTURE_SAMPLE_HEIGHT },
+    ({ base64, width, height }) =>
+      new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          const off = document.createElement("canvas");
+          off.width = width;
+          off.height = height;
+          const ctx = off.getContext("2d", { willReadFrequently: true });
+          if (!ctx) return resolve(null);
+          // `img` is a fully-decoded static bitmap by the time `onload`
+          // fires — no live render loop to race, unlike the WebGL canvas
+          // this replaced.
+          ctx.drawImage(img, 0, 0, width, height);
+          const { data } = ctx.getImageData(0, 0, width, height);
+          let min = 255;
+          let max = 0;
+          let sumR = 0;
+          let sumG = 0;
+          let sumB = 0;
+          let n = 0;
+          const colorBuckets = new Set();
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i];
+            const g = data[i + 1];
+            const b = data[i + 2];
+            const lum = (r + g + b) / 3;
+            if (lum < min) min = lum;
+            if (lum > max) max = lum;
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            n++;
+            colorBuckets.add(((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+          }
+          resolve({
+            min,
+            max,
+            spread: max - min,
+            avgR: sumR / n,
+            avgG: sumG / n,
+            avgB: sumB / n,
+            uniqueColors: colorBuckets.size,
+            pixels: Array.from(data),
+          });
+        };
+        img.onerror = () => resolve(null);
+        img.src = "data:image/png;base64," + base64;
+      }),
+    { base64, width: PICTURE_SAMPLE_WIDTH, height: PICTURE_SAMPLE_HEIGHT },
   );
 }
 
