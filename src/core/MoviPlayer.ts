@@ -2146,14 +2146,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // owns the resume now, so release it or the pipeline waits for a completion
     // that can never arrive (see notifySeekCompletion's superseded-seek branch).
     this.waitingForVideoSync = false;
-    let guard = 0;
-    while (this.demuxInFlight && guard++ < 100) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
-
-    // The wait above can outlast a prime: the clock kept running through it, so
-    // frames staged for a playhead that has since passed them are no longer a
-    // handover, they are a jump backwards. Drop them, and if that empties the
+    // No wait for demuxInFlight here. It used to spin up to a second so a read
+    // in flight could not be re-entered by the swap, but Demuxer now serializes
+    // its own WASM entry points — the invariant holds whether this waits or not
+    // — so all the wait could still do was stall the swap for up to a second
+    // and push the prime below closer to going stale.
+    //
+    // The prime is a network-length wait and the clock kept running through it,
+    // so frames staged for a playhead that has since passed them are no longer
+    // a handover, they are a jump backwards. Drop them, and if that empties the
     // staging the switch is simply not seamless this time — nothing has been
     // swapped yet, so the hard path below is still open.
     if (primed) {
