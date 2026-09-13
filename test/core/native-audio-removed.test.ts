@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { stubBrowserGlobals } from "../helpers/browser-globals";
 
 vi.mock("../../dist/wasm/movi.js", () => ({ default: vi.fn(async () => ({})) }));
 vi.mock("dashjs", () => ({ MediaPlayer: vi.fn() }));
@@ -9,23 +10,6 @@ vi.mock("shaka-player/dist/shaka-player.compiled", () => ({
     net: { NetworkingEngine: { RequestType: { LICENSE: 1 } } },
   },
 }));
-
-function stubBrowserGlobals() {
-  vi.stubGlobal("document", {
-    hidden: false,
-    visibilityState: "visible",
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-  });
-  vi.stubGlobal("window", {
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    setInterval,
-    clearInterval,
-  });
-  vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
-  vi.stubGlobal("cancelAnimationFrame", vi.fn());
-}
 
 afterEach(() => {
   vi.unstubAllGlobals();
