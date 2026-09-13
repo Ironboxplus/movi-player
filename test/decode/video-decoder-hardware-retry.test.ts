@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MoviVideoDecoder } from "../../src/decode/VideoDecoder";
+import type { VideoTrack } from "../../src/types";
+import type { WasmBindings } from "../../src/wasm/bindings";
 
 /**
  * V3/M3 (docs/PLAN_MERGE.MD §3.2, §3.4c): `shouldRetryHardware()` gates the
@@ -8,16 +10,6 @@ import { MoviVideoDecoder } from "../../src/decode/VideoDecoder";
  * Object.create + field-injection pattern as canvas-renderer-frame-clock and
  * video-worker-policy) since it has no side effects worth routing through
  * the full decode() pipeline for.
- *
- * NOTE: this file deliberately does NOT test gating on `_softwareReason`.
- * Reading the implementation (VideoDecoder.ts:1613-1630) and its only call
- * site (:850-889), neither reads `_softwareReason` — an "unmapped" codec
- * (WebCodecs never had a mapping for it at all) is retried on exactly the
- * same cooldown as "hardware-refused" (a transient hardware failure).
- * Verified empirically: with `_softwareReason` set to each of the two
- * values and every other gate satisfied, `shouldRetryHardware()` returns
- * `true` in both cases. Flagged to the team lead as a possible gap rather
- * than assumed — not fixed here without sign-off.
  */
 function makeDecoder(overrides: Record<string, unknown>) {
   const d = Object.create(MoviVideoDecoder.prototype) as unknown as {
@@ -105,5 +97,120 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
     // NAL type 5 = IDR slice.
     const idr = new Uint8Array([0, 0, 1, 0x65]);
     expect(d.shouldRetryHardware(idr)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M3 fix: shouldRetryHardware() must not retry when `_softwareReason` is
+// permanent for this track ("unmapped" — WebCodecs has no codec string for
+// it at all; "no-webcodecs" — the API isn't present in this browser), while
+// still retrying for the transient reason ("hardware-refused" — a rejected
+// config or decode error, where the hardware might genuinely recover).
+//
+// These run through the REAL MoviVideoDecoder.configure() + decode() (same
+// pattern as video-decoder.test.ts's "reports why the CPU is decoding"
+// suite) rather than hand-injecting `_softwareReason`, so the reason comes
+// from the real classification logic, not from the test's assumption about
+// it. The only stand-ins are WebCodecs itself (genuinely absent in Node —
+// window/globalThis stubs) and WasmBindings (its calls ARE the assertions).
+// ---------------------------------------------------------------------------
+describe("M3: shouldRetryHardware gates on whether the fallback reason is permanent", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const mpeg2Track: VideoTrack = {
+    id: 0,
+    type: "video",
+    codec: "mpeg2video",
+    codecId: 2,
+    width: 1920,
+    height: 1080,
+    frameRate: 23.976,
+    bitRate: 0,
+    profile: 4,
+    level: 4,
+    pixelFormat: "yuv420p",
+  };
+
+  it('does not attempt resurrection, and hardwareRetryCount stays 0, when the reason is "unmapped"', async () => {
+    // WebCodecs is present (both the configure()-time check and the
+    // resurrection-time globalThis check) — the codec is simply not one
+    // WebCodecs knows, which is the "unmapped" case.
+    vi.stubGlobal("window", { VideoDecoder: class {} });
+    vi.stubGlobal("VideoDecoder", class {});
+
+    const bindings = {
+      enableDecoder: vi.fn(() => 0),
+      setSkipFrame: vi.fn(),
+      sendPacket: vi.fn(() => -1), // fail fast, don't need a real decode round-trip
+    } as unknown as WasmBindings;
+    const decoder = new MoviVideoDecoder();
+    decoder.setBindings(bindings);
+
+    await expect(decoder.configure(mpeg2Track)).resolves.toBe(true);
+    expect(decoder.softwareReason).toBe("unmapped");
+
+    // Cooldown wide open — if the gate were missing, this keyframe would
+    // trigger a resurrection attempt.
+    (decoder as unknown as { lastHardwareRetryTime: number }).lastHardwareRetryTime = -1e9;
+
+    decoder.decode(new Uint8Array([0, 0, 1, 0x65]), 1.0, true);
+
+    expect(
+      (decoder as unknown as { hardwareRetryCount: number }).hardwareRetryCount,
+    ).toBe(0);
+    expect((decoder as unknown as { useSoftware: boolean }).useSoftware).toBe(
+      true,
+    );
+  });
+
+  it('still attempts resurrection, and hardwareRetryCount increments, when the reason is "hardware-refused"', async () => {
+    const isConfigSupported = vi.fn(async () => ({ supported: false }));
+    class RefusingVideoDecoder {
+      static isConfigSupported = isConfigSupported;
+      constructor() {}
+      configure(): void {}
+      close(): void {}
+    }
+    vi.stubGlobal("window", { VideoDecoder: RefusingVideoDecoder });
+    vi.stubGlobal("VideoDecoder", RefusingVideoDecoder);
+
+    const bindings = {
+      enableDecoder: vi.fn(() => 0),
+      setSkipFrame: vi.fn(),
+      sendPacket: vi.fn(() => -1),
+    } as unknown as WasmBindings;
+    const decoder = new MoviVideoDecoder();
+    decoder.setBindings(bindings);
+
+    const h264Track: VideoTrack = {
+      id: 3,
+      type: "video",
+      codec: "h264",
+      codecId: 27,
+      width: 1920,
+      height: 1080,
+      frameRate: 24,
+      bitRate: 0,
+      profile: 77,
+      level: 40,
+      pixelFormat: "yuv420p",
+    };
+
+    await expect(decoder.configure(h264Track)).resolves.toBe(true);
+    expect(decoder.softwareReason).toBe("hardware-refused");
+
+    (decoder as unknown as { lastHardwareRetryTime: number }).lastHardwareRetryTime = -1e9;
+
+    decoder.decode(new Uint8Array([0, 0, 1, 0x65]), 1.0, true);
+
+    // recreateDecoder() bails immediately (no lastConfig for a refused
+    // hardware path) and flips back to software — but the retry ATTEMPT,
+    // and its count, must still have happened. That's the transient case
+    // resurrection exists for.
+    expect(
+      (decoder as unknown as { hardwareRetryCount: number }).hardwareRetryCount,
+    ).toBe(1);
   });
 });

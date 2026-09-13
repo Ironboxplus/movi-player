@@ -1608,10 +1608,37 @@ export class MoviVideoDecoder {
   }
 
   /**
+   * Reasons the hardware path is closed for good this configure() (until a
+   * new track/rendition re-decides it) — as opposed to a one-off failure
+   * that might not recur. "unmapped" means WebCodecs has no codec string for
+   * this track at all (VideoDecoder.ts:238); "no-webcodecs" means the API
+   * itself isn't present in this browser (:202). Neither is going to change
+   * between now and the next keyframe, so retrying on a timer just spends a
+   * recreateDecoder() every 10-30s for a result that's fixed in advance.
+   * "hardware-refused" (:553, the ??= catch-all for a rejected config or a
+   * decode error with no more specific reason recorded) and `null` (fresh
+   * fallback, resurrection not yet attempted) both stay retryable — those
+   * are the transient cases resurrection exists for.
+   */
+  private static readonly PERMANENT_SOFTWARE_REASONS: ReadonlySet<
+    NonNullable<MoviVideoDecoder["_softwareReason"]>
+  > = new Set(["unmapped", "no-webcodecs"]);
+
+  /**
    * Helper to check if we should try switching back to hardware
    */
   private shouldRetryHardware(data: Uint8Array): boolean {
     if (!this.useSoftware || !this.currentTrack) return false;
+
+    // Don't retry when the fallback reason is permanent for this track —
+    // the codec was never mapped to WebCodecs, or the browser has no
+    // WebCodecs at all. Retrying would fail identically every time.
+    if (
+      this._softwareReason &&
+      MoviVideoDecoder.PERMANENT_SOFTWARE_REASONS.has(this._softwareReason)
+    ) {
+      return false;
+    }
 
     // Safety: Don't retry too many times if it keeps failing
     if (this.hardwareRetryCount >= 10) return false;
