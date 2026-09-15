@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { byteBudget, isSteady, progression } from "./blackbox-metrics.mjs";
+import {
+  byteBudget,
+  classifyWindow,
+  isSteady,
+  progression,
+  summarizeDisturbances,
+} from "./blackbox-metrics.mjs";
 
 const required = (name) => {
   const value = process.env[name];
@@ -192,7 +198,31 @@ async function snapshot(page) {
   });
 }
 
+// `classifyWindow`/`summarizeDisturbances` were written, exported and unit
+// tested — and never called. `presentation-rebase` therefore never appeared in
+// a single report since the day it was implemented, and the one time it
+// mattered (a renderer presentation start that moved underneath a window that
+// stayed in `playing` throughout) it took hand-diffing two raw before/after
+// snapshots to notice. This wrapper is the missing wire.
+//
+// Disturbances are recorded on the way out as well as on the way to a throw:
+// a gate that only leaves evidence when it fails cannot explain its own green
+// light.
 function assertHealthy(label, before, after, phase, options = {}) {
+  const disturbances = classifyWindow([before, after]);
+  const summary = summarizeDisturbances(disturbances);
+  try {
+    const progress = assertHealthyInner(label, before, after, phase, options);
+    return { ...progress, disturbances: summary };
+  } catch (error) {
+    if (summary && error instanceof Error) {
+      error.message += `; window disturbances: ${summary}`;
+    }
+    throw error;
+  }
+}
+
+function assertHealthyInner(label, before, after, phase, options = {}) {
   const generationBudget = options.generationBudget ?? 4;
   const progress = progression(before, after);
   const errors = after.errors.map((entry) => String(entry));
