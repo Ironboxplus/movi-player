@@ -1,0 +1,281 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Clock } from "../../src/core/Clock";
+import { AudioRenderer } from "../../src/render/AudioRenderer";
+import type { PCMFrame } from "../../src/decode/SoftwareAudioDecoder";
+
+/**
+ * B1 (docs/PLAN_MERGE.MD §4.11, "B 系列") — audio track switch corrupts the
+ * media clock by 1-2 orders of magnitude, direction depending on the sample
+ * (Paprika -> ac3 measured 0.064x; Star Trek's historical reading for the
+ * same step was 4.13x).
+ *
+ * Root cause (confirmed by the RED phase of this investigation, since fixed):
+ * `MoviPlayer.ts`'s `trackManager.on("audioTrackChange", ...)` handler used
+ * to close the old `MoviAudioDecoder` and construct a new one without
+ * touching `this.clock` or `this.audioRenderer` at all. Two things then went
+ * stale across the switch: `Clock.syncedToAudio` stayed `true` (so Clock only
+ * ever nudged `baseTime` by 50% of observed drift per `getTime()` call,
+ * Clock.ts:127-131, instead of hard-resyncing), and `AudioRenderer`'s
+ * scheduling anchor (`firstBufferScheduledAt`/`firstBufferMediaTime`)
+ * survived, so the natural decode gap during the worker swap read as an
+ * ordinary underrun and silently re-pivoted the anchor to the new track's
+ * raw PTS (AudioRenderer.ts:927-961). A gradual 50%/call correction chasing
+ * a step discontinuity is what produced the 0.064x-4.13x readings.
+ *
+ * Fix (team-lead-approved, "reuse the seek path's primitives, don't invent a
+ * new mechanism"): `MoviPlayer`'s `realignAudioTimelineForTrackSwitch()` now
+ * calls exactly the same two primitives the seek/replay/subtitle-prefetch-
+ * resume paths already use to rebuild the pipeline at a fixed position —
+ * `audioRenderer.reset()` then `clock.seek(clock.getTime())` — just without
+ * the demuxer re-seek, since a track switch doesn't change position. See
+ * `test/core/moviplayer-audio-track-switch-realign.test.ts` for proof that
+ * the real `MoviPlayer` handler actually calls these two, in this order.
+ *
+ * THIS file locks the other half of the contract, at the `Clock` +
+ * `AudioRenderer` level directly (real instances, no mock executors — the
+ * `FakeAudioContext` below stands in for the missing browser API, same
+ * pattern as test/render/audio-renderer.test.ts): that calling
+ * `reset()` + `seek(getTime())` at the moment of a track switch is actually
+ * SUFFICIENT to keep the reported media rate at 1x immediately afterward,
+ * for a track switch whose new PTS disagrees with the old timeline by 1.5s
+ * in either direction (mirroring the Star Trek/Paprika sign split). The one
+ * expected artifact is a single clean hard-sync jump AT the switch instant —
+ * exactly the same kind of one-time discontinuity a real seek() produces,
+ * which is why the blackbox harness (PLAN_MERGE.MD §5.4b) doesn't start its
+ * rate measurement window until the clock has run stable for 2s: sampling
+ * across that jump is not a meaningful rate. So the assertion below measures
+ * rate using two readings taken strictly AFTER the jump has landed, not
+ * straddling it.
+ */
+
+class FakeAudioBuffer {
+  readonly duration: number;
+  private data: Float32Array[];
+
+  constructor(
+    readonly numberOfChannels: number,
+    readonly length: number,
+    readonly sampleRate: number,
+  ) {
+    this.duration = length / sampleRate;
+    this.data = Array.from(
+      { length: numberOfChannels },
+      () => new Float32Array(length),
+    );
+  }
+
+  copyToChannel(source: Float32Array, channel: number): void {
+    this.data[channel].set(source);
+  }
+
+  getChannelData(channel: number): Float32Array {
+    return this.data[channel];
+  }
+}
+
+class FakeSource {
+  buffer: FakeAudioBuffer | null = null;
+  playbackRate = { value: 1 };
+  onended: (() => void) | null = null;
+  connect = vi.fn();
+  disconnect = vi.fn();
+  stop = vi.fn();
+  start(): void {
+    /* no-op: only scheduling timestamps matter to this test */
+  }
+}
+
+class FakeGain {
+  gain = {
+    value: 1,
+    cancelScheduledValues: vi.fn(),
+    setValueAtTime: vi.fn(),
+    linearRampToValueAtTime: vi.fn(),
+  };
+  connect = vi.fn();
+  disconnect = vi.fn();
+}
+
+class FakeAudioContext {
+  currentTime = 0;
+  state = "running";
+  destination = { maxChannelCount: 2 };
+  createGain(): FakeGain {
+    return new FakeGain();
+  }
+  createDynamicsCompressor(): FakeGain {
+    return new FakeGain();
+  }
+  createBuffer(channels: number, frames: number, sampleRate: number): FakeAudioBuffer {
+    return new FakeAudioBuffer(channels, frames, sampleRate);
+  }
+  createBufferSource(): FakeSource {
+    return new FakeSource();
+  }
+}
+
+function makeRenderer(ctx: FakeAudioContext): AudioRenderer {
+  const renderer = new AudioRenderer();
+  Object.assign(renderer as unknown as Record<string, unknown>, {
+    audioContext: ctx,
+    gainNode: ctx.createGain(),
+    isPlaying: true,
+  });
+  return renderer;
+}
+
+const SAMPLE_RATE = 48_000;
+const FRAME_SAMPLES = 4_800; // 0.1s/frame at 48kHz — a clean, round duration
+const FRAME_DURATION = FRAME_SAMPLES / SAMPLE_RATE;
+
+/** A decoded PCM frame at `timestampSeconds` into the media timeline. */
+function makeFrame(timestampSeconds: number): PCMFrame {
+  return {
+    planes: [new Float32Array(FRAME_SAMPLES), new Float32Array(FRAME_SAMPLES)],
+    numberOfFrames: FRAME_SAMPLES,
+    numberOfChannels: 2,
+    sampleRate: SAMPLE_RATE,
+    timestamp: Math.round(timestampSeconds * 1_000_000),
+  };
+}
+
+/**
+ * Wires a real Clock to a real AudioRenderer the way MoviPlayer does, feeds
+ * five contiguous frames of "track A" starting at media time 30s, and drives
+ * both the AudioContext clock and Clock's wall clock to a healthy steady
+ * state 0.3s later (wall time, not media time). Returns everything needed to
+ * then simulate a track switch.
+ */
+function buildSteadyTrackA() {
+  const now = vi.spyOn(performance, "now");
+  let wallNow = 0;
+  now.mockReturnValue(0);
+
+  const ctx = new FakeAudioContext();
+  const renderer = makeRenderer(ctx);
+  const clock = new Clock();
+  clock.setAudioProvider(renderer);
+  clock.start();
+
+  // Five contiguous 0.1s frames from media time 30.0s — establishes
+  // AudioRenderer's anchor (firstBufferScheduledAt/firstBufferMediaTime) and
+  // gives Clock enough scheduledCount for hasHealthyBuffer()'s lower (0.02s)
+  // threshold.
+  for (let i = 0; i < 5; i++) {
+    renderer.renderPCM(makeFrame(30.0 + i * FRAME_DURATION));
+  }
+
+  // First getTime() call while the buffer is healthy hard-syncs Clock to the
+  // audio clock (Clock.ts:116-121) — real production behaviour on playback
+  // start, not something this test injects.
+  const hardSyncReading = clock.getTime();
+  expect(hardSyncReading).toBeCloseTo(30.0, 6);
+  expect(clock.isSyncedToAudio()).toBe(true);
+
+  function advanceRealTime(deltaSeconds: number): void {
+    wallNow += deltaSeconds;
+    ctx.currentTime += deltaSeconds;
+    now.mockReturnValue(wallNow * 1000);
+  }
+
+  // 0.3s of ordinary healthy playback before the switch.
+  advanceRealTime(0.3);
+  const preSwitchReading = clock.getTime();
+  // Steady state: wall clock and audio clock agree to a few ms — nowhere
+  // near the multi-hundred-ms drift threshold that triggers correction.
+  expect(preSwitchReading).toBeCloseTo(30.3, 2);
+  expect(clock.isSyncedToAudio()).toBe(true);
+
+  return { renderer, clock, ctx, advanceRealTime, preSwitchReading, wallNowAt: () => wallNow };
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("B1 fix: realigning AudioRenderer+Clock at a track switch keeps the settled rate at 1x", () => {
+  it("forward jump (new track's PTS reads 1.5s AHEAD of the old timeline): rate is a single clean hard-sync, then exactly 1x", () => {
+    const { renderer, clock, advanceRealTime, wallNowAt } = buildSteadyTrackA();
+
+    // The decode gap while the old worker tears down and the new one spins
+    // up/configures — long enough to exhaust the healthy buffer built up
+    // above.
+    advanceRealTime(0.25);
+
+    // Where continuous playback of the OLD track would have reached by now —
+    // for narration only, not fed to either object.
+    const continuousExpectation = 30.0 + (wallNowAt() - 0.005);
+    const newTrackPts = continuousExpectation + 1.5;
+
+    // Apply the fix — exactly what MoviPlayer's
+    // realignAudioTimelineForTrackSwitch() does, in the same order, at the
+    // same point (old decoder already closed, new one not yet producing
+    // output).
+    renderer.reset();
+    clock.seek(clock.getTime());
+
+    renderer.renderPCM(makeFrame(newTrackPts));
+    renderer.renderPCM(makeFrame(newTrackPts + FRAME_DURATION));
+    renderer.renderPCM(makeFrame(newTrackPts + 2 * FRAME_DURATION));
+
+    // The jump itself still happens — reset() doesn't make the new track's
+    // real PTS match the old timeline, it just makes Clock treat the jump as
+    // a single hard resync instead of a runaway gradual correction. This is
+    // the same kind of one-time discontinuity a real seek() produces.
+    const jumpReading = clock.getTime();
+    expect(jumpReading).toBeCloseTo(newTrackPts, 2);
+
+    // The important part: sample TWICE, both AFTER the jump has landed (not
+    // straddling it) — this is what settles, and what the blackbox harness's
+    // post-switch mediaRate window actually measures.
+    advanceRealTime(0.1);
+    const settledReadingA = clock.getTime();
+    advanceRealTime(0.1);
+    const settledReadingB = clock.getTime();
+    const settledRate = (settledReadingB - settledReadingA) / 0.1;
+
+    // eslint-disable-next-line no-console -- test diagnostic, not app code
+    console.info(
+      `[B1 fix] forward jump: jumpReading=${jumpReading.toFixed(4)} ` +
+        `settledRate=${settledRate.toFixed(4)}x`,
+    );
+
+    expect(Math.abs(settledRate - 1)).toBeLessThan(0.02);
+  });
+
+  it("backward jump (new track's PTS reads 1.5s BEHIND the old timeline): rate is a single clean hard-sync, then exactly 1x", () => {
+    const { renderer, clock, advanceRealTime, wallNowAt } = buildSteadyTrackA();
+
+    advanceRealTime(0.25);
+
+    const continuousExpectation = 30.0 + (wallNowAt() - 0.005);
+    // Same switch, opposite sign — mirrors the Star Trek (fast) / Paprika
+    // (slow) split from PLAN_MERGE.MD §4.11 B1: same code path, same fix,
+    // opposite direction.
+    const newTrackPts = continuousExpectation - 1.5;
+
+    renderer.reset();
+    clock.seek(clock.getTime());
+
+    renderer.renderPCM(makeFrame(newTrackPts));
+    renderer.renderPCM(makeFrame(newTrackPts + FRAME_DURATION));
+    renderer.renderPCM(makeFrame(newTrackPts + 2 * FRAME_DURATION));
+
+    const jumpReading = clock.getTime();
+    expect(jumpReading).toBeCloseTo(newTrackPts, 2);
+
+    advanceRealTime(0.1);
+    const settledReadingA = clock.getTime();
+    advanceRealTime(0.1);
+    const settledReadingB = clock.getTime();
+    const settledRate = (settledReadingB - settledReadingA) / 0.1;
+
+    // eslint-disable-next-line no-console -- test diagnostic, not app code
+    console.info(
+      `[B1 fix] backward jump: jumpReading=${jumpReading.toFixed(4)} ` +
+        `settledRate=${settledRate.toFixed(4)}x`,
+    );
+
+    expect(Math.abs(settledRate - 1)).toBeLessThan(0.02);
+  });
+});

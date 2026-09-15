@@ -1277,6 +1277,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.audioDecoder.close();
       }
 
+      // B1: re-anchor AudioRenderer/Clock at the current position BEFORE the
+      // new decoder starts producing output — see realignAudioTimelineForTrackSwitch's
+      // doc comment. Must happen here (old decoder closed, new one not yet
+      // configured) so the old track's already-scheduled audio is dropped
+      // cleanly and the new track's first buffer lands on a fresh anchor.
+      this.realignAudioTimelineForTrackSwitch();
+
       // Recreate audio decoder for new track
       this.audioDecoder = new MoviAudioDecoder();
 
@@ -4704,6 +4711,52 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         bindings.setStreamDiscard(t.id, t.id !== activeAudioId);
       }
     }
+  }
+
+  /**
+   * Re-anchor AudioRenderer and Clock at the CURRENT position across an
+   * audio track switch — no position change, just a decoder rebuild.
+   *
+   * B1 (docs/PLAN_MERGE.MD §4.11): the audioTrackChange handler used to close
+   * the old MoviAudioDecoder and construct a new one without touching either
+   * object. That left two things stale:
+   *
+   *   - AudioRenderer's scheduling anchor (firstBufferScheduledAt /
+   *     firstBufferMediaTime) survived the switch. The gap while the old
+   *     worker tears down and the new one spins up/configures reads as an
+   *     ordinary buffer underrun to AudioRenderer, whose underrun-recovery
+   *     path (AudioRenderer.ts's commitAudioBuffer) silently re-pivots that
+   *     anchor to whatever raw PTS the new track's first decoded buffer
+   *     carries — with no check that it continues the old timeline.
+   *   - Clock.syncedToAudio survived the switch too, so Clock treated the
+   *     resulting step discontinuity as ordinary drift and only ever nudged
+   *     baseTime by 50% of it per getTime() call (Clock.ts) instead of
+   *     hard-resyncing — turning a step into an extended, direction-
+   *     dependent rate distortion (measured 0.064x-4.13x across samples).
+   *
+   * Both primitives already exist and are exactly what the seek path uses
+   * to rebuild the pipeline at a fixed position (see seek()'s
+   * `audioRenderer.reset()` -> `demuxer.seek(target)` -> `clock.seek(target)`
+   * sequence, and the equivalent in the first-play and subtitle-prefetch-
+   * resume paths). A track switch skips the demuxer re-seek (position is
+   * unchanged) but needs the other two:
+   *
+   *   - `audioRenderer.reset()` stops the old track's already-scheduled Web
+   *     Audio nodes and clears hasFirstBuffer, so the new track's first
+   *     buffer establishes a FRESH anchor instead of hitting the
+   *     underrun-recovery re-pivot.
+   *   - `clock.seek(currentTime)` re-anchors Clock's wall clock to the
+   *     position we were actually at and drops syncedToAudio, so the next
+   *     getTime() call hard-syncs cleanly to the new anchor the first time
+   *     it becomes healthy, instead of gradually drift-correcting toward it.
+   *
+   * Captured as its own method (not inlined in the handler) so it can be
+   * driven directly in a test without wiring a full MoviPlayer instance.
+   */
+  private realignAudioTimelineForTrackSwitch(): void {
+    const currentTime = this.clock.getTime();
+    this.audioRenderer.reset();
+    this.clock.seek(currentTime);
   }
 
   /**
