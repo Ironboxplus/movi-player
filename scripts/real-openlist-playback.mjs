@@ -347,14 +347,20 @@ function assertHealthyInner(label, before, after, phase, options = {}) {
     // no bytes to have arrived across it — a source that is downloading is a
     // source that is waking waiters. `readStalls` above remains the cumulative
     // counter and is asserted unchanged.
-    const waitersBefore = Number(before.network?.bufferWaiters ?? 0);
-    const waitersAfter = Number(after.network.bufferWaiters ?? 0);
-    const bytesMoved =
-      Number(after.network.totalBytes ?? 0) - Number(before.network?.totalBytes ?? 0);
-    if (waitersBefore > 0 && waitersAfter > 0 && bytesMoved <= 0) {
+    // `oldestPendingReadWaitMs` is the age of the longest-running waitForData
+    // call — the only field that distinguishes one stranded read from a
+    // succession of ordinary short ones, which the count cannot.
+    const oldestRead = Number(after.network.oldestPendingReadWaitMs ?? 0);
+    if (oldestRead >= 10_000) {
       throw new Error(
-        `${label} left ${waitersAfter} HTTP buffer waiter(s) stranded during ${phase}: ` +
-          `parked at both ends of a ${progress.wallSeconds.toFixed(3)}s window with no bytes arriving`,
+        `${label} has an HTTP read stranded during ${phase}: waiting ` +
+          `${(oldestRead / 1000).toFixed(1)}s for its bytes ` +
+          `(${Number(after.network.bufferWaiters ?? 0)} parked waiter(s), ` +
+          `${(
+            (Number(after.network.totalBytes ?? 0) -
+              Number(before.network?.totalBytes ?? 0)) /
+            1e6
+          ).toFixed(1)} MB arrived across the window)`,
       );
     }
     if (Number(after.network.streamGeneration ?? 0) > generationBudget) {
@@ -854,28 +860,41 @@ async function assertRealAudio(page, label, phase, windowMs = 3_000) {
   return result;
 }
 
+// A read that has been waiting this long for its bytes is stranded, not slow.
+// HttpSource's own waitForData gives a read a 30s deadline and calls it stalled
+// after 15s without progress, so this sits below both: it reports a stuck read
+// rather than waiting for the source to give up on it.
+const STRANDED_READ_MS = 10_000;
+
 /**
- * Poll the live buffer-waiter gauge until it reaches zero, or `timeoutMs`.
+ * Poll until no read has been waiting longer than `STRANDED_READ_MS`.
  *
- * Returns the last observed count — 0 means everything parked drained, which
- * is what a healthy source does within milliseconds of its bytes landing.
+ * Reads the AGE of the longest-running waitForData call, not the waiter count.
+ * The count cannot answer this: the park inside waitForData re-arms every
+ * 250ms, so `bufferWaiters === 1` sampled repeatedly looks identical whether
+ * one read has been stuck for 30s or four different reads each waited 250ms.
+ * The first sweep to use the count over a 5s window flagged Paprika while the
+ * source was downloading at 3.2 MB/s with readStalls=0 — a reading that could
+ * not be turned into a claim either way. `oldestPendingReadWaitMs` was added to
+ * HttpSource for exactly this question.
  */
-async function waitForBufferWaitersToDrain(page, timeoutMs) {
+async function waitForStrandedReads(page, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let last = 0;
+  let last = { bufferWaiters: 0, oldestPendingReadWaitMs: 0 };
   for (;;) {
     last = await page
-      .evaluate(
-        () =>
-          Number(
-            document
-              .querySelector("movi-player")
-              ?.player?.source?.getNetworkStats?.().bufferWaiters ?? 0,
-          ),
-      )
-      .catch(() => 0);
-    if (last === 0 || Date.now() >= deadline) return last;
-    await page.waitForTimeout(250);
+      .evaluate(() => {
+        const stats =
+          document.querySelector("movi-player")?.player?.source?.getNetworkStats?.() ?? {};
+        return {
+          bufferWaiters: Number(stats.bufferWaiters ?? 0),
+          oldestPendingReadWaitMs: Number(stats.oldestPendingReadWaitMs ?? 0),
+        };
+      })
+      .catch(() => ({ bufferWaiters: 0, oldestPendingReadWaitMs: 0 }));
+    if (last.oldestPendingReadWaitMs < STRANDED_READ_MS) return last;
+    if (Date.now() >= deadline) return last;
+    await page.waitForTimeout(500);
   }
 }
 
@@ -1723,6 +1742,15 @@ async function runOne(browser, token, mediaPath) {
     if (/B1b instrumentation/i.test(text)) {
       process.stderr.write(`[B1b LIVE] ${label}: ${text}\n`);
     }
+    // Per-read HttpSource chatter matches the filter below on "buffer"
+    // (bufferStart=/bufferEnd=) and it is emitted once per 512KB, so on a
+    // multi-GB remux it is the overwhelming majority of the ring and evicts
+    // everything worth reading. Measured on 萤火虫之墓: the 100-entry tail
+    // attached to a `steady playback` failure held 85 of these and 15 lines
+    // of actual state, which was not enough to say what stopped the picture.
+    // Stalls, restarts and generation changes still come through — only the
+    // routine per-read lines are dropped.
+    if (/HttpSource\] Read:/.test(text)) return;
     if (
       /VideoDecoder|codec|decoder|software|WebCodecs|post-seek|burst|backpressure|buffer|worker|underrun|starv|Clock|PlayerState|playback-transition|B1b instrumentation/i.test(
         text,
@@ -1862,10 +1890,29 @@ async function runOne(browser, token, mediaPath) {
     const { before: playBefore, after: playAfter } = await sampleWindow(page, sampleMs);
     try {
       const playProgress = assertHealthy(label, playBefore, playAfter, "steady playback");
-      const pictureEvidence = await assertRealPicture(page, label, "steady playback");
+      // CONTENT is recorded here, not asserted. This window opens ~2s after
+      // play() by construction, and on a feature film that is the studio card:
+      // the picture is legitimately motionless and the audio legitimately
+      // silent. Measured on 萤火虫之墓, three different runs, three different
+      // "failures" at the same t≈1.97s — flat picture, then unchanged picture,
+      // then maxRms=2.08e-4 — while the SAME run read avgRms=0.0059 (37x the
+      // silence floor) with a moving picture at the middle seek. Nothing was
+      // wrong with the pipeline in any of them.
+      //
+      // A content assertion can only be made where content must exist, and no
+      // fixed timestamp near t=0 is such a place. The binding picture/audio
+      // assertions therefore live at the seek positions (mid-film, chosen
+      // fractions of duration) and the end-of-run gate below requires that at
+      // least one of them actually produced evidence — so this is a relocation
+      // of the content gate, not a removal of it.
+      const pictureEvidence = await assertRealPicture(page, label, "steady playback").catch(
+        (error) => ({ advisory: error instanceof Error ? error.message : String(error) }),
+      );
       let audioEvidence;
       if (playAfter.audioCodec && playAfter.audioCodec !== "N/A") {
-        audioEvidence = await assertRealAudio(page, label, "steady playback");
+        audioEvidence = await assertRealAudio(page, label, "steady playback").catch(
+          (error) => ({ advisory: error instanceof Error ? error.message : String(error) }),
+        );
       }
       return { playAfter, playProgress, pictureEvidence, audioEvidence };
     } catch (error) {
@@ -2146,6 +2193,40 @@ async function runOne(browser, token, mediaPath) {
     validateSubtitles(page, label),
   );
 
+  // The content gate, stated once for the whole session. `steady playback`
+  // records picture/audio evidence rather than asserting it (see the note
+  // there: its window lands on the studio card), so SOMETHING has to still
+  // require that this sample proved it can put a picture on the canvas and
+  // sound in the graph. That is this step. It is deliberately position-
+  // agnostic — any step that produced real evidence satisfies it — so it
+  // cannot be defeated by a title card, and it cannot be satisfied by a
+  // decoder that never produced content anywhere.
+  await runPhase("content evidence", async () => {
+    const real = (evidence) =>
+      Boolean(evidence) && !evidence.advisory;
+    const pictureProofs = [pictureEvidence, ...seeks.map((s) => s?.picture)].filter(real);
+    const audioProofs = [audioEvidence, ...seeks.map((s) => s?.audio)].filter(real);
+    const needsAudio = Boolean(playAfter.audioCodec && playAfter.audioCodec !== "N/A");
+    if (pictureProofs.length === 0) {
+      throw new Error(
+        `${label} never produced real picture evidence at any position this session ` +
+          `(steady playback advisory: ${pictureEvidence?.advisory ?? "n/a"})`,
+      );
+    }
+    if (needsAudio && audioProofs.length === 0) {
+      throw new Error(
+        `${label} never produced real audio evidence at any position this session ` +
+          `(steady playback advisory: ${audioEvidence?.advisory ?? "n/a"})`,
+      );
+    }
+    return {
+      picturePositions: pictureProofs.length,
+      audioPositions: audioProofs.length,
+      steadyPictureAdvisory: pictureEvidence?.advisory ?? null,
+      steadyAudioAdvisory: audioEvidence?.advisory ?? null,
+    };
+  });
+
   await runPhase("final state check", async () => {
     const check = await snapshot(page);
     if (check.state !== "playing" || !check.clockRunning) {
@@ -2164,11 +2245,12 @@ async function runOne(browser, token, mediaPath) {
       // window to drain and fail only if they never do. This is the site that
       // actually fired — one Star Trek run in three, immediately after a
       // subtitle probe's burst of seeks, with playback otherwise healthy.
-      const drained = await waitForBufferWaitersToDrain(page, 5_000);
-      if (drained > 0) {
+      const reads = await waitForStrandedReads(page, 15_000);
+      if (reads.oldestPendingReadWaitMs >= STRANDED_READ_MS) {
         throw new Error(
-          `${label} left ${drained} HTTP buffer waiter(s) stranded after subtitle testing — ` +
-            `still parked 5000ms later`,
+          `${label} has an HTTP read stranded after subtitle testing: waiting ` +
+            `${(reads.oldestPendingReadWaitMs / 1000).toFixed(1)}s for its bytes ` +
+            `(${reads.bufferWaiters} parked waiter(s))`,
         );
       }
     }

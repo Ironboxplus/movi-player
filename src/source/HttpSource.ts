@@ -173,6 +173,12 @@ export class HttpSource implements SourceAdapter {
   // time froze the whole module, decoders included.
   private bufferWaiters: Set<{ needed: number; wake: () => void }> = new Set();
 
+  // One entry per in-flight waitForData() call, carrying when that READ began
+  // waiting — not when its current 250ms park did. See the note at the record's
+  // creation site for why the waiter count cannot answer the same question.
+  private pendingReadWaits: Set<{ startedAt: number; needed: number }> =
+    new Set();
+
   // Stream state
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private abortController: AbortController | null = null;
@@ -2023,6 +2029,17 @@ export class HttpSource implements SourceAdapter {
     const initialVersion = this.atomicGetVersion();
     const initialPreemptEpoch = this.preemptEpoch;
 
+    // How long THIS read has been waiting for its bytes. `bufferWaiters.size`
+    // cannot answer that: the park inside the loop below re-arms every 250ms,
+    // so the set membership is continuously recycled and a count sampled at
+    // any instant looks identical whether one read has been stuck for 30s or
+    // four different reads each waited 250ms. The black-box gate needs to tell
+    // those apart — one is a stranded read, the other is an ordinary streaming
+    // source — and nothing exposed today could.
+    const waitRecord = { startedAt: startTime, needed };
+    this.pendingReadWaits.add(waitRecord);
+    try {
+
     // Track progress to allow slow but steady streams
     let lastProgress = this.bufferEnd;
     let lastProgressTime = Date.now();
@@ -2119,6 +2136,9 @@ export class HttpSource implements SourceAdapter {
     }
 
     return success;
+    } finally {
+      this.pendingReadWaits.delete(waitRecord);
+    }
   }
 
   async read(offset: number, length: number): Promise<ArrayBuffer> {
@@ -2757,6 +2777,7 @@ export class HttpSource implements SourceAdapter {
     readStalls: number;
     supersededStreams: number;
     bufferWaiters: number;
+    oldestPendingReadWaitMs: number;
     lastProgressAt: number;
   } {
     const timeSinceLastRead = this.lastSpeedTime > 0 ? (Date.now() - this.lastSpeedTime) / 1000 : 0;
@@ -2771,6 +2792,12 @@ export class HttpSource implements SourceAdapter {
       readStalls: this.readStalls,
       supersededStreams: this.supersededStreams,
       bufferWaiters: this.bufferWaiters.size,
+      // 0 when nothing is waiting. See pendingReadWaits.
+      oldestPendingReadWaitMs: this.pendingReadWaits.size
+        ? Math.max(
+            ...[...this.pendingReadWaits].map((wait) => Date.now() - wait.startedAt),
+          )
+        : 0,
       lastProgressAt: this.lastProgressAt,
     };
   }
