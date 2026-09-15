@@ -1101,18 +1101,15 @@ async function runAudioTrackSwitch(page, label) {
     // windows before opening the measurement window, exactly like seeks do.
     await waitForStablePlayback(page, switchIssuedAt);
     const { before, after } = await sampleWindow(page, phaseSampleMs);
-    const progress = assertHealthy(
-      label,
-      before,
-      after,
-      `audio track ${track.id} (${track.codec})`,
-      { generationBudget: numeric(before.network?.streamGeneration) + 2 },
-    );
-    // A track switch is not a seek: require the playhead itself not to have
-    // jumped. If it has, waiting out the resync above does not explain it
-    // away — that is a real bug, not a measurement artifact, and this catches
-    // it even though the wait above would otherwise paper over a rate blip
-    // caused by exactly this kind of jump.
+    // Displacement is judged BEFORE assertHealthy, and the ordering is load
+    // bearing. A track switch is not a seek: if the playhead itself jumped,
+    // every throughput number measured across that jump is meaningless, and
+    // assertHealthy's frame/rate checks will happily throw first and hide the
+    // cause behind a symptom. That is not hypothetical — an A/B against the
+    // pre-merge tree (2026-09-15) came back "presented only 0 frames" and was
+    // read as a different failure mode, when in fact the run had never reached
+    // the displacement check at all, so it said nothing about whether the
+    // playhead had moved. The more fundamental fact gets asserted first.
     const displacement = Math.abs(before.currentTime - preSwitchTime);
     if (displacement > AUDIO_SWITCH_MAX_DISPLACEMENT_S) {
       throw new Error(
@@ -1120,6 +1117,13 @@ async function runAudioTrackSwitch(page, label) {
           `just from switching to audio track ${track.id} (${track.codec}); a track switch must not move the playhead`,
       );
     }
+    const progress = assertHealthy(
+      label,
+      before,
+      after,
+      `audio track ${track.id} (${track.codec})`,
+      { generationBudget: numeric(before.network?.streamGeneration) + 2 },
+    );
     if (after.audioWorkerStaleDrops > before.audioWorkerStaleDrops + 64) {
       throw new Error(
         `${label} dropped ${after.audioWorkerStaleDrops - before.audioWorkerStaleDrops} stale worker frames after switching to track ${track.id}; the generation gate is letting the old track's work through`,
