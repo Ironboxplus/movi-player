@@ -27,6 +27,18 @@ export default defineConfig({
   },
   server: {
     allowedHosts: true,
+    watch: {
+      // A crash dump must not be able to kill the dev server. Git Bash drops
+      // `bash.exe.stackdump` in the CWD when it faults, and Windows keeps that
+      // file locked while it is being written; chokidar's watcher then throws
+      // EBUSY on it, and the error propagates out of the FSWatcher and takes
+      // the whole `vite` process down. Observed twice on 2026-09-15, both
+      // times presenting as "dev server started, then silently died" — which
+      // reads like a harness failure, not a stray file. Also covers the
+      // black-box run artefacts, which change constantly during a sweep and
+      // are of no interest to HMR.
+      ignored: ['**/*.stackdump', '**/.blackbox-results/**', '**/coverage/**'],
+    },
     headers: {
       // 'same-origin-allow-popups' (not 'same-origin') so Google Identity
       // Services OAuth popups can post the token back to the opener — plain
