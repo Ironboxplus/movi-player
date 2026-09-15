@@ -1717,8 +1717,28 @@ async function runOne(browser, token, mediaPath) {
   // unit. `hardwareAcceleration: "prefer-hardware"` is a hint; a browser is
   // free to honour the config string while still decoding on the CPU.
   await runPhase("hardware-preferred config check", async () => {
-  if (/h\.?264|avc/i.test(playAfter.videoCodec || label)) {
-    if (/software|wasm/i.test(playAfter.videoDecoder)) {
+  // The probe result is recorded whether or not it fails. A gate that only
+  // leaves evidence when it trips cannot explain its own green light: the
+  // first run of this capability check passed on a HEVC sample that was
+  // demonstrably sitting on the software decoder, and nothing in the report
+  // said whether the probe had answered "hardware not available" or had
+  // simply failed to run.
+  let hardwareProbeEvidence = { probed: false, reason: "decoder was not software" };
+  // Capability-driven, NOT a codec allowlist. This phase used to run only for
+  // /h\.?264|avc/, so the matrix's one HEVC Main10 sample could sit on
+  // `Software (FFmpeg Worker)` and still pass the gate — which is what it was
+  // doing on 2026-09-15, on a host whose capability probe reports HEVC
+  // Main/Main10 (1080p and 4K), VP9 and AV1 all `supported: true` with
+  // `powerEfficient: true` (Chrome 152, headless). Any allowlist has the same
+  // shape of bug waiting in it: the next codec added to the matrix is exempt
+  // until somebody remembers to extend the regex.
+  //
+  // So the question asked is the one that actually matters — "the player chose
+  // software; could this browser have done it in hardware?" — and it is asked
+  // of whatever codec is really playing. MPEG-2 (the Paprika sample) exempts
+  // itself for free: WebCodecs has no MPEG-2 support, the probe comes back
+  // unsupported, and software there is the only correct choice.
+  if (/software|wasm/i.test(playAfter.videoDecoder)) {
       const supportProbe = await page.evaluate(async () => {
         const element = document.querySelector("movi-player");
         const player = element?.player;
@@ -1729,8 +1749,35 @@ async function runOne(browser, token, mediaPath) {
         if (!track || typeof VideoDecoder?.isConfigSupported !== "function") {
           return null;
         }
+        // A representative codec string per family, used only to ask "is this
+        // family hardware-decodable here". Deliberately generic: the player's
+        // own resolved string is what it should have used, and if it failed to
+        // resolve one at all (videoCodec === undefined in the stats snapshot)
+        // that is itself the thing being caught.
+        const family = String(track.codec ?? "").toLowerCase();
+        const probeCodec = /hevc|h\.?265|hvc1|hev1/.test(family)
+          ? (/10|main10/.test(family) ? "hvc1.2.4.L120.B0" : "hvc1.1.6.L120.B0")
+          : /av01|av1/.test(family)
+            ? "av01.0.04M.08"
+            : /vp9|vp09/.test(family)
+              ? "vp09.00.10.08"
+              : /avc|h\.?264/.test(family)
+                ? "avc1.640028"
+                : null;
+        if (!probeCodec) {
+          // No WebCodecs equivalent (MPEG-2, and anything else the browser has
+          // no decoder for). Software is correct here, not a defect.
+          return {
+            trackCodec: family,
+            trackWidth: track.width,
+            trackHeight: track.height,
+            probeCodec: null,
+            hardwareCapable: false,
+            reason: "no WebCodecs equivalent for this codec family",
+          };
+        }
         const base = {
-          codec: "avc1.640028",
+          codec: probeCodec,
           codedWidth: track.width,
           codedHeight: track.height,
         };
@@ -1741,16 +1788,22 @@ async function runOne(browser, token, mediaPath) {
             return false;
           }
         };
+        const hardwareCapable = await check({
+          ...base,
+          hardwareAcceleration: "prefer-hardware",
+        });
         return {
+          trackCodec: family,
+          trackWidth: track.width,
+          trackHeight: track.height,
+          probeCodec,
+          hardwareCapable,
           extradataHex: extradata
             ? [...extradata.slice(0, 48)]
                 .map((byte) => byte.toString(16).padStart(2, "0"))
                 .join("")
             : "",
-          genericHardwareNoDescription: await check({
-            ...base,
-            hardwareAcceleration: "prefer-hardware",
-          }),
+          genericHardwareNoDescription: hardwareCapable,
           genericDefaultNoDescription: await check(base),
           genericHardwareWithDescription: extradata
             ? await check({
@@ -1764,22 +1817,38 @@ async function runOne(browser, token, mediaPath) {
             : null,
         };
       });
-      throw new Error(
-        `${label} used ${playAfter.videoDecoder} for H.264 instead of WebCodecs hardware decoding; ` +
-          `support probe: ${JSON.stringify(supportProbe)}; ` +
-          `decoder diagnostics: ${decoderDiagnostics.slice(-30).join(" | ")}`,
-      );
-    }
-    if (!/hardware-preferred/i.test(playAfter.videoDecoder)) {
+      hardwareProbeEvidence = {
+        videoDecoder: playAfter.videoDecoder,
+        videoCodec: playAfter.videoCodec ?? null,
+        softwareDecodeReason: playAfter.softwareDecodeReason ?? null,
+        probe: supportProbe,
+      };
+      // Only a defect when the browser says it COULD have done this in
+      // hardware. A `hardwareCapable: false` probe means software was the
+      // right call and this is not a finding.
+      if (supportProbe?.hardwareCapable) {
+        throw new Error(
+          `${label} used ${playAfter.videoDecoder} for ${supportProbe.trackCodec || "this codec"} ` +
+            `even though the browser reports hardware support for it ` +
+            `(probe codec ${supportProbe.probeCodec}); ` +
+            `videoCodec in stats=${String(playAfter.videoCodec)}; ` +
+            `softwareDecodeReason=${String(playAfter.softwareDecodeReason)}; ` +
+            `support probe: ${JSON.stringify(supportProbe)}; ` +
+            `decoder diagnostics: ${decoderDiagnostics.slice(-30).join(" | ")}`,
+        );
+      }
+    } else if (!/hardware-preferred/i.test(playAfter.videoDecoder)) {
       const message =
-        `${label} used ${playAfter.videoDecoder}; H.264 blackbox requires the hardware-preferred WebCodecs config; ` +
+        `${label} used ${playAfter.videoDecoder}; blackbox requires the hardware-preferred WebCodecs config; ` +
         `queue=${playAfter.frameQueue} [${playAfter.frameQueueHeadTime.toFixed(3)}, ${playAfter.frameQueueTailTime.toFixed(3)}], ` +
         `renderer=${playAfter.rendererCurrentTime.toFixed(3)}, audioClock=${playAfter.audioClock.toFixed(3)}`;
       if (!allowNoPreference) throw new Error(message);
       process.stderr.write(`DIAGNOSTIC-ONLY: ${message}\n`);
     }
-  }
-  return null;
+  // runPhase already records a phase's return value under `completedPhases`
+  // in the report, so returning the evidence here is all that is needed to
+  // make it readable after the fact.
+  return hardwareProbeEvidence;
   });
 
   // Observation, not an assertion (team-lead call, 2026-09-13): `powerEfficient`

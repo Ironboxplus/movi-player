@@ -15,9 +15,30 @@ npx vite --port 4173 --strictPort --host 127.0.0.1
 # 2. 凭据与样本矩阵
 source /e/Go/Openlist/.secrets/openlist.env
 
-# 3. 跑
+# 3. 浏览器：发布证据必须用系统 Chrome，不能用 Playwright 自带 Chromium（见下）
+export MOVI_CHROME_EXECUTABLE="C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+# 4. 跑
 node scripts/real-openlist-playback.mjs
 ```
+
+### 用哪个浏览器决定了硬件解码的结论
+
+不设 `MOVI_CHROME_EXECUTABLE` 时，Playwright 用它自带的 Chromium。**那个二进制没有硬件解码，也没有
+HEVC。** 2026-09-15 同机同时实测（能力查询，不取媒体）：
+
+| | 系统 Chrome 152 | Playwright 自带 Chromium 145 |
+|---|---|---|
+| HEVC Main / Main10 | `true`，`powerEfficient: true` | **`false`（完全不支持）** |
+| H.264 | `true`，`powerEfficient: true` | `true`，`powerEfficient: **false**` |
+| VP9 / AV1 | `true`，`powerEfficient: true` | `true`，`powerEfficient: **false**` |
+
+后果：在自带 Chromium 上，HEVC 样本会掉到 `Software (FFmpeg Worker)` 并报
+`softwareDecodeReason: "hardware-refused"`——**那是正确行为，不是缺陷**；而 `hardware-preferred` 与
+`no-preference` 之间的反复翻转，也是在一个没有硬件后端的二进制上测"是否协商到硬件"的必然结果。
+
+**任何关于硬件解码的结论，必须先确认报告里的浏览器版本。** harness 每次运行都会记录 Chrome 版本与 GPU
+renderer 字符串，就是为了这个。
 
 结果 JSON 落在 `MOVI_BLACKBOX_OUTPUT`（默认 `.blackbox-results/real-openlist.json`），失败截图落在
 `.blackbox-results/screenshots/`。
