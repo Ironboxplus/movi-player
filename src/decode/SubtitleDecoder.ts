@@ -134,6 +134,23 @@ export class SubtitleDecoder {
           } else {
             Logger.warn(TAG, 'Failed to extract image data from subtitle');
           }
+        } else if (this.currentTrack.subtitleType === "image") {
+          // A bitmap track with no image in this packet is a display-set
+          // CLEAR — PGS ends a caption by sending a small segment carrying no
+          // bitmap, and the previous cue simply runs out at its own `end`.
+          // Falling through to the text branch below asked a bitmap codec for
+          // text, got null, and logged "No text extracted from subtitle" at
+          // warn level for a completely ordinary event. That false signal is
+          // not free: it was the first thing that looked wrong while
+          // investigating why Memories rendered no cues, and it had nothing to
+          // do with it (the real cause was playback sitting in audio
+          // cold-prime, so the playhead never reached the one cue that HAD
+          // decoded). Nothing about the behaviour changes here — no cue was
+          // ever emitted on this path — only what it says about itself.
+          Logger.debug(
+            TAG,
+            `Bitmap subtitle display-set clear at ${times.start.toFixed(3)}s (no image in packet)`,
+          );
         } else {
           // Text subtitle (SRT, ASS, etc.)
           const text = await this.bindings.getSubtitleText();
