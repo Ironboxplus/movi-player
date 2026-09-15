@@ -959,6 +959,48 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private _decoderStuckSince: number = 0; // When video decoder was first detected stuck
   private _lastDesyncSeekTime: number = 0; // performance.now() of last desync-triggered resync
 
+  // B1b (docs/PLAN_MERGE.MD §4.11) instrumentation — NOT a fix. Diagnostic
+  // only, to tell apart the two possible causes of the audio-track-switch
+  // playhead jump: (a) the demuxer's shared read cursor was already parked
+  // ahead of the playhead when the track was re-enabled (fix: reposition the
+  // demuxer on switch), vs (b) the new track's first decoded PTS is anomalous
+  // even relative to where the demuxer itself last was (a different bug).
+  // `_lastDemuxedPacketPts`/`_lastDemuxedStreamIndex` are updated on every
+  // packet actually handed back by `demuxer.readPacket()` (see
+  // `trackDemuxedPacketForB1bDiagnostic`), so they're a live proxy for "where
+  // the shared av_read_frame cursor currently is" without needing a new WASM
+  // binding. `_b1bSwitchDiagnostic` is a one-shot snapshot taken at the
+  // moment of a track switch and consumed (logged + cleared) by the first
+  // post-switch call into `renderDecodedPCM`/`renderDecodedAudio`.
+  private _lastDemuxedPacketPts: number = -1;
+  private _lastDemuxedStreamIndex: number = -1;
+  private _b1bSwitchDiagnostic: {
+    switchPlayhead: number;
+    lastDemuxedPts: number;
+    lastDemuxedStreamIndex: number;
+    toTrackId: number;
+    // Wall-clock stamp of the switch, so the fed-packet log can say how long
+    // the gap took as well as how large it was.
+    switchAtMs: number;
+    // HttpSource.getNetworkStats().totalBytes at switch time, or -1 when the
+    // source isn't HttpSource (FileSource, etc). Diffed against the same
+    // reading at feed time — a genuine "read loop walked N seconds of stream
+    // forward" (hypothesis A) should show a proportional byte cost; a feed
+    // from a stash/other source (hypothesis B) shouldn't.
+    switchNetworkBytes: number;
+    // Set true once the first post-switch packet actually handed to the new
+    // audio decoder (either direct .decode() or the canBatch() queue) has
+    // been logged, so the dispatch-loop hook below fires exactly once per
+    // switch. Independent of consumeB1bSwitchDiagnostic's own one-shot
+    // clearing, which happens later (on the first DECODED frame OUT) — this
+    // is the packet FED IN, an earlier point in the same pipeline.
+    firstFedLogged?: boolean;
+  } | null = null;
+  // B (root-cause fix): the exact position realignAudioTimelineForTrackSwitch()
+  // just anchored Clock to, consumed once by repositionDemuxerForTrackSwitch()
+  // later in the same handler. See both methods' doc comments.
+  private _pendingTrackSwitchRepositionTarget: number | null = null;
+
   // Playback Loop
   private animationFrameId: number | null = null;
   private backgroundIntervalId: number | null = null;
@@ -1284,6 +1326,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // cleanly and the new track's first buffer lands on a fresh anchor.
       this.realignAudioTimelineForTrackSwitch();
 
+      // B1b instrumentation only (docs/PLAN_MERGE.MD §4.11) — snapshot the
+      // three values needed to tell apart "the demuxer's read cursor was
+      // already ahead" from "the new track's first PTS is anomalous even
+      // relative to that cursor": the playhead right after realign, and the
+      // most recent packet `demuxer.readPacket()` actually returned (a proxy
+      // for the shared av_read_frame position, since discarded streams'
+      // packets never reach JS — see applyStreamDiscard's doc comment).
+      // Consumed and logged by the first post-switch call into
+      // renderDecodedPCM/renderDecodedAudio, below.
+      this._b1bSwitchDiagnostic = {
+        switchPlayhead: this.clock.getTime(),
+        lastDemuxedPts: this._lastDemuxedPacketPts,
+        lastDemuxedStreamIndex: this._lastDemuxedStreamIndex,
+        toTrackId: track.id,
+        switchAtMs: performance.now(),
+        switchNetworkBytes:
+          this.source instanceof HttpSource
+            ? this.source.getNetworkStats().totalBytes
+            : -1,
+      };
+      Logger.info(
+        TAG,
+        `[B1b instrumentation] track switch to ${track.id}: playhead=${this._b1bSwitchDiagnostic.switchPlayhead.toFixed(3)}s ` +
+          `lastDemuxedPacket pts=${this._lastDemuxedPacketPts.toFixed(3)}s stream=${this._lastDemuxedStreamIndex}`,
+      );
+
       // Recreate audio decoder for new track
       this.audioDecoder = new MoviAudioDecoder();
 
@@ -1342,6 +1410,28 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // Re-apply demuxer discard: re-enable the newly-selected audio track and
       // discard the previously-active one (issue #11).
       this.applyStreamDiscard();
+
+      // …and then put the demuxer back at the playhead. Flipping discard is
+      // not enough on its own: the track being re-enabled was, until this
+      // moment, skipped inside av_read_frame (for Matroska, an avio_skip over
+      // the cluster body), so there is no packet of it to be had at the
+      // current file position. Left alone, the read loop — driven by an
+      // audio buffer that realignAudioTimelineForTrackSwitch just emptied —
+      // scans FORWARD looking for one, with nothing bounding how far it will
+      // go (measured: 60-100s of real media, 8.9-21.4 MB over the network,
+      // on one sample; the first packet the new decoder is then handed
+      // carries that far-ahead PTS unchanged, and Clock hard-syncs onto it).
+      // cf23cb6 added discard to the audio path (2026-07-08) without the
+      // matching re-seek; the 0.4.0 merge did not introduce this (it added
+      // one line, setOnBroken, to this handler) but amplified the distance
+      // from ~2s to 39-100s, and why it did is still open.
+      //
+      // Deliberately NOT fixed by bounding the scan or by rewriting the
+      // packet's timestamp: a cap only limits how wrong the position gets,
+      // and relabelling a far-away packet would trade a visible clock jump
+      // for an inaudible A/V desync. See repositionDemuxerForTrackSwitch's
+      // doc comment for the rest (target alignment, video-side recovery).
+      await this.repositionDemuxerForTrackSwitch();
     });
 
     this.trackManager.on("tracksChange", (tracks) => {
@@ -3763,6 +3853,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         eof = true;
         break;
       }
+      this.trackDemuxedPacketForB1bDiagnostic(packet);
 
       this.pendingPrebufferPackets.push(packet);
 
@@ -4181,7 +4272,60 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * case once the packet has entered a decoder, so both output formats are
    * guarded at the final renderer boundary, mirroring the video-frame guard.
    */
+  /**
+   * Audio decoded before this position is dropped after an audio track switch,
+   * one shot, cleared by the first frame that lands at or after it.
+   *
+   * Why not reuse `seekTargetTime`: that field is shared with the seek state
+   * machine — notifySeekCompletion, the sync-armed guards and the black-frame
+   * watchdog all read it, and line ~2388 already carries a standing note not
+   * to set it from outside a real seek. A track switch needs the drop, not the
+   * rest of that machinery.
+   *
+   * Why the drop is needed at all: the re-seek the switch now issues lands on
+   * the nearest sync point at or BEFORE the playhead (measured: 2.76-2.79s
+   * before it on the HEVC sample). AudioRenderer.reset() has just cleared
+   * hasFirstBuffer, so without this gate the first buffer to arrive — the one
+   * from before the playhead — establishes the anchor, Clock hard-syncs onto
+   * it, and the playhead walks BACKWARD by that distance. Same class of bug as
+   * the forward jump, one order of magnitude smaller and pointing the other
+   * way.
+   */
+  private _trackSwitchDropAudioBefore: number = -1;
+
+  /**
+   * True from the moment an audio track switch flips the discard flags until
+   * the demuxer has finished being repositioned. While it is set, no audio
+   * packet is handed to the decoder at all.
+   *
+   * This exists because repositioning is `await`ed and the read loop does not
+   * stop for it. Measured, with the three log lines in order:
+   *
+   *     reposition entered ... target=1009.401
+   *     first post-switch packet FED ... pts=1102.443
+   *     demuxer repositioned to 1009.401
+   *
+   * The packet the decoder anchored on was read, and fed, DURING the seek —
+   * the loop had spent that window scanning 93s forward looking for audio that
+   * could not exist at the old position yet. Repositioning alone therefore
+   * fixed where packets come from without fixing what gets fed in the meantime,
+   * and `_trackSwitchDropAudioBefore` could not catch it either: that gate
+   * drops audio from BEFORE the playhead, and this packet was far AHEAD of it.
+   */
+  private _trackSwitchRepositioning: boolean = false;
+
   private renderDecodedAudio(data: AudioData): void {
+    if (this._b1bSwitchDiagnostic) {
+      this.consumeB1bSwitchDiagnostic(data.timestamp / 1_000_000);
+    }
+    if (this.dropsForTrackSwitch(data.timestamp / 1_000_000)) {
+      try {
+        data.close();
+      } catch {
+        // Already closed by a decoder shutdown race.
+      }
+      return;
+    }
     if (
       this.seekTargetTime !== -1 &&
       data.timestamp / 1_000_000 < this.seekTargetTime
@@ -4197,6 +4341,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   private renderDecodedPCM(frame: PCMFrame): void {
+    if (this._b1bSwitchDiagnostic) {
+      this.consumeB1bSwitchDiagnostic(frame.timestamp / 1_000_000);
+    }
+    if (this.dropsForTrackSwitch(frame.timestamp / 1_000_000)) {
+      return;
+    }
     if (
       this.seekTargetTime !== -1 &&
       frame.timestamp / 1_000_000 < this.seekTargetTime
@@ -4204,6 +4354,97 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return;
     }
     this.audioRenderer.renderPCM(frame);
+  }
+
+  /**
+   * True while post-track-switch audio is still arriving from before the
+   * playhead. Self-clearing: the first frame at or after the position ends the
+   * drop, so a switch near a sparse sync point cannot leave the gate latched.
+   */
+  private dropsForTrackSwitch(ptsSeconds: number): boolean {
+    if (this._trackSwitchDropAudioBefore < 0) return false;
+    if (ptsSeconds < this._trackSwitchDropAudioBefore) return true;
+    this._trackSwitchDropAudioBefore = -1;
+    return false;
+  }
+
+  /**
+   * B1b instrumentation only (docs/PLAN_MERGE.MD §4.11) — logs and clears the
+   * one-shot snapshot taken at the moment of an audio track switch (see the
+   * `audioTrackChange` handler), comparing it against the first decoded frame
+   * to reach the renderer after that switch. Two diffs matter:
+   *
+   *   - frame PTS vs. `lastDemuxedPts` (what the demuxer's shared read cursor
+   *     last returned, any stream): near zero means the new track's first
+   *     packet came from right where the cursor already was — the fix is
+   *     repositioning the demuxer on switch.
+   *   - frame PTS vs. `switchPlayhead` (the actual position played back): the
+   *     jump size a user would perceive. If this is large while the above is
+   *     near zero, the read cursor itself (not the decoded PTS) is the thing
+   *     that's ahead — i.e. a demuxer/discard positioning bug, not a decoder
+   *     or PTS-interpretation bug.
+   *
+   * Cleared unconditionally so only the FIRST frame after a switch is
+   * measured — a second frame is no longer "at the switch instant".
+   */
+  private consumeB1bSwitchDiagnostic(framePtsSeconds: number): void {
+    const diag = this._b1bSwitchDiagnostic;
+    this._b1bSwitchDiagnostic = null;
+    if (!diag) return;
+    Logger.info(
+      TAG,
+      `[B1b instrumentation] first post-switch audio frame (track ${diag.toTrackId}): ` +
+        `pts=${framePtsSeconds.toFixed(3)}s switchPlayhead=${diag.switchPlayhead.toFixed(3)}s ` +
+        `lastDemuxedPts=${diag.lastDemuxedPts.toFixed(3)}s (stream ${diag.lastDemuxedStreamIndex}) — ` +
+        `frame-vs-playhead=${(framePtsSeconds - diag.switchPlayhead).toFixed(3)}s ` +
+        `frame-vs-lastDemuxed=${(framePtsSeconds - diag.lastDemuxedPts).toFixed(3)}s`,
+    );
+  }
+
+  /**
+   * B1b instrumentation only — the "which call site fed this packet, and did
+   * the read cursor actually get there" log. Called from every place a
+   * packet reaches `audioDecoder.decode()` (or is queued for it), tagged with
+   * a fixed `source` string identifying that call site. One-shot per switch
+   * (guarded by `firstFedLogged`, same flag the inline hook used to set
+   * itself) so whichever call site gets there FIRST after a switch is the one
+   * that's logged — that's the answer to "where did this packet come from".
+   *
+   * `cursorNow` vs `diag.lastDemuxedPts` (the switch-time snapshot) is the
+   * A/B split team-lead asked for: if the cursor has itself walked forward to
+   * ~ the fed packet's PTS, the read loop genuinely advanced the stream (A —
+   * fix the read-loop/burst-control); if the cursor is still back where the
+   * switch left it, this packet did not come from the normal read path at
+   * all (B — fix wherever `source` says it came from). Network bytes
+   * downloaded between switch and feed are logged alongside because "the read
+   * loop walked 70+ seconds of stream forward" has a network cost that
+   * should be visible if (A) is what happened.
+   */
+  private logB1bFirstFed(pts: number, source: string): void {
+    const diag = this._b1bSwitchDiagnostic;
+    if (!diag || diag.firstFedLogged) return;
+    diag.firstFedLogged = true;
+    const netNow =
+      this.source instanceof HttpSource
+        ? this.source.getNetworkStats().totalBytes
+        : -1;
+    const bytesSinceSwitch =
+      netNow >= 0 && diag.switchNetworkBytes >= 0
+        ? netNow - diag.switchNetworkBytes
+        : -1;
+    Logger.info(
+      TAG,
+      `[B1b instrumentation] first post-switch packet FED to decoder (track ${diag.toTrackId}, source=${source}): ` +
+        `pts=${pts.toFixed(3)}s switchPlayhead=${diag.switchPlayhead.toFixed(3)}s ` +
+        `lastDemuxedPts@switch=${diag.lastDemuxedPts.toFixed(3)}s — ` +
+        `fed-vs-playhead=${(pts - diag.switchPlayhead).toFixed(3)}s ` +
+        `fed-vs-lastDemuxed@switch=${(pts - diag.lastDemuxedPts).toFixed(3)}s` +
+        ` || cursorNow=${this._lastDemuxedPacketPts.toFixed(3)}s ` +
+        `cursorAdvanced=${(this._lastDemuxedPacketPts - diag.lastDemuxedPts).toFixed(3)}s ` +
+        `fed-vs-cursorNow=${(pts - this._lastDemuxedPacketPts).toFixed(3)}s ` +
+        `elapsedSinceSwitch=${((performance.now() - diag.switchAtMs) / 1000).toFixed(3)}s ` +
+        `bytesSinceSwitch=${bytesSinceSwitch}`,
+    );
   }
 
   /**
@@ -4581,7 +4822,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           TAG,
           `Flushing ${this.pendingAudioPackets.length} buffered audio packets after seek sync`,
         );
-        this.submitAudioPackets(this.pendingAudioPackets);
+        this.submitAudioPackets(this.pendingAudioPackets, "notifySeekCompletion-pendingAudioPackets-flush");
         this.pendingAudioPackets = [];
         this.droppedSeekAudioPackets = 0;
       }
@@ -4714,6 +4955,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
+   * B1b instrumentation only (see the `_lastDemuxedPacketPts` doc comment
+   * above) — records the PTS/stream of every packet `demuxer.readPacket()`
+   * actually hands back, as a live proxy for the shared av_read_frame read
+   * cursor. Called from every read-loop call site (main process loop,
+   * seek/prebuffer loop, pause-buffer loop) right after a non-null packet is
+   * obtained. Cheap (two field writes), does nothing unless a track switch
+   * is pending a diagnostic snapshot.
+   */
+  private trackDemuxedPacketForB1bDiagnostic(packet: Packet): void {
+    this._lastDemuxedPacketPts = packet.timestamp;
+    this._lastDemuxedStreamIndex = packet.streamIndex;
+  }
+
+  /**
    * Re-anchor AudioRenderer and Clock at the CURRENT position across an
    * audio track switch — no position change, just a decoder rebuild.
    *
@@ -4738,8 +4993,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * to rebuild the pipeline at a fixed position (see seek()'s
    * `audioRenderer.reset()` -> `demuxer.seek(target)` -> `clock.seek(target)`
    * sequence, and the equivalent in the first-play and subtitle-prefetch-
-   * resume paths). A track switch skips the demuxer re-seek (position is
-   * unchanged) but needs the other two:
+   * resume paths). This method covers the latter two; the demuxer re-seek is
+   * issued by the audioTrackChange handler after applyStreamDiscard(), which
+   * is where it belongs — it has to happen AFTER the discard flags flip, or
+   * the re-enabled track still has no packet at the seek target. (This comment
+   * used to claim a track switch needs no demuxer re-seek at all "position is
+   * unchanged". The playhead's position is indeed unchanged; the demuxer's
+   * ability to produce the newly-enabled stream at that position is not. See
+   * the handler's comment for the measurements that disproved it.)
    *
    *   - `audioRenderer.reset()` stops the old track's already-scheduled Web
    *     Audio nodes and clears hasFirstBuffer, so the new track's first
@@ -4757,6 +5018,127 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const currentTime = this.clock.getTime();
     this.audioRenderer.reset();
     this.clock.seek(currentTime);
+    // B (docs/PLAN_MERGE.MD §4.11 B1b root-cause fix): stash the EXACT value
+    // just handed to clock.seek() so repositionDemuxerForTrackSwitch() (called
+    // later in the same handler, after applyStreamDiscard()) can target the
+    // identical position — Clock and demuxer must land on the same number by
+    // construction, not by both separately calling clock.getTime() a few
+    // lines apart and hoping nothing shifted in between.
+    this._pendingTrackSwitchRepositionTarget = currentTime;
+  }
+
+  /**
+   * B1b root-cause fix (docs/PLAN_MERGE.MD §4.11). Called from the
+   * `audioTrackChange` handler right after `applyStreamDiscard()` flips which
+   * stream is readable. Flipping discard alone is not enough: the track being
+   * re-enabled was, until that moment, skipped inside av_read_frame, so
+   * there is no packet of it to be had at the current file position. Left
+   * alone, the read loop scans forward — unbounded — until it finds one
+   * (measured: 60-100s of real media, 8.9-21.4 MB over the network, on one
+   * sample). This method is the fix: reposition the demuxer to the playhead
+   * so the re-enabled track has a packet to yield right there, the same way
+   * movi_decode.c's subtitle-cue prefetch re-seeks immediately after it flips
+   * discard flags.
+   *
+   * Consumes `_pendingTrackSwitchRepositionTarget`, the exact value
+   * `realignAudioTimelineForTrackSwitch()` just handed to `clock.seek()` —
+   * not a fresh `clock.getTime()` call — so Clock and demuxer land on the
+   * same position by construction rather than by two reads a few lines apart
+   * that happen to agree.
+   *
+   * Deliberately NOT the full `seek()` choreography: no event emission, no
+   * state transition, no `seekTargetTime`/`waitingForVideoSync` (that
+   * machinery is for the public, user-facing seek and a track switch isn't
+   * one — see `_trackSwitchDropAudioBefore`'s doc comment for why audio
+   * reuses a purpose-built gate instead of `seekTargetTime`). What IS reused:
+   * the demuxer seek primitive itself, and the video pipeline's existing
+   * keyframe-resync bookkeeping — because the physical seek moves the video
+   * read position too (the container has one shared cursor), and video
+   * packets were still flowing normally during the old unbounded scan (only
+   * audio was discarded), so the video decoder/renderer queue is currently
+   * sitting on frames from the far-ahead position this reposition undoes.
+   * Left in place, those stale frames would either corrupt decode (fed out
+   * of order after the cursor jumps back) or surface as their own visible
+   * forward jump once Clock reaches them. Flushing the decoder, clearing the
+   * queue, and re-arming the keyframe scan is the same recovery `seek()`
+   * itself does for exactly this situation, applied here without the rest of
+   * the seek state machine.
+   */
+  private async repositionDemuxerForTrackSwitch(): Promise<void> {
+    // Tagged so the black-box harness forwards it (it only relays lines
+    // carrying this marker). Logged BEFORE any early return, and reporting
+    // which branch was taken, because "the log never appeared" is not evidence
+    // that code did not run — it can equally mean the line was never relayed.
+    // That ambiguity already cost one wrong conclusion in this investigation.
+    Logger.info(
+      TAG,
+      `[B1b instrumentation] reposition entered: hasDemuxer=${Boolean(this.demuxer)} ` +
+        `disableAudio=${this.disableAudio} target=${String(this._pendingTrackSwitchRepositionTarget)}`,
+    );
+    if (!this.demuxer || this.disableAudio) {
+      this._pendingTrackSwitchRepositionTarget = null;
+      return;
+    }
+    const resumeAt = this._pendingTrackSwitchRepositionTarget;
+    this._pendingTrackSwitchRepositionTarget = null;
+    if (resumeAt === null) return;
+
+    // Close the feed before yielding to the seek — see the field's doc
+    // comment. Everything read between here and the seek landing comes from
+    // the position we are abandoning, so none of it may reach the decoder.
+    this._trackSwitchRepositioning = true;
+
+    // The seek lands at the nearest sync point at or before this position;
+    // drop what comes back from before it so the first buffer AudioRenderer
+    // anchors on is the one at the playhead, not one the container happened
+    // to offer a few seconds earlier (measured 2.76-2.79s early on the HEVC
+    // sample — see dropsForTrackSwitch's doc comment).
+    this._trackSwitchDropAudioBefore = resumeAt;
+    try {
+      await this.demuxer.seek(
+        resumeAt + this.startTime,
+        1,
+        this.getSeekStreamIndex(),
+      );
+      Logger.info(
+        TAG,
+        `[B1b instrumentation] demuxer repositioned to ${resumeAt.toFixed(3)}s so the re-enabled track yields packets here`,
+      );
+    } catch (error) {
+      // A failed reposition is not worth tearing playback down over: the old
+      // behaviour (scan forward) still produces audio, just from the wrong
+      // place. Report it and let the existing recovery paths run.
+      Logger.error(TAG, "Audio track switch: demuxer reposition failed", error);
+      return;
+    } finally {
+      // Reopen the feed on every exit path, including the failure one. A
+      // latched-closed gate would silence audio for the rest of playback,
+      // which is a far worse failure than the jump this is fixing.
+      this._trackSwitchRepositioning = false;
+    }
+
+    // The physical seek moved the video read position too and stranded
+    // whatever the video decoder/renderer already had queued from the
+    // far-ahead position the old unbounded scan reached. Recover exactly the
+    // way seek() does: flush, clear the queue, and re-arm the keyframe scan
+    // so the next packets — however discontinuous from what was queued —
+    // start clean instead of erroring or painting a stale frame.
+    if (this.videoDecoder) {
+      try {
+        await this.videoDecoder.flush();
+      } catch {
+        // Same tolerance as seek()'s own flush: a decoder that's already
+        // gone (closed by a concurrent teardown) has nothing left to flush.
+      }
+    }
+    this.videoRenderer?.clearQueue();
+    this.seekingToKeyframe = true;
+    this.seekingToKeyframeStartTime = performance.now();
+    this.seekKeyframeScanned = 0;
+    this.seekCraSeen = 0;
+    this.videoChainBrokenUntilKeyframe = false;
+    // Stashed prebuffer packets are pre-reposition and now stale.
+    this.pendingPrebufferPackets = [];
   }
 
   /**
@@ -4769,7 +5151,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private beginAudioPrime(): void {
     this.audioRenderer.primeForBuffering();
     if (this.pendingAudioPackets.length > 0) {
-      this.submitAudioPackets(this.pendingAudioPackets);
+      this.submitAudioPackets(this.pendingAudioPackets, "beginAudioPrime-pendingAudioPackets-flush");
       this.pendingAudioPackets = [];
     }
     this._primingAudio = true;
@@ -4792,8 +5174,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   private submitAudioPackets(
     packets: { data: Uint8Array; timestamp: number; keyframe: boolean }[],
+    // B1b instrumentation only — identifies which caller's packets these are,
+    // for logB1bFirstFed's "where did this packet actually come from" tag.
+    // Defaults cover any caller this signature gains later without needing
+    // an update here.
+    b1bSource: string = "submitAudioPackets(unlabeled)",
   ): void {
     if (packets.length === 0) return;
+    // Same gate as the main loop's: nothing read from the position an
+    // in-flight track switch is abandoning may reach the decoder.
+    if (this._trackSwitchRepositioning) return;
+    this.logB1bFirstFed(packets[0].timestamp, b1bSource);
 
     if (!this.audioDecoder.canBatch()) {
       for (const pkt of packets) {
@@ -5985,6 +6376,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           Logger.debug(TAG, "EOF reached");
           break;
         }
+        this.trackDemuxedPacketForB1bDiagnostic(packet);
 
         // Track how far past the seek target we've demuxed so the read-ahead
         // cap above can halt a frame-starved seek before it downloads forever.
@@ -6183,6 +6575,26 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
                 }
               }
 
+              // B1b instrumentation only (docs/PLAN_MERGE.MD §4.11) — the
+              // FOURTH measured point, between the demux-cursor proxy and the
+              // decoded-frame-out log below. Fires exactly once per switch, at
+              // the very first packet actually handed to the new decoder
+              // (either branch below), before any batching/decode happens to
+              // it. Answers: was the packet ITSELF already anomalous when fed
+              // in (a feed/stash bug), or was it fine and something downstream
+              // (batching/pcmTimestampClock) corrupted the timestamp on the
+              // way out?
+              // An audio track switch is mid-flight and the demuxer has not
+              // landed at the playhead yet: this packet is from the position
+              // being abandoned, so it must not reach the decoder. Dropping it
+              // is safe — the seek about to complete will re-read this span
+              // from the right place. See _trackSwitchRepositioning.
+              if (this._trackSwitchRepositioning) {
+                continue;
+              }
+
+              this.logB1bFirstFed(packet.timestamp, "main-process-loop");
+
               // Software codecs (TrueHD/MLP/DTS) go in as one batch per tick —
               // their access units are tiny, so the per-packet WASM round-trip,
               // not the decode itself, is what starves the renderer. WebCodecs
@@ -6329,7 +6741,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (this._audioBatchPending.length > 0) {
         const batch = this._audioBatchPending;
         this._audioBatchPending = [];
-        this.submitAudioPackets(batch);
+        this.submitAudioPackets(batch, "audioBatchPending-tick-flush");
       }
     }
   };
@@ -11063,6 +11475,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           this.eofReached = true;
           break;
         }
+        this.trackDemuxedPacketForB1bDiagnostic(packet);
 
         // Only stash packets for active tracks
         if (this.trackManager.isActiveStream(packet.streamIndex)) {
