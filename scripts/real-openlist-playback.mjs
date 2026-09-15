@@ -1060,15 +1060,16 @@ async function runAudioTrackSwitch(page, label) {
     };
   }
 
-  // How far currentTime may move as a side effect of switching tracks. A
-  // track switch changes which decoder is producing sound, not where
-  // playback is — it is not a seek. Generous (seconds, not frames) because a
-  // legitimate flush/re-buffer can cost some ground, but an order-of-
-  // magnitude clock displacement is not that.
+  // How far AHEAD of free-running playback currentTime may land as a side
+  // effect of switching tracks. A track switch changes which decoder is
+  // producing sound, not where playback is — it is not a seek. Generous
+  // (seconds, not frames) because a legitimate flush/re-buffer can cost some
+  // ground, but an order-of-magnitude clock displacement is not that.
   const AUDIO_SWITCH_MAX_DISPLACEMENT_S = 1;
 
   const switched = [];
   let preSwitchTime = start.currentTime;
+  let preSwitchWallMs = start.wallMs;
   for (const track of start.audioTracks) {
     if (track.id === start.activeAudioTrackId) continue;
     const switchIssuedAt = Date.now();
@@ -1110,13 +1111,31 @@ async function runAudioTrackSwitch(page, label) {
     // read as a different failure mode, when in fact the run had never reached
     // the displacement check at all, so it said nothing about whether the
     // playhead had moved. The more fundamental fact gets asserted first.
-    const displacement = Math.abs(before.currentTime - preSwitchTime);
+    //
+    // The baseline is where free-running playback WOULD have reached, not
+    // where the playhead was before the switch. `waitForStablePlayback` above
+    // deliberately burns wall time — it polls at 1s and needs two consecutive
+    // ~1x windows — and at ~1x that is seconds of entirely legitimate media
+    // advance. 574e05f introduced the wait and this bound in one commit and
+    // asserted they were independent ("the wait above can't paper over a real
+    // jump"); they are not. Subtracting only `preSwitchTime` charged the
+    // wait's own cost to the player, putting the floor of a perfect run at
+    // ~2s against a 1s budget — the 2.044s the pre-merge tree reported on
+    // 2026-09-15 is that floor, not a jump. Only the excess over elapsed time
+    // is the player's.
+    const elapsedS = (before.wallMs - preSwitchWallMs) / 1_000;
+    const displacement = before.currentTime - (preSwitchTime + elapsedS);
     if (displacement > AUDIO_SWITCH_MAX_DISPLACEMENT_S) {
       throw new Error(
-        `${label} playhead moved ${displacement.toFixed(3)}s (from ${preSwitchTime.toFixed(3)}s to ${before.currentTime.toFixed(3)}s) ` +
+        `${label} playhead jumped ${displacement.toFixed(3)}s ahead of free-running playback ` +
+          `(from ${preSwitchTime.toFixed(3)}s to ${before.currentTime.toFixed(3)}s over ${elapsedS.toFixed(3)}s of wall time) ` +
           `just from switching to audio track ${track.id} (${track.codec}); a track switch must not move the playhead`,
       );
     }
+    // Landing BEHIND free-running playback is a stall, not a jump, and it is
+    // a different defect with its own owner: `waitForStablePlayback` requires
+    // ~1x windows to exit and assertHealthy asserts the rate across the
+    // measurement window. Record it, do not double-report it here.
     const progress = assertHealthy(
       label,
       before,
@@ -1134,9 +1153,11 @@ async function runAudioTrackSwitch(page, label) {
       codec: track.codec,
       audioDecoder: after.audioDecoder,
       displacementS: Number(displacement.toFixed(3)),
+      settleElapsedS: Number(elapsedS.toFixed(3)),
       ...progress,
     });
     preSwitchTime = after.currentTime;
+    preSwitchWallMs = after.wallMs;
   }
 
   return { status: "switched", tracks: start.audioTracks, switched };
@@ -1559,8 +1580,19 @@ async function runOne(browser, token, mediaPath) {
       .text()
       .replace(/https?:\/\/\S+/gi, "[URL]")
       .replace(/[?&](?:token|sign|signature|authorization)=[^\s&]+/gi, "[REDACTED]");
+    // B1b instrumentation (docs/PLAN_MERGE.MD §4.11) — printed live, unbounded,
+    // separately from the 240-entry decoderDiagnostics ring buffer below. A
+    // multi-GB sample generates enough HttpSource/buffer spam over the REST of
+    // the run (final state check, subtitle testing, etc.) to evict the
+    // switch-instant lines from that ring buffer long before the JSON gets
+    // serialized at the end — confirmed empirically (Star Trek/Grave of the
+    // Fireflies lost both B1b lines this way; only the small 少女终末旅行
+    // sample kept one of two). This line is the reliable capture path.
+    if (/B1b instrumentation/i.test(text)) {
+      process.stderr.write(`[B1b LIVE] ${label}: ${text}\n`);
+    }
     if (
-      /VideoDecoder|codec|decoder|software|WebCodecs|post-seek|burst|backpressure|buffer|worker|underrun|starv|Clock|PlayerState|playback-transition/i.test(
+      /VideoDecoder|codec|decoder|software|WebCodecs|post-seek|burst|backpressure|buffer|worker|underrun|starv|Clock|PlayerState|playback-transition|B1b instrumentation/i.test(
         text,
       )
     ) {
