@@ -31,21 +31,35 @@ import type { PCMFrame } from "../../src/decode/SoftwareAudioDecoder";
  * `test/core/moviplayer-audio-track-switch-realign.test.ts` for proof that
  * the real `MoviPlayer` handler actually calls these two, in this order.
  *
- * THIS file locks the other half of the contract, at the `Clock` +
- * `AudioRenderer` level directly (real instances, no mock executors — the
- * `FakeAudioContext` below stands in for the missing browser API, same
- * pattern as test/render/audio-renderer.test.ts): that calling
- * `reset()` + `seek(getTime())` at the moment of a track switch is actually
- * SUFFICIENT to keep the reported media rate at 1x immediately afterward,
- * for a track switch whose new PTS disagrees with the old timeline by 1.5s
- * in either direction (mirroring the Star Trek/Paprika sign split). The one
- * expected artifact is a single clean hard-sync jump AT the switch instant —
- * exactly the same kind of one-time discontinuity a real seek() produces,
- * which is why the blackbox harness (PLAN_MERGE.MD §5.4b) doesn't start its
- * rate measurement window until the clock has run stable for 2s: sampling
- * across that jump is not a meaningful rate. So the assertion below measures
- * rate using two readings taken strictly AFTER the jump has landed, not
- * straddling it.
+ * IMPORTANT — what this file does and does NOT cover (corrected 2026-09-15
+ * after team-lead's revert verification): this file drives `Clock` and
+ * `AudioRenderer` DIRECTLY, real instances, never through `MoviPlayer` (the
+ * `FakeAudioContext` below stands in only for the missing browser API, same
+ * pattern as test/render/audio-renderer.test.ts). It proves that calling
+ * `reset()` + `seek(getTime())` — the two primitives the fix uses — is
+ * SUFFICIENT to keep the reported media rate at 1x immediately after a track
+ * switch whose new PTS disagrees with the old timeline by 1.5s in either
+ * direction (mirroring the Star Trek/Paprika sign split). That is a lock on
+ * the PRIMITIVE CONTRACT (e.g. it fails if `Clock.seek()` ever stops setting
+ * `syncedToAudio = false`, or if `AudioRenderer.reset()` stops clearing
+ * `hasFirstBuffer`) — it is NOT a regression test for B1's fix itself.
+ *
+ * Confirmed by reverting `MoviPlayer.ts`'s fix (team lead, independently):
+ * with `realignAudioTimelineForTrackSwitch()` removed from the
+ * `audioTrackChange` handler, this file's tests still pass unchanged — they
+ * never call into `MoviPlayer` at all, so they cannot see that the handler
+ * stopped calling these primitives. The handler-wiring regression lock lives
+ * in `test/core/moviplayer-audio-track-switch-realign.test.ts`, which DOES
+ * fail on that revert (2 tests red: "expected reset to be called 1 times,
+ * but got 0 times") — that is the file that actually protects B1's fix.
+ *
+ * The one expected artifact in the scenario below is a single clean
+ * hard-sync jump AT the switch instant — exactly the same kind of one-time
+ * discontinuity a real seek() produces, which is why the blackbox harness
+ * (PLAN_MERGE.MD §5.4b) doesn't start its rate measurement window until the
+ * clock has run stable for 2s: sampling across that jump is not a meaningful
+ * rate. So the assertions below measure rate using two readings taken
+ * strictly AFTER the jump has landed, not straddling it.
  */
 
 class FakeAudioBuffer {
