@@ -274,8 +274,18 @@ function assertHealthyInner(label, before, after, phase, options = {}) {
     );
   }
   if (progress.mediaRate < 0.65 || progress.mediaRate > 1.35) {
+    // Carry the endpoints, not just the ratio. A rate on its own cannot
+    // distinguish "the clock ran fast" from "the clock caught up to an audio
+    // anchor that was already ahead of it" — and those want different fixes.
+    // Both readings are already in the snapshots; not printing them cost a
+    // whole extra real-media round trip the first time this fired (B1c).
     throw new Error(
-      `${label} media clock rate ${progress.mediaRate.toFixed(3)} during ${phase}; expected near 1x`,
+      `${label} media clock rate ${progress.mediaRate.toFixed(3)} during ${phase}; expected near 1x ` +
+        `(clock ${before.currentTime.toFixed(3)}s -> ${after.currentTime.toFixed(3)}s over ` +
+        `${progress.wallSeconds.toFixed(3)}s wall; audioClock ${before.audioClock.toFixed(3)}s -> ` +
+        `${after.audioClock.toFixed(3)}s; clock-minus-audio ${(before.currentTime - before.audioClock).toFixed(3)}s -> ` +
+        `${(after.currentTime - after.audioClock).toFixed(3)}s; audioBuffered ` +
+        `${before.audioBufferedSeconds.toFixed(3)}s -> ${after.audioBufferedSeconds.toFixed(3)}s)`,
     );
   }
   if (
@@ -323,8 +333,29 @@ function assertHealthyInner(label, before, after, phase, options = {}) {
     if (Number(after.network.readStalls ?? 0) !== 0) {
       throw new Error(`${label} recorded HTTP source stalls during ${phase}`);
     }
-    if (Number(after.network.bufferWaiters ?? 0) !== 0) {
-      throw new Error(`${label} left HTTP buffer waiters pending during ${phase}`);
+    // bufferWaiters is a LIVE GAUGE, not a leak counter: HttpSource reports
+    // `this.bufferWaiters.size` (HttpSource.ts:2774), the number of reads
+    // parked in waitForData RIGHT NOW. A parked read is the normal steady
+    // state of a streaming source any time the demuxer is momentarily ahead
+    // of the network, so a single instantaneous sample cannot tell a stranded
+    // read from an in-progress one. It read nonzero on a Star Trek run
+    // (2026-09-15) whose state was "playing", clock running, readStalls 0 —
+    // and PASSED on the two runs either side of it.
+    //
+    // What the assertion MEANS is "no read was left stranded". Measure that:
+    // require the waiters to still be parked at BOTH ends of the window AND
+    // no bytes to have arrived across it — a source that is downloading is a
+    // source that is waking waiters. `readStalls` above remains the cumulative
+    // counter and is asserted unchanged.
+    const waitersBefore = Number(before.network?.bufferWaiters ?? 0);
+    const waitersAfter = Number(after.network.bufferWaiters ?? 0);
+    const bytesMoved =
+      Number(after.network.totalBytes ?? 0) - Number(before.network?.totalBytes ?? 0);
+    if (waitersBefore > 0 && waitersAfter > 0 && bytesMoved <= 0) {
+      throw new Error(
+        `${label} left ${waitersAfter} HTTP buffer waiter(s) stranded during ${phase}: ` +
+          `parked at both ends of a ${progress.wallSeconds.toFixed(3)}s window with no bytes arriving`,
+      );
     }
     if (Number(after.network.streamGeneration ?? 0) > generationBudget) {
       throw new Error(
@@ -496,6 +527,10 @@ const PICTURE_BLACK_MAX_LUMA = 20;
 // captures count as "different pictures" rather than the same frozen frame
 // with capture noise.
 const PICTURE_CHANGE_THRESHOLD = 6;
+// Frames that must reach the canvas across the ~3s picture window before an
+// unchanging picture may be called a frozen pipeline rather than a static
+// shot. Same floor assertHealthy uses for the same question.
+const PICTURE_STATIC_MIN_FRAMES = 5;
 
 /**
  * Downscale a screenshot of the video canvas and read it back.
@@ -647,6 +682,7 @@ async function saveFailureScreenshot(page, label, phase) {
  */
 async function assertRealPicture(page, label, phase) {
   const shots = [];
+  const framesAt = [];
   for (let i = 0; i < 3; i++) {
     // Judge each sample the moment it is captured. The previous shape captured
     // all three first and only then evaluated them, so the failure screenshot
@@ -659,9 +695,21 @@ async function assertRealPicture(page, label, phase) {
     // frame. Screenshot now lands within milliseconds of the failing sample.
     const shot = await capturePicture(page);
     shots.push(shot);
-    const at = await page
-      .evaluate(() => Number(document.querySelector("movi-player")?.currentTime ?? -1))
-      .catch(() => -1);
+    // framesPresented rides along with every sample: it is the only thing that
+    // separates "the pipeline stopped" from "the shot is static" further down.
+    const { at, frames } = await page
+      .evaluate(() => {
+        const element = document.querySelector("movi-player");
+        const renderer = element?.player?.videoRenderer ?? null;
+        return {
+          at: Number(element?.currentTime ?? -1),
+          frames: Number(
+            renderer?.getStats?.().framesPresented ?? renderer?.framesPresented ?? -1,
+          ),
+        };
+      })
+      .catch(() => ({ at: -1, frames: -1 }));
+    framesAt.push(frames);
     const where = `during ${phase} (sample ${i}, currentTime=${at.toFixed(2)}s)`;
     if (!shot) {
       const shotPath = await saveFailureScreenshot(page, label, phase);
@@ -702,16 +750,46 @@ async function assertRealPicture(page, label, phase) {
         `screenshot=${shotPath}`,
     );
   }
-  if (!pictureChanged(shots[0], shots[1]) && !pictureChanged(shots[1], shots[2])) {
+  // A picture that does not change is not by itself a frozen pipeline. Static
+  // shots are ordinary content, and the `steady playback` window opens at
+  // t≈2s — which on a feature film is the studio logo or the presents card,
+  // i.e. deliberately motionless. Measured 2026-09-15, both with a perfect
+  // picture on screen (screenshots saved by this very function): 萤火虫之墓 at
+  // t=1.97s showing the Shinchosha 1988 logo, Memories at t=2.07s showing
+  // "KATSUHIRO OTOMO PRESENTS". Grave failed this twice out of two.
+  //
+  // This is the same blind spot the flat/black verdict above already had
+  // fixed for it — "fades, transitions and letterboxed title cards are
+  // legitimate content" — carried over verbatim into the time dimension and
+  // left unfixed there.
+  //
+  // What separates the two cases is not the pixels: it is whether frames are
+  // still REACHING the canvas. A static shot still presents a frame per
+  // vsync-ish tick; a frozen pipeline presents none. So the verdict is now
+  // conjunctive, and the frame floor matches assertHealthy's own (`frames <
+  // 5` over its window) so the two cannot disagree about what "the picture
+  // stopped" means.
+  const framesAcross =
+    framesAt[0] >= 0 && framesAt[2] >= 0 ? framesAt[2] - framesAt[0] : -1;
+  const pictureStatic =
+    !pictureChanged(shots[0], shots[1]) && !pictureChanged(shots[1], shots[2]);
+  if (pictureStatic && framesAcross >= 0 && framesAcross < PICTURE_STATIC_MIN_FRAMES) {
     const shotPath = await saveFailureScreenshot(page, label, phase);
     throw new Error(
-      `${label} canvas did not change across 3 samples over ~3s during ${phase} — looks like a frozen frame; ` +
+      `${label} canvas did not change across 3 samples over ~3s during ${phase} and only ` +
+        `${framesAcross} frames were presented across that window (framesPresented ` +
+        `${framesAt[0]} -> ${framesAt[2]}) — the pipeline is frozen, not the shot; ` +
         `screenshot=${shotPath}`,
     );
   }
   return {
     spreads: shots.map((s) => Number(s.spread.toFixed(1))),
     uniqueColors: shots.map((s) => s.uniqueColors),
+    // Recorded on the pass path too: a run that was static-but-presenting
+    // should be able to say so afterwards, rather than looking identical in
+    // the report to one that had motion.
+    framesAcrossPictureWindow: framesAcross,
+    pictureStatic,
   };
 }
 
@@ -774,6 +852,31 @@ async function assertRealAudio(page, label, phase, windowMs = 3_000) {
     );
   }
   return result;
+}
+
+/**
+ * Poll the live buffer-waiter gauge until it reaches zero, or `timeoutMs`.
+ *
+ * Returns the last observed count — 0 means everything parked drained, which
+ * is what a healthy source does within milliseconds of its bytes landing.
+ */
+async function waitForBufferWaitersToDrain(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let last = 0;
+  for (;;) {
+    last = await page
+      .evaluate(
+        () =>
+          Number(
+            document
+              .querySelector("movi-player")
+              ?.player?.source?.getNetworkStats?.().bufferWaiters ?? 0,
+          ),
+      )
+      .catch(() => 0);
+    if (last === 0 || Date.now() >= deadline) return last;
+    await page.waitForTimeout(250);
+  }
 }
 
 async function assertPlaybackStillAdvances(page, label, phase) {
@@ -1543,11 +1646,40 @@ async function validateSubtitles(page, label) {
           postProbePlayback,
         };
       } catch (error) {
+        // "No cue appeared at t" has two readings and the bare timeout cannot
+        // tell them apart: the bitmap pipeline is broken, or this position
+        // simply has nothing to show. Samples with many PGS tracks hide the
+        // ambiguity by brute force — Paprika needed 7 attempts before one
+        // landed, Star Trek 3 — but a 2-track sample only gets 6 chances and
+        // can run out while the decoder is perfectly healthy. So record what
+        // the streaming decoder actually produced: how many cues it has for
+        // this track, and where the nearest one to this target is. A nonzero
+        // cue list with the nearest cue minutes away is a sampling miss; an
+        // empty list after a 12s wait is a real failure.
+        const cueContext = await page
+          .evaluate(() => {
+            const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
+            const cues = renderer?.subtitleCues ?? [];
+            const at = Number(
+              document.querySelector("movi-player")?.currentTime ?? -1,
+            );
+            let nearest = null;
+            for (const cue of cues) {
+              const distance =
+                at < cue.start ? cue.start - at : at > cue.end ? at - cue.end : 0;
+              if (nearest === null || distance < nearest.distance) {
+                nearest = { start: cue.start, end: cue.end, distance };
+              }
+            }
+            return { streamedCueCount: cues.length, at, nearest };
+          })
+          .catch(() => null);
         attempts.push({
           trackId: track.id,
           target,
           result: "no-visible-image-cue",
           error: error instanceof Error ? error.message : String(error),
+          ...(cueContext ?? {}),
         });
       }
     }
@@ -2026,8 +2158,18 @@ async function runOne(browser, token, mediaPath) {
       if (Number(check.network.readStalls ?? 0) !== 0) {
         throw new Error(`${label} recorded HTTP source stalls after subtitle testing`);
       }
-      if (Number(check.network.bufferWaiters ?? 0) !== 0) {
-        throw new Error(`${label} left HTTP buffer waiters after subtitle testing`);
+      // Same gauge-vs-counter problem as assertHealthy's copy of this check
+      // (see the long note there). Here there IS a page to poll, so measure
+      // the thing the message claims outright: give the parked reads a bounded
+      // window to drain and fail only if they never do. This is the site that
+      // actually fired — one Star Trek run in three, immediately after a
+      // subtitle probe's burst of seeks, with playback otherwise healthy.
+      const drained = await waitForBufferWaitersToDrain(page, 5_000);
+      if (drained > 0) {
+        throw new Error(
+          `${label} left ${drained} HTTP buffer waiter(s) stranded after subtitle testing — ` +
+            `still parked 5000ms later`,
+        );
       }
     }
     return null;
