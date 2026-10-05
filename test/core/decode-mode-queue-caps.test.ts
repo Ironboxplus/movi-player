@@ -203,6 +203,79 @@ describe("MoviPlayer P2: decodeMode-driven video decoder queue cap", () => {
   }, 20_000);
 });
 
+/**
+ * The starve exemption (`skipVideoDecodeForAudio`) must not fire while a seek
+ * is waiting for its first frame.
+ *
+ * During a seek, audio packets are stashed in `pendingAudioPackets` and only
+ * submitted once notifySeekCompletion runs, so the audio buffer reads 0 by
+ * construction — it is being held, not starving. Meanwhile the burst right
+ * after the target keyframe fills the hardware decoder past its relaxed seek
+ * cap. Reading that pair as "audio starving, video full" dropped the next
+ * delta and latched `videoChainBrokenUntilKeyframe`, so every delta up to the
+ * NEXT keyframe was thrown away: on a 10s-GOP x264 file (BluRay-style keyint)
+ * the picture sat on the seek frame for ~3s of running clock and then jumped
+ * to the next keyframe. Measured on a local loopback copy of the 萤火虫之墓
+ * shape (2026-10-05): latch cleared at the target keyframe 181ms after the
+ * seek, re-latched 20ms later with audioBuffered=0 and decoder queue 61, held
+ * until the next keyframe 3.4s later.
+ */
+describe("MoviPlayer: starve exemption during a seek", () => {
+  it("does not drop deltas (or latch the broken chain) while the seek holds audio back", async () => {
+    const player = await makePlayer();
+    const readPacket = queueCapPlayer(player, hwVideo(61), idleAudio, {
+      waitingForVideoSync: true,
+      audioBuffered: 0,
+    });
+    readPacket.mockImplementationOnce(async () => deltaVideoPacket());
+    await (player as any).processLoop();
+    expect((player as any).videoChainBrokenUntilKeyframe).toBe(false);
+  }, 20_000);
+
+  // One step later, the same misread: notifySeekCompletion has handed the
+  // stashed packets to the audio decoder, which has not produced output yet.
+  // Same loopback run, after the fix above: re-latched 526ms after the seek in
+  // state "playing" with audioBuffered=0 and 29 packets in the audio decoder.
+  it("does not treat audio as starving while packets are still in its decoder", async () => {
+    const player = await makePlayer();
+    const readPacket = queueCapPlayer(
+      player,
+      hwVideo(54),
+      { isSoftware: true, worker: true, queueSize: 29 },
+      { audioBuffered: 0 },
+    );
+    readPacket.mockImplementationOnce(async () => deltaVideoPacket());
+    await (player as any).processLoop();
+    expect((player as any).videoChainBrokenUntilKeyframe).toBe(false);
+  }, 20_000);
+
+  // The case the exemption exists for must still trip: backpressure has
+  // stopped the loop, the audio decoder has nothing left, the buffer is dry.
+  it("still drops deltas when audio is dry with nothing left to decode", async () => {
+    const player = await makePlayer();
+    const readPacket = queueCapPlayer(
+      player,
+      hwVideo(54),
+      { isSoftware: true, worker: true, queueSize: 0 },
+      { audioBuffered: 0 },
+    );
+    readPacket.mockImplementationOnce(async () => deltaVideoPacket());
+    await (player as any).processLoop();
+    expect((player as any).videoChainBrokenUntilKeyframe).toBe(true);
+  }, 20_000);
+});
+
+function deltaVideoPacket() {
+  return {
+    streamIndex: videoTrack.id,
+    timestamp: 30.07,
+    dts: 30.07,
+    duration: 1 / 24,
+    keyframe: false,
+    data: new Uint8Array(16),
+  } as any;
+}
+
 describe("MoviPlayer P2: decodeMode-driven audio decoder queue cap", () => {
   it("worker-offloaded software audio: reads at 95, gates at 97 (cap 96)", async () => {
     const audio: DecoderShape = { isSoftware: true, worker: true, queueSize: 95 };

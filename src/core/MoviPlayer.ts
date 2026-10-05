@@ -6045,7 +6045,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // as permanently — a video-only file (movi-tube serves exactly these,
     // paired with a separate audio URL) was dropping deltas throughout.
     const hasAudioToStarve = this.trackManager.getActiveAudioTrack() !== null;
-    const audioStarving = gateOnAudio && hasAudioToStarve && audioBuffered < 0.1;
+    // Nor while the audio is already on its way. An empty buffer only means
+    // starving when nothing is left to decode — the case this exists for, where
+    // backpressure has stopped the loop and the audio decoder has run dry.
+    // Right after a seek it reads 0 twice over without being that: while the
+    // seek waits for its first frame the packets are stashed in
+    // pendingAudioPackets (held by construction), and once notifySeekCompletion
+    // submits them they sit in the audio decoder for a few hundred ms before
+    // any output. Both moments coincide with the burst after the target
+    // keyframe filling the video decoder, so each latched the broken chain and
+    // dropped every delta up to the NEXT keyframe — on a 10s-GOP x264 remux the
+    // picture froze for seconds of running clock, then jumped (local loopback
+    // repro of the 萤火虫之墓 shape, 2026-10-05: latched at 201ms with the
+    // packets stashed, and again at 526ms with 29 of them in the decoder).
+    // Reading more packets would not have helped either moment: the audio was
+    // already read.
+    const audioInFlight = this.waitingForVideoSync || this.audioDecoder.queueSize > 0;
+    const audioStarving =
+      gateOnAudio && hasAudioToStarve && !audioInFlight && audioBuffered < 0.1;
     const videoDecoderFull = this.videoDecoder.queueSize > maxVideoQueue;
     const videoBufferFull = !skipVideoBackpressure && videoBuffered > maxVideoBuffered;
     // Muted is not the same as audio-less. The clock is mastered by audio in

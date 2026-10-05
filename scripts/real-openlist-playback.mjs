@@ -1781,8 +1781,13 @@ async function runOne(browser, token, mediaPath) {
     // Stalls, restarts and generation changes still come through — only the
     // routine per-read lines are dropped.
     if (/HttpSource\] Read:/.test(text)) return;
+    // `desync` / `Black-frame recovery` are the player's own seek triggers.
+    // Without them a run shows that a seek happened (the clock and decoder
+    // lines get through) but never why: 萤火虫之墓 on 2026-09-15 recorded a
+    // seek to 3735.774s two seconds after an audio track switch, with nothing
+    // naming the desync detector or the black-frame watchdog as its source.
     if (
-      /VideoDecoder|codec|decoder|software|WebCodecs|post-seek|burst|backpressure|buffer|worker|underrun|starv|Clock|PlayerState|playback-transition|B1b instrumentation/i.test(
+      /VideoDecoder|codec|decoder|software|WebCodecs|post-seek|burst|backpressure|buffer|worker|underrun|starv|Clock|PlayerState|playback-transition|B1b instrumentation|desync|Black-frame recovery/i.test(
         text,
       )
     ) {
