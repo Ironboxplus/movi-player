@@ -154,7 +154,6 @@ export async function makePipelinePlayer(
     demuxer: { readPacket, seek: vi.fn(async () => {}) },
     mediaInfo: { duration: 1422, videoFrameRate: 24 },
     wasPlayingBeforeRebuffer: opts.wasPlayingBeforeRebuffer ?? opts.state === "buffering",
-    _bufferingEntryTime: performance.now() - 1000,
     _playStartTime: performance.now() - 20_000,
     waitingForVideoSync: opts.waitingForVideoSync ?? false,
     seekTargetTime: -1,

@@ -908,7 +908,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  running at 30, or a 24fps one dropping half its frames, is comfortably
    *  over it; a picture that has actually stopped presents nothing at all. */
   private static readonly STALL_MOVING_FPS = 5;
-  private _bufferingEntryTime: number = 0; // When we entered buffering state
   // True when the current buffering state was entered because of something WE
   // just did — a rate change's audio re-anchor, or a seek resuming on the thin
   // buffer it left behind — rather than a real data/decode stall. Those resume
@@ -920,23 +919,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  attributable to the flush/re-anchor that operation performed itself. */
   private static readonly SELF_INFLICTED_STALL_WINDOW_MS = 1500;
   /**
-   * How long a bound stall may hold before it gives up and resumes on whatever
-   * it has.
-   *
-   * Generous on purpose. Under a binding the picture is frozen for the whole
-   * wait either way — resuming early does not un-freeze it, it only lets the
-   * sound walk off without it. So the only thing this protects against is a
-   * video pipeline that is not slow but DEAD, and for that the decoder's own
-   * error paths are the real answer; this is the backstop behind them.
+   * How much media every active stream must hold ahead of the playhead before
+   * a stall lets go — mpv's `cache_pause_wait` (playloop.c), one second. It
+   * has to stay under the read loop's readahead (2s at the least), or the
+   * wait could not be satisfied by the reads it is waiting on.
    */
-  private static readonly BOUND_RESUME_ESCAPE_MS = 15000;
-  /**
-   * How much video, in seconds of queued frames, a bound stall wants back
-   * before it lets go. One frame is not a picture that is running again — it is
-   * a picture that will freeze one frame later, with the sound released for the
-   * whole grace that follows.
-   */
-  private static readonly BOUND_RESUME_CUSHION_S = 0.2;
+  private static readonly RESUME_SECS = 1.0;
   /** The stall-detection grace given to a resume that came out of a stall
    *  rather than out of a cold start. Long enough for the queue we just waited
    *  for to start playing, short enough that the sound cannot walk. */
@@ -2057,7 +2045,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // immediately.
       if (this._bindAV && this.stateManager.is("playing")) {
         this.wasPlayingBeforeRebuffer = true;
-        this._bufferingEntryTime = performance.now();
         this._bufferingSelfInflicted = true;
         this.stateManager.setState("buffering");
         this.clock.pause();
@@ -4630,7 +4617,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) {
         this.wasPlayingBeforeSeek = false;
         this.wasPlayingBeforeRebuffer = true;
-        this._bufferingEntryTime = performance.now();
         this._bufferingSelfInflicted = true;
         if (this.activeAudioNeedsColdPrime()) {
           this.beginAudioPrime();
@@ -4790,7 +4776,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (this.activeAudioNeedsColdPrime()) {
         this.beginAudioPrime();
         this.wasPlayingBeforeRebuffer = true; // resume intent for buffering→play
-        this._bufferingEntryTime = performance.now();
         this._bufferingSelfInflicted = false;
         this.stateManager.setState("buffering");
         this.clock.pause();
@@ -5135,27 +5120,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * buffering→resume gate waits for a real cushion (2s) rather than the thin
    * 0.1s default before resuming.
    */
-  /**
-   * How much audio a rebuffer waits for before it resumes. Read by the resume
-   * gate.
-   */
-  private rebufferAudioTargetS(): number {
-    const softwareAudioStall =
-      !this.disableAudio && this.audioDecoder.usesSoftware;
-    // The 2s cushion is for a decoder that fell BEHIND realtime — rebuilding
-    // a real buffer is the only way out of that. A rate change is the
-    // opposite case: nothing was starving, we discarded the scheduled audio
-    // ourselves in the re-anchor, and the decoder is idle and refilling at
-    // full speed. Demanding 2s there just extends the frozen picture (since
-    // A5 every codec decodes in software, so every title would pay it on
-    // every speed change). Use the light threshold; if the new rate genuinely
-    // can't be sustained, the stall detector re-enters buffering and the full
-    // cushion applies then.
-    return (this._primingAudio || softwareAudioStall) && !this._bufferingSelfInflicted
-      ? 2.0
-      : 0.1;
-  }
-
   private beginAudioPrime(): void {
     this.audioRenderer.primeForBuffering();
     this._primingAudio = true;
@@ -5274,7 +5238,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const currentState = this.stateManager.getState();
       if (currentState === "playing") {
         this.wasPlayingBeforeRebuffer = true;
-        this._bufferingEntryTime = performance.now();
         this.stateManager.setState("buffering");
         this.clock.pause();
         if (this.videoRenderer) this.videoRenderer.stopPresentationLoop();
@@ -5283,145 +5246,52 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
       // Continue processing to allow new audio to be decoded and scheduled
     } else if (this.stateManager.getState() === "buffering" && this.wasPlayingBeforeRebuffer) {
-      // Resume after minimum dwell time to accumulate enough data
+      // Out of a stall when every stream the player is consuming holds
+      // RESUME_SECS ahead, or the file has ended — mpv's `cache_pause_wait`.
+      // Waiting by the clock instead (a 1.5s floor, a 3s fallback, a 15s
+      // escape when the picture was bound to the sound) was a guess at how
+      // long a refill takes; the queues say how much is there, and the reads
+      // are no longer blocked by anything a full decoder does, so a second
+      // is always reachable unless the source has nothing left to give.
       //
-      // Split (separate-URL) audio has no track in the MAIN demuxer's
-      // trackManager — it is decoded from its own demuxer straight into the
-      // audio renderer — so asking the track manager alone reads as "no audio
-      // at all" on every split source. The stall detector below already counts
-      // `audioDemuxer` for exactly this reason; the resume gate did not, and
-      // the consequence was worse than a loose audioReady: `bound` (see below)
-      // was false, so on precisely the sources this player streams — YouTube's
-      // separate video and audio URLs — `bindav` held the way IN to a stall and
-      // then let go the way OUT on audio alone. That is the drift the binding
-      // exists to prevent.
-      const hasAudioTrack =
-        !!this.trackManager.getActiveAudioTrack() || !!this.audioDemuxer;
-      // The first-play cold prime needs a REAL cushion before it starts: the
-      // software decode is still sub-realtime (and gets even slower once video
-      // decode/render competes for CPU), so resuming on a thin 0.1s buffer just
-      // underruns again → a second stall + a ~2s A/V resync. Require ~1.5s
-      // buffered for the prime (with a generous max-dwell fallback so a very
-      // slow decoder still eventually starts). A normal mid-playback rebuffer
-      // keeps the lighter 0.1s threshold for responsiveness. NOTE: with our
-      // worker audio path the decode is off-thread, so this cushion is usually
-      // reached fast — but keeping the gate makes cold starts robust on any tier.
-      const audioTargetS = this.rebufferAudioTargetS();
+      // Decoded media counts toward it. The presentation loop is stopped for
+      // the whole stall, so frames and audio the decoders already produced sit
+      // waiting to be played: leaving them out would make the player wait for
+      // a second MORE than it holds, by however deep the renderer's queue is.
+      //
+      // The first-play cold prime still needs a REAL decoded audio cushion on
+      // top: the software decode is sub-realtime to begin with (and slower once
+      // video competes for CPU), so starting on a thin buffer underruns again
+      // → a second stall + a ~2s A/V resync. The wait for it is bounded by the
+      // reads, which nothing blocks any more, so it needs no dwell cap. A rate
+      // change is not that case — we discarded the scheduled audio ourselves in
+      // the re-anchor and the decoder is idle and refilling at full speed — so
+      // it takes the light threshold (_bufferingSelfInflicted).
+      const audioTargetS =
+        this._primingAudio && !this._bufferingSelfInflicted ? 2.0 : 0.1;
       const audioReady =
-        this.disableAudio ||
-        !hasAudioTrack ||
+        !this.audioIsPlayable() ||
         this.audioRenderer.getBufferedDuration() > audioTargetS;
-      // Bound, sound and picture stall together and start together — see the
-      // long note at the resume decision below, and MoviPlayer's _bindAV.
-      //
-      // …but only where there IS a picture. Data-saver audio-only and a hidden
-      // tab both skip video decode on purpose, so the video queue is empty for
-      // a reason that has nothing to do with the link: binding to it would hold
-      // the sound for a picture nobody asked to be decoded.
-      const pictureRunning =
-        !this._audioOnly && (!this.isBackgrounded || this.isPiPActive);
-      // Nor where the sound is being dropped rather than played: an
-      // autoplay-blocked context is suspended, so there is no sound to come back
-      // in step with and waiting for it never ends. See the stall detector.
-      const bound =
-        this._bindAV &&
-        hasAudioTrack &&
-        !this.disableAudio &&
-        pictureRunning &&
-        !this.audioRenderer.isDroppingAudio();
-      // …and bound, "a frame exists" is not "the picture is running again". One
-      // frame satisfies a `> 0` test the instant it lands; the presentation
-      // loop shows it, the queue is empty again, and the post-play grace then
-      // covers the next three seconds during which the stall detector may not
-      // even look — so the sound gets all of it. Repeated on a link that is
-      // delivering the odd frame and nothing more, it ratchets: stall, resume,
-      // ~3.5s of audio over a picture that never moved, stall again. Ask
-      // instead for enough queue to actually play through that grace. The
-      // presentation loop is stopped for the whole of buffering, so this counts
-      // only frames that ACCUMULATED — and the escape below still caps the wait.
-      const fps =
-        this.trackManager.getActiveVideoTrack()?.frameRate ||
-        (this.mediaInfo as any)?.videoFrameRate ||
-        24;
-      const videoTargetFrames = bound
-        ? Math.max(2, Math.round(fps * MoviPlayer.BOUND_RESUME_CUSHION_S))
-        : 1;
+      // At least one frame to show: resuming the clock over a black picture
+      // is the one thing no amount of queued packets excuses.
       const videoReady =
-        !this.videoRenderer ||
-        this.videoRenderer.getQueueSize() >= videoTargetFrames;
-      const dwellMs = performance.now() - this._bufferingEntryTime;
-      // A rate change is NOT a stall. AudioRenderer.isRebuffering() is raised
-      // only for the rate-change re-anchor, and while it's up the clock is
-      // paused, the AudioContext is suspended and the presentation loop is
-      // stopped — the picture is frozen. The 1.5s floor below exists to stop a
-      // starved pipeline from resuming onto a thin buffer and stalling right
-      // back; neither applies here, where audio is typically still scheduled
-      // seconds ahead and the video queue is full. Holding the freeze for a
-      // fixed 1.5s (every speed change, and again on every change back) was
-      // the entire stall. Let the readiness checks below decide instead.
-      const dwellFloor = this._bufferingSelfInflicted ? 0 : 1500;
-      const minDwell = dwellFloor; // Wait at least 1.5s to accumulate buffer
-      // Cap the prime startup so a very CPU-bound decoder doesn't spin forever;
-      // it starts with whatever cushion it built (a residual stall is possible
-      // on such machines — the real fix is off-thread audio decode, which our
-      // worker path provides).
-      const maxDwell = this._primingAudio ? 4000 : 3000;
-      // Under a binding, audio alone is not enough to leave.
-      //
-      // `bindav` bound the way IN to a stall — either side running dry enters
-      // buffering — and left the way OUT on audio, which on a slow link is the
-      // side that is never short: a YouTube audio track is a fraction of its
-      // video, so it refills in the time the picture needs to fetch one frame.
-      // Measured on Slow 4G: the player entered buffering, served three
-      // seconds, resumed on audio alone, played a beat, and stalled again —
-      // and over 25 seconds of that the sound advanced from 6.8s to 14.2s
-      // while the picture sat at 6.04s throughout. Nothing was lost by the
-      // stalls, which freeze both properly; it was drifting apart in the
-      // moments BETWEEN them. Then the ABR dropped a rung, the video pipeline
-      // caught up in one jump, and the viewer saw playback "resume" eight
-      // seconds late. It had not resumed late — the picture had jumped forward
-      // to meet the sound.
-      //
-      // So when the two are bound, resuming needs both. The escape is far
-      // longer (see BOUND_RESUME_ESCAPE_MS): a bound wait costs nothing but
-      // the wait, since the picture is frozen throughout it either way.
-      const escapeMs = bound ? MoviPlayer.BOUND_RESUME_ESCAPE_MS : maxDwell;
-      // The escape is for a picture that is BEHIND, not one that is absent.
-      // With nothing at all in the renderer, resuming is not "letting go on
-      // what we have" — it is starting the sound over a still frame, which is
-      // the exact thing a binding is asked to prevent. Two sessions of a
-      // dropped connection show what it costs: the wait ran its 15 seconds,
-      // gave up on `videoReady=false`, played a second of audio, stalled, and
-      // came back to do it again — and once, with EOF having quietly switched
-      // the stall detector off, it ran twenty-one seconds before the viewer
-      // seeked by hand. Bound and empty, keep waiting: the spinner is the
-      // honest state, and the rescues that matter (the ABR's downshift, the
-      // element's stuck watchdog, the decoder's own recreate) all run inside
-      // buffering anyway.
-      const somethingToShow = (this.videoRenderer?.getQueueSize() ?? 0) > 0;
-      const mayEscape = !bound || somethingToShow;
-      // Resume if: (1) both ready after minDwell, (2) unbound, audio ready
-      // after a longer wait, or (3) the escape (don't wait forever).
+        !this.videoRenderer || this.videoRenderer.getQueueSize() >= 1;
+      const aheadReady =
+        this.eofReached ||
+        this.bufferedAheadSeconds() >= MoviPlayer.RESUME_SECS ||
+        // The queues stop growing at the byte ceiling, so seconds they can
+        // never hold are not worth waiting for (8K AV1 reaches it first).
+        this.videoQueue.bytes + this.audioQueue.bytes >=
+          MoviPlayer.MAX_QUEUE_BYTES;
       // The `!waitingForVideoSync` guard is OURS and is load-bearing under the
       // P3 restart barrier: notifySeekCompletion's forcedWithoutFrame branch
       // deliberately stays sync-armed and buffers until a real frame lands or
       // the hard-timeout backstop fires. Upstream can drop it because upstream
-      // COMPLETES the seek before buffering; we do not. Without it, the
-      // audio-only and escape fallbacks below resume over a black screen
-      // mid-seek — around 3s in, well before the backstop — and then snap back
-      // when the frame finally decodes. Upstream's bound/escape tuning and our
-      // seek-safety guard are both kept.
-      const canResume = dwellMs >= minDwell && !this.waitingForVideoSync && (
-        (audioReady && videoReady) ||
-        (!bound && audioReady && dwellMs >= 3000) ||
-        (dwellMs >= escapeMs && mayEscape)
-      );
-      if (canResume && bound && !(audioReady && videoReady)) {
-        Logger.warn(
-          TAG,
-          `Bound stall gave up after ${Math.round(dwellMs)}ms — audioReady=${audioReady} videoReady=${videoReady}`,
-        );
-      }
+      // COMPLETES the seek before buffering; we do not. Without it, the gate
+      // resumes over a black screen mid-seek and then snaps back when the frame
+      // finally decodes.
+      const canResume =
+        !this.waitingForVideoSync && aheadReady && audioReady && videoReady;
       if (canResume) {
         this._primingAudio = false;
         this._bufferingSelfInflicted = false;
@@ -5577,11 +5447,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // every frame. It has to be audio that EXISTS and has run out.
       const audioStarved =
         hasAudio && this.audioRenderer.getBufferedDuration() < 0.05;
+      // An output running dry is only a stall when its packet queue has
+      // nothing left to feed it. Otherwise the decoder is behind, and
+      // freezing the picture to wait for data that is already here would only
+      // make it later.
       const videoStalled =
-        videoEmpty && (audioLow || this._bindAV) && !decoderRecovering;
+        videoEmpty &&
+        (audioLow || this._bindAV) &&
+        !decoderRecovering &&
+        this.videoSourceStarved();
       // The audio side of the stall, whether it arrived as a real underrun
       // (holes already heard) or as an empty buffer under a binding.
-      const audioBlocking = audioUnderrunning || (this._bindAV && audioStarved);
+      const audioBlocking =
+        (audioUnderrunning || (this._bindAV && audioStarved)) &&
+        this.audioSourceStarved();
       if (videoStalled || audioBlocking) {
         // An underrun isn't a silent buffer dipping low — it's a hole the user
         // ALREADY heard as a click. Waiting the full stall window means five or
@@ -5631,7 +5510,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
                 : "Stall detected: buffers empty for 500ms, entering buffering state",
           );
           this.wasPlayingBeforeRebuffer = true;
-          this._bufferingEntryTime = performance.now();
           // A stall landing right after a rate change is one WE caused:
           // AudioRenderer's re-anchor drops the scheduled old-rate audio, so
           // the buffer reads empty for exactly as long as the decoder needs to
@@ -6260,6 +6138,82 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // scan, 9-21 MB over a real link.
       this._pendingTrackSwitchRepositionTarget === null &&
       !this._trackSwitchRepositioning
+    );
+  }
+
+  /**
+   * Whether there is sound the stall logic should wait on. Split
+   * (separate-URL) audio has no track in the MAIN demuxer's trackManager — it
+   * is decoded from its own demuxer straight into the audio renderer — so
+   * asking the track manager alone reads as "no audio at all" on every split
+   * source, and `bindav` then held the way IN to a stall and let go the way
+   * OUT on the picture alone. And audio the browser will not let us start
+   * (autoplay-blocked, suspended context) never fills its buffer, so waiting
+   * on it never ends.
+   */
+  private audioIsPlayable(): boolean {
+    return (
+      (!!this.trackManager.getActiveAudioTrack() || !!this.audioDemuxer) &&
+      !this.disableAudio &&
+      !this.audioRenderer.isDroppingAudio()
+    );
+  }
+
+  /** The packet queue the active audio is read into. */
+  private activeAudioQueue(): PacketQueue {
+    return this.audioDemuxer ? this.splitAudioQueue : this.audioQueue;
+  }
+
+  /**
+   * Seconds of media held ahead of the playhead on the least-provisioned
+   * stream the player is consuming: packets still queued plus what the
+   * decoders already turned into frames and samples. Infinity when nothing is
+   * consumed. The buffering exit measures this (mpv reads the same quantity
+   * off the demuxer to decide when to leave "paused for cache").
+   */
+  private bufferedAheadSeconds(): number {
+    let ahead = Infinity;
+    if (this.videoIsConsumed()) {
+      const fps =
+        this.trackManager.getActiveVideoTrack()?.frameRate ||
+        (this.mediaInfo as any)?.videoFrameRate ||
+        24;
+      ahead = Math.min(
+        ahead,
+        this.videoQueue.forwardSeconds() +
+          (this.videoRenderer?.getQueueSize() ?? 0) / fps,
+      );
+    }
+    if (this.audioIsPlayable()) {
+      // A split track that has been read to its end has nothing more to wait
+      // for, however short what is left is.
+      ahead = Math.min(
+        ahead,
+        this.audioDemuxer && this._splitAudioEof
+          ? Infinity
+          : this.activeAudioQueue().forwardSeconds() +
+              this.audioRenderer.getBufferedDuration(),
+      );
+    }
+    return ahead;
+  }
+
+  /**
+   * True when a stream's output has run dry because nothing is left to feed
+   * it — its packet queue is empty and its decoder holds nothing in flight.
+   * An output that is empty while packets wait in the queue, or sit in the
+   * decoder, is a slow decode, which buffering cannot fix (mpv enters
+   * "paused for cache" only when the demuxer is also starved).
+   */
+  private videoSourceStarved(): boolean {
+    return (
+      this.videoQueue.length === 0 && (this.videoDecoder?.queueSize ?? 0) === 0
+    );
+  }
+
+  private audioSourceStarved(): boolean {
+    return (
+      this.activeAudioQueue().length === 0 && this.audioDecoder.queueSize === 0
     );
   }
 
@@ -10976,7 +10930,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         `${reason}: the picture is still coming — holding sound and clock for it`,
       );
       this.wasPlayingBeforeRebuffer = true;
-      this._bufferingEntryTime = performance.now();
       // Our own doing, not a starved pipeline: the resume gate lets go on
       // readiness instead of serving the cushion meant for a decoder that fell
       // behind, and the ABR knows not to read it as the rung failing.

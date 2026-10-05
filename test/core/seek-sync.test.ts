@@ -122,7 +122,6 @@ describe("MoviPlayer seek sync", () => {
       demuxer: { readPacket },
       mediaInfo: { duration: 100, videoFrameRate: 24 },
       wasPlayingBeforeRebuffer: true,
-      _bufferingEntryTime: performance.now() - 4000, // dwellMs 4000 > minDwell AND > maxDwell(3000)
       _playStartTime: performance.now() - 8000,
       waitingForVideoSync: true, // still sync-armed — seek NOT completed
       seekTargetTime: 42,
