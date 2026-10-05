@@ -6844,9 +6844,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (this.seekSessionId !== mySessionId)
         return this.abandonSupersededSeek(mySessionId);
 
+      // Discard, do not drain (mpv resets its decoders on seek). Draining a
+      // hardware decoder emits every queued frame into a free output surface,
+      // and a renderer holding them all — presentation loop stopped for a
+      // stall — never frees one: the seek then sat out the flush timeout. The
+      // old position's frames are not wanted anyway. The audio decoder needs
+      // no such option: it is software (the worker bumps its generation, the
+      // WASM flush drops its state), and neither waits on a drain.
       // Flush decoders
       Logger.info(TAG, `seek: flushing video decoder...`);
-      await this.videoDecoder.flush();
+      await this.videoDecoder.flush({ discard: true });
       Logger.info(TAG, `seek: flushing audio decoder...`);
       await this.audioDecoder.flush();
       // Drop the host subtitle renderer's pending state — its cues are for the
