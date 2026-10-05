@@ -144,6 +144,7 @@ export async function makePipelinePlayer(
     queueSize: audio.queueSize,
     getStats: () => (audio.worker ? { worker: { queueDepth: 0 } } : {}),
     canBatch: () => false,
+    close: vi.fn(),
     flush: vi.fn(async () => {}),
     decode: vi.fn(() => {
       audioDecoder.queueSize++;
@@ -151,7 +152,13 @@ export async function makePipelinePlayer(
   };
 
   Object.assign(player, {
-    demuxer: { readPacket, seek: vi.fn(async () => {}) },
+    demuxer: {
+      readPacket,
+      seek: vi.fn(async () => {}),
+      // What an audio track switch asks of the demuxer besides the seek.
+      getBindings: () => undefined,
+      getExtradata: () => undefined,
+    },
     mediaInfo: { duration: 1422, videoFrameRate: 24 },
     wasPlayingBeforeRebuffer: opts.wasPlayingBeforeRebuffer ?? opts.state === "buffering",
     _playStartTime: performance.now() - 20_000,
@@ -191,6 +198,10 @@ export async function makePipelinePlayer(
       play: vi.fn(async () => {}),
       pause: vi.fn(),
       isAudioPlaying: () => true,
+      getMaxChannelCount: () => 2,
+      setOutputChannelCount: vi.fn(),
+      render: vi.fn(),
+      renderPCM: vi.fn(),
     },
   });
   for (const p of opts.queuedVideo ?? []) player.videoQueue.push(p);

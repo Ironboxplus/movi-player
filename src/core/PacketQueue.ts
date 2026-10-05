@@ -26,6 +26,7 @@ export class PacketQueue {
   private packets: Packet[] = [];
   private head = 0;
   private _bytes = 0;
+  private _lastDts = Number.NaN;
 
   get length(): number {
     return this.packets.length - this.head;
@@ -33,6 +34,18 @@ export class PacketQueue {
 
   get bytes(): number {
     return this._bytes;
+  }
+
+  /**
+   * Decode timestamp of the last packet pushed, kept after it has been fed to
+   * the decoder. It marks how far the demuxer has read on this stream, which
+   * an audio track switch needs: the switch re-reads the file from before the
+   * playhead, and what this stream already took must not be taken twice.
+   * Falls back to the pts for a packet with no dts. NaN until a push, and
+   * after clear().
+   */
+  get lastDts(): number {
+    return this._lastDts;
   }
 
   get firstTimestamp(): number {
@@ -48,6 +61,7 @@ export class PacketQueue {
   push(packet: Packet): void {
     this.packets.push(packet);
     this._bytes += packet.data.byteLength;
+    this._lastDts = Number.isFinite(packet.dts) ? packet.dts : packet.timestamp;
   }
 
   peek(): Packet | undefined {
@@ -74,6 +88,7 @@ export class PacketQueue {
     this.packets = [];
     this.head = 0;
     this._bytes = 0;
+    this._lastDts = Number.NaN;
   }
 
   forwardSeconds(): number {

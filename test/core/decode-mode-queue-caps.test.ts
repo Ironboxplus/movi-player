@@ -147,7 +147,8 @@ describe("MoviPlayer: a full video decoder around a seek", () => {
       audioBuffered: 0,
       reads: [deltaVideoPacket()],
     });
-    f.player._pendingTrackSwitchRepositionTarget = 37.9;
+    f.player._audioSwitching = true;
+    f.player._audioDecoderConfiguring = true;
     await f.tick();
     expect(f.videoDecode).not.toHaveBeenCalled();
     expect(f.player.videoQueue.length).toBe(1);
@@ -219,16 +220,20 @@ describe("MoviPlayer: rebuffer waiting for an audio cushion", () => {
     expect(f.videoDecode).not.toHaveBeenCalled();
   }, 20_000);
 
-  // Reading only helps if it brings audio. Between an audio track switch and
-  // its reposition the new track is still discarded in the demuxer, so it
-  // cannot — and without this the loop poured the rest of the file into the
-  // video side: 1953 queued chunks on the loopback run, i.e. the B1b forward
-  // scan to EOF that costs 9-21 MB over a real link.
-  it("does not read for audio before an audio track switch's reposition lands", async () => {
-    const f = await stuckRebuffer(0, { _pendingTrackSwitchRepositionTarget: 37.9 }, {
+  // The switch's refresh seek is issued with the discard flip, so the new
+  // track has packets to give from the first read — nothing waits for a
+  // reposition to land (that wait is what let the loop pour the rest of the
+  // file into the video side: 1953 queued chunks on the loopback run, the
+  // forward scan to EOF that costs 9-21 MB over a real link). Its packets are
+  // read at once and wait in the queue until the new decoder is configured.
+  it("reads for the new audio right after a track switch and holds it until the new decoder is ready", async () => {
+    const f = await stuckRebuffer(0, { _audioDecoderConfiguring: true }, {
       queuedVideo: packetRun((t) => videoPacket(t), 37, 43, 1 / 24),
+      reads: [audioPacket(37.9)],
     });
-    expect(f.readPacket).not.toHaveBeenCalled();
+    expect(f.readPacket).toHaveBeenCalled();
+    expect(f.player.audioQueue.length).toBe(1);
+    expect(f.audioDecode).not.toHaveBeenCalled();
   }, 20_000);
 
   // And never without bound: the queues together stop at their byte ceiling.

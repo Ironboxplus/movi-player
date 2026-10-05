@@ -55,6 +55,30 @@ describe("PacketQueue", () => {
     expect(q.forwardSeconds()).toBe(0);
   });
 
+  // An audio track switch re-reads the stream from before the playhead and
+  // has to drop what the queue already took (mpv: last_ret_dts). That position
+  // is where the demuxer has got to on this stream; feeding the decoder does
+  // not move it back, only a clear (seek, new source) does.
+  it("keeps the dts of the last packet pushed after it is fed, until cleared", () => {
+    const q = new PacketQueue();
+    expect(q.lastDts).toBeNaN();
+    q.push({ ...pkt(10.2), dts: 10 });
+    q.push({ ...pkt(10.1), dts: 10.04 });
+    expect(q.lastDts).toBeCloseTo(10.04);
+    q.shift();
+    q.shift();
+    expect(q.length).toBe(0);
+    expect(q.lastDts).toBeCloseTo(10.04);
+    q.clear();
+    expect(q.lastDts).toBeNaN();
+  });
+
+  it("falls back to the pts when a packet has no usable dts", () => {
+    const q = new PacketQueue();
+    q.push({ ...pkt(7), dts: Number.NaN });
+    expect(q.lastDts).toBe(7);
+  });
+
   it("clear() empties it", () => {
     const q = new PacketQueue();
     for (let i = 0; i < 2000; i++) q.push(pkt(i * 0.01));

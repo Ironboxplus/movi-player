@@ -100,21 +100,22 @@ import { stubBrowserGlobals } from "../helpers/browser-globals";
  * fully real and fully exercised.
  *
  * ROOT CAUSE RESOLVED, THIS FILE DELIBERATELY STAYS RED
- * (`moviplayer-audio-track-switch-reposition.test.ts` is the fix's real
- * regression test — read that one first): the OPEN QUESTION above is
+ * (`moviplayer-audio-track-switch-refresh.test.ts` and
+ * `audio-track-switch-playhead-continuity.test.ts` are the fix's real
+ * regression tests — read those first): the OPEN QUESTION above is
  * answered — `applyStreamDiscard()` re-enables a track that was being
  * skipped inside `av_read_frame`, so there is no packet of it near the
  * current file position; the read loop then scans forward unbounded
  * (measured 60-100s of real media) until it finds one, and that packet's
  * far-ahead PTS is what `newTrackFirstFramePts` below stands in for. The fix
- * (`MoviPlayer.repositionDemuxerForTrackSwitch()`) closes this at the
- * source: it re-seeks the demuxer to the playhead right after
- * `applyStreamDiscard()` flips discard, so in real production the decoder
+ * (`MoviPlayer.refreshDemuxerForAudioSwitch()`, a refresh seek) closes this at
+ * the source: it re-seeks the demuxer to a second before the playhead right
+ * after `applyStreamDiscard()` flips discard, so in real production the decoder
  * is never actually handed a far-ahead PTS to begin with.
  *
  * This file cannot observe that fix. It never wires a `this.demuxer` (same
  * lightweight setup as `moviplayer-audio-track-switch-realign.test.ts`), so
- * `repositionDemuxerForTrackSwitch()` no-ops here (see its own "no demuxer"
+ * `refreshDemuxerForAudioSwitch()` no-ops here (see its own "no demuxer"
  * guard), and it injects `newTrackFirstFramePts` directly into
  * `renderDecodedPCM` — downstream of, and unreachable from, the demuxer the
  * fix operates on. It is therefore testing a narrower, still-true claim: IF
