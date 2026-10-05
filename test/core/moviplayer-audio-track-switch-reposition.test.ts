@@ -214,6 +214,108 @@ describe("MoviPlayer B1b fix: audioTrackChange handler repositions the demuxer",
     expect(decodeSpy).toHaveBeenCalledTimes(1);
   }, 20_000);
 
+  // The forward scan this reposition undoes can run all the way to the end of
+  // the file before the reposition gets its turn — the new decoder's configure
+  // is awaited first, and on a local loopback 1080p x264 file (2026-10-05) the
+  // worker AAC configure took 4.5s while the scan hit EOF 70ms after the
+  // switch. processLoop does no reading while eofReached is set (it only waits
+  // for `ended`), so a reposition that moved the cursor back but left the flag
+  // up read nothing at all: the player sat in buffering until MoviElement's
+  // stuck-watchdog fired a full seek, which is what cleared it.
+  it("clears a latched EOF, since the cursor is no longer at the end", async () => {
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+
+    player.trackManager.setTracks([videoTrack, aacTrack, ac3Track]);
+    player.trackManager.selectAudioTrack(aacTrack.id);
+
+    const fakeDemuxer = {
+      seek: vi.fn(async () => {}),
+      getBindings: () => undefined,
+      getExtradata: () => undefined,
+    };
+    (player as unknown as { demuxer: Pick<Demuxer, "seek"> }).demuxer =
+      fakeDemuxer as unknown as Demuxer;
+    const internals = player as unknown as { eofReached: boolean; eofSince: number };
+    internals.eofReached = true;
+    internals.eofSince = 1234;
+
+    player.trackManager.selectAudioTrack(ac3Track.id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fakeDemuxer.seek).toHaveBeenCalledTimes(1);
+    expect(internals.eofReached).toBe(false);
+    expect(internals.eofSince).toBe(0);
+  }, 20_000);
+
+  // The reposition lands the cursor on the keyframe at or before the playhead,
+  // so the video decoder walks the rest of that GOP before it reaches the
+  // picture the viewer left. Those walk frames are not wanted — and they cannot
+  // just be queued: the player is buffering with the presentation loop
+  // stopped, so nothing drains the renderer, a hardware decoder runs out of
+  // output surfaces, and the walk never reaches the playhead. Measured on a
+  // local loopback 1080p x264 file with a 10s GOP (2026-10-05): the renderer
+  // held 8 frames from 30.03s while the playhead sat at 37.81s, decoder queue
+  // stuck at 31, until the element's stuck-watchdog fired a full seek.
+  it("drops video frames before the playhead until the first one reaches it", async () => {
+    stubBrowserGlobals();
+    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
+    const player = new MoviPlayer({});
+
+    player.trackManager.setTracks([videoTrack, aacTrack, ac3Track]);
+    player.trackManager.selectAudioTrack(aacTrack.id);
+
+    const fakeDemuxer = {
+      seek: vi.fn(async () => {}),
+      getBindings: () => undefined,
+      getExtradata: () => undefined,
+    };
+    (player as unknown as { demuxer: Pick<Demuxer, "seek"> }).demuxer =
+      fakeDemuxer as unknown as Demuxer;
+
+    let onFrame: (frame: { timestamp: number; close: () => void }) => void = () => {};
+    const internals = player as unknown as {
+      wireVideoDecoder: (dec: unknown) => void;
+      videoRenderer: { queueFrame: (frame: unknown) => void; clearQueue: () => void };
+      clock: Clock;
+      stateManager: { setState: (state: string) => void };
+    };
+    internals.wireVideoDecoder({
+      setOnFrame: (cb: typeof onFrame) => {
+        onFrame = cb;
+      },
+      setOnError: () => {},
+    });
+    const queued: number[] = [];
+    internals.videoRenderer = {
+      queueFrame: (frame) => queued.push((frame as { timestamp: number }).timestamp / 1_000_000),
+      clearQueue: () => {},
+    };
+    internals.stateManager.setState("loading");
+    internals.stateManager.setState("ready");
+    internals.stateManager.setState("playing");
+    internals.clock.seek(37.81);
+
+    player.trackManager.selectAudioTrack(ac3Track.id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    internals.stateManager.setState("buffering");
+
+    const frame = (seconds: number) => {
+      const f = { timestamp: Math.round(seconds * 1_000_000), close: vi.fn() };
+      onFrame(f);
+      return f;
+    };
+    const walk = frame(30.03);
+    const atPlayhead = frame(37.83);
+    const after = frame(37.87);
+
+    expect(walk.close).toHaveBeenCalled();
+    expect(atPlayhead.close).not.toHaveBeenCalled();
+    expect(after.close).not.toHaveBeenCalled();
+    expect(queued).toEqual([37.83, 37.87]);
+  }, 20_000);
+
   it("does not touch the demuxer when audio is disabled", async () => {
     stubBrowserGlobals();
     const { MoviPlayer } = await import("../../src/core/MoviPlayer");

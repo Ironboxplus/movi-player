@@ -1457,7 +1457,15 @@ export class MoviVideoDecoder {
   /**
    * Flush the decoder
    */
-  async flush(): Promise<void> {
+  /**
+   * `discard`: the caller wants the pending work gone, not its frames — so a
+   * hardware decoder is re-armed in place (reset + configure, which emits
+   * nothing) instead of drained. Draining has to emit every queued frame into
+   * a free output surface, and when the renderer is holding them all (its
+   * presentation loop stopped for buffering) that never happens: the audio
+   * track switch's reposition sat on 37 queued chunks for the full timeout.
+   */
+  async flush(options: { discard?: boolean } = {}): Promise<void> {
     this.openGopErrorCount = 0;
     this.justFlushed = true;
     this.postFlushKeyframeRejects = 0;
@@ -1502,6 +1510,10 @@ export class MoviVideoDecoder {
         return; // fresh decoder is configured and waiting for a keyframe
       }
       // recreate failed — fall through to a normal flush
+    }
+
+    if (options.discard && !this.forceSoftware && !this.useSoftware && this.softRecreateDecoder()) {
+      return;
     }
 
     try {

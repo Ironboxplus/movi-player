@@ -249,6 +249,31 @@ describe("MoviPlayer: starve exemption during a seek", () => {
     expect((player as any).videoChainBrokenUntilKeyframe).toBe(false);
   }, 20_000);
 
+  // An audio track switch empties the audio side on purpose: the old decoder
+  // is closed, the renderer reset, and until the reposition lands there is no
+  // decoder fed at all; after it, the walk up to the playhead decodes audio
+  // that is then dropped, so the buffer stays at 0 while the decoder queue
+  // touches 0 between batches. Same loopback file, 2026-10-05: latched at the
+  // switch itself (buffer 0, decoder queue 0), and again during the walk, which
+  // dropped every delta up to the next keyframe — the picture came back 2s
+  // ahead of the sound and the desync detector fired a full seek.
+  it.each([
+    ["the switch, before the reposition", { _pendingTrackSwitchRepositionTarget: 37.9 }],
+    ["the walk, before audio reaches the playhead", { _trackSwitchDropAudioBefore: 37.9 }],
+  ])("does not treat audio as starving during %s", async (_moment, switchState) => {
+    const player = await makePlayer();
+    const readPacket = queueCapPlayer(
+      player,
+      hwVideo(54),
+      { isSoftware: true, worker: true, queueSize: 0 },
+      { audioBuffered: 0 },
+    );
+    Object.assign(player as unknown as Record<string, unknown>, switchState);
+    readPacket.mockImplementationOnce(async () => deltaVideoPacket());
+    await (player as any).processLoop();
+    expect((player as any).videoChainBrokenUntilKeyframe).toBe(false);
+  }, 20_000);
+
   // The case the exemption exists for must still trip: backpressure has
   // stopped the loop, the audio decoder has nothing left, the buffer is dry.
   it("still drops deltas when audio is dry with nothing left to decode", async () => {
@@ -275,6 +300,75 @@ function deltaVideoPacket() {
     data: new Uint8Array(16),
   } as any;
 }
+
+/**
+ * A rebuffer that is waiting for an AUDIO cushion must be allowed to read it.
+ *
+ * The resume gate asks software / cold-primed audio for a 2s cushion. A
+ * hardware video decoder only emits into free output surfaces, and with the
+ * presentation loop stopped for buffering the renderer frees none — so once
+ * the renderer holds its handful of frames the decoder's queue sits at its cap,
+ * the decoder-queue gate stops every read, and the audio cushion can never
+ * grow: no reads, no cushion; no cushion, no resume; no resume, no drain.
+ * Loopback 1080p x264 + software AAC, 2026-10-05: stuck at 1.837s against the
+ * 2.0s target, decoder queue 31 against a cap of 30, renderer holding 8 frames
+ * at the playhead, until the element's stuck-watchdog fired a full seek.
+ * Mirror image of needsRebufferVideoFrame.
+ */
+describe("MoviPlayer: rebuffer waiting for an audio cushion", () => {
+  function stuckRebuffer(
+    audioBuffered: number,
+    extraState: Record<string, unknown> = {},
+    videoQueue = 31,
+  ) {
+    return async () => {
+      const player = await makePlayer();
+      // Worker software audio, as in the measured run — and as every audio
+      // track has been since A5, which is what puts maxAudioBuffered at 5s.
+      const readPacket = queueCapPlayer(
+        player,
+        hwVideo(videoQueue),
+        { isSoftware: true, worker: true, queueSize: 0 },
+        { audioBuffered },
+      );
+      (player as any).stateManager.setState("buffering");
+      Object.assign(player as unknown as Record<string, unknown>, {
+        wasPlayingBeforeRebuffer: true,
+        _primingAudio: true,
+        ...extraState,
+      });
+      await (player as any).processLoop();
+      return readPacket;
+    };
+  }
+
+  it("reads past a full video decoder while audio is short of its resume target", async () => {
+    const readPacket = await stuckRebuffer(1.837)();
+    expect(readPacket).toHaveBeenCalled();
+  }, 20_000);
+
+  it("keeps the video decoder cap once the cushion is there", async () => {
+    const readPacket = await stuckRebuffer(2.2)();
+    expect(readPacket).not.toHaveBeenCalled();
+  }, 20_000);
+
+  // Reading only helps if it brings audio. Between an audio track switch and
+  // its reposition the new track is still discarded in the demuxer, so it
+  // cannot — and without this the loop poured the rest of the file into the
+  // video decoder: 1953 queued chunks on the loopback run, i.e. the B1b
+  // forward scan to EOF that costs 9-21 MB over a real link.
+  it("does not read past the cap before an audio track switch's reposition lands", async () => {
+    const readPacket = await stuckRebuffer(0, { _pendingTrackSwitchRepositionTarget: 37.9 })();
+    expect(readPacket).not.toHaveBeenCalled();
+  }, 20_000);
+
+  // And never without bound: the extra reads are the video packets that come
+  // interleaved with the missing audio, so the ceiling is that much video.
+  it("stops at a ceiling even while the cushion is still short", async () => {
+    const readPacket = await stuckRebuffer(1.837, {}, 400)();
+    expect(readPacket).not.toHaveBeenCalled();
+  }, 20_000);
+});
 
 describe("MoviPlayer P2: decodeMode-driven audio decoder queue cap", () => {
   it("worker-offloaded software audio: reads at 95, gates at 97 (cap 96)", async () => {

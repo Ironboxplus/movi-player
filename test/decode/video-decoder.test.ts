@@ -287,3 +287,50 @@ describe("merge: adaptive load shedding reaches both software paths", () => {
     expect(bindings.setSkipFrame).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * `flush({ discard: true })` is for callers that want the decoder's pending
+ * work gone, not its frames — the audio track switch's reposition, which has
+ * just moved the demuxer back and has no use for anything decoded from the
+ * position it abandoned.
+ *
+ * A plain flush() there deadlocked. It must emit every queued frame, and a
+ * hardware decoder can only emit into free output surfaces; during the switch
+ * the player is buffering with the presentation loop stopped, so the renderer
+ * frees none. Measured on a local loopback 1080p x264 file (2026-10-05): the
+ * reposition's flush sat with 37 chunks queued until its 2220ms timeout, by
+ * which time the element's stuck-watchdog had already fired a recovery seek.
+ * The fake below models exactly that: a flush() that never settles.
+ */
+describe("MoviVideoDecoder flush({ discard: true })", () => {
+  function hardwareDecoderWithStuckFlush() {
+    const fake = {
+      state: "configured",
+      decodeQueueSize: 37,
+      flush: vi.fn(() => new Promise<void>(() => {})),
+      reset: vi.fn(),
+      configure: vi.fn(),
+      close: vi.fn(),
+    };
+    const decoder = new MoviVideoDecoder();
+    Object.assign(decoder as unknown as Record<string, unknown>, {
+      decoder: fake,
+      lastConfig: { codec: "avc1.640028", codedWidth: 1920, codedHeight: 1080 },
+      useSoftware: false,
+      forceSoftware: false,
+      isConfigured: true,
+    });
+    return { decoder, fake };
+  }
+
+  it("re-arms the hardware decoder in place instead of waiting for it to drain", async () => {
+    const { decoder, fake } = hardwareDecoderWithStuckFlush();
+    await decoder.flush({ discard: true });
+    expect(fake.flush).not.toHaveBeenCalled();
+    expect(fake.reset).toHaveBeenCalledTimes(1);
+    expect(fake.configure).toHaveBeenCalledWith(
+      expect.objectContaining({ codec: "avc1.640028" }),
+    );
+    expect(decoder.isWaitingForKeyframe).toBe(true);
+  });
+});

@@ -4294,6 +4294,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private _trackSwitchDropAudioBefore: number = -1;
 
   /**
+   * The video side of the same one-shot drop: frames decoded before this
+   * position after an audio track switch are closed, and the first one at or
+   * after it clears the gate. Separate from the audio field because each is
+   * cleared by its own stream's first frame past the playhead.
+   *
+   * The re-seek lands on the keyframe at or before the playhead, so the video
+   * decoder walks the rest of that GOP before reaching it. Queuing those walk
+   * frames is worse than showing them early: the player is buffering with the
+   * presentation loop stopped, nothing drains the renderer, a hardware decoder
+   * runs out of output surfaces, and the walk never reaches the playhead.
+   * Measured on a loopback 1080p x264 file with a 10s GOP: 8 frames from
+   * 30.03s held in the renderer with the playhead at 37.81s and the decoder
+   * stuck at 31 queued, until the element's stuck-watchdog fired a full seek.
+   * A real seek supersedes it (seek() clears it).
+   */
+  private _trackSwitchDropVideoBefore: number = -1;
+
+  /**
    * True from the moment an audio track switch flips the discard flags until
    * the demuxer has finished being repositioned. While it is set, no audio
    * packet is handed to the decoder at all.
@@ -5104,6 +5122,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         TAG,
         `[B1b instrumentation] demuxer repositioned to ${resumeAt.toFixed(3)}s so the re-enabled track yields packets here`,
       );
+      // The forward scan being undone can reach the end of the file before
+      // this runs (the new decoder's configure is awaited first — 4.5s for a
+      // worker AAC decoder on loopback, while the scan hit EOF in 70ms), and
+      // processLoop reads nothing while eofReached is up. seek() clears it for
+      // the same reason; without this the player sat in buffering until the
+      // element's stuck-watchdog fired a full seek.
+      this.eofReached = false;
+      this.eofSince = 0;
     } catch (error) {
       // A failed reposition is not worth tearing playback down over: the old
       // behaviour (scan forward) still produces audio, just from the wrong
@@ -5123,15 +5149,23 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // way seek() does: flush, clear the queue, and re-arm the keyframe scan
     // so the next packets — however discontinuous from what was queued —
     // start clean instead of erroring or painting a stale frame.
+    // Discard, not drain: nothing decoded from the abandoned position is
+    // wanted, and draining deadlocks here — the player is buffering with the
+    // presentation loop stopped, so the renderer frees no output surfaces and
+    // a hardware decoder cannot emit its backlog (see flush()'s `discard`).
     if (this.videoDecoder) {
       try {
-        await this.videoDecoder.flush();
+        await this.videoDecoder.flush({ discard: true });
       } catch {
         // Same tolerance as seek()'s own flush: a decoder that's already
         // gone (closed by a concurrent teardown) has nothing left to flush.
       }
     }
     this.videoRenderer?.clearQueue();
+    // Raised only now, with the old position's work discarded: a frame from
+    // there sits past the playhead and would clear the gate before the walk
+    // frames it is for ever arrive.
+    this._trackSwitchDropVideoBefore = resumeAt;
     this.seekingToKeyframe = true;
     this.seekingToKeyframeStartTime = performance.now();
     this.seekKeyframeScanned = 0;
@@ -5148,6 +5182,28 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * flag _primingAudio so the buffering→resume gate waits for a real cushion
    * (2s) rather than the thin 0.1s default before resuming.
    */
+  /**
+   * How much audio a rebuffer waits for before it resumes. Read by the resume
+   * gate, and by the read loop so that it keeps reading until there is that
+   * much (see needsRebufferAudioCushion).
+   */
+  private rebufferAudioTargetS(): number {
+    const softwareAudioStall =
+      !this.disableAudio && this.audioDecoder.usesSoftware;
+    // The 2s cushion is for a decoder that fell BEHIND realtime — rebuilding
+    // a real buffer is the only way out of that. A rate change is the
+    // opposite case: nothing was starving, we discarded the scheduled audio
+    // ourselves in the re-anchor, and the decoder is idle and refilling at
+    // full speed. Demanding 2s there just extends the frozen picture (since
+    // A5 every codec decodes in software, so every title would pay it on
+    // every speed change). Use the light threshold; if the new rate genuinely
+    // can't be sustained, the stall detector re-enters buffering and the full
+    // cushion applies then.
+    return (this._primingAudio || softwareAudioStall) && !this._bufferingSelfInflicted
+      ? 2.0
+      : 0.1;
+  }
+
   private beginAudioPrime(): void {
     this.audioRenderer.primeForBuffering();
     if (this.pendingAudioPackets.length > 0) {
@@ -5302,21 +5358,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // keeps the lighter 0.1s threshold for responsiveness. NOTE: with our
       // worker audio path the decode is off-thread, so this cushion is usually
       // reached fast — but keeping the gate makes cold starts robust on any tier.
-      const softwareAudioStall =
-        !this.disableAudio && this.audioDecoder.usesSoftware;
-      // The 2s cushion is for a decoder that fell BEHIND realtime — rebuilding
-      // a real buffer is the only way out of that. A rate change is the
-      // opposite case: nothing was starving, we discarded the scheduled audio
-      // ourselves in the re-anchor, and the decoder is idle and refilling at
-      // full speed. Demanding 2s there just extends the frozen picture (since
-      // A5 every codec decodes in software, so every title would pay it on
-      // every speed change). Use the light threshold; if the new rate genuinely
-      // can't be sustained, the stall detector re-enters buffering and the full
-      // cushion applies then.
-      const audioTargetS =
-        (this._primingAudio || softwareAudioStall) && !this._bufferingSelfInflicted
-          ? 2.0
-          : 0.1;
+      const audioTargetS = this.rebufferAudioTargetS();
       const audioReady =
         this.disableAudio ||
         !hasAudioTrack ||
@@ -6060,7 +6102,23 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // packets stashed, and again at 526ms with 29 of them in the decoder).
     // Reading more packets would not have helped either moment: the audio was
     // already read.
-    const audioInFlight = this.waitingForVideoSync || this.audioDecoder.queueSize > 0;
+    //
+    // An audio track switch empties the audio side on purpose, from the switch
+    // (old decoder closed, renderer reset, no decoder fed until the reposition
+    // lands) until the first audio at the playhead (the walk up to it decodes
+    // audio that is then dropped, so the buffer stays at 0 while the decoder
+    // queue touches 0 between batches). Same loopback file: latched at the
+    // switch and again during the walk, which dropped every delta to the next
+    // keyframe; the picture came back 2s ahead of the sound and the desync
+    // detector fired a full seek.
+    const rebuildingAudioForSwitch =
+      this._pendingTrackSwitchRepositionTarget !== null ||
+      this._trackSwitchRepositioning ||
+      this._trackSwitchDropAudioBefore !== -1;
+    const audioInFlight =
+      this.waitingForVideoSync ||
+      this.audioDecoder.queueSize > 0 ||
+      rebuildingAudioForSwitch;
     const audioStarving =
       gateOnAudio && hasAudioToStarve && !audioInFlight && audioBuffered < 0.1;
     const videoDecoderFull = this.videoDecoder.queueSize > maxVideoQueue;
@@ -6123,9 +6181,46 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       videoBuffered === 0 &&
       this.videoDecoder.queueSize === 0;
 
+    // The mirror image: a rebuffer waiting for its AUDIO cushion, held shut by
+    // the VIDEO decoder's queue. A hardware decoder only emits into free output
+    // surfaces, and with the presentation loop stopped the renderer frees none,
+    // so once the renderer holds its handful of frames the decoder sits at its
+    // cap and stops every read — and the cushion the resume gate is waiting for
+    // can never grow. Loopback 1080p x264 + software AAC: stuck at 1.837s
+    // against the 2.0s target, decoder queue 31 over a cap of 30, renderer
+    // holding 8 frames at the playhead, until the element's stuck-watchdog
+    // fired a full seek. Only once there IS a picture waiting (the video side
+    // of the resume is satisfied or close); the extra video packets read on
+    // the way are what the decoder will need anyway, and it closes the moment
+    // the cushion is reached.
+    //
+    // Reading only helps if it brings audio. Between an audio track switch
+    // and its reposition the new track is still discarded in the demuxer, so
+    // it cannot: there this poured the rest of the file into the video decoder
+    // (1953 queued chunks on the same run — the B1b forward scan to EOF, 9-21
+    // MB over a real link). And never unbounded: the extra reads are the video
+    // packets interleaved with the missing audio, so the ceiling is that much
+    // video with room to spare.
+    const audioCannotArriveYet =
+      this._pendingTrackSwitchRepositionTarget !== null || this._trackSwitchRepositioning;
+    const rebufferAudioTargetS = this.rebufferAudioTargetS();
+    const needsRebufferAudioCushion =
+      currentState === "buffering" &&
+      this.wasPlayingBeforeRebuffer &&
+      gateOnAudio &&
+      hasAudioToStarve &&
+      !audioCannotArriveYet &&
+      videoBuffered > 0 &&
+      audioBuffered <= rebufferAudioTargetS &&
+      this.videoDecoder.queueSize <=
+        maxVideoQueue + Math.ceil(fps * rebufferAudioTargetS * 1.5);
+
     const catchingUpVideo = this._videoResumeTarget !== -1;
     if (
-      (!skipVideoBackpressure && !skipVideoDecodeForAudio && this.videoDecoder.queueSize > maxVideoQueue) ||
+      (!skipVideoBackpressure &&
+        !skipVideoDecodeForAudio &&
+        !needsRebufferAudioCushion &&
+        this.videoDecoder.queueSize > maxVideoQueue) ||
       (gateOnAudio && this.audioDecoder.queueSize > maxAudioQueue) ||
       (gateOnAudio &&
         !catchingUpVideo &&
@@ -6280,7 +6375,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // seek "fixed" it.
         const drainingStash = this.pendingPrebufferPackets.length > 0;
         if (
-          (!skipVideoDecodeForAudio && this.videoDecoder.queueSize > maxVideoQueue) ||
+          (!skipVideoDecodeForAudio &&
+            !needsRebufferAudioCushion &&
+            this.videoDecoder.queueSize > maxVideoQueue) ||
           (!drainingStash && !this.disableAudio && this.audioDecoder.queueSize > maxAudioQueue)
         ) {
           // Queue getting full, stop to let decoders catch up
@@ -7193,6 +7290,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // Normalize target time against startTime offset
       this.seekTargetTime = seconds + this.startTime;
     this._videoResumeTarget = -1; // a real seek supersedes a video-only catch-up
+    this._trackSwitchDropVideoBefore = -1; // …and a track switch's walk-frame drop
       this.waitingForVideoSync = true;
       // Arm the read-ahead cap + hard-timeout watchdog for this seek so a
       // never-arriving first frame can't run away downloading / hang forever.
@@ -12046,6 +12144,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // is coming", which is the only case the deadline is for.
         if (this.waitingForVideoSync) {
           this._seekFrameProgressAt = performance.now();
+        }
+
+        if (this._trackSwitchDropVideoBefore !== -1) {
+          if (frame.timestamp / 1_000_000 < this._trackSwitchDropVideoBefore) {
+            frame.close();
+            return;
+          }
+          this._trackSwitchDropVideoBefore = -1;
         }
 
         // IMPORTANT: Drop video frames before the seek target time
