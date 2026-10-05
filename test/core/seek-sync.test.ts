@@ -95,92 +95,37 @@ describe("MoviPlayer seek sync", () => {
   }, 20_000);
 
   // Merge regression guard (upstream 0.3.5): the forced-timeout path above leaves
-  // us buffering + sync-armed on purpose. Upstream's canResume rewrite added the
-  // prime-aware (audioReady && dwellMs>=3000) / maxDwell fallbacks but dropped
+  // us buffering + sync-armed on purpose. Upstream's canResume rewrite dropped
   // our `!waitingForVideoSync` guard (safe upstream because upstream completes
   // the seek before buffering; unsafe with our stay-armed design). Without the
-  // guard, the process loop resumes over a black screen ~3s into a slow seek,
-  // then snaps back to paused when the frame lands. dwellMs here (4000) is past
-  // every resume fallback, so the ONLY thing that may keep us buffering is the
-  // guard — this locks it in.
+  // guard, the process loop resumes over a black screen mid-seek, then snaps
+  // back to paused when the frame lands. Everything else the resume gate asks
+  // for is satisfied here — a second of media queued ahead on both streams, a
+  // decoded frame to show, audio buffered — so the ONLY thing that may keep us
+  // buffering is the guard; this locks it in.
   it("does not resume while a forced-timeout seek is still sync-armed (no premature black-screen resume)", async () => {
-    stubBrowserGlobals();
-    const { MoviPlayer } = await import("../../src/core/MoviPlayer");
-    const player = new MoviPlayer({});
-    const readPacket = vi.fn(async () => null);
-    const resumeFromBuffering = vi.fn();
-
-    player.trackManager.setTracks([videoTrack, trueHdTrack]);
-
-    const stateManager = (player as any).stateManager;
-    stateManager.setState("loading");
-    stateManager.setState("ready");
-    stateManager.setState("playing");
-    stateManager.setState("buffering");
-
-    Object.assign(player as any, {
-      demuxer: { readPacket },
-      mediaInfo: { duration: 100, videoFrameRate: 24 },
-      wasPlayingBeforeRebuffer: true,
-      _playStartTime: performance.now() - 8000,
-      waitingForVideoSync: true, // still sync-armed — seek NOT completed
-      seekTargetTime: 42,
-      // Demuxed 10s past target (>SEEK_MAX_DEMUX_AHEAD_SECONDS=8): trips
-      // seekReadAheadExceeded() so processLoop returns right after the resume
-      // gate, before the demux/EOF path — isolating the gate under test. Realistic
-      // for a frame-starved seek that has read well ahead waiting for a keyframe.
-      seekDemuxAheadTime: 52,
-      seekSyncArmedAt: performance.now() - 1000, // armed 1s ago — far from the 12s hard-timeout
-      justSeeked: false,
-      seekTime: 0,
-      disableAudio: false,
-      muted: false,
-      eofReached: false,
-      demuxInFlight: false,
-      isBackgrounded: false,
-      isPiPActive: false,
-      _primingAudio: false,
-      videoDecoder: {
-        isSoftware: false,
-        queueSize: 0,
-        isWaitingForKeyframe: false,
-        isRecentlyRecovering: () => false,
-        // How long the decoder has been holding out for a keyframe —
-        // upstream's bound-to-audio hold check reads it every pass.
-        keyframeWaitMs: () => 0,
-        flush: vi.fn(),
-      },
-      audioDecoder: {
-        isSoftware: true,
-        queueSize: 0,
-        getStats: () => ({ worker: { queueDepth: 0 } }),
-        decode: vi.fn(),
-      },
-      videoRenderer: {
-        getQueueSize: () => 0, // no decoded video frame yet
-        stopPresentationLoop: vi.fn(),
-        getHeadFrameTime: () => -1,
-      },
-      audioRenderer: {
-        getBufferedDuration: () => 5.1, // audio well-buffered → audioReady=true
-        isRebuffering: () => false,
-        // Upstream's processLoop asks the renderer whether audio is being
-        // DROPPED (muted-and-suspended), not whether it is muted — these
-        // fixtures all have audio genuinely in the pipeline.
-        isDroppingAudio: () => false,
-        getAudioClock: () => -1,
-        getMaxScheduledMediaTime: () => 0,
-        resumeFromBuffering,
-      },
+    const f = await makePipelinePlayer({
+      state: "buffering",
+      waitingForVideoSync: true,
+      rendererQueue: 5,
+      audioBuffered: 5.1,
+      queuedVideo: packetRun((t) => videoPacket(t), 42, 45, 1 / 24),
+      queuedAudio: packetRun((t) => audioPacket(t), 42, 45, 0.02),
     });
+    // Demuxed 10s past target (>SEEK_MAX_DEMUX_AHEAD_SECONDS=8): trips
+    // seekReadAheadExceeded() so processLoop returns right after the resume
+    // gate, before the demux/EOF path — isolating the gate under test.
+    f.player.seekTargetTime = 42;
+    f.player.seekDemuxAheadTime = 52;
+    f.player.seekSyncArmedAt = performance.now() - 1000; // far from the 12s hard-timeout
 
-    await (player as any).processLoop();
+    await f.tick();
 
     // Seek still armed → must stay buffering, must NOT resume over a black screen.
-    expect(stateManager.getState()).toBe("buffering");
-    expect((player as any).waitingForVideoSync).toBe(true);
-    expect((player as any).wasPlayingBeforeRebuffer).toBe(true);
-    expect(resumeFromBuffering).not.toHaveBeenCalled();
+    expect(f.player.stateManager.getState()).toBe("buffering");
+    expect(f.player.waitingForVideoSync).toBe(true);
+    expect(f.player.wasPlayingBeforeRebuffer).toBe(true);
+    expect(f.player.audioRenderer.resumeFromBuffering).not.toHaveBeenCalled();
   }, 20_000);
 
   // The old hold was a separate stash with its own packet cap (512) and a

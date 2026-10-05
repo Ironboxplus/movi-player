@@ -301,13 +301,15 @@ Hardware AV1/HEVC decoders cannot sustain ≥120 effective fps at 8K. 2x playbac
 
 A deeper queue locks GBs of VRAM and starves the GPU compositor; a too-shallow queue fires backpressure before audio refills. Don't tune these without measuring on the target device.
 
-### 7.3 `audioStarving` threshold tracks `latencyHint`
+### 7.3 The read loop pulls; one stream's decoder never stops the other's reads
 
-`AudioRenderer` uses `latencyHint: "interactive"` (~50–150 ms output buffer) so playback-rate changes don't glitch on Chromium. The demux loop's `skipVideoDecodeForAudio` path watches `audioBuffered < threshold`. **Threshold must scale with `latencyHint`**: at `"playback"` (~200 ms buffer) 0.5 s is correct; at `"interactive"` 0.1 s is the right number. Mismatching them produces false-positive "audio starving" every demux tick, which drops AV1 non-keyframes, which corrupts the reference chain, which produces `EncodingError` once per GOP. Don't paper over decoder errors with log-level downgrades — fix the threshold.
+Demuxed packets go into one `PacketQueue` per stream (`src/core/PacketQueue.ts`) and each decoder is fed from its own queue while it has room (`feedVideo` / `feedAudio` in `MoviPlayer.ts`). The loop reads while any consumed stream's queue is empty or holds less than the readahead (2s hardware audio, 5s software audio — scaled by rate), and only while the queues are under `MAX_QUEUE_BYTES`. This is mpv's demuxer model (`demux/demux.c`): a full video decoder only stops the video feed, the audio queue running dry is reason enough to read, and nothing is dropped to make room. Do not reintroduce a decoder queue length as the read gate — that coupling is what the old `skipVideoDecodeForAudio` / `audioStarving` machinery (drop video deltas when audio ran low, latch until the next keyframe) existed to patch, and it corrupted AV1/HEVC reference chains.
 
-### 7.4 `skipVideoDecodeForAudio` is disabled on 4K+
+### 7.4 Buffering is decided on forward seconds, not dwell time
 
-For lighter sources, dropping a few video packets to keep audio flowing is acceptable (you get glitches, not freezes). For 4K+ the decoder is already at its ceiling — dropping packets doesn't help it catch up, it just corrupts the reference chain. So the path is gated `!isHighRes`. Accept a little audio drift instead.
+A stall is declared only when an output ran dry AND its stream has nothing left to feed it (empty packet queue, nothing in the decoder): an empty output over queued packets is a slow decoder, and freezing the picture does not help it. Playback resumes when every active stream holds `RESUME_SECS` (1s) ahead (packets queued plus frames/samples already decoded), or at end of file, with a frame to show and the audio's decoded cushion (2s for a cold prime). There is no minimum dwell and no timeout escape; if a resume never comes, the read side is what to look at.
+
+An audio track switch is a refresh seek (`refreshDemuxerForAudioSwitch`): the demuxer goes back a second, the streams already playing drop what they had taken, and the video pipeline is not touched. While the new sound is rebuilt (`_audioSwitching`) no stall is declared on its empty buffer.
 
 ### 7.5 Ambient mode is heavy on mobile
 
@@ -347,7 +349,7 @@ PiP requires the `<video>` element to be in the light DOM, not the shadow root, 
 
 ### 8.5 Backpressure and audio drift
 
-If you see audio drifting away from video, check `audioBuffered` vs the `audioStarving` threshold first (§7.3). If you see `Stall detected: buffers empty for 500ms` repeatedly on 4K+ non-1x playback, that's the decoder genuinely failing to keep up — there's no buffer tweak that will fix it.
+If you see audio drifting away from video, check what the audio queue and decoder are holding against the readahead first (§7.3). If you see `Stall detected: buffers empty for 500ms` repeatedly on 4K+ non-1x playback, that's the decoder genuinely failing to keep up — there's no buffer tweak that will fix it.
 
 ---
 
@@ -424,8 +426,8 @@ When reporting "this works" / "this is fixed", actually load a representative fi
 
 | Symptom | Start here |
 |---------|------------|
-| Decoder error / EncodingError loop | [src/decode/VideoDecoder.ts](src/decode/VideoDecoder.ts) `_doRecover`, plus `audioStarving` threshold in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |
-| A/V drift, audio out of sync | `notifySeekCompletion` and `skipVideoDecodeForAudio` in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |
+| Decoder error / EncodingError loop | [src/decode/VideoDecoder.ts](src/decode/VideoDecoder.ts) `_doRecover`, plus the feed and read decisions (`feedVideo`, `feedAudio`, `needsMorePackets`) in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |
+| A/V drift, audio out of sync | `notifySeekCompletion` and `dropsBeforeAudioStart` in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |
 | Stuttering 4K/8K, frame drops | Renderer queue cap (`baseHwQueue`), `Backpressure during sync` logs |
 | Mobile lag with no decoder errors | Check `ambientmode`, `resume` attributes; bisect against `app/test-native.html` |
 | Seek lands at wrong time on `.ts` | `seekKeyframeOffset` (UI clamp) + `onKeyframeWaitChange` (mid-playback recovery) in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |

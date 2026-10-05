@@ -3982,9 +3982,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const targetTime = this.clock.getTime();
 
       // Flush the decode pipeline before re-seeking the demuxer. The
-      // poster seek's processLoop bursts ~40 packets per rAF, racing the
-      // demuxer cursor ahead of pts=0 while it hunts for the first video
-      // frame. Without a flush + audio reset here, the first audio packet
+      // poster seek's processLoop reads ahead, racing the demuxer cursor
+      // ahead of pts=0 while it hunts for the first video frame. Without a
+      // flush + audio reset here, the first audio packet
       // that surfaces after demuxer.seek(targetTime) can land at a stale
       // interleaved PTS (e.g. 2.6s), anchoring firstBufferMediaTime there
       // and forcing video to skip ahead to catch up — the first-play

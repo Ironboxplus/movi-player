@@ -1462,8 +1462,8 @@ export class MoviVideoDecoder {
    * hardware decoder is re-armed in place (reset + configure, which emits
    * nothing) instead of drained. Draining has to emit every queued frame into
    * a free output surface, and when the renderer is holding them all (its
-   * presentation loop stopped for buffering) that never happens: the audio
-   * track switch's reposition sat on 37 queued chunks for the full timeout.
+   * presentation loop stopped for buffering) that never happens: a flush on
+   * that path sat on 37 queued chunks for the full timeout. Seeks use it.
    */
   async flush(options: { discard?: boolean } = {}): Promise<void> {
     this.openGopErrorCount = 0;
