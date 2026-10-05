@@ -57,6 +57,7 @@ import { HLSPlayerWrapper } from "../render/HLSPlayerWrapper";
 import { DASHPlayerWrapper } from "../render/DASHPlayerWrapper";
 import { ThumbnailRenderer } from "../utils/ThumbnailRenderer";
 import { getDecodeMode, isSoftwareDecodePath } from "./decodeMode";
+import { PacketQueue } from "./PacketQueue";
 import { childAbort } from "../utils/abort";
 
 // Any of the three adaptive-streaming engines (Shaka primary; hls.js / dash.js
@@ -1062,12 +1063,34 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private seekCraSeen: number = 0;
   private static readonly SEEK_IDR_WAIT_MS = 400; // wait this long for an IDR before accepting a CRA
 
-  // Set when an audio-starve video skip drops a non-keyframe, breaking AV1's
-  // reference chain. While true the demux loop keeps dropping deltas until the
-  // next keyframe (even after the starve clears) so no orphaned delta ever
-  // reaches the decoder — that orphan is what throws EncodingError. Cleared on
-  // the next keyframe, which rebuilds the chain. See the demux loop.
-  private videoChainBrokenUntilKeyframe: boolean = false;
+  // Demuxed packets waiting for their decoder, one queue per stream — see
+  // PacketQueue for why the read loop no longer pushes straight into the
+  // decoders. Subtitles are not queued: they are cheap to decode, sparse, and
+  // must never be the reason the demuxer reads ahead.
+  private videoQueue = new PacketQueue();
+  private audioQueue = new PacketQueue();
+  // The split-audio demuxer's own queue, read and fed by pumpSplitAudio.
+  private splitAudioQueue = new PacketQueue();
+  /**
+   * Ceiling on what the two queues may hold together, whatever the readahead
+   * says. Readahead is measured in seconds, and seconds are cheap on a 1080p
+   * AAC file and expensive on 8K AV1; this is what stops a stream that can
+   * never fill its readahead (a decoder that drops everything waiting for a
+   * keyframe, an audio side that is never fed) from reading the rest of the
+   * file into memory. 64MB is a few seconds of the heaviest sources this
+   * player handles and well inside the 100MB default byte cache the source
+   * reads through, so hitting it never evicts what the queues are about to
+   * consume.
+   */
+  private static readonly MAX_QUEUE_BYTES = 64 * 1024 * 1024;
+  /**
+   * How long the read loop may hold the main thread before yielding to it.
+   * Half a 60Hz frame: the presentation loop and the decoders' output
+   * callbacks get every other slice, and the reads still keep pace with a
+   * dense audio codec (TrueHD's ~1200 packets/s) because the loop resumes
+   * as soon as they have run instead of waiting for the next rAF.
+   */
+  private static readonly READ_SLICE_MS = 8;
 
   // Prebuffer targets — accumulate this much before reporting "ready" so
   // play() doesn't immediately stall on short videos where the demux burst
@@ -1075,8 +1098,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private static readonly PREBUFFER_AUDIO_SECONDS = 0.5;
   private static readonly PREBUFFER_VIDEO_FRAMES = 2;
   // How many further packets to read looking for the video frames once audio is
-  // already satisfied. Bounded because the stash is drained before playback
-  // reads anything new — see the note in the prebuffer loop.
+  // already satisfied — see the note in the prebuffer loop.
   private static readonly PREBUFFER_VIDEO_SEARCH_PACKETS = 120;
   private static readonly PREBUFFER_MAX_WALL_MS = 5000;
   private static readonly PREBUFFER_MAX_PACKETS = 400;
@@ -1109,41 +1131,18 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  from a wait worth putting a spinner on. */
   private _videoCatchUpStartedAt = 0;
 
-  // Buffer audio packets while waiting for video to catch up after seek
+  // While a seek waits for its first video frame, audio is not fed: it stays in
+  // audioQueue until notifySeekCompletion has decided where the clock starts.
   private waitingForVideoSync: boolean = false;
-  private static readonly SEEK_AUDIO_HOLD_SECONDS = 4;
-  private static readonly SEEK_AUDIO_HOLD_MAX_PACKETS = 512;
   // Safety bounds for a seek whose first video frame never arrives (decode
-  // stuck, unseekable/indexless stream, WASM decode error, etc). Without them
-  // the process loop keeps reading at full burst while waitingForVideoSync —
-  // backpressure is bypassed there (skipVideoBackpressure on buffering, stashed
-  // audio, pre-target frames dropped all read as "empty") — so the source
-  // sequentially Range-downloads the whole file (maxed bandwidth) and the
-  // demuxer piles packets that never unblock the seek. SEEK_MAX_DEMUX_AHEAD
-  // caps how far past the target we demux before pausing reads (media seconds);
-  // SEEK_SYNC_HARD_TIMEOUT_MS is the terminal backstop that force-completes the
-  // seek so playback can't hang forever. Neither triggers on a healthy seek —
-  // the first frame normally arrives within ~1 GOP.
+  // stuck, unseekable/indexless stream, WASM decode error, etc).
+  // SEEK_MAX_DEMUX_AHEAD caps how far past the target we demux before pausing
+  // reads (media seconds); SEEK_SYNC_HARD_TIMEOUT_MS is the terminal backstop
+  // that force-completes the seek so playback can't hang forever. Neither
+  // triggers on a healthy seek — the first frame normally arrives within ~1
+  // GOP.
   private static readonly SEEK_MAX_DEMUX_AHEAD_SECONDS = 8;
   private static readonly SEEK_SYNC_HARD_TIMEOUT_MS = 12000;
-  private pendingAudioPackets: Array<{
-    data: Uint8Array;
-    timestamp: number;
-    keyframe: boolean;
-  }> = [];
-  // This tick's audio, held back so it can cross into WASM once instead of
-  // once per packet. Only filled while the legacy main-thread software decoder
-  // is active (see AudioDecoder.canBatch): TrueHD/MLP emits a 40-sample access
-  // unit, so feeding ~1200 packets/s one at a time spends more time crossing
-  // into WASM than decoding, leaving the renderer to fill the shortfall with
-  // silence ("Gap filled" underruns). Flushed in processLoop's finally so no
-  // demuxed packet is ever dropped on an early exit.
-  private _audioBatchPending: {
-    data: Uint8Array;
-    timestamp: number;
-    keyframe: boolean;
-  }[] = [];
-  private droppedSeekAudioPackets: number = 0;
   // performance.now() when the current seek armed waitingForVideoSync (0 = not
   // waiting). Drives the hard-timeout watchdog so a frame-starved seek can't
   // hang or download forever.
@@ -1151,13 +1150,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // Newest packet timestamp (media seconds) demuxed since the seek armed; used
   // to cap read-ahead while waiting for the first post-seek video frame.
   private seekDemuxAheadTime: number = -1;
-
-  // Packets read during prebuffer — stashed unmodified so that normal
-  // playback consumes them before resuming demux. We cannot decode during
-  // prebuffer because (a) video frames would be dropped by the "playing"
-  // state gate in setOnFrame and (b) the audio renderer eagerly schedules
-  // buffers on AudioContext which would start audio playback early.
-  private pendingPrebufferPackets: Packet[] = [];
 
   // Post-seek throttling to prevent stuttering on low-end devices
   private justSeeked: boolean = false;
@@ -1177,9 +1169,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // YouTube buffers ~2-5 minutes ahead while paused, then stops.
   private pauseBufferTimerId: number | null = null;
   private static readonly PAUSE_BUFFER_INTERVAL_MS = 100; // Demux every 100ms while paused
-  private static readonly PAUSE_BUFFER_MAX_PACKETS = 3000; // Safety cap on packet count
-  private static readonly PAUSE_BUFFER_AUDIO_SECONDS = 180; // ~3 minutes audio ahead (YouTube-like)
-  private static readonly PAUSE_BUFFER_VIDEO_FRAMES = 5400; // ~3 minutes @ 30fps
+  private static readonly PAUSE_BUFFER_SECONDS = 180; // ~3 minutes ahead (YouTube-like), within MAX_QUEUE_BYTES
 
   constructor(config: PlayerConfig) {
     super();
@@ -2290,6 +2280,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // generation check in processLoop's catch.
     this._demuxerGeneration++;
     this.demuxer = newDemuxer;
+    // Queued packets belong to the outgoing rendition's file.
+    this.clearPacketQueues();
     this.source = newSource;
     // Adopted — the ordinary teardown owns them from here.
     this._pendingSwitchSource = null;
@@ -3775,16 +3767,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
-   * Pre-read a small amount of media before reporting "ready" and stash the
-   * packets for the normal demux loop to consume. On short videos the demux
-   * burst can drain the file faster than the HTTP source delivers bytes,
-   * tripping the stall detector the moment play() starts; reading ahead
-   * gives the source layer more time to buffer bytes.
+   * Pre-read a small amount of media into the packet queues before reporting
+   * "ready". On short videos the demux burst can drain the file faster than
+   * the HTTP source delivers bytes, tripping the stall detector the moment
+   * play() starts; reading ahead gives the source layer more time to buffer
+   * bytes.
    *
    * We deliberately do NOT decode here — the video decoder's onFrame
    * callback drops frames whenever state !== "playing", and the audio
    * renderer starts AudioContext playback the moment samples arrive. Both
-   * break if we decode during prebuffer.
+   * break if we decode during prebuffer. Nothing feeds the decoders until
+   * processLoop runs, so queuing is enough.
    */
   private async prebuffer(): Promise<void> {
     if (!this.demuxer) return;
@@ -3796,6 +3789,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (!hasVideoTrack && !hasInFileAudio) return;
 
     const startWall = performance.now();
+    let packetsRead = 0;
     let videoPacketsStashed = 0;
     let audioDurationStashed = 0;
     let eof = false;
@@ -3810,16 +3804,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Once audio has what it needs, keep looking for the video frames — but not
     // to the end of the packet budget. A file can interleave so much audio at
     // the head (two TrueHD tracks and PGS subtitles, in the case this was found
-    // on) that chasing a second video frame stashes hundreds of audio packets,
-    // and every one of them has to be chewed through before playback reads
-    // anything new. Past this point the pipeline is better off starting and
-    // letting the normal read loop find the rest.
-    // Stash size at the moment audio was satisfied; the video search gets a
+    // on) that chasing a second video frame reads hundreds of audio packets
+    // before the player has even been asked to play. Past this point the
+    // pipeline is better off starting and letting the normal read loop find
+    // the rest.
+    // Packets read at the moment audio was satisfied; the video search gets a
     // bounded number of packets beyond it.
     let audioMetAt = -1;
     const packetBudget = () => {
       if (audioMetAt < 0 && audioTargetMet()) {
-        audioMetAt = this.pendingPrebufferPackets.length;
+        audioMetAt = packetsRead;
       }
       return audioMetAt < 0
         ? MoviPlayer.PREBUFFER_MAX_PACKETS
@@ -3831,7 +3825,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     while (
       (!videoTargetMet() || !audioTargetMet()) &&
       !eof &&
-      this.pendingPrebufferPackets.length < packetBudget()
+      packetsRead < packetBudget()
     ) {
       if (performance.now() - startWall > MoviPlayer.PREBUFFER_MAX_WALL_MS) {
         Logger.warn(
@@ -3853,9 +3847,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         eof = true;
         break;
       }
-      this.trackDemuxedPacketForB1bDiagnostic(packet);
-
-      this.pendingPrebufferPackets.push(packet);
+      packetsRead++;
+      this.enqueuePacket(packet);
 
       if (!this.trackManager.isActiveStream(packet.streamIndex)) continue;
 
@@ -3879,7 +3872,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     Logger.info(
       TAG,
-      `Prebuffer complete: stashed=${this.pendingPrebufferPackets.length}, video=${videoPacketsStashed}, audio=${audioDurationStashed.toFixed(2)}s, eof=${eof}`,
+      `Prebuffer complete: read=${packetsRead}, video=${videoPacketsStashed}, audio=${audioDurationStashed.toFixed(2)}s, eof=${eof}`,
     );
   }
 
@@ -4072,12 +4065,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         await this.audioRenderer.play();
       }
       this.clock.seek(targetTime);
-      this.pendingAudioPackets = [];
-      this.droppedSeekAudioPackets = 0;
       // Discard pause-time buffered packets — demuxer was just re-seeked,
-      // so stashed packets are stale (would feed later timestamps into the
+      // so queued packets are stale (would feed later timestamps into the
       // decoder, making first frame jump ahead instead of starting at targetTime).
-      this.pendingPrebufferPackets = [];
+      this.clearPacketQueues();
       this.eofReached = false;
       this.eofSince = 0;
     } else {
@@ -4696,10 +4687,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       let syncTime = time;
       let syncedToAudio = false;
 
-      if (this.pendingAudioPackets.length > 0) {
-        const earliestAudioTime = Math.min(
-          ...this.pendingAudioPackets.map((p) => p.timestamp)
-        );
+      if (this.audioQueue.length > 0) {
+        const earliestAudioTime = this.audioQueue.firstTimestamp;
 
         if (earliestAudioTime < time) {
           const gap = time - earliestAudioTime;
@@ -4736,10 +4725,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       //  - synced to video: drop audio before the video frame so AV stays
       //    aligned after the seek
       const cutoff = syncedToAudio ? seekTarget - 0.01 : syncTime - 0.01;
-      this.pendingAudioPackets = this.pendingAudioPackets.filter(
-        (p) => p.timestamp >= cutoff,
-      );
-      // Split (separate-URL) audio never passes through pendingAudioPackets —
+      while (
+        this.audioQueue.length > 0 &&
+        this.audioQueue.firstTimestamp < cutoff
+      ) {
+        this.audioQueue.shift();
+      }
+      // Split (separate-URL) audio never passes through audioQueue —
       // its own loop decodes straight from the audio demuxer — so that filter
       // left it untouched and the two paths disagreed about where playback
       // resumes. The audio demuxer's seek lands on ITS container boundary,
@@ -4829,34 +4821,21 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this._playStartTime = performance.now();
       }
       this.clock.start();
+      // The audio held in audioQueue during the wait is fed by the read loop's
+      // next pass, AFTER this play() — AudioRenderer.isPlaying is true by then,
+      // so render() accepts the decoded AudioData instead of dropping it.
       if (!this.disableAudio && !this.audioRenderer.isAudioPlaying()) {
         this.audioRenderer.play();
-      }
-
-      // Flush buffered audio packets AFTER play() so AudioRenderer.isPlaying=true
-      // and render() accepts the decoded AudioData instead of dropping it.
-      if (this.pendingAudioPackets.length > 0) {
-        Logger.debug(
-          TAG,
-          `Flushing ${this.pendingAudioPackets.length} buffered audio packets after seek sync`,
-        );
-        this.submitAudioPackets(this.pendingAudioPackets, "notifySeekCompletion-pendingAudioPackets-flush");
-        this.pendingAudioPackets = [];
-        this.droppedSeekAudioPackets = 0;
       }
     } else {
       Logger.info(TAG, "Seek completed in paused state");
       this.wasPlayingBeforeSeek = false;
       this.stateManager.setState("paused");
 
-      // Don't decode audio now (AudioRenderer not playing — would drop all data).
-      // Discard stashed audio and prebuffer packets — play() will re-seek the
-      // demuxer to startTime so all packets will be re-read fresh from 0.
-      // Keeping stale packets causes A/V desync (prebuffer audio at 0.4s+
-      // would be processed before fresh audio at 0s).
-      this.pendingAudioPackets = [];
-      this.droppedSeekAudioPackets = 0;
-      this.pendingPrebufferPackets = [];
+      // Don't decode audio now (AudioRenderer not playing — would drop all
+      // data). The held audio stays queued from the target onward, which is
+      // exactly where play() resumes; a first play re-seeks to 0 and clears
+      // the queues itself.
 
       // Don't start clock or audio — but continue buffering ahead
       this.startPauseBuffering();
@@ -4922,31 +4901,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.seekDemuxAheadTime - this.seekTargetTime >
         MoviPlayer.SEEK_MAX_DEMUX_AHEAD_SECONDS
     );
-  }
-
-  private stashSeekAudioPacket(packet: Packet): void {
-    if (this.seekTargetTime !== -1) {
-      const maxHeldTime =
-        this.seekTargetTime + MoviPlayer.SEEK_AUDIO_HOLD_SECONDS;
-      if (packet.timestamp > maxHeldTime) {
-        this.droppedSeekAudioPackets++;
-        return;
-      }
-    }
-
-    if (
-      this.pendingAudioPackets.length >=
-      MoviPlayer.SEEK_AUDIO_HOLD_MAX_PACKETS
-    ) {
-      this.droppedSeekAudioPackets++;
-      return;
-    }
-
-    this.pendingAudioPackets.push({
-      data: packet.data,
-      timestamp: packet.timestamp,
-      keyframe: packet.keyframe,
-    });
   }
 
   /**
@@ -5122,6 +5076,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         TAG,
         `[B1b instrumentation] demuxer repositioned to ${resumeAt.toFixed(3)}s so the re-enabled track yields packets here`,
       );
+      // Everything queued so far was read from the position being abandoned.
+      this.clearPacketQueues();
       // The forward scan being undone can reach the end of the file before
       // this runs (the new decoder's configure is awaited first — 4.5s for a
       // worker AAC decoder on loopback, while the scan hit EOF in 70ms), and
@@ -5170,22 +5126,18 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.seekingToKeyframeStartTime = performance.now();
     this.seekKeyframeScanned = 0;
     this.seekCraSeen = 0;
-    this.videoChainBrokenUntilKeyframe = false;
-    // Stashed prebuffer packets are pre-reposition and now stale.
-    this.pendingPrebufferPackets = [];
   }
 
   /**
    * Begin an audio prime: hold the AudioContext suspended (primeForBuffering,
-   * which never issues a resume() so it can't drain/race), flush any pending
-   * post-seek audio packets into the decoder so the cushion starts filling, and
-   * flag _primingAudio so the buffering→resume gate waits for a real cushion
-   * (2s) rather than the thin 0.1s default before resuming.
+   * which never issues a resume() so it can't drain/race) while the read loop
+   * keeps feeding queued audio into the decoder, and flag _primingAudio so the
+   * buffering→resume gate waits for a real cushion (2s) rather than the thin
+   * 0.1s default before resuming.
    */
   /**
    * How much audio a rebuffer waits for before it resumes. Read by the resume
-   * gate, and by the read loop so that it keeps reading until there is that
-   * much (see needsRebufferAudioCushion).
+   * gate.
    */
   private rebufferAudioTargetS(): number {
     const softwareAudioStall =
@@ -5206,10 +5158,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   private beginAudioPrime(): void {
     this.audioRenderer.primeForBuffering();
-    if (this.pendingAudioPackets.length > 0) {
-      this.submitAudioPackets(this.pendingAudioPackets, "beginAudioPrime-pendingAudioPackets-flush");
-      this.pendingAudioPackets = [];
-    }
     this._primingAudio = true;
   }
 
@@ -5775,6 +5723,29 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
     }
 
+    const limits = this.pipelineLimits();
+
+    const videoBuffered = this.videoRenderer?.getQueueSize() ?? 0;
+    // Stuck decoder detection: if video decoder queue is full but renderer queue
+    // stays empty for too long, the decoder is hung (e.g. 8K content too heavy).
+    // Flush it to unstick — some frames may be lost but playback continues.
+    if (this.videoDecoder.queueSize > limits.maxVideoQueue && videoBuffered === 0) {
+      if (!this._decoderStuckSince) {
+        this._decoderStuckSince = performance.now();
+      } else if (performance.now() - this._decoderStuckSince > 5000) {
+        Logger.warn(TAG, `Video decoder stuck for 5s (queue=${this.videoDecoder.queueSize}, output=0), flushing`);
+        this.videoDecoder.flush().catch(() => {});
+        this._decoderStuckSince = 0;
+      }
+    } else {
+      this._decoderStuckSince = 0;
+    }
+
+    // Feed before anything that can return early. A read can sit in flight for
+    // a long time on a slow link (the check below returns while it does), and
+    // the decoders must not wait on it when their packets are already queued.
+    this.feedDecoders(limits);
+
     // Prevent concurrent async WASM operations (Asyncify limitation)
     // Add timeout safeguard - if demux has been in flight too long, reset it
     if (this.demuxInFlight) {
@@ -5802,7 +5773,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
       if (hasAudioTrack) {
         const decodersDone =
-          this.videoDecoder.queueSize === 0 && this.audioDecoder.queueSize === 0;
+          this.videoQueue.length === 0 &&
+          this.audioQueue.length === 0 &&
+          this.videoDecoder.queueSize === 0 &&
+          this.audioDecoder.queueSize === 0;
         // The audio renderer keeps playing buffers it already scheduled for
         // seconds after the decoder queue drains. The clock is synced to that
         // playout head, so it only reaches maxScheduledMediaTime once the final
@@ -5879,29 +5853,238 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return; // Don't demux more, just wait for playback to finish
     }
 
-    // Check backpressure - relax limits for better throughput
-    // After seek, use stricter limits to prevent overwhelming low-end devices
+    // Read-ahead cap: while a seek's first frame hasn't arrived, stop reading
+    // once we've demuxed SEEK_MAX_DEMUX_AHEAD_SECONDS past the target. Every
+    // packet the first frame needs (keyframe <= target through target) is
+    // already read well before this, so this only halts a runaway; the hard
+    // watchdog above terminates the seek if the frame never comes.
+    if (this.seekReadAheadExceeded()) {
+      return;
+    }
+
+    // Read until every consumed stream has its readahead queued (see
+    // needsMorePackets), feeding the decoders after each packet, and give the
+    // main thread back every READ_SLICE_MS. This replaced a per-tick burst
+    // size tuned by fps, post-seek state, keyframe waits and whether the file
+    // had audio — all of them guesses at how many packets would keep the
+    // decoders fed without starving anything, which the queues now answer
+    // directly.
+    try {
+      // Final check before starting async operation - ensure no new seek started
+      if (this.seekSessionId !== currentSessionId) {
+        Logger.debug(TAG, "ProcessLoop aborted before demux: new seek started");
+        return;
+      }
+
+      this.demuxInFlight = true;
+      this.demuxInFlightStartTime = performance.now();
+      let sliceStart = performance.now();
+
+      for (;;) {
+        const sliceLimits = this.pipelineLimits();
+        this.feedDecoders(sliceLimits);
+        if (!this.needsMorePackets(sliceLimits.readaheadSecs)) break;
+        if (this.seekReadAheadExceeded()) break;
+
+        if (performance.now() - sliceStart >= MoviPlayer.READ_SLICE_MS) {
+          // MessageChannel rather than setTimeout: it runs as soon as the
+          // tasks queued behind us have, without the timer clamp.
+          const channel = new MessageChannel();
+          await new Promise((resolve) => {
+            channel.port1.onmessage = resolve;
+            channel.port2.postMessage(null);
+          });
+          if (this.seekSessionId !== currentSessionId) {
+            Logger.debug(
+              TAG,
+              "ProcessLoop aborted during packet read: new seek started",
+            );
+            return;
+          }
+          // Paused (or torn down) while we yielded: stop reading for a
+          // pipeline nothing is consuming.
+          if (!this.pipelineRunning()) break;
+          sliceStart = performance.now();
+        }
+
+        const demuxer = this.demuxer;
+        if (!demuxer) break;
+        // Per read, not per loop: the in-flight timeout above is about one
+        // read that never returns, and a loop that keeps reading for longer
+        // than that on a slow link is healthy.
+        this.demuxInFlightStartTime = performance.now();
+        const packet = await demuxer.readPacket();
+
+        // Check again after async readPacket - seek may have started during read
+        if (this.seekSessionId !== currentSessionId) {
+          Logger.debug(
+            TAG,
+            "ProcessLoop aborted after readPacket: new seek started",
+          );
+          return;
+        }
+
+        if (!packet) {
+          // No bytes can mean two very different things, and they arrive
+          // identically. The demuxer reads through a C callback that answers
+          // with a byte count, so a read that FAILED looks exactly like the end
+          // of the file: FFmpeg reports EOF either way. A source that had been
+          // refused mid-file therefore ended the video — the picture stopped,
+          // the clock jumped to the duration, and anything watching for "ended"
+          // (an autoplay-next, a playlist) moved on as though the video had
+          // simply finished. Ask the source which of the two this was.
+          const sourceFailure = (
+            this.source as { getFatalError?: () => Error | null } | null
+          )?.getFatalError?.();
+          if (sourceFailure) {
+            Logger.error(
+              TAG,
+              `Read returned nothing because the source failed, not because the file ended: ${sourceFailure.message}`,
+            );
+            throw sourceFailure;
+          }
+          // EOF reached - mark it but don't stop immediately
+          // Let the decoders finish processing
+          if (!this.eofReached) this.eofSince = performance.now();
+          this.eofReached = true;
+
+          // Clear seeking flag if we hit EOF before finding keyframe
+          if (this.seekingToKeyframe) {
+            this.seekingToKeyframe = false;
+            Logger.warn(TAG, "EOF reached before finding keyframe after seek");
+          }
+
+          // If we were waiting for sync, trigger it now so player doesn't hang in loading state
+          if (this.waitingForVideoSync) {
+            Logger.warn(
+              TAG,
+              "EOF reached while waiting for seek sync, forcing completion",
+            );
+            // forced=true: this is a no-frame forced completion (the decoder
+            // exhausted the stream without a decodable frame — e.g. an open-GOP
+            // 4K AV1 whose keyframes the HW decoder keeps rejecting). Without the
+            // flag, notifySeekCompletion advances the clock straight into
+            // "playing" over a BLACK screen (framesPresented=0) that only a
+            // manual seek recovers. With it, the forcedWithoutFrame path resumes
+            // into "buffering" with play intent latched, so the first frame that
+            // actually decodes — e.g. after the ABR downshifts to a rendition the
+            // decoder CAN handle — auto-flips to "playing". Matches the seek-
+            // timeout path, which already passes forced=true.
+            this.notifySeekCompletion(this.seekTargetTime, true);
+          }
+
+          Logger.debug(TAG, "EOF reached");
+          break;
+        }
+
+        this.enqueuePacket(packet);
+      }
+    } catch (e) {
+      // Belongs to a pipeline that has since been swapped out — its source was
+      // closed under it on purpose. Nothing to report and nothing to recover.
+      if (pipelineGeneration !== this._demuxerGeneration) {
+        Logger.debug(TAG, "Demux error from a retired pipeline — ignoring", e);
+        this.demuxInFlight = false;
+        return;
+      }
+      Logger.error(TAG, "Demux error", e);
+
+      // Check for fatal errors that indicate corrupted state
+      const errorMessage = (e as any).message || "";
+      // WASM-level traps. Once av_read_frame or any other FFmpeg entry
+      // point dereferences past the heap, the entire WASM module is
+      // unrecoverable — every subsequent ccall hits the same OOB. Without
+      // this branch, processLoop classifies it as transient and retries
+      // every ~17ms, flooding the console and pinning the CPU until the
+      // user closes the tab.
+      const isWasmFatal =
+        /out of bounds memory access|memory access out of bounds|RuntimeError|Aborted\(\)/i.test(
+          errorMessage,
+        );
+      const isCorruptError =
+        isWasmFatal ||
+        errorMessage.includes("Invalid packet size") ||
+        errorMessage.includes("Invalid typed array length") ||
+        errorMessage.includes("State may be corrupted");
+
+      // Source-level failures (HTTP 4xx/5xx, exhausted retries, CORS, etc.)
+      // surface through here as the demuxer reads its bytes from the source.
+      // Without classifying these as fatal, processLoop just keeps retrying
+      // the demux and the buffering spinner spins indefinitely with no
+      // user-visible reason. The actual messages come from HttpSource —
+      // see the strings it throws in startStream/buildHeaders.
+      const isSourceError =
+        // Unanchored — the demuxer wraps it ("Failed to open media: HTTP 403"),
+        // and a wrapped 4xx is every bit as fatal as a bare one.
+        /\bHTTP \d{3}\b/.test(errorMessage) ||
+        errorMessage.includes("Access denied") ||
+        errorMessage.includes("Authentication required") ||
+        errorMessage.includes("Video not found") ||
+        errorMessage.includes("Failed to fetch video resource") ||
+        errorMessage.includes("Stream failed after") ||
+        errorMessage.includes("Server does not support range requests");
+
+      if (isWasmFatal) {
+        // The abort left the SHARED cached WASM module permanently dead — the
+        // main demuxer reuses that singleton, so without this every later open
+        // (a new video, a quality switch) fails "File is corrupted" until a page
+        // reload. Drop the cached module so the recovery reload — and the next
+        // source — instantiates a fresh one instead of reusing the corpse.
+        resetWasmModule();
+      }
+
+      if (isCorruptError || isSourceError) {
+        Logger.error(
+          TAG,
+          isSourceError
+            ? `Fatal source error, pausing playback: ${errorMessage}`
+            : "Fatal demux error detected, pausing playback",
+        );
+        this.pause();
+        this.stateManager.setState("error");
+        this.emit(
+          "error",
+          isSourceError
+            ? (e instanceof Error ? e : new Error(errorMessage))
+            : new Error("Playback error: corrupt data stream"),
+        );
+        return; // Exit process loop
+      }
+
+      // For non-fatal errors, continue (transient network glitches, etc.)
+    } finally {
+      this.demuxInFlight = false;
+    }
+  };
+
+  /** True while something is consuming what the read loop produces. */
+  private pipelineRunning(): boolean {
+    const state = this.stateManager.getState();
+    return (
+      state === "playing" || state === "buffering" || this.waitingForVideoSync
+    );
+  }
+
+  /**
+   * The ceilings the feed step works to, and the readahead the read loop
+   * reads to. Recomputed per use because every input (rate, decoder path,
+   * seek state, backgrounding) can change between two packets.
+   */
+  private pipelineLimits(): {
+    maxVideoQueue: number;
+    maxAudioQueue: number;
+    maxVideoBuffered: number;
+    maxAudioBuffered: number;
+    readaheadSecs: number;
+  } {
     const decodeMode = getDecodeMode(this.videoDecoder, this.audioDecoder);
-    const isSoftware = decodeMode.softwareHeavy;
     const isVideoSoftware = decodeMode.videoSoftware;
     const isAudioSoftware = decodeMode.audioSoftware;
-    const videoPolicyStats = this.videoDecoder.getStats?.();
-    const audioPolicyStats = this.audioDecoder.getStats();
-    const isVideoWorkerSoftware = Boolean(videoPolicyStats?.worker);
-    const isAudioWorkerSoftware = Boolean(audioPolicyStats.worker);
-    const isMainThreadSoftwareDecode =
-      (isVideoSoftware && !isVideoWorkerSoftware) ||
-      (isAudioSoftware && !isAudioWorkerSoftware);
-    const timeSinceSeek = performance.now() - this.seekTime;
+    const isVideoWorkerSoftware = Boolean(this.videoDecoder.getStats?.()?.worker);
+    const isAudioWorkerSoftware = Boolean(this.audioDecoder.getStats().worker);
     const isPostSeek =
-      this.justSeeked && timeSinceSeek < MoviPlayer.POST_SEEK_THROTTLE_MS;
-
-    const audioBuffered = this.disableAudio
-      ? 0
-      : this.audioRenderer.getBufferedDuration();
-
-    // Canvas/WebCodecs path
-    const videoBuffered = this.videoRenderer?.getQueueSize() ?? 0;
+      this.justSeeked &&
+      performance.now() - this.seekTime < MoviPlayer.POST_SEEK_THROTTLE_MS;
 
     // Adaptive limits for software/hardware modes
     // During post-seek or while waiting for initial sync, we are more permissive with decoder queues
@@ -6013,852 +6196,381 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
     const maxVideoBuffered = Math.round((isVideoSoftware ? 60 : baseHwQueue) * rateScale);
 
-    // Skip video backpressure only where video genuinely isn't being consumed:
-    // backgrounded (not PiP), where decode is skipped outright.
-    //
-    // Buffering used to be exempt too, on the reasoning that the presentation
-    // loop is stopped so the queue can't drain and the cap would block the loop
-    // forever. That reasoning described a queue that never filled — frames
-    // decoded while buffering were being dropped before they reached it — so
-    // the exemption was a no-op on the video side and a licence to read without
-    // any ceiling at all. Measured during one stall: 14MB pulled in a single
-    // uninterrupted burst, the demuxer racing off through the file while the
-    // renderer stayed empty. Now that the frames are kept, the cap means
-    // something and is the brake. Nothing deadlocks behind it: split audio runs
-    // its own loop, and muxed audio starving with the video queue full is
-    // exactly what the delta-skip below is for.
-    const skipVideoBackpressure = this.isBackgrounded && !this.isPiPActive;
+    // How much each consumed stream's queue should hold beyond what its
+    // decoder has taken before the read loop rests — mpv's demuxer readahead.
+    // The same seconds the decoded-audio target already uses (5s for software
+    // audio, which since A5 is every track; 2s otherwise), so the packets
+    // waiting behind a full decoder cover about as much as the decoder itself
+    // was allowed to get ahead.
+    const readaheadSecs = (isAudioSoftware ? 5.0 : 2.0) * rateScale;
 
-    // Stuck decoder detection: if video decoder queue is full but renderer queue
-    // stays empty for too long, the decoder is hung (e.g. 8K content too heavy).
-    // Flush it to unstick — some frames may be lost but playback continues.
-    if (this.videoDecoder.queueSize > maxVideoQueue && videoBuffered === 0) {
-      if (!this._decoderStuckSince) {
-        this._decoderStuckSince = performance.now();
-      } else if (performance.now() - this._decoderStuckSince > 5000) {
-        Logger.warn(TAG, `Video decoder stuck for 5s (queue=${this.videoDecoder.queueSize}, output=0), flushing`);
-        this.videoDecoder.flush().catch(() => {});
-        this._decoderStuckSince = 0;
-      }
-    } else {
-      this._decoderStuckSince = 0;
-    }
+    return {
+      maxVideoQueue,
+      maxAudioQueue,
+      maxVideoBuffered,
+      maxAudioBuffered,
+      readaheadSecs,
+    };
+  }
 
-    // When the video buffer/decoder queue is full but audio is STARVING, don't
-    // block demuxing — set a flag so the demux loop skips video DELTA decode
-    // while keeping audio flowing. Critical for content the decoder can't
-    // sustain in real time: 120fps, and (the case this was missing) a heavy 8K
-    // AV1 MUXED file at 1x, where the decoder falls behind, the backpressure
-    // gate stops the whole demux loop, and the muxed audio then underruns and
-    // rebuffers every few seconds even though the network is fast.
-    //
-    // Once gated to non-1x only, on two now-obsolete worries:
-    //   - "1x skipping causes early EOF" — the EOF check is near-end-gated
-    //     (currentTime >= duration - 0.5), so a mid-file skip can't trip it.
-    //   - "skipping AV1 deltas corrupts the reference chain" — the skip below
-    //     drops ONLY deltas, keeps every keyframe, and latches
-    //     videoChainBrokenUntilKeyframe, so nothing the decoder gets is orphaned
-    //     (no EncodingError). Video updates ~1 frame/GOP until audio recovers.
-    // So the rate gate is gone. The tight trigger — audio within 100ms of
-    // underrun AND the video decoder/buffer genuinely full — means it only ever
-    // engages when the pipeline truly can't keep up, never on healthy playback.
-    //
-    // The 100ms threshold matches latencyHint="interactive"'s ~50-150ms
-    // steady-state scheduled buffer; below it audio is genuinely about to
-    // underrun and warrants the packet-drop tradeoff.
-    // Split (separate-URL) audio is decoded by its OWN loop (audioProcessLoop),
-    // not this one. Its buffer intentionally runs a several-second lead, which is
-    // far above maxAudioBuffered — so gating THIS (video) loop on the audio
-    // buffer/queue would wrongly stop video decode the moment split audio is
-    // full, draining the video renderer and freezing the picture (audio keeps
-    // playing). Exclude the audio conditions when split audio owns the audio.
-    const gateOnAudio = !this.disableAudio && !this.audioDemuxer;
-    // The delta-drop below needs that same exclusion, and didn't have it. With
-    // split audio this loop's view of the audio buffer reads ~0 no matter how
-    // far ahead the audio loop actually is, so audioStarving was permanently
-    // true — and every time the video queue filled (which is the normal state
-    // on a healthy 4K source) deltas were dropped until the next keyframe.
-    // Measured on movi-tube, whose YouTube-style sources are always split:
-    // videoChainBrokenUntilKeyframe latched on 9 of 10 seeks with the audio
-    // buffer reading 0.000, punching GOP-sized holes in the decoded video. The
-    // symptom is the picture freezing for ~0.5-1s a second or two after a seek
-    // while the queue sits full and the clock keeps running.
-    // A source with no audio at all reads 0 here for the same reason and just
-    // as permanently — a video-only file (movi-tube serves exactly these,
-    // paired with a separate audio URL) was dropping deltas throughout.
-    const hasAudioToStarve = this.trackManager.getActiveAudioTrack() !== null;
-    // Nor while the audio is already on its way. An empty buffer only means
-    // starving when nothing is left to decode — the case this exists for, where
-    // backpressure has stopped the loop and the audio decoder has run dry.
-    // Right after a seek it reads 0 twice over without being that: while the
-    // seek waits for its first frame the packets are stashed in
-    // pendingAudioPackets (held by construction), and once notifySeekCompletion
-    // submits them they sit in the audio decoder for a few hundred ms before
-    // any output. Both moments coincide with the burst after the target
-    // keyframe filling the video decoder, so each latched the broken chain and
-    // dropped every delta up to the NEXT keyframe — on a 10s-GOP x264 remux the
-    // picture froze for seconds of running clock, then jumped (local loopback
-    // repro of the 萤火虫之墓 shape, 2026-10-05: latched at 201ms with the
-    // packets stashed, and again at 526ms with 29 of them in the decoder).
-    // Reading more packets would not have helped either moment: the audio was
-    // already read.
-    //
-    // An audio track switch empties the audio side on purpose, from the switch
-    // (old decoder closed, renderer reset, no decoder fed until the reposition
-    // lands) until the first audio at the playhead (the walk up to it decodes
-    // audio that is then dropped, so the buffer stays at 0 while the decoder
-    // queue touches 0 between batches). Same loopback file: latched at the
-    // switch and again during the walk, which dropped every delta to the next
-    // keyframe; the picture came back 2s ahead of the sound and the desync
-    // detector fired a full seek.
-    const rebuildingAudioForSwitch =
-      this._pendingTrackSwitchRepositionTarget !== null ||
-      this._trackSwitchRepositioning ||
-      this._trackSwitchDropAudioBefore !== -1;
-    const audioInFlight =
-      this.waitingForVideoSync ||
-      this.audioDecoder.queueSize > 0 ||
-      rebuildingAudioForSwitch;
-    const audioStarving =
-      gateOnAudio && hasAudioToStarve && !audioInFlight && audioBuffered < 0.1;
-    const videoDecoderFull = this.videoDecoder.queueSize > maxVideoQueue;
-    const videoBufferFull = !skipVideoBackpressure && videoBuffered > maxVideoBuffered;
-    // Muted is not the same as audio-less. The clock is mastered by audio in
-    // every state, so an empty audio buffer stalls playback whether or not
-    // anyone can hear it — and gating this protection on `muted` is why a
-    // software-decoded file played fine with sound and stuttered with the
-    // spinner flashing while it was still on muted autoplay: unmuted, video
-    // decode yields to keep audio alive; muted, it didn't, and the buffers ran
-    // dry every couple of seconds. The one state where audio really is out of
-    // the pipeline is muted-and-suspended (autoplay blocked, pre-gesture),
-    // where frames are dropped rather than scheduled.
-    const audioInPipeline = !this.audioRenderer.isDroppingAudio();
-    const skipVideoDecodeForAudio =
-      audioInPipeline && (videoBufferFull || videoDecoderFull) && audioStarving;
-
-    // Audio's cushion must not hold the loop shut while the PICTURE has
-    // nothing at all. Coming back from a backgrounded tab the two are at
-    // opposite extremes by construction: the background timer kept decoding
-    // audio, so its buffer is seconds over target, while video was skipped
-    // entirely and its queues are empty. The single "audio is full → read
-    // nothing" gate then stopped every read — audio AND video — until the
-    // cushion drained back under target in real time. Measured: a 12-second
-    // background stint returned with ~3.8s of audio buffered and the first
-    // packet was not read for 1.5s, the whole of it with an empty video queue.
-    // That was the frozen picture.
-    //
-    // Narrow on purpose: only while a video-only catch-up is in flight (see
-    // _videoResumeTarget), which ends as soon as the first frame lands. The
-    // audio DECODER's own queue gate above still applies, so this cannot flood
-    // it; all it allows is reading ahead by the few hundred ms the catch-up
-    // takes.
-    // Audio's cushion must not hold the loop shut while the PICTURE has none
-    // AND the player is rebuffering with intent to resume: the rebuffer only
-    // ends when a frame arrives, and the frame only arrives if we read. Same
-    // shape as catchingUpVideo below, different trigger (that one is the
-    // background-return catch-up; this one is a stalled rebuffer).
-    //
-    // Deliberately NOT conditioned on how far ahead audio got. A rebuffer is
-    // precisely when the cushion cannot drain — the renderer is suspended and
-    // the clock is paused — so whatever `audioBuffered` read at the stall is
-    // what it reads forever. An overshoot allowance (this used to permit 1s
-    // past the target) therefore does not bound anything; it just decides,
-    // once, whether the player deadlocks: no reads, so no frame; no frame, so
-    // no resume; no resume, so no drain. Measured on a real HEVC Main10 + FLAC
-    // source over OpenList: 8.6s buffered against the 5.0s software-audio
-    // target, stuck in "buffering" with an empty video queue for the rest of
-    // the run (`media clock rate 0.340`).
-    //
-    // The read-ahead this opens is bounded by the VIDEO decoder's own queue
-    // ceiling in the first branch below — the right bound, since the only
-    // reason to be reading here is to get a frame out of that decoder — and it
-    // closes the instant one lands, because videoBuffered/queueSize stop being
-    // zero.
-    const needsRebufferVideoFrame =
-      currentState === "buffering" &&
-      this.wasPlayingBeforeRebuffer &&
-      !!activeVideo &&
-      videoBuffered === 0 &&
-      this.videoDecoder.queueSize === 0;
-
-    // The mirror image: a rebuffer waiting for its AUDIO cushion, held shut by
-    // the VIDEO decoder's queue. A hardware decoder only emits into free output
-    // surfaces, and with the presentation loop stopped the renderer frees none,
-    // so once the renderer holds its handful of frames the decoder sits at its
-    // cap and stops every read — and the cushion the resume gate is waiting for
-    // can never grow. Loopback 1080p x264 + software AAC: stuck at 1.837s
-    // against the 2.0s target, decoder queue 31 over a cap of 30, renderer
-    // holding 8 frames at the playhead, until the element's stuck-watchdog
-    // fired a full seek. Only once there IS a picture waiting (the video side
-    // of the resume is satisfied or close); the extra video packets read on
-    // the way are what the decoder will need anyway, and it closes the moment
-    // the cushion is reached.
-    //
-    // Reading only helps if it brings audio. Between an audio track switch
-    // and its reposition the new track is still discarded in the demuxer, so
-    // it cannot: there this poured the rest of the file into the video decoder
-    // (1953 queued chunks on the same run — the B1b forward scan to EOF, 9-21
-    // MB over a real link). And never unbounded: the extra reads are the video
-    // packets interleaved with the missing audio, so the ceiling is that much
-    // video with room to spare.
-    const audioCannotArriveYet =
-      this._pendingTrackSwitchRepositionTarget !== null || this._trackSwitchRepositioning;
-    const rebufferAudioTargetS = this.rebufferAudioTargetS();
-    const needsRebufferAudioCushion =
-      currentState === "buffering" &&
-      this.wasPlayingBeforeRebuffer &&
-      gateOnAudio &&
-      hasAudioToStarve &&
-      !audioCannotArriveYet &&
-      videoBuffered > 0 &&
-      audioBuffered <= rebufferAudioTargetS &&
-      this.videoDecoder.queueSize <=
-        maxVideoQueue + Math.ceil(fps * rebufferAudioTargetS * 1.5);
-
-    const catchingUpVideo = this._videoResumeTarget !== -1;
+  /**
+   * mpv's read decision (demux/demux.c): read while any stream the player is
+   * consuming has nothing queued, or less than the readahead, and only while
+   * the queues together are under their byte ceiling. A full video decoder no
+   * longer stops anything but the video feed — the audio queue running dry is
+   * reason enough to read, and the video packets read on the way wait in
+   * their own queue instead of being dropped to make room.
+   */
+  private needsMorePackets(readaheadSecs: number): boolean {
     if (
-      (!skipVideoBackpressure &&
-        !skipVideoDecodeForAudio &&
-        !needsRebufferAudioCushion &&
-        this.videoDecoder.queueSize > maxVideoQueue) ||
-      (gateOnAudio && this.audioDecoder.queueSize > maxAudioQueue) ||
-      (gateOnAudio &&
-        !catchingUpVideo &&
-        !needsRebufferVideoFrame &&
-        audioBuffered > maxAudioBuffered) ||
-      (!skipVideoBackpressure && !skipVideoDecodeForAudio && videoBuffered > maxVideoBuffered)
+      this.videoQueue.bytes + this.audioQueue.bytes >=
+      MoviPlayer.MAX_QUEUE_BYTES
     ) {
+      return false;
+    }
+    const consumed: PacketQueue[] = [];
+    if (this.videoIsConsumed()) consumed.push(this.videoQueue);
+    if (this.audioIsConsumed()) consumed.push(this.audioQueue);
+    return consumed.some(
+      (q) => q.length === 0 || q.forwardSeconds() < readaheadSecs,
+    );
+  }
+
+  /**
+   * Video whose packets are thrown away at the feed — audio-only mode, a
+   * hidden tab outside PiP — gets no say in the read decision: its queue is
+   * empty by construction and would keep the loop reading to the end of the
+   * file.
+   */
+  private videoIsConsumed(): boolean {
+    return (
+      !!this.trackManager.getActiveVideoTrack() &&
+      !this._audioOnly &&
+      !(this.isBackgrounded && !this.isPiPActive)
+    );
+  }
+
+  private audioIsConsumed(): boolean {
+    return (
+      !!this.trackManager.getActiveAudioTrack() &&
+      !this.disableAudio &&
+      // Between an audio track switch and its reposition the new track is
+      // still discarded inside the demuxer, so no read can bring it. Counting
+      // its empty queue then read on to the end of the file — the B1b forward
+      // scan, 9-21 MB over a real link.
+      this._pendingTrackSwitchRepositionTarget === null &&
+      !this._trackSwitchRepositioning
+    );
+  }
+
+  private clearPacketQueues(): void {
+    this.videoQueue.clear();
+    this.audioQueue.clear();
+  }
+
+  /**
+   * Route a packet the demuxer returned: audio and video into their queues,
+   * subtitles straight to their decoder, anything inactive nowhere. The read
+   * loop, the load-time prebuffer and pause-time buffering all go through
+   * here, which is what lets the first two stop keeping stashes of their own.
+   */
+  private enqueuePacket(packet: Packet): void {
+    this.trackDemuxedPacketForB1bDiagnostic(packet);
+
+    // Track how far past the seek target we've demuxed so the read-ahead
+    // cap can halt a frame-starved seek before it downloads forever.
+    if (
+      this.waitingForVideoSync &&
+      Number.isFinite(packet.timestamp) &&
+      packet.timestamp > this.seekDemuxAheadTime
+    ) {
+      this.seekDemuxAheadTime = packet.timestamp;
+    }
+
+    if (!this.trackManager.isActiveStream(packet.streamIndex)) return;
+
+    const activeVideo = this.trackManager.getActiveVideoTrack();
+    if (activeVideo && activeVideo.id === packet.streamIndex) {
+      this.videoQueue.push(packet);
+      return;
+    }
+
+    const activeAudio = this.trackManager.getActiveAudioTrack();
+    if (activeAudio && activeAudio.id === packet.streamIndex) {
+      if (this.disableAudio) return;
+      // Audio before the seek target is never wanted: FFmpeg lands on the
+      // keyframe before the target, and the audio interleaved up to it would
+      // otherwise anchor the renderer early.
       if (
-        this.waitingForVideoSync &&
-        (this.videoDecoder.queueSize > maxVideoQueue ||
-          videoBuffered > maxVideoBuffered)
+        this.seekTargetTime !== -1 &&
+        packet.timestamp < this.seekTargetTime
       ) {
+        return;
+      }
+      // Read from the position an in-flight audio track switch is
+      // abandoning; the reposition re-reads this span from the right place.
+      // See _trackSwitchRepositioning.
+      if (this._trackSwitchRepositioning) return;
+      this.audioQueue.push(packet);
+      return;
+    }
+
+    this.dispatchSubtitlePacket(packet);
+  }
+
+  private dispatchSubtitlePacket(packet: Packet): void {
+    // Check for subtitle track
+    const activeSubtitle = this.trackManager.getActiveSubtitleTrack();
+    if (
+      activeSubtitle &&
+      activeSubtitle.id === packet.streamIndex &&
+      this._customSubtitleRenderer
+    ) {
+      // A host renderer (e.g. jassub/libass) owns this track — hand it the
+      // raw packet and skip the internal decoder entirely.
+      try {
+        void this._customSubtitleRenderer.pushPacket(packet);
+      } catch (e) {
+        Logger.error(TAG, "Custom subtitle renderer pushPacket failed", e);
+      }
+    } else if (
+      activeSubtitle &&
+      activeSubtitle.id === packet.streamIndex &&
+      this.subtitleDecoder
+    ) {
+      let duration = packet.duration;
+      if (!duration || duration <= 0) {
+        duration = 0;
         Logger.debug(
           TAG,
-          `Backpressure during sync: videoDecoder=${this.videoDecoder.queueSize}, videoBuffered=${videoBuffered}`,
+          `Subtitle packet has no duration, will use fallback: timestamp=${packet.timestamp.toFixed(3)}s`,
         );
+      }
+      Logger.debug(
+        TAG,
+        `Processing subtitle packet: stream=${packet.streamIndex}, size=${packet.data.length}, timestamp=${packet.timestamp.toFixed(3)}s, duration=${duration > 0 ? duration.toFixed(3) : "fallback"}s`,
+      );
+      this.subtitleDecoder
+        .decode(
+          packet.data,
+          packet.timestamp,
+          packet.keyframe,
+          duration,
+        )
+        .catch((error) => {
+          Logger.error(TAG, "Subtitle decode error", error);
+        });
+    }
+  }
+
+  private feedDecoders(limits = this.pipelineLimits()): void {
+    this.feedVideo(limits);
+    this.feedAudio(limits);
+  }
+
+  /**
+   * Hand queued video to the decoder while it — and the renderer behind it —
+   * has room. Packets that are not wanted are dropped here, at the head of
+   * the queue, rather than at read time, so the read decision never depends
+   * on what the decoder will do with them.
+   */
+  private feedVideo(limits: {
+    maxVideoQueue: number;
+    maxVideoBuffered: number;
+  }): void {
+    // Audio-only mode and a hidden tab (outside PiP) skip video decode
+    // entirely: decode is the expensive part, and nothing would show the
+    // frames. Toggling back to video re-seeks to recover a keyframe (see
+    // setAudioOnly and resyncVideoToAudio).
+    const discard =
+      this._audioOnly || (this.isBackgrounded && !this.isPiPActive);
+    while (this.videoQueue.length > 0) {
+      if (discard) {
+        this.videoQueue.shift();
+        continue;
+      }
+      if (this.videoDecoder.queueSize > limits.maxVideoQueue) return;
+      if ((this.videoRenderer?.getQueueSize() ?? 0) > limits.maxVideoBuffered) {
+        return;
+      }
+      const packet = this.videoQueue.shift()!;
+      if (this.seekingToKeyframe && !this.admitVideoAfterSeek(packet)) continue;
+      // All packets including pre-target are decoded to build reference
+      // frames; the onFrame callback filters out frames before seekTargetTime.
+      this.videoDecoder.decode(
+        packet.data,
+        packet.timestamp,
+        packet.keyframe,
+        packet.dts,
+        packet.isIdr,
+        packet.isRasl,
+      );
+    }
+  }
+
+  /**
+   * After a seek, skip video until a keyframe the decoder can restart on —
+   * a flushed decoder fed a delta errors. Returns false for a packet to skip.
+   */
+  private admitVideoAfterSeek(packet: Packet): boolean {
+    // Check timeout - if we've been waiting too long, give up and accept any frame
+    const elapsed = performance.now() - this.seekingToKeyframeStartTime;
+    this.seekKeyframeScanned++;
+    // Prefer a true IDR to restart: on mixed-keyframe HEVC a CRA sent
+    // as `key` is rejected by the HW decoder (open-GOP) and forces a
+    // software fallback, while an IDR restarts cleanly. But accept a
+    // CRA if no IDR arrives quickly — some streams have only CRA
+    // keyframes for long stretches (seeking deep into a DoVi P8 .ts),
+    // where waiting for an IDR never resumes and the video stays black.
+    const idrWaitElapsed = elapsed > MoviPlayer.SEEK_IDR_WAIT_MS;
+    // A CRA at/before the seek target IS the demuxer's restart point —
+    // decode straight from it (pre-target frames are dropped by the
+    // onFrame filter). The IDR-preference below only helps when a true
+    // IDR sits within a few frames of the target; a CRA-only stream
+    // has none, and skipping the target CRA then lets the demux loop
+    // (which outruns the 400ms wall-clock IDR wait) race through the
+    // whole file, skipping every CRA to EOF with no frame decoded →
+    // permanent "buffering". So accept the target CRA outright rather
+    // than hunt for an IDR that never arrives.
+    const isTargetCra =
+      packet.keyframe &&
+      this.seekTargetTime !== -1 &&
+      packet.timestamp <= this.seekTargetTime + 0.05;
+    const acceptThisKeyframe =
+      packet.keyframe && (packet.isIdr || idrWaitElapsed || isTargetCra);
+    // Starved (few packets scanned) means we're waiting on the network,
+    // not on a distant keyframe — extend to the hard ceiling instead of
+    // feeding the decoder a non-keyframe and painting black.
+    const starved =
+      this.seekKeyframeScanned < MoviPlayer.SEEK_KEYFRAME_MIN_SCAN;
+    const timedOut =
+      elapsed >
+      (starved
+        ? MoviPlayer.KEYFRAME_SEEK_HARD_TIMEOUT
+        : MoviPlayer.KEYFRAME_SEEK_TIMEOUT);
+    if (timedOut) {
+      Logger.warn(
+        TAG,
+        `Keyframe seek timeout after ${elapsed.toFixed(0)}ms (scanned=${this.seekKeyframeScanned}, starved=${starved}), accepting any frame`,
+      );
+      this.seekingToKeyframe = false;
+      return true;
+    }
+    if (!acceptThisKeyframe) {
+      // Not yet: skip non-keyframes, and skip CRA keyframes while still
+      // within the short IDR-wait window (hoping a true IDR is near).
+      if (packet.keyframe) this.seekCraSeen++;
+      return false;
+    }
+    // Found a keyframe to restart on (IDR, or a CRA after the wait).
+    this.seekingToKeyframe = false;
+    Logger.debug(
+      TAG,
+      `Found ${packet.isIdr ? "IDR" : "CRA"} keyframe after seek (craSkipped=${this.seekCraSeen}), resuming normal playback`,
+    );
+    this.seekCraSeen = 0;
+    return true;
+  }
+
+  /**
+   * Hand queued audio to the decoder while it has room and the decoded
+   * cushion is under target. Held entirely while a seek waits for its first
+   * video frame — notifySeekCompletion decides where the clock starts and
+   * trims the head of this queue to match.
+   */
+  private feedAudio(limits: {
+    maxAudioQueue: number;
+    maxAudioBuffered: number;
+  }): void {
+    if (this.audioQueue.length === 0) return;
+    if (this.waitingForVideoSync && this.trackManager.getActiveVideoTrack()) {
+      return;
+    }
+    // An audio track switch is mid-flight and the demuxer has not landed at
+    // the playhead yet. See _trackSwitchRepositioning.
+    if (this._trackSwitchRepositioning) return;
+
+    // Audio the browser will not let us play (muted autoplay with a
+    // suspended context) is decoded and dropped. With no cushion to fill,
+    // nothing would stop the decoder taking the whole queue as fast as the
+    // demuxer can supply it; pace it to the clock instead, the way the
+    // split-audio pump does.
+    const paceLimit = this.audioRenderer.isDroppingAudio()
+      ? this.clock.getTime() + 0.25
+      : Number.POSITIVE_INFINITY;
+
+    // Software codecs (TrueHD/MLP/DTS) on the legacy main-thread decoder go
+    // in as one batch per feed — their access units are tiny, so the
+    // per-packet WASM round-trip, not the decode itself, is what starves the
+    // renderer. Nothing reaches the decoder until the batch is submitted, so
+    // its size is bounded by the cushion still missing, in media time.
+    if (this.audioDecoder.canBatch()) {
+      const buffered = this.audioRenderer.getBufferedDuration();
+      if (buffered > limits.maxAudioBuffered) return;
+      const room = limits.maxAudioBuffered - buffered;
+      const batch: Packet[] = [];
+      let first = Number.NaN;
+      while (this.audioQueue.length > 0) {
+        const head = this.audioQueue.peek()!;
+        if (head.timestamp > paceLimit) break;
+        if (batch.length > 0 && head.timestamp - first > room) break;
+        if (batch.length === 0) first = head.timestamp;
+        batch.push(this.audioQueue.shift()!);
+      }
+      if (batch.length > 0) {
+        this.submitAudioPackets(batch, "feedAudio-batch");
+        for (const packet of batch) this.noteAudioFed(packet);
       }
       return;
     }
 
-    // Read-ahead cap: while a seek's first frame hasn't arrived, the backpressure
-    // checks above are all bypassed (skipVideoBackpressure on buffering, stashed
-    // audio → empty decoder/renderer queues), so stop reading once we've demuxed
-    // SEEK_MAX_DEMUX_AHEAD_SECONDS past the target. Every packet the first frame
-    // needs (keyframe ≤ target through target) is already read well before this,
-    // so this only halts a runaway that would otherwise download the whole file;
-    // the hard watchdog above terminates the seek if the frame never comes.
-    if (this.seekReadAheadExceeded()) {
+    while (this.audioQueue.length > 0) {
+      if (this.audioDecoder.queueSize > limits.maxAudioQueue) return;
+      if (this.audioRenderer.getBufferedDuration() > limits.maxAudioBuffered) {
+        return;
+      }
+      const head = this.audioQueue.peek()!;
+      if (head.timestamp > paceLimit) return;
+      const packet = this.audioQueue.shift()!;
+      this.logB1bFirstFed(packet.timestamp, "feedAudio");
+      // Decode audio even when muted. AudioRenderer keeps gain at 0 so
+      // it stays silent, but the audio clock advances normally — without
+      // this, unmute pivots firstBufferMediaTime to wherever the demuxer
+      // is (~1-3s ahead of presentation due to video buffer), and the
+      // drift correction in CanvasRenderer judders the video to chase it.
+      this.audioDecoder.decode(packet.data, packet.timestamp, packet.keyframe);
+      this.noteAudioFed(packet);
+    }
+  }
+
+  /** The seek bookkeeping that hangs off audio reaching the seek target. */
+  private noteAudioFed(packet: Packet): void {
+    if (this.seekTargetTime === -1 || packet.timestamp < this.seekTargetTime) {
       return;
     }
-
-    // Read packet
-    try {
-      // Final check before starting async operation - ensure no new seek started
-      if (this.seekSessionId !== currentSessionId) {
-        Logger.debug(TAG, "ProcessLoop aborted before demux: new seek started");
-        return;
-      }
-
-      this.demuxInFlight = true;
-      this.demuxInFlightStartTime = performance.now();
-
-      // Determine burst size based on buffer levels, post-seek state, and FPS.
-      // High-FPS content (120fps) has ~120 video packets per ~47 audio packets.
-      // A burst of 20 may only yield 1-2 audio packets (~42ms) which isn't enough
-      // to prevent audio buffer underruns between rAF callbacks (~16.7ms).
-      const fps = this.trackManager?.getActiveVideoTrack()?.frameRate ?? 30;
-      const fpsScale = Math.max(1, Math.ceil(fps / 30)); // 1x for 30fps, 2x for 60fps, 4x for 120fps
-      let burstSize = 20 * fpsScale;
-
-      if (isPostSeek) {
-        burstSize = 5 * fpsScale;
-        // The cap counts container packets, not decoded samples. Dense audio
-        // codecs such as TrueHD/DTS can carry only a fraction of a millisecond
-        // per packet, so five interleaved packets cannot rebuild a realtime
-        // audio cushion. Temporarily use the normal dense-interleave burst
-        // until one second is buffered; the outer queue limits remain the
-        // backpressure boundary.
-        const hasMuxedAudio =
-          !this.disableAudio && !!this.trackManager.getActiveAudioTrack();
-        if (hasMuxedAudio && audioBuffered < 1.0) {
-          burstSize = 160 * fpsScale;
-        }
-        Logger.debug(
-          TAG,
-          `Post-seek throttling: using burst size ${burstSize}`,
-        );
-      } else {
-        // Clear the justSeeked flag after throttle period
-        if (
-          this.justSeeked &&
-          timeSinceSeek >= MoviPlayer.POST_SEEK_THROTTLE_MS
-        ) {
-          this.justSeeked = false;
-          Logger.debug(TAG, "Post-seek throttle period ended");
-        }
-
-        // Normal burst size logic
-        const videoQueue = this.videoRenderer?.getQueueSize() ?? 0;
-        const currentAudioBuffered = this.audioRenderer.getBufferedDuration();
-
-        // If buffers are low, increase burst size to fill faster.
-        // High-FPS needs more headroom because audio packets are sparse among video packets.
-        // During initial play grace period with audio active, use a gentler burst to
-        // avoid overwhelming the main thread (audio decode + render + stable audio
-        // processing is CPU-heavy alongside 4K video decode).
-        const bufferTarget = isAudioSoftware ? 2.0 : fps >= 60 ? 1.0 : 0.5;
-        if (videoQueue < 30 || currentAudioBuffered < bufferTarget) {
-          if (
-            inPlayGrace &&
-            !this.audioRenderer.isDroppingAudio() &&
-            !this.disableAudio &&
-            // The ramp exists to protect the MAIN THREAD, so it's main-thread
-            // software decode that has to skip it — worker-offloaded software
-            // decode leaves the main thread free and wants the normal burst.
-            !isMainThreadSoftwareDecode &&
-            // Software audio can't afford the gentle ramp either — 20 packets a
-            // tick is a few ms of TrueHD, nowhere near realtime. That's a
-            // throughput limit, not a CPU one, so it holds in the worker too.
-            !isAudioSoftware
-          ) {
-            burstSize = 20 * fpsScale; // Gentler ramp during initial fill with audio
-          } else {
-            // Burst is a PACKET cap, but what matters for a cushion is how many
-            // VIDEO packets it reads — and in a heavily-interleaved file that
-            // can be a tiny fraction. e.g. a dual-audio 1080p TrueHD source
-            // reads ~933 pkt/s PER audio track vs ~19 video pkt/s, so a
-            // 40-packet burst pulls only ~0.4 video packets and video can never
-            // read ahead of realtime → no cushion → a stall on any hiccup
-            // (issue #11, "stalls every ~60s" on a 2×TrueHD file). A larger cap
-            // lets video outpace consumption and build a cushion; it stays
-            // self-limiting because the outer backpressure gate stops reading
-            // once videoBuffered/audioBuffered pass their targets, and the
-            // periodic MessageChannel yield below keeps the tick non-blocking.
-            burstSize = (isSoftware ? 160 : 160) * fpsScale;
-          }
-        }
-      }
-
-      // For video-only content, throttle submissions based on renderer queue.
-      // Without audio backpressure, all packets get submitted in one burst which
-      // overwhelms VP8/software WebCodecs decoders (output callbacks stop firing).
-      const hasAudioForBurst = !!this.trackManager?.getActiveAudioTrack() && !this.disableAudio;
-      const maxRendererQueue = 60; // ~2.4s at 25fps, enough buffer without overwhelming
-
-      // When decoder is skipping frames (waitingForKeyframe after error), limit burst
-      // to prevent the demuxer from racing through the entire file in one rAF.
-      // Without this, non-keyframes skip silently → no backpressure → early EOF.
-      if (this.videoDecoder.isWaitingForKeyframe) {
-        burstSize = Math.min(burstSize, 5);
-      }
-
-      for (let i = 0; i < burstSize; i++) {
-        // Video-only throttle: if renderer queue is full enough, stop submitting
-        // and let the presentation loop consume frames before adding more.
-        if (!hasAudioForBurst && this.videoRenderer && this.videoRenderer.getQueueSize() > maxRendererQueue) {
-          break;
-        }
-
-        // Check both video and audio queues after seek to prevent overwhelming decoders
-        // When audio is starving, don't let video queue fullness stop the burst — we need
-        // to keep reading packets to find audio data (video decode is skipped below).
-        //
-        // The AUDIO queue does not gate the prebuffer stash. Those packets were
-        // read before playback began and are already in memory; holding them
-        // back throttles them out at audio-decode speed, and the video packets
-        // buried behind them arrive at that same crawl. On a file whose opening
-        // is dense with audio — two TrueHD tracks here — the stash ended up
-        // holding 400 packets and exactly one video frame, so the picture sat
-        // on that frame for half a minute while slow software audio decode let
-        // the rest dribble through. Seeking cleared the stash, which is why a
-        // seek "fixed" it.
-        const drainingStash = this.pendingPrebufferPackets.length > 0;
-        if (
-          (!skipVideoDecodeForAudio &&
-            !needsRebufferAudioCushion &&
-            this.videoDecoder.queueSize > maxVideoQueue) ||
-          (!drainingStash && !this.disableAudio && this.audioDecoder.queueSize > maxAudioQueue)
-        ) {
-          // Queue getting full, stop to let decoders catch up
-          if (isPostSeek) {
-            Logger.debug(
-              TAG,
-              `Post-seek: queue full (video: ${this.videoDecoder.queueSize}, audio: ${this.audioDecoder.queueSize}), pausing burst`,
-            );
-          }
-          break;
-        }
-
-        // Yield periodically to prevent blocking the main thread, especially in software mode
-        // Scale with FPS — at 120fps, packets are small and fast, yielding too often starves audio
-        const yieldInterval = isPostSeek
-          ? 2 * fpsScale
-          : isMainThreadSoftwareDecode
-            ? 3
-            : isAudioWorkerSoftware
-              ? 8
-              : 20 * fpsScale;
-        if (i > 0 && i % yieldInterval === 0) {
-          // Use MessageChannel for fast yielding (better than setTimeout)
-          const channel = new MessageChannel();
-          await new Promise((resolve) => {
-            channel.port1.onmessage = resolve;
-            channel.port2.postMessage(null);
-          });
-
-          // Check if a new seek started during yield
-          if (this.seekSessionId !== currentSessionId) {
-            Logger.debug(
-              TAG,
-              "ProcessLoop aborted during packet read: new seek started",
-            );
-            this.demuxInFlight = false; // Reset flag so new seek can proceed
-            return;
-          }
-        }
-
-        // Drain prebuffered packets first so play() doesn't re-read them
-        // from the source. Stashed packets are pre-seek and always safe.
-        let packet: Packet | null;
-        if (this.pendingPrebufferPackets.length > 0) {
-          packet = this.pendingPrebufferPackets.shift()!;
-        } else {
-          // When separate audio demuxer exists, primary demuxer only provides video/subtitle
-          packet = await this.demuxer.readPacket();
-
-          // Check again after async readPacket - seek may have started during read
-          if (this.seekSessionId !== currentSessionId) {
-            Logger.debug(
-              TAG,
-              "ProcessLoop aborted after readPacket: new seek started",
-            );
-            this.demuxInFlight = false; // Reset flag so new seek can proceed
-            return;
-          }
-        }
-
-        if (!packet) {
-          // No bytes can mean two very different things, and they arrive
-          // identically. The demuxer reads through a C callback that answers
-          // with a byte count, so a read that FAILED looks exactly like the end
-          // of the file: FFmpeg reports EOF either way. A source that had been
-          // refused mid-file therefore ended the video — the picture stopped,
-          // the clock jumped to the duration, and anything watching for "ended"
-          // (an autoplay-next, a playlist) moved on as though the video had
-          // simply finished. Ask the source which of the two this was.
-          const sourceFailure = (
-            this.source as { getFatalError?: () => Error | null } | null
-          )?.getFatalError?.();
-          if (sourceFailure) {
-            Logger.error(
-              TAG,
-              `Read returned nothing because the source failed, not because the file ended: ${sourceFailure.message}`,
-            );
-            throw sourceFailure;
-          }
-          // EOF reached - mark it but don't stop immediately
-          // Let the decoders finish processing
-          if (!this.eofReached) this.eofSince = performance.now();
-          this.eofReached = true;
-
-          // Clear seeking flag if we hit EOF before finding keyframe
-          if (this.seekingToKeyframe) {
-            this.seekingToKeyframe = false;
-            Logger.warn(TAG, "EOF reached before finding keyframe after seek");
-          }
-
-          // If we were waiting for sync, trigger it now so player doesn't hang in loading state
-          if (this.waitingForVideoSync) {
-            Logger.warn(
-              TAG,
-              "EOF reached while waiting for seek sync, forcing completion",
-            );
-            // forced=true: this is a no-frame forced completion (the decoder
-            // exhausted the stream without a decodable frame — e.g. an open-GOP
-            // 4K AV1 whose keyframes the HW decoder keeps rejecting). Without the
-            // flag, notifySeekCompletion advances the clock straight into
-            // "playing" over a BLACK screen (framesPresented=0) that only a
-            // manual seek recovers. With it, the forcedWithoutFrame path resumes
-            // into "buffering" with play intent latched, so the first frame that
-            // actually decodes — e.g. after the ABR downshifts to a rendition the
-            // decoder CAN handle — auto-flips to "playing". Matches the seek-
-            // timeout path, which already passes forced=true.
-            this.notifySeekCompletion(this.seekTargetTime, true);
-          }
-
-          Logger.debug(TAG, "EOF reached");
-          break;
-        }
-        this.trackDemuxedPacketForB1bDiagnostic(packet);
-
-        // Track how far past the seek target we've demuxed so the read-ahead
-        // cap above can halt a frame-starved seek before it downloads forever.
-        if (
-          this.waitingForVideoSync &&
-          Number.isFinite(packet.timestamp) &&
-          packet.timestamp > this.seekDemuxAheadTime
-        ) {
-          this.seekDemuxAheadTime = packet.timestamp;
-        }
-
-        // Dispatch to decoders/renderers
-        if (this.trackManager.isActiveStream(packet.streamIndex)) {
-          const activeVideo = this.trackManager.getActiveVideoTrack();
-          const activeAudio = this.trackManager.getActiveAudioTrack();
-
-          if (activeVideo && activeVideo.id === packet.streamIndex) {
-            // Audio-only mode: skip ALL video decoding to save CPU. Decode is
-            // the expensive part; the interleaved bytes still arrive (no single-
-            // file bandwidth saving — that's the adaptive-stream wrapper's job),
-            // but the GPU/CPU video pipeline stays idle. Toggling back to video
-            // re-seeks to recover a keyframe (see setAudioOnly).
-            if (this._audioOnly) {
-              continue;
-            }
-            // In background (not PiP), skip video decoding entirely.
-            // This prevents frame queue buildup that blocks audio demuxing via backpressure.
-            // At 60fps, video queue fills in ~1.7s and starves audio.
-            if (this.isBackgrounded && !this.isPiPActive) {
-              continue;
-            }
-
-            // Skip video decode when video buffer is full but audio is starving.
-            // This keeps audio flowing at non-1x rates where video frames accumulate
-            // faster than consumed. Some video frames are lost but audio stays smooth.
-            //
-            // Keyframes-only during the starve: AV1's inter-frame dependency means
-            // dropping a non-keyframe orphans every delta that references it, so
-            // feeding those deltas to the decoder throws EncodingError → decoder
-            // close → recreate→keyframe-wait recovery (noisy, and a momentary
-            // freeze). Dropping ALL video (the old behavior) is even worse — the
-            // next decoded delta is still an orphan, so the error fires the
-            // moment the starve ends. Instead we keep decoding keyframes and skip
-            // only deltas: each keyframe is a self-contained reference reset, so
-            // nothing the decoder receives is ever orphaned — no EncodingError.
-            // Video updates at roughly one frame per GOP (~0.5fps on a 2s GOP)
-            // until audio recovers, then full-rate decode resumes at the next
-            // keyframe with the reference chain intact.
-            if (skipVideoDecodeForAudio && !packet.keyframe) {
-              // A delta was skipped, so every following delta is now orphaned
-              // until the next keyframe rebuilds the reference chain. Latch this
-              // so that even after the starve clears we keep skipping deltas
-              // until a keyframe — otherwise the first post-starve delta is an
-              // orphan and throws the very EncodingError we're avoiding.
-              this.videoChainBrokenUntilKeyframe = true;
-              continue;
-            }
-            // Reference chain broken by an earlier skip: keep dropping deltas
-            // until a keyframe resets it, regardless of current starve state.
-            if (this.videoChainBrokenUntilKeyframe) {
-              if (!packet.keyframe) {
-                continue;
-              }
-              this.videoChainBrokenUntilKeyframe = false;
-            }
-
-            // After seek, skip non-keyframe video packets until we find a keyframe
-            // This prevents decoder errors (decoder needs keyframe after flush)
-            if (this.seekingToKeyframe) {
-              // Check timeout - if we've been waiting too long, give up and accept any frame
-              const elapsed =
-                performance.now() - this.seekingToKeyframeStartTime;
-              this.seekKeyframeScanned++;
-              // Prefer a true IDR to restart: on mixed-keyframe HEVC a CRA sent
-              // as `key` is rejected by the HW decoder (open-GOP) and forces a
-              // software fallback, while an IDR restarts cleanly. But accept a
-              // CRA if no IDR arrives quickly — some streams have only CRA
-              // keyframes for long stretches (seeking deep into a DoVi P8 .ts),
-              // where waiting for an IDR never resumes and the video stays black.
-              const idrWaitElapsed = elapsed > MoviPlayer.SEEK_IDR_WAIT_MS;
-              // A CRA at/before the seek target IS the demuxer's restart point —
-              // decode straight from it (pre-target frames are dropped by the
-              // onFrame filter). The IDR-preference below only helps when a true
-              // IDR sits within a few frames of the target; a CRA-only stream
-              // has none, and skipping the target CRA then lets the demux loop
-              // (which outruns the 400ms wall-clock IDR wait) race through the
-              // whole file, skipping every CRA to EOF with no frame decoded →
-              // permanent "buffering". So accept the target CRA outright rather
-              // than hunt for an IDR that never arrives.
-              const isTargetCra =
-                packet.keyframe &&
-                this.seekTargetTime !== -1 &&
-                packet.timestamp <= this.seekTargetTime + 0.05;
-              const acceptThisKeyframe =
-                packet.keyframe && (packet.isIdr || idrWaitElapsed || isTargetCra);
-              // Starved (few packets scanned) means we're waiting on the network,
-              // not on a distant keyframe — extend to the hard ceiling instead of
-              // feeding the decoder a non-keyframe and painting black.
-              const starved =
-                this.seekKeyframeScanned < MoviPlayer.SEEK_KEYFRAME_MIN_SCAN;
-              const timedOut =
-                elapsed >
-                (starved
-                  ? MoviPlayer.KEYFRAME_SEEK_HARD_TIMEOUT
-                  : MoviPlayer.KEYFRAME_SEEK_TIMEOUT);
-              if (timedOut) {
-                Logger.warn(
-                  TAG,
-                  `Keyframe seek timeout after ${elapsed.toFixed(0)}ms (scanned=${this.seekKeyframeScanned}, starved=${starved}), accepting any frame`,
-                );
-                this.seekingToKeyframe = false;
-              } else if (!acceptThisKeyframe) {
-                // Not yet: skip non-keyframes, and skip CRA keyframes while still
-                // within the short IDR-wait window (hoping a true IDR is near).
-                if (packet.keyframe) this.seekCraSeen++;
-                continue;
-              } else {
-                // Found a keyframe to restart on (IDR, or a CRA after the wait).
-                this.seekingToKeyframe = false;
-                Logger.debug(
-                  TAG,
-                  `Found ${packet.isIdr ? "IDR" : "CRA"} keyframe after seek (craSkipped=${this.seekCraSeen}), resuming normal playback`,
-                );
-                this.seekCraSeen = 0;
-              }
-            }
-
-            if (this.videoDecoder) {
-              // Decode and render to canvas
-              // Note: All packets including pre-target are decoded to build reference frames
-              // The onFrame callback filters out frames before seekTargetTime
-              this.videoDecoder.decode(
-                packet.data,
-                packet.timestamp,
-                packet.keyframe,
-                packet.dts,
-                packet.isIdr,
-                packet.isRasl,
-              );
-            }
-          } else if (activeAudio && activeAudio.id === packet.streamIndex) {
-            // Audio can be processed normally (doesn't need keyframes)
-            // Skip audio processing if disabled for debugging
-            if (!this.disableAudio) {
-              // IMPORTANT: Skip audio packets before the seek target time
-              if (
-                this.seekTargetTime !== -1 &&
-                packet.timestamp < this.seekTargetTime
-              ) {
-                continue;
-              }
-
-              // If waiting for video frame to ensure sync, buffer audio packets
-              // (even when muted — needed for clock alignment to start at 0s)
-              if (
-                this.waitingForVideoSync &&
-                this.trackManager.getActiveVideoTrack()
-              ) {
-                this.stashSeekAudioPacket(packet);
-                continue;
-              }
-
-              // Decode audio even when muted. AudioRenderer keeps gain at 0 so
-              // it stays silent, but the audio clock advances normally — without
-              // this, unmute pivots firstBufferMediaTime to wherever the demuxer
-              // is (~1-3s ahead of presentation due to video buffer), and the
-              // drift correction in CanvasRenderer judders the video to chase it.
-
-              if (
-                this.seekTargetTime !== -1 &&
-                packet.timestamp >= this.seekTargetTime
-              ) {
-                Logger.debug(
-                  TAG,
-                  `Audio reached seek target: ${packet.timestamp.toFixed(3)}s (target: ${this.seekTargetTime.toFixed(3)}s)`,
-                );
-                if (!this.trackManager.getActiveVideoTrack()) {
-                  this.notifySeekCompletion(packet.timestamp);
-                }
-                // Retire it once audio is past: the guard exists to stop
-                // already-scheduled audio being decoded a second time, and
-                // there is none left behind this packet.
-                //
-                // Only safe to do here when VIDEO is not reading the same
-                // field. On an ordinary seek it is — the pre-target frame
-                // filter is this value — and the video side clears it when a
-                // frame passes. During a video-only catch-up video has its own
-                // gate (_videoResumeTarget) and deliberately leaves this one
-                // armed for audio's sake, so nothing would ever clear it: the
-                // branch above then logged for every audio packet, forever.
-                if (
-                  this._videoResumeTarget !== -1 ||
-                  !this.trackManager.getActiveVideoTrack()
-                ) {
-                  this.seekTargetTime = -1;
-                }
-              }
-
-              // B1b instrumentation only (docs/PLAN_MERGE.MD §4.11) — the
-              // FOURTH measured point, between the demux-cursor proxy and the
-              // decoded-frame-out log below. Fires exactly once per switch, at
-              // the very first packet actually handed to the new decoder
-              // (either branch below), before any batching/decode happens to
-              // it. Answers: was the packet ITSELF already anomalous when fed
-              // in (a feed/stash bug), or was it fine and something downstream
-              // (batching/pcmTimestampClock) corrupted the timestamp on the
-              // way out?
-              // An audio track switch is mid-flight and the demuxer has not
-              // landed at the playhead yet: this packet is from the position
-              // being abandoned, so it must not reach the decoder. Dropping it
-              // is safe — the seek about to complete will re-read this span
-              // from the right place. See _trackSwitchRepositioning.
-              if (this._trackSwitchRepositioning) {
-                continue;
-              }
-
-              this.logB1bFirstFed(packet.timestamp, "main-process-loop");
-
-              // Software codecs (TrueHD/MLP/DTS) go in as one batch per tick —
-              // their access units are tiny, so the per-packet WASM round-trip,
-              // not the decode itself, is what starves the renderer. WebCodecs
-              // and the worker decoder have no such cost, so they decode inline
-              // as before (canBatch() is false for both).
-              if (this.audioDecoder.canBatch()) {
-                this._audioBatchPending.push(packet);
-              } else {
-                this.audioDecoder.decode(
-                  packet.data,
-                  packet.timestamp,
-                  packet.keyframe,
-                );
-              }
-            }
-          } else {
-            // Check for subtitle track
-            const activeSubtitle = this.trackManager.getActiveSubtitleTrack();
-            if (
-              activeSubtitle &&
-              activeSubtitle.id === packet.streamIndex &&
-              this._customSubtitleRenderer
-            ) {
-              // A host renderer (e.g. jassub/libass) owns this track — hand it the
-              // raw packet and skip the internal decoder entirely.
-              try {
-                void this._customSubtitleRenderer.pushPacket(packet);
-              } catch (e) {
-                Logger.error(TAG, "Custom subtitle renderer pushPacket failed", e);
-              }
-            } else if (
-              activeSubtitle &&
-              activeSubtitle.id === packet.streamIndex &&
-              this.subtitleDecoder
-            ) {
-              let duration = packet.duration;
-              if (!duration || duration <= 0) {
-                duration = 0;
-                Logger.debug(
-                  TAG,
-                  `Subtitle packet has no duration, will use fallback: timestamp=${packet.timestamp.toFixed(3)}s`,
-                );
-              }
-              Logger.debug(
-                TAG,
-                `Processing subtitle packet: stream=${packet.streamIndex}, size=${packet.data.length}, timestamp=${packet.timestamp.toFixed(3)}s, duration=${duration > 0 ? duration.toFixed(3) : "fallback"}s`,
-              );
-              this.subtitleDecoder
-                .decode(
-                  packet.data,
-                  packet.timestamp,
-                  packet.keyframe,
-                  duration,
-                )
-                .catch((error) => {
-                  Logger.error(TAG, "Subtitle decode error", error);
-                });
-            }
-          }
-        }
-      }
-    } catch (e) {
-      // Belongs to a pipeline that has since been swapped out — its source was
-      // closed under it on purpose. Nothing to report and nothing to recover.
-      if (pipelineGeneration !== this._demuxerGeneration) {
-        Logger.debug(TAG, "Demux error from a retired pipeline — ignoring", e);
-        this.demuxInFlight = false;
-        return;
-      }
-      Logger.error(TAG, "Demux error", e);
-
-      // Check for fatal errors that indicate corrupted state
-      const errorMessage = (e as any).message || "";
-      // WASM-level traps. Once av_read_frame or any other FFmpeg entry
-      // point dereferences past the heap, the entire WASM module is
-      // unrecoverable — every subsequent ccall hits the same OOB. Without
-      // this branch, processLoop classifies it as transient and retries
-      // every ~17ms, flooding the console and pinning the CPU until the
-      // user closes the tab.
-      const isWasmFatal =
-        /out of bounds memory access|memory access out of bounds|RuntimeError|Aborted\(\)/i.test(
-          errorMessage,
-        );
-      const isCorruptError =
-        isWasmFatal ||
-        errorMessage.includes("Invalid packet size") ||
-        errorMessage.includes("Invalid typed array length") ||
-        errorMessage.includes("State may be corrupted");
-
-      // Source-level failures (HTTP 4xx/5xx, exhausted retries, CORS, etc.)
-      // surface through here as the demuxer reads its bytes from the source.
-      // Without classifying these as fatal, processLoop just keeps retrying
-      // the demux and the buffering spinner spins indefinitely with no
-      // user-visible reason. The actual messages come from HttpSource —
-      // see the strings it throws in startStream/buildHeaders.
-      const isSourceError =
-        // Unanchored — the demuxer wraps it ("Failed to open media: HTTP 403"),
-        // and a wrapped 4xx is every bit as fatal as a bare one.
-        /\bHTTP \d{3}\b/.test(errorMessage) ||
-        errorMessage.includes("Access denied") ||
-        errorMessage.includes("Authentication required") ||
-        errorMessage.includes("Video not found") ||
-        errorMessage.includes("Failed to fetch video resource") ||
-        errorMessage.includes("Stream failed after") ||
-        errorMessage.includes("Server does not support range requests");
-
-      if (isWasmFatal) {
-        // The abort left the SHARED cached WASM module permanently dead — the
-        // main demuxer reuses that singleton, so without this every later open
-        // (a new video, a quality switch) fails "File is corrupted" until a page
-        // reload. Drop the cached module so the recovery reload — and the next
-        // source — instantiates a fresh one instead of reusing the corpse.
-        resetWasmModule();
-      }
-
-      if (isCorruptError || isSourceError) {
-        Logger.error(
-          TAG,
-          isSourceError
-            ? `Fatal source error, pausing playback: ${errorMessage}`
-            : "Fatal demux error detected, pausing playback",
-        );
-        this.pause();
-        this.stateManager.setState("error");
-        this.emit(
-          "error",
-          isSourceError
-            ? (e instanceof Error ? e : new Error(errorMessage))
-            : new Error("Playback error: corrupt data stream"),
-        );
-        return; // Exit process loop
-      }
-
-      // For non-fatal errors, continue (transient network glitches, etc.)
-    } finally {
-      this.demuxInFlight = false;
-      // Hand this tick's audio to the decoder as one batch. In the finally so
-      // it runs on EVERY exit path — an early return on a superseded seek, a
-      // non-fatal error, or normal completion. The packets are already demuxed;
-      // dropping them would tear a hole in the audio the same way the old
-      // per-packet path did by starving the renderer. (A seek flushes the
-      // decoder anyway, so any stale batch decoded here is discarded — exactly
-      // what happened before, when packets were decoded as they were read.)
-      if (this._audioBatchPending.length > 0) {
-        const batch = this._audioBatchPending;
-        this._audioBatchPending = [];
-        this.submitAudioPackets(batch, "audioBatchPending-tick-flush");
-      }
+    Logger.debug(
+      TAG,
+      `Audio reached seek target: ${packet.timestamp.toFixed(3)}s (target: ${this.seekTargetTime.toFixed(3)}s)`,
+    );
+    const hasVideo = !!this.trackManager.getActiveVideoTrack();
+    if (!hasVideo) {
+      this.notifySeekCompletion(packet.timestamp);
     }
-  };
+    // Retire it once audio is past: the guard exists to stop
+    // already-scheduled audio being decoded a second time, and
+    // there is none left behind this packet.
+    //
+    // Only safe to do here when VIDEO is not reading the same
+    // field. On an ordinary seek it is — the pre-target frame
+    // filter is this value — and the video side clears it when a
+    // frame passes. During a video-only catch-up video has its own
+    // gate (_videoResumeTarget) and deliberately leaves this one
+    // armed for audio's sake, so nothing would ever clear it: the
+    // branch above then logged for every audio packet, forever.
+    if (this._videoResumeTarget !== -1 || !hasVideo) {
+      this.seekTargetTime = -1;
+    }
+  }
 
   /**
    * Handle playback ended
@@ -7009,6 +6721,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         Logger.warn(TAG, `Split audio-only seek failed: ${(e as any)?.message ?? e}`);
       }
       this._splitAudioEof = false;
+      this.splitAudioQueue.clear();
       this._lastSplitAudioPts = t;
       this.seekTargetTime = -1;
       this.clock.seek(t + this.startTime);
@@ -7097,7 +6810,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       throw new Error("Demuxer not initialized");
     }
 
-    // Stop pause-time buffering — seek invalidates stashed packets
+    // Stop pause-time buffering — seek invalidates queued packets
     this.stopPauseBuffering();
 
     // Track intent: if we were playing (or already seeking but originally playing), we want to resume
@@ -7191,13 +6904,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           /* ignore */
         }
       }
-      // Drop any audio collected for the current tick's batch — it belongs to
-      // the position we're leaving. The decoder has just been flushed, and the
-      // batch is submitted from processLoop's finally AFTER this, so keeping it
-      // would push pre-seek packets into the fresh decoder and emit audio at
-      // stale timestamps. play() re-seeks, which is why pause→play was enough
-      // to trigger it: the batch stranded by the pause got replayed on resume.
-      this._audioBatchPending = [];
       Logger.info(TAG, `seek: decoders flushed`);
 
       // Clear video frame queue to prevent old frames from being displayed
@@ -7253,6 +6959,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           Logger.warn(TAG, `Split audio seek failed: ${(e as any)?.message ?? e}`);
         }
         this._splitAudioEof = false;
+        this.splitAudioQueue.clear();
         // Re-baseline the decode-lead gate to the seek target so it doesn't
         // think audio is already seconds ahead (or behind) the new playhead.
         this._lastSplitAudioPts = seconds;
@@ -7279,9 +6986,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.seekingToKeyframeStartTime = performance.now();
       this.seekKeyframeScanned = 0;
       this.seekCraSeen = 0;
-      // A seek is a fresh keyframe-anchored start; any pending starve-induced
-      // chain break is moot.
-      this.videoChainBrokenUntilKeyframe = false;
 
       // IMPORTANT: Set seek target time for accurate seek positioning
       // FFmpeg seeks to the nearest keyframe BEFORE the target time,
@@ -7302,10 +7006,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // consume wasPlayingBeforeSeek out from under the live seek — which
       // intermittently left rapid seeks stuck paused.
       this.seekArmedSessionId = mySessionId;
-      this.pendingAudioPackets = [];
-      this.droppedSeekAudioPackets = 0;
-      // Stashed prebuffer packets are pre-seek and now stale
-      this.pendingPrebufferPackets = [];
+      // Everything queued was read for the position we just left.
+      this.clearPacketQueues();
 
       // Enable post-seek throttling to prevent overwhelming low-end devices
       // BUT skip throttling when seeking within already-buffered data — the bytes
@@ -8757,9 +8459,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.waitingForVideoSync = false; // no stale seek-completion armed
     this._playStartTime = 0; // keep first-play branch eligible
     this._primingAudio = false;
-    this.pendingAudioPackets = []; // poster-era audio is stale; play() re-seeks
-    this.droppedSeekAudioPackets = 0;
-    this.pendingPrebufferPackets = [];
+    this.clearPacketQueues(); // poster-era packets are stale; play() re-seeks
     // The poster seek advanced HttpSource's monotonic buffered-end to ~poster
     // time; reset it (as a real seek does) so the buffer bar starts from 0
     // instead of showing a false prebuffer at the poster timestamp.
@@ -9430,6 +9130,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.audioRenderer.setOutputChannelCount(2);
       }
       this._splitAudioEof = false;
+      this.splitAudioQueue.clear();
       this._lastSplitAudioPts = 0;
       // Sync the freshly-opened audio demuxer to where the player ACTUALLY is.
       // This setup is async: a recovery recreate's resume-seek (or any seek that
@@ -9458,6 +9159,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       try { this.audioDemuxer?.close(); } catch {}
       try { this.audioSource?.close(); } catch {}
       this.audioDemuxer = null;
+      this.splitAudioQueue.clear();
       this.audioSource = null;
       // A stall/timeout opening the audio demuxer is usually transient — the
       // video's opening burst monopolised the link and the audio's first-bytes
@@ -9495,7 +9197,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // foreground, the un-throttled background Worker timer when hidden (rAF is
   // throttled in background, which is exactly what stalled audio there).
   private async pumpSplitAudio(): Promise<boolean> {
-    if (!this.audioDemuxer || this._splitAudioEof) return false;
+    if (!this.audioDemuxer) return false;
+    if (this._splitAudioEof && this.splitAudioQueue.length === 0) return false;
     const state = this.stateManager.getState();
     if (
       state !== "playing" &&
@@ -9511,61 +9214,40 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // decoded (even before the clock starts), so decoding here would let audio
     // run ahead during the ~2s sync window — the clock then snaps to an audio
     // position seconds past the video, which never catches up (perpetual
-    // "buffers empty" stall loop). The muxed path holds audio the same way via
-    // pendingAudioPackets. Idle until video sync completes.
+    // "buffers empty" stall loop). The muxed path holds audio the same way, in
+    // audioQueue. Held, not unread: the packets wait in splitAudioQueue.
     //
     // Never in audio-only: there's no video being shown to sync to, so holding
     // audio for a video keyframe just starves it — worst on a seek into a
     // not-yet-buffered region, where the video can't produce that frame for
     // seconds and the audio (often fully cached) goes silent for no reason.
-    if (
+    const holdForVideo =
       !this._audioOnly &&
       this.waitingForVideoSync &&
-      this.trackManager.getActiveVideoTrack()
-    ) {
-      return true;
-    }
+      !!this.trackManager.getActiveVideoTrack();
 
-    // Read a SMALL burst of packets per tick — enough to stay ahead of AAC's
-    // ~43 frames/sec (one-per-rAF underran when rAF stuttered under video load),
-    // but NOT so many that the sequential WASM readFrame calls monopolise the
-    // main thread and starve the video decode/present loop (a big burst stalled
-    // heavy 1440p60 AV1). ~24/tick × 60fps ≈ 1440 pkt/s capacity vs 43 needed,
-    // filling the lead over a few ticks instead of one blocking gulp. Hold a
-    // few seconds of lead (scaled with rate); the audio bitrate is tiny so the
-    // time-cushion costs almost no bytes.
+    // Hold a few seconds of lead (scaled with rate); the audio bitrate is tiny
+    // so the time-cushion costs almost no bytes. The same seconds serve as the
+    // queue's readahead.
     const rate = Math.max(0.25, this.clock.getPlaybackRate());
     const bufferedTarget = 5 * (rate < 1 ? 1 / rate : Math.min(2, rate));
 
-    // Bound the audio decode lead against the CLOCK, not the AudioRenderer
-    // buffer. While the AudioContext is suspended (Safari muted-autoplay) the
-    // buffer-duration reading is unreliable, so a buffer-only gate let audio
-    // race far ahead of the wall-clock-rolling video and land wildly out of sync
-    // on unmute. Gating on how far the last decoded PTS is past the playhead
-    // keeps audio close to the video in every state. Crucially, while audio is
-    // being DROPPED (muted with a suspended context — autoplay blocked, before
-    // any gesture) keep the lead tiny: that renderer advances its media clock to
-    // the lead edge, so a big lead becomes exactly that much A/V drift the
-    // instant the user unmutes. A small lead makes unmute land on the playhead.
-    // A muted-but-RUNNING context schedules audio like any other, so it gets the
-    // full smooth-buffer lead — starving it there was making muted playback
-    // stall in a loop while the same file played smoothly with sound.
-    const lead = this.audioRenderer.isDroppingAudio() ? 0.25 : bufferedTarget;
-    const mediaNow = Math.max(0, this.clock.getTime() - this.startTime);
-    if (this._lastSplitAudioPts - mediaNow > lead) return true;
+    if (!holdForVideo) this.feedSplitAudio(bufferedTarget);
+    if (this._splitAudioEof) return true; // keep ticking until the queue drains
 
+    const demuxer = this.audioDemuxer;
     this.audioDemuxInFlight = true;
     try {
-      let reads = 0;
+      const sliceStart = performance.now();
       while (
-        reads < 24 &&
         !this._splitAudioEof &&
-        this.audioDecoder.queueSize <= 40 &&
-        this.audioRenderer.getBufferedDuration() < bufferedTarget &&
-        this._lastSplitAudioPts - mediaNow <= lead
+        this.audioDemuxer === demuxer &&
+        this.splitAudioQueue.bytes < MoviPlayer.MAX_QUEUE_BYTES &&
+        (this.splitAudioQueue.length === 0 ||
+          this.splitAudioQueue.forwardSeconds() < bufferedTarget) &&
+        performance.now() - sliceStart < MoviPlayer.READ_SLICE_MS
       ) {
-        const pkt = await this.audioDemuxer.readPacket();
-        reads++;
+        const pkt = await demuxer.readPacket();
         if (!pkt) {
           this._splitAudioEof = true;
           break;
@@ -9579,22 +9261,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // Shift a separately-timed audio rendition onto the video's PTS timeline
         // (delta is 0 when they share a baseline), so decode timestamps, the
         // seek-target filter (video-PTS scale) and the clock all agree.
-        const pts = pkt.timestamp + this._splitAudioPtsDelta;
-        // Skip packets before an in-flight seek target (mirror the video path).
-        if (this.seekTargetTime !== -1 && pts < this.seekTargetTime) {
-          continue;
-        }
-        // …and keep skipping past completion, up to where the seek actually
-        // resumed (see _splitAudioSkipBefore). Cleared by the first packet that
-        // reaches it, so it costs one comparison per packet afterwards.
-        if (this._splitAudioSkipBefore >= 0) {
-          if (pts < this._splitAudioSkipBefore) continue;
-          this._splitAudioSkipBefore = -1;
-        }
-        this.audioDecoder.decode(pkt.data, pts, pkt.keyframe);
-        // Track the last PTS 0-based (content time) to match the pump's lead
-        // gate, which compares against `mediaNow` (clock − startTime).
-        this._lastSplitAudioPts = pts - this.startTime;
+        this.splitAudioQueue.push({
+          ...pkt,
+          timestamp: pkt.timestamp + this._splitAudioPtsDelta,
+        });
+        if (!holdForVideo) this.feedSplitAudio(bufferedTarget);
       }
     } catch (e) {
       Logger.warn(TAG, `Split audio demux error: ${(e as any)?.message ?? e}`);
@@ -9602,7 +9273,50 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.audioDemuxInFlight = false;
     }
 
-    return !this._splitAudioEof;
+    return !this._splitAudioEof || this.splitAudioQueue.length > 0;
+  }
+
+  private feedSplitAudio(bufferedTarget: number): void {
+    // Bound the audio decode lead against the CLOCK, not the AudioRenderer
+    // buffer. While the AudioContext is suspended (Safari muted-autoplay) the
+    // buffer-duration reading is unreliable, so a buffer-only gate let audio
+    // race far ahead of the wall-clock-rolling video and land seconds/minutes
+    // out of sync on unmute. Gating on how far the last decoded PTS is past the
+    // playhead keeps audio close to the video in every state. Crucially, while
+    // audio is being DROPPED (muted with a suspended context — autoplay
+    // blocked, before any gesture) keep the lead tiny: that renderer advances
+    // its media clock to the lead edge, so a big lead becomes exactly that much
+    // A/V drift the instant the user unmutes. A small lead makes unmute land on
+    // the playhead. A muted-but-RUNNING context schedules audio like any other,
+    // so it gets the full smooth-buffer lead — starving it there was making
+    // muted playback stall in a loop while the same file played smoothly with
+    // sound.
+    const lead = this.audioRenderer.isDroppingAudio() ? 0.25 : bufferedTarget;
+    const mediaNow = Math.max(0, this.clock.getTime() - this.startTime);
+    while (
+      this.splitAudioQueue.length > 0 &&
+      this.audioDecoder.queueSize <= 40 &&
+      this.audioRenderer.getBufferedDuration() < bufferedTarget &&
+      this._lastSplitAudioPts - mediaNow <= lead
+    ) {
+      const pkt = this.splitAudioQueue.shift()!;
+      const pts = pkt.timestamp;
+      // Skip packets before an in-flight seek target (mirror the video path).
+      if (this.seekTargetTime !== -1 && pts < this.seekTargetTime) {
+        continue;
+      }
+      // …and keep skipping past completion, up to where the seek actually
+      // resumed (see _splitAudioSkipBefore). Cleared by the first packet that
+      // reaches it, so it costs one comparison per packet afterwards.
+      if (this._splitAudioSkipBefore >= 0) {
+        if (pts < this._splitAudioSkipBefore) continue;
+        this._splitAudioSkipBefore = -1;
+      }
+      this.audioDecoder.decode(pkt.data, pts, pkt.keyframe);
+      // Track the last PTS 0-based (content time) to match the lead gate,
+      // which compares against `mediaNow` (clock − startTime).
+      this._lastSplitAudioPts = pts - this.startTime;
+    }
   }
 
   /** True once the split-audio demuxer has hit EOF and the renderer has played
@@ -9644,6 +9358,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (
       mainLoopParked &&
       this._splitAudioEof &&
+      this.splitAudioQueue.length === 0 &&
       (this.stateManager.is("playing") || this.stateManager.is("buffering")) &&
       this.isSplitAudioPlayedOut()
     ) {
@@ -9734,6 +9449,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           );
         }
         this._splitAudioEof = false;
+        this.splitAudioQueue.clear();
         this._lastSplitAudioPts = playhead;
         this.audioRenderer.reset();
         this.startAudioLoop();
@@ -9906,6 +9622,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.disableAudio = false;
     this._activeAudioLang = lang;
     this._splitAudioEof = false;
+    this.splitAudioQueue.clear();
     this._lastSplitAudioPts = t;
     if (resume) {
       if (!this.audioRenderer.isAudioPlaying()) this.audioRenderer.play();
@@ -10459,9 +10176,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.audioRenderer.reset();
       await this.demuxer.seek(resumeTime, 1, this.getSeekStreamIndex());
       this.clock.seek(resumeTime);
-      this.pendingAudioPackets = [];
-      this.droppedSeekAudioPackets = 0;
-      this.pendingPrebufferPackets = [];
+      this.clearPacketQueues();
       this.eofReached = false;
       this.eofSince = 0;
     } catch (err) {
@@ -10793,13 +10508,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     stats["Video Decoder Queue"] = videoDecoderStats.queueSize;
     stats["Audio Decoder Queue"] = audioDecoderStats.queueSize;
     stats["Seek Waiting For Video"] = this.waitingForVideoSync ? "Yes" : "No";
-    stats["Seek Audio Hold Packets"] = this.pendingAudioPackets.length;
-    stats["Seek Audio Dropped Packets"] = this.droppedSeekAudioPackets;
+    stats["Seek Audio Hold Packets"] = this.waitingForVideoSync
+      ? this.audioQueue.length
+      : 0;
     stats["Seek Demux Ahead"] =
       this.waitingForVideoSync && this.seekDemuxAheadTime >= 0
         ? `${(this.seekDemuxAheadTime - this.seekTargetTime).toFixed(1)}s / ${MoviPlayer.SEEK_MAX_DEMUX_AHEAD_SECONDS}s`
         : "—";
-    stats["Pause Prebuffer Packets"] = this.pendingPrebufferPackets.length;
+    stats["Pause Prebuffer Packets"] = this.stateManager.is("paused")
+      ? this.videoQueue.length + this.audioQueue.length
+      : 0;
     if (audioDecoderStats.worker) {
       stats["Audio Worker Generation"] = audioDecoderStats.worker.generation;
       stats["Audio Worker Track"] = audioDecoderStats.worker.trackId;
@@ -11307,6 +11025,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (this.demuxer) {
         await this.demuxer.seek(audioTime + this.startTime);
       }
+      // Both queues hold what was read from the old cursor; the audio from
+      // here on is re-read, and seekTargetTime below keeps what was already
+      // scheduled from being decoded twice.
+      this.clearPacketQueues();
       // The blocking part is behind us — whatever happens now, the pipeline is
       // moving again, so the hold has nothing left to protect against.
       clearTimeout(holdTimer);
@@ -11331,7 +11053,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.seekingToKeyframeStartTime = performance.now();
       this.seekKeyframeScanned = 0;
       this.seekCraSeen = 0;
-      this.videoChainBrokenUntilKeyframe = false;
 
       // Restart video pipeline. If the hold went up while we were waiting, the
       // presentation loop stays down: the resume gate is measuring the queue
@@ -11485,7 +11206,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   /**
    * Start pause-time buffering: demux packets while paused so that
    * resume/seek within buffered area is near-instant (YouTube-like behavior).
-   * Stashes packets into pendingPrebufferPackets without decoding.
+   * Reads into the packet queues without decoding; play() feeds from them.
    */
   private startPauseBuffering(): void {
     if (this.pauseBufferTimerId !== null) return;
@@ -11525,36 +11246,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return;
     }
 
-    // Check if we've buffered enough
-    const stashedCount = this.pendingPrebufferPackets.length;
-    if (stashedCount >= MoviPlayer.PAUSE_BUFFER_MAX_PACKETS) {
-      Logger.debug(TAG, `Pause buffer full: ${stashedCount} packets stashed`);
-      this.stopPauseBuffering();
-      return;
-    }
-
-    // Check audio/video targets
-    let audioDuration = 0;
-    let videoFrames = 0;
-    const activeVideo = this.trackManager.getActiveVideoTrack();
-    const activeAudio = this.trackManager.getActiveAudioTrack();
-    for (const pkt of this.pendingPrebufferPackets) {
-      if (activeVideo && pkt.streamIndex === activeVideo.id) {
-        videoFrames++;
-      } else if (activeAudio && pkt.streamIndex === activeAudio.id) {
-        audioDuration += pkt.duration ?? 0;
-      }
-    }
-
-    // Only require targets for tracks that actually exist. A video-only or
-    // audio-only stream would otherwise never satisfy the AND check, so the
-    // loop ran until the 3000-packet safety cap (~30s of demux work) — which
-    // shows up as a long burst of "Read: served from full-file cache" log
-    // spam after pause.
-    const videoTargetMet = !activeVideo || videoFrames >= MoviPlayer.PAUSE_BUFFER_VIDEO_FRAMES;
-    const audioTargetMet = !activeAudio || audioDuration >= MoviPlayer.PAUSE_BUFFER_AUDIO_SECONDS;
-    if (videoTargetMet && audioTargetMet) {
-      Logger.debug(TAG, `Pause buffer targets met: audio=${audioDuration.toFixed(1)}s, video=${videoFrames} frames`);
+    // The same read decision as playback, against a longer readahead, and
+    // under the same byte ceiling.
+    if (!this.needsMorePackets(MoviPlayer.PAUSE_BUFFER_SECONDS)) {
+      Logger.debug(
+        TAG,
+        `Pause buffer full: video=${this.videoQueue.forwardSeconds().toFixed(1)}s audio=${this.audioQueue.forwardSeconds().toFixed(1)}s, ${(
+          (this.videoQueue.bytes + this.audioQueue.bytes) /
+          1048576
+        ).toFixed(1)}MB`,
+      );
       this.stopPauseBuffering();
       return;
     }
@@ -11567,7 +11268,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const burstSize = 10;
       for (let i = 0; i < burstSize; i++) {
         if (this.stateManager.getState() !== "paused") break;
-        if (this.pendingPrebufferPackets.length >= MoviPlayer.PAUSE_BUFFER_MAX_PACKETS) break;
+        if (!this.needsMorePackets(MoviPlayer.PAUSE_BUFFER_SECONDS)) break;
 
         // Don't push the demuxer past what HttpSource already holds — the next
         // read would otherwise trigger startStream() at the new offset, which
@@ -11590,12 +11291,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           this.eofReached = true;
           break;
         }
-        this.trackDemuxedPacketForB1bDiagnostic(packet);
-
-        // Only stash packets for active tracks
-        if (this.trackManager.isActiveStream(packet.streamIndex)) {
-          this.pendingPrebufferPackets.push(packet);
-        }
+        this.enqueuePacket(packet);
       }
     } catch (e) {
       Logger.error(TAG, "Pause buffer demux error", e);
@@ -12414,6 +12110,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (this.audioDemuxer) {
       this.audioDemuxer.close();
       this.audioDemuxer = null;
+      this.splitAudioQueue.clear();
     }
     if (this.audioSource) {
       try {
@@ -12428,7 +12125,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.streamWrapper = null;
     }
 
-    this.pendingPrebufferPackets = [];
+    this.clearPacketQueues();
 
     // Close resources
     this.videoDecoder.close();
