@@ -8,6 +8,7 @@ import {
   progression,
   summarizeDisturbances,
 } from "./blackbox-metrics.mjs";
+import { createPageGuard } from "./blackbox-page-guard.mjs";
 
 const required = (name) => {
   const value = process.env[name];
@@ -1725,6 +1726,7 @@ async function runOne(browser, token, mediaPath) {
   const sessionStartedAt = Date.now();
   const context = await browser.newContext();
   const page = await context.newPage();
+  const pageGuard = createPageGuard(page);
   const decoderDiagnostics = [];
   page.on("console", (message) => {
     const text = message
@@ -1772,14 +1774,25 @@ async function runOne(browser, token, mediaPath) {
   // that COULD run still did, and the report keeps its result.
   const completed = {};
   const stepFailures = [];
+  // Once the page is lost, later steps would only measure a fresh page (or
+  // none) and each burn its own timeout; record them as skipped with the cause.
   const runPhase = async (name, fn) => {
+    const lostBefore = pageGuard.lostReason();
+    if (lostBefore !== null) {
+      stepFailures.push({ step: name, error: `skipped: ${lostBefore}`, snapshot: null });
+      process.stderr.write(`  [${label}] step "${name}" skipped: ${lostBefore}\n`);
+      return null;
+    }
     try {
       const value = await fn();
       completed[name] = value;
       return value;
     } catch (error) {
       const current = await snapshot(page).catch(() => null);
-      const message = error instanceof Error ? error.message : String(error);
+      const lost = pageGuard.lostReason();
+      const message =
+        (error instanceof Error ? error.message : String(error)) +
+        (lost === null ? "" : ` [${lost}]`);
       stepFailures.push({
         step: name,
         error: message,
@@ -1799,6 +1812,7 @@ async function runOne(browser, token, mediaPath) {
     null,
     { timeout: 30_000 },
   );
+  pageGuard.arm();
   await page.evaluate(({ rawUrl, bufferSizeMb }) => {
     globalThis.__moviBlackboxErrors = [];
     globalThis.__moviBlackboxQoe = [];
@@ -2328,6 +2342,8 @@ async function runOne(browser, token, mediaPath) {
     // triage needs most.
     const current = await snapshot(page).catch(() => null);
     if (error instanceof Error) {
+      const lost = pageGuard.lostReason();
+      if (lost !== null) error.message += ` [${lost}]`;
       error.decoderDiagnostics = decoderDiagnostics.slice(-120);
       error.networkStats = current?.network ?? null;
       error.partial = { failedPhase: "setup", completed };

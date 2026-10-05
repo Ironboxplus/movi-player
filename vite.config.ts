@@ -27,6 +27,14 @@ export default defineConfig({
   },
   server: {
     allowedHosts: true,
+    // Black-box runs start the dev server with MOVI_DEV_NO_HMR=1. With HMR on,
+    // saving any watched source file reloads the page under test mid-session:
+    // on 2026-09-15 an edit to src/source/HttpSource.ts during the Good Will
+    // Hunting run re-initialised the element and the report read it as "middle
+    // seek never recovers". hmr:false stops file changes from reaching the
+    // page; scripts/blackbox-page-guard.mjs still names any reload that slips
+    // through (e.g. a vite.config.ts edit, which restarts the server).
+    hmr: process.env.MOVI_DEV_NO_HMR === '1' ? false : undefined,
     watch: {
       // A crash dump must not be able to kill the dev server. Git Bash drops
       // `bash.exe.stackdump` in the CWD when it faults, and Windows keeps that

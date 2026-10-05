@@ -10,7 +10,8 @@
 
 ```bash
 # 1. 页面（必须显式 --host 127.0.0.1；只写 --port 会绑到 [::1]，harness 连不上）
-npx vite --port 4173 --strictPort --host 127.0.0.1
+#    MOVI_DEV_NO_HMR=1 必须带：否则跑的过程中保存任何源文件都会把被测页面整页重载（见下）
+MOVI_DEV_NO_HMR=1 npx vite --port 4173 --strictPort --host 127.0.0.1
 
 # 2. 凭据与样本矩阵
 source /e/Go/Openlist/.secrets/openlist.env
@@ -21,6 +22,15 @@ export MOVI_CHROME_EXECUTABLE="C:\Program Files\Google\Chrome\Application\chrome
 # 4. 跑
 node scripts/real-openlist-playback.mjs
 ```
+
+### 跑的过程中页面被重载 = 之后的结果全部作废
+
+2026-09-15 Good Will Hunting 的「middle seek 之后整场不再恢复」是 dev server 的 HMR 在跑的过程中把页面重载了（当时正在改 `src/source/HttpSource.ts`），不是播放器缺陷。失败快照是 `state: "missing"`，诊断里元素初始化日志连出 4 次。现在：
+
+- 起 dev server 带 `MOVI_DEV_NO_HMR=1`（`vite.config.ts` → `server.hmr=false`），改源文件不再推给页面；
+- harness 用 `scripts/blackbox-page-guard.mjs` 盯着页面：初始加载之后的主框架导航、renderer crash、页面关闭都会被记成具名原因，其后的步骤记为 `skipped: <原因>`，不再每步等 60s 超时。
+
+报告里看到 `page reloaded mid-session` / `page renderer crashed`，这个样本就要重跑，不能据此给播放器定性。改 `vite.config.ts` 会让 dev server 重启并重载页面，`hmr=false` 拦不住，guard 会照样报出来。
 
 ### 用哪个浏览器决定了硬件解码的结论
 
