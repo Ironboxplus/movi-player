@@ -1426,6 +1426,50 @@ async function runVisibilityCycle(page, label) {
   };
 }
 
+/**
+ * Seek and wait for the seek to finish before a subtitle probe opens its cue
+ * window, so the window measures the subtitle path and not seek recovery (which
+ * the seek matrix already measures on its own).
+ *
+ * The bitmap branch used to give the seek a fixed 1s and then start its 12s cue
+ * window. On a heavy DTS-HD MA remux the post-seek audio cold-prime holds
+ * playback until a 2s audio cushion and a few video frames are buffered, and
+ * on a link slower than the file's bitrate that alone can outlast 13s. Memories
+ * (2026-09-15, run on a weak local network) read as "bitmap subtitles never
+ * render" six times in a row while its only decoded cue sat 1.4s ahead of a
+ * playhead still held in cold-prime — consistent with that, though not proven
+ * to be it; either way the probe was charging seek recovery to subtitles.
+ */
+async function seekForSubtitleProbe(page, label, target) {
+  await page.evaluate((seconds) => {
+    document.querySelector("movi-player").currentTime = seconds;
+  }, target);
+  try {
+    await page.waitForFunction(
+      (seconds) => {
+        const element = document.querySelector("movi-player");
+        return (
+          Math.abs(element.currentTime - seconds) < 5 &&
+          ["playing", "paused"].includes(element.player?.getState?.())
+        );
+      },
+      target,
+      { timeout: 60_000 },
+    );
+  } catch (error) {
+    const state = await page
+      .evaluate(() => {
+        const element = document.querySelector("movi-player");
+        return { at: element?.currentTime ?? null, state: element?.player?.getState?.() ?? "missing" };
+      })
+      .catch(() => null);
+    throw new Error(
+      `${label} subtitle probe: seek to ${target.toFixed(2)}s did not settle within 60s ` +
+        `(${JSON.stringify(state)}): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 async function validateSubtitles(page, label) {
   const tracks = await page.evaluate(() => {
     const player = document.querySelector("movi-player")?.player;
@@ -1469,20 +1513,7 @@ async function validateSubtitles(page, label) {
       () => Number(document.querySelector("movi-player")?.duration ?? 0),
     );
     for (const target of [duration * 0.35, duration * 0.2, duration * 0.5, duration * 0.75]) {
-      await page.evaluate((seconds) => {
-        document.querySelector("movi-player").currentTime = seconds;
-      }, target);
-      await page.waitForFunction(
-        (seconds) => {
-          const element = document.querySelector("movi-player");
-          return (
-            Math.abs(element.currentTime - seconds) < 5 &&
-            ["playing", "paused"].includes(element.player?.getState?.())
-          );
-        },
-        target,
-        { timeout: 60_000 },
-      );
+      await seekForSubtitleProbe(page, label, target);
       if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
         await page.evaluate(() => document.querySelector("movi-player").play());
       }
@@ -1571,10 +1602,7 @@ async function validateSubtitles(page, label) {
       () => Number(document.querySelector("movi-player")?.duration ?? 0),
     );
     for (const target of [duration * 0.2, duration * 0.5, duration * 0.75]) {
-      await page.evaluate((seconds) => {
-        document.querySelector("movi-player").currentTime = seconds;
-      }, target);
-      await page.waitForTimeout(1_000);
+      await seekForSubtitleProbe(page, label, target);
       if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
         await page.evaluate(() => document.querySelector("movi-player").play());
       }
