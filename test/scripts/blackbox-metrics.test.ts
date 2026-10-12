@@ -104,69 +104,111 @@ describe("classifyWindow", () => {
 });
 
 const MIB = 1024 * 1024;
+const NO_ONE_OFF = { fetches: 0, requestedBytes: 0, bytes: 0 };
 
 describe("generationAllowance", () => {
-  it("is playback consumption plus two chunks plus one window", () => {
-    // 10s x 3MB/s x 2.5 slack, 4MiB first chunk, 8MiB fill, 250MiB window.
+  it("is the consumed span plus one window plus the two chunks", () => {
     expect(
       generationAllowance({
-        bitrate: 3_000_000,
-        ms: 10_000,
+        startOffset: 1000 * MIB,
+        consumedEnd: 1300 * MIB,
         windowBytes: 250 * MIB,
       }),
-    ).toBe(75_000_000 + 12 * MIB + 250 * MIB);
+    ).toBe(300 * MIB + 250 * MIB + 12 * MIB);
   });
 
-  it("is just the fixed part for a generation that lived no time", () => {
-    expect(generationAllowance({ bitrate: 3_000_000, ms: 0, windowBytes: 0 })).toBe(
-      12 * MIB,
-    );
+  it("never goes below the fixed part for a generation that consumed nothing", () => {
+    expect(
+      generationAllowance({ startOffset: 500, consumedEnd: 500, windowBytes: 0 }),
+    ).toBe(12 * MIB);
+    expect(
+      generationAllowance({ startOffset: 500, consumedEnd: 100, windowBytes: 0 }),
+    ).toBe(12 * MIB);
   });
 });
 
 describe("byteBudget", () => {
-  // The 19.6GB MPEG-2 remux: 5432s, so ~3.6MB/s average.
-  const base = { sizeBytes: 19_600_000_000, durationSeconds: 5432 };
   const window = 250 * MIB;
+  const gen = (
+    over: Partial<{
+      generation: number;
+      startOffset: number;
+      consumedEnd: number;
+      bytes: number;
+      ms: number;
+    }> = {},
+  ) => ({
+    generation: 1,
+    startOffset: 0,
+    consumedEnd: 0,
+    bytes: 0,
+    ms: 10_000,
+    ...over,
+  });
 
   it("sums per-generation allowances into the budget", () => {
     const generationBytes = [
-      { generation: 1, startOffset: 0, bytes: 100 * MIB, ms: 20_000 },
-      { generation: 2, startOffset: 9e9, bytes: 200 * MIB, ms: 40_000 },
+      gen({ generation: 1, consumedEnd: 80 * MIB, bytes: 100 * MIB }),
+      gen({
+        generation: 2,
+        startOffset: 9000 * MIB,
+        consumedEnd: 9100 * MIB,
+        bytes: 200 * MIB,
+      }),
     ];
     const budget = byteBudget({
-      ...base,
       totalBytes: 300 * MIB,
       generationBytes,
+      oneOff: NO_ONE_OFF,
       windowBytes: window,
     });
-    expect(budget.bitrateBytesPerSecond).toBe(3_608_247);
-    const expected = generationBytes.map((g) =>
-      Math.round(
-        generationAllowance({ bitrate: 3_608_247, ms: g.ms, windowBytes: window }),
-      ),
-    );
-    expect(budget.perGeneration.map((g) => g.allowance)).toEqual(expected);
-    expect(budget.budgetBytes).toBe(expected[0] + expected[1]);
+    expect(budget.perGeneration.map((g) => g.allowance)).toEqual([
+      80 * MIB + window + 12 * MIB,
+      100 * MIB + window + 12 * MIB,
+    ]);
+    expect(budget.budgetBytes).toBe(180 * MIB + 2 * (window + 12 * MIB));
     expect(budget.violations).toEqual([]);
     expect(budget.worstGeneration?.generation).toBe(2);
   });
 
-  it("names the generation that outgrew its window", () => {
+  it("accepts the refill after a forward jump inside the window", () => {
+    // The Good Will Hunting shape: the head seek jumped about 300MB forward
+    // inside the window, the window slid over it and refilled. Bytes are the
+    // jump plus a window, which is the allowance minus the two chunks.
     const budget = byteBudget({
-      ...base,
+      totalBytes: 300 * MIB + window,
+      generationBytes: [
+        gen({ consumedEnd: 300 * MIB, bytes: 300 * MIB + window, ms: 36_000 }),
+      ],
+      oneOff: NO_ONE_OFF,
+      windowBytes: window,
+    });
+    expect(budget.violations).toEqual([]);
+    expect(budget.worstGeneration?.ratio).toBeLessThan(1);
+  });
+
+  it("names the generation that downloaded past its span and window", () => {
+    const budget = byteBudget({
       totalBytes: 700 * MIB,
       generationBytes: [
-        { generation: 4, startOffset: 0, bytes: 100 * MIB, ms: 20_000 },
-        { generation: 5, startOffset: 7_000_000_000, bytes: 600 * MIB, ms: 1_000 },
+        gen({ generation: 4, consumedEnd: 50 * MIB, bytes: 100 * MIB }),
+        gen({
+          generation: 5,
+          startOffset: 7000 * MIB,
+          consumedEnd: 7010 * MIB,
+          bytes: 600 * MIB,
+          ms: 1_000,
+        }),
       ],
+      oneOff: NO_ONE_OFF,
       windowBytes: window,
     });
     expect(budget.violations).toHaveLength(1);
     expect(budget.violations[0]).toMatchObject({
       kind: "generation-over-allowance",
       generation: 5,
-      startOffset: 7_000_000_000,
+      startOffset: 7000 * MIB,
+      consumedEnd: 7010 * MIB,
       bytes: 600 * MIB,
       ms: 1_000,
     });
@@ -174,65 +216,81 @@ describe("byteBudget", () => {
     expect(budget.worstGeneration?.ratio).toBeGreaterThan(1);
   });
 
-  it("fails when the per-generation counters do not add up to the total", () => {
+  it("fails when one-off reads returned more than they asked for", () => {
     const budget = byteBudget({
-      ...base,
-      totalBytes: 300 * MIB,
-      generationBytes: [
-        { generation: 1, startOffset: 0, bytes: 100 * MIB, ms: 60_000 },
-      ],
+      totalBytes: 10 * MIB,
+      generationBytes: [],
+      oneOff: { fetches: 2, requestedBytes: 4 * MIB, bytes: 10 * MIB },
       windowBytes: window,
     });
     expect(budget.violations).toEqual([
-      { kind: "counter-mismatch", totalBytes: 300 * MIB, generationSum: 100 * MIB },
+      { kind: "one-off-over-request", requestedBytes: 4 * MIB, bytes: 10 * MIB },
     ]);
   });
 
-  it("tolerates a sub-MiB difference between the two counters", () => {
+  it("counts one-off bytes toward the total", () => {
+    const generationBytes = [gen({ consumedEnd: 100 * MIB, bytes: 100 * MIB })];
+    const oneOff = { fetches: 3, requestedBytes: 30 * MIB, bytes: 20 * MIB };
+    expect(
+      byteBudget({ totalBytes: 120 * MIB, generationBytes, oneOff, windowBytes: window })
+        .violations,
+    ).toEqual([]);
+    // Without crediting the one-off bytes the same totals do not add up.
+    expect(
+      byteBudget({
+        totalBytes: 120 * MIB,
+        generationBytes,
+        oneOff: NO_ONE_OFF,
+        windowBytes: window,
+      }).violations.map((v) => v.kind),
+    ).toEqual(["counter-mismatch"]);
+  });
+
+  it("fails when the counters do not add up to the total", () => {
     const budget = byteBudget({
-      ...base,
+      totalBytes: 300 * MIB,
+      generationBytes: [gen({ consumedEnd: 100 * MIB, bytes: 100 * MIB })],
+      oneOff: NO_ONE_OFF,
+      windowBytes: window,
+    });
+    expect(budget.violations).toEqual([
+      {
+        kind: "counter-mismatch",
+        totalBytes: 300 * MIB,
+        generationSum: 100 * MIB,
+        oneOffBytes: 0,
+      },
+    ]);
+  });
+
+  it("tolerates a sub-MiB difference between the counters", () => {
+    const budget = byteBudget({
       totalBytes: 100 * MIB + 1000,
-      generationBytes: [
-        { generation: 1, startOffset: 0, bytes: 100 * MIB, ms: 60_000 },
-      ],
+      generationBytes: [gen({ consumedEnd: 100 * MIB, bytes: 100 * MIB })],
+      oneOff: NO_ONE_OFF,
       windowBytes: window,
     });
     expect(budget.violations).toEqual([]);
   });
 
   it("does not demand a sum once the source has dropped old generations", () => {
-    const generationBytes = Array.from({ length: 64 }, (_, i) => ({
-      generation: i + 10,
-      startOffset: i,
-      bytes: MIB,
-      ms: 10_000,
-    }));
+    const generationBytes = Array.from({ length: 64 }, (_, i) =>
+      gen({ generation: i + 10, startOffset: i, consumedEnd: i + MIB, bytes: MIB }),
+    );
     const budget = byteBudget({
-      ...base,
       totalBytes: 100 * MIB,
       generationBytes,
+      oneOff: NO_ONE_OFF,
       windowBytes: window,
     });
     expect(budget.violations).toEqual([]);
   });
 
-  it("stays finite for a zero-duration file rather than dividing by it", () => {
-    const budget = byteBudget({
-      sizeBytes: 1_000,
-      durationSeconds: 0,
-      totalBytes: 0,
-      generationBytes: [{ generation: 1, startOffset: 0, bytes: 0, ms: 10_000 }],
-      windowBytes: 0,
-    });
-    expect(budget.bitrateBytesPerSecond).toBe(0);
-    expect(Number.isFinite(budget.budgetBytes)).toBe(true);
-  });
-
   it("has no worst generation when none was recorded", () => {
     const budget = byteBudget({
-      ...base,
       totalBytes: 0,
       generationBytes: [],
+      oneOff: NO_ONE_OFF,
       windowBytes: window,
     });
     expect(budget.worstGeneration).toBeNull();

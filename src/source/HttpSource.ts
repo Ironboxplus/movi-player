@@ -311,9 +311,18 @@ export class HttpSource implements SourceAdapter {
     generation: number;
     startOffset: number;
     bytes: number;
+    // Farthest byte the demuxer took out of THIS generation's window. The
+    // window only ever slides over bytes already consumed, so a generation can
+    // download at most (consumedEnd - startOffset) plus one window plus the
+    // chunks in flight: the invariant the black-box byte budget checks.
+    consumedEnd: number;
     startedAt: number;
     endedAt: number | null;
   }> = [];
+  // One-off range reads (outside the window, main stream keeps running) are
+  // fetched and counted separately from any generation. `requestedBytes` is
+  // what the reads asked for, so a server that answers with more is visible.
+  private oneOffStats = { fetches: 0, requestedBytes: 0, bytes: 0 };
   private streamStartTime: number = 0;
   private lastSpeedBytes: number = 0;
   private lastSpeedTime: number = 0;
@@ -1113,12 +1122,18 @@ export class HttpSource implements SourceAdapter {
       generation: this.atomicGetVersion(),
       startOffset,
       bytes: 0,
+      consumedEnd: startOffset,
       startedAt: now,
       endedAt: null,
     });
     if (this.generationLog.length > MAX_GENERATION_RECORDS) {
       this.generationLog.shift();
     }
+  }
+
+  private noteConsumed(end: number): void {
+    const current = this.generationLog[this.generationLog.length - 1];
+    if (current && end > current.consumedEnd) current.consumedEnd = end;
   }
 
   private countDownloaded(bytes: number): void {
@@ -1151,6 +1166,7 @@ export class HttpSource implements SourceAdapter {
     const writePos = this.atomicGetWritePos();
     const shift = Math.floor(this.position - bufStart);
     if (shift <= 0 || writePos <= shift) return null;
+    this.noteConsumed(bufStart + shift);
     buffer.copyWithin(0, shift, writePos);
     this.atomicSetBufferStart(bufStart + shift);
     this.atomicSetWritePos(writePos - shift);
@@ -2460,6 +2476,8 @@ export class HttpSource implements SourceAdapter {
             ? Math.min(offset + length - 1, this.size - 1)
             : offset + length - 1;
         const rangeLen = rangeEnd - offset + 1;
+        this.oneOffStats.fetches++;
+        this.oneOffStats.requestedBytes += rangeLen;
         const response = await fetch(this.url, {
           headers: await this.buildRequestHeaders({ offset, length: rangeLen }),
           signal: oneOffAbort.signal,
@@ -2475,6 +2493,8 @@ export class HttpSource implements SourceAdapter {
             );
           }
           const arrayBuffer = await response.arrayBuffer();
+          this.oneOffStats.bytes += arrayBuffer.byteLength;
+          this.totalBytesDownloaded += arrayBuffer.byteLength;
           if (
             response.status !== 206 &&
             arrayBuffer.byteLength > rangeLen * 1.5
@@ -2578,6 +2598,7 @@ export class HttpSource implements SourceAdapter {
     result.set(buffer.subarray(localOffset, localOffset + available));
 
     this.position = offset + available;
+    this.noteConsumed(this.position);
     if (this.position > this.readMax) this.readMax = this.position;
     return result.buffer;
   }
@@ -2820,8 +2841,10 @@ export class HttpSource implements SourceAdapter {
       generation: number;
       startOffset: number;
       bytes: number;
+      consumedEnd: number;
       ms: number;
     }>;
+    oneOff: { fetches: number; requestedBytes: number; bytes: number };
   } {
     const now = Date.now();
     const timeSinceLastRead = this.lastSpeedTime > 0 ? (Date.now() - this.lastSpeedTime) / 1000 : 0;
@@ -2848,8 +2871,10 @@ export class HttpSource implements SourceAdapter {
         generation: record.generation,
         startOffset: record.startOffset,
         bytes: record.bytes,
+        consumedEnd: record.consumedEnd,
         ms: (record.endedAt ?? now) - record.startedAt,
       })),
+      oneOff: { ...this.oneOffStats },
     };
   }
 }

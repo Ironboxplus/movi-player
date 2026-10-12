@@ -380,29 +380,26 @@ function assertHealthyInner(label, before, after, phase, options = {}) {
 // "30 seconds of playback must not download the whole 19GB file" was recorded
 // in the report and never asserted. This is the assertion.
 //
-// The ceiling is derived from the source's own fetching strategy rather than
-// picked, and it is kept PER STREAM GENERATION (the arithmetic lives in
+// The ceiling is derived from an invariant of the source rather than picked,
+// and it is kept PER STREAM GENERATION (the arithmetic lives in
 // blackbox-metrics.mjs, the counting in HttpSource.getNetworkStats()): a seek
 // outside the window abandons the running stream and the new one refills a
 // window from the new position, so a session of N generations can move N
 // windows without anything being wrong. What would be wrong is one generation
-// not held by its own window. Each generation is therefore checked against
-// what it could have used while alive: its lifetime of playback consumption,
-// one window, the opening chunk and one in-flight fill. The session total is
-// the sum of those allowances, and the per-generation counters must add up to
-// the source-wide counter or some download went unrecorded.
-//
-// Paused time only reduces consumption, so a generation's lifetime is a
-// sound upper bound for its streaming term.
-function assertByteBudget(label, { sizeBytes, durationSeconds, wallSeconds, snapshot: final }) {
+// not held by its own window, i.e. downloading more than the span the demuxer
+// consumed from it plus one window and the chunks in flight. Bytes fetched by
+// one-off range reads belong to no generation and are counted on their own,
+// and may not exceed what those reads asked for. Everything downloaded must
+// be accounted for: the per-generation counters plus the one-off bytes have to
+// add up to the source-wide counter, or some download went unrecorded.
+function assertByteBudget(label, { sizeBytes, wallSeconds, snapshot: final }) {
   const totalBytes = numeric(final.network?.totalBytes);
   const generations = numeric(final.network?.streamGeneration);
   const windowBytes = numeric(final.network?.streamWindowBytes);
   const budget = byteBudget({
-    sizeBytes,
-    durationSeconds,
     totalBytes,
     generationBytes: final.network?.generationBytes ?? [],
+    oneOff: final.network?.oneOff ?? { fetches: 0, requestedBytes: 0, bytes: 0 },
     windowBytes,
   });
   const detail = {
@@ -2332,7 +2329,6 @@ async function runOne(browser, token, mediaPath) {
   const budget = await runPhase("byte budget", async () =>
     assertByteBudget(label, {
       sizeBytes: media.size,
-      durationSeconds: playAfter.duration,
       wallSeconds: (Date.now() - sessionStartedAt) / 1000,
       snapshot: finalSnapshot,
     }),

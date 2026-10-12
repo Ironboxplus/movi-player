@@ -64,8 +64,46 @@ describe("HttpSource per-generation byte accounting", () => {
     expect(second.generation).toBeGreaterThan(first.generation);
     expect(first.bytes).toBeGreaterThan(0);
     expect(second.bytes).toBeGreaterThan(0);
-    expect(first.bytes + second.bytes).toBe(stats.totalBytes);
+    expect(first.bytes + second.bytes + stats.oneOff.bytes).toBe(stats.totalBytes);
     expect(stats.streamWindowBytes).toBeGreaterThan(0);
+  }, 60_000);
+
+  it("advances consumedEnd with the reads the generation serves", async () => {
+    const source = await openSource(24 * MIB);
+    await source.read(0, 64 * 1024);
+    expect(source.getNetworkStats().generationBytes[0].consumedEnd).toBe(64 * 1024);
+
+    // A forward jump inside the same window moves it by the whole jump.
+    await source.read(3 * MIB / 2, 64 * 1024);
+    expect(source.getNetworkStats().generationBytes[0].consumedEnd).toBe(
+      3 * MIB / 2 + 64 * 1024,
+    );
+
+    // Reading behind the farthest point does not pull it back.
+    await source.read(MIB / 2, 4096);
+    expect(source.getNetworkStats().generationBytes[0].consumedEnd).toBe(
+      3 * MIB / 2 + 64 * 1024,
+    );
+  }, 60_000);
+
+  it("counts one-off range reads on their own and in the total", async () => {
+    const source = await openSource(48 * MIB);
+    await source.read(0, 64 * 1024);
+    expect(source.getNetworkStats().oneOff).toEqual({
+      fetches: 0,
+      requestedBytes: 0,
+      bytes: 0,
+    });
+
+    const probe = 64 * 1024;
+    await source.read(Math.floor(48 * MIB * 0.4), probe);
+    const after = source.getNetworkStats();
+    expect(after.oneOff.fetches).toBe(1);
+    expect(after.oneOff.requestedBytes).toBe(probe);
+    expect(after.oneOff.bytes).toBe(probe);
+    expect(after.generationBytes).toHaveLength(1);
+    const generationSum = after.generationBytes.reduce((n, g) => n + g.bytes, 0);
+    expect(generationSum + after.oneOff.bytes).toBe(after.totalBytes);
   }, 60_000);
 
   it("keeps only the newest 64 generations", async () => {

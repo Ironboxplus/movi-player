@@ -10,7 +10,6 @@
 
 const FIRST_RANGE_CHUNK_BYTES = 4 * 1024 * 1024;
 const MAX_RANGE_CHUNK_BYTES = 8 * 1024 * 1024;
-const VBR_SLACK = 2.5;
 
 // States a steady-state assertion may sample in. Anything else is a
 // transition — seeking, (re)buffering, loading, erroring out — and a sample
@@ -77,31 +76,38 @@ export function summarizeDisturbances(disturbances) {
   return disturbances.map((d) => d.kind).join(", ");
 }
 
-// What one stream generation may download. A generation is one HttpSource
-// stream opened by startStream(): it is bounded to a single read-ahead window,
-// opens with a FIRST_RANGE_CHUNK and can have one MAX_RANGE_CHUNK fill in
-// flight when it is superseded, and while it lives the player consumes
-// ms x bitrate (VBR_SLACK covers stretches above the average and the container
-// index reads on top of the picture). A generation that exceeds this was not
-// held by its window, which is the prefetch running away.
+// What one stream generation may download, derived from an invariant of
+// HttpSource rather than estimated. A generation downloads forward from its
+// startOffset into a window of at most `windowBytes`, and the window only
+// slides over bytes the demuxer has already consumed, so by the time the
+// demuxer has read up to `consumedEnd` the generation can have fetched
+// everything up to consumedEnd plus one window, plus the first chunk and one
+// in-flight fill that are in transit when it is superseded:
+//
+//   bytes <= (consumedEnd - startOffset) + windowBytes + FIRST + MAX chunk
+//
+// Measuring the consumed span instead of guessing it from lifetime x bitrate
+// matters because a forward seek that lands inside the window skips hundreds of
+// megabytes without any wall time passing; the window slides over them and
+// refills, which is correct and which a time-based estimate cannot see.
 //
 // The allowance is per generation rather than one window for the whole
 // session because every seek outside the window abandons the old stream and
 // the new one refills a window from the new position: N generations can
-// legitimately move N windows. How many bytes that is depends on how fast the
-// link refills the window, so the session total scales with link speed while
-// the per-generation bound does not.
-export function generationAllowance({ bitrate, ms, windowBytes }) {
+// legitimately move N windows, and how fast the link refills them is the
+// link's business. A generation that exceeds this was not held by its window,
+// which is the prefetch running away.
+export function generationAllowance({ startOffset, consumedEnd, windowBytes }) {
   return (
-    (ms / 1000) * bitrate * VBR_SLACK +
+    Math.max(0, consumedEnd - startOffset) +
+    windowBytes +
     FIRST_RANGE_CHUNK_BYTES +
-    MAX_RANGE_CHUNK_BYTES +
-    windowBytes
+    MAX_RANGE_CHUNK_BYTES
   );
 }
 
-// Largest gap between the source-wide byte counter and the sum of the
-// per-generation counters before the accounting is declared leaky.
+// Largest gap between the source-wide byte counter and everything the
+// per-source counters add up to before the accounting is declared leaky.
 const COUNTER_DRIFT_BYTES = 1024 * 1024;
 
 // The source keeps only this many generations, so once it has reached it the
@@ -109,25 +115,23 @@ const COUNTER_DRIFT_BYTES = 1024 * 1024;
 const GENERATION_LOG_CAPACITY = 64;
 
 export function byteBudget({
-  sizeBytes,
-  durationSeconds,
   totalBytes,
   generationBytes,
+  oneOff,
   windowBytes,
 }) {
-  // Round the bitrate before it feeds the allowances. The budget is a ceiling
-  // meant to be read alongside `bitrateBytesPerSecond` in a report; deriving it
-  // from the unrounded fraction would make the two numbers disagree by the
-  // rounding error, for no benefit.
-  const rawBitrate = durationSeconds > 0 ? sizeBytes / durationSeconds : 0;
-  const bitrate = Math.round(rawBitrate);
   const perGeneration = generationBytes.map((generation) => {
     const allowance = Math.round(
-      generationAllowance({ bitrate, ms: generation.ms, windowBytes }),
+      generationAllowance({
+        startOffset: generation.startOffset,
+        consumedEnd: generation.consumedEnd,
+        windowBytes,
+      }),
     );
     return {
       generation: generation.generation,
       startOffset: generation.startOffset,
+      consumedEnd: generation.consumedEnd,
       bytes: generation.bytes,
       ms: generation.ms,
       allowance,
@@ -148,25 +152,35 @@ export function byteBudget({
         kind: "generation-over-allowance",
         generation: entry.generation,
         startOffset: entry.startOffset,
+        consumedEnd: entry.consumedEnd,
         bytes: entry.bytes,
         allowance: entry.allowance,
         ms: entry.ms,
       });
     }
   }
+  if (oneOff.bytes > oneOff.requestedBytes) {
+    violations.push({
+      kind: "one-off-over-request",
+      requestedBytes: oneOff.requestedBytes,
+      bytes: oneOff.bytes,
+    });
+  }
+  const accounted = summed + oneOff.bytes;
   const logTruncated = generationBytes.length >= GENERATION_LOG_CAPACITY;
-  if (!logTruncated && Math.abs(totalBytes - summed) > COUNTER_DRIFT_BYTES) {
+  if (!logTruncated && Math.abs(totalBytes - accounted) > COUNTER_DRIFT_BYTES) {
     violations.push({
       kind: "counter-mismatch",
       totalBytes,
       generationSum: summed,
+      oneOffBytes: oneOff.bytes,
     });
   }
   return {
-    bitrateBytesPerSecond: bitrate,
     windowTerm: windowBytes,
     budgetBytes: perGeneration.reduce((sum, g) => sum + g.allowance, 0),
     generationSum: summed,
+    oneOff,
     perGeneration,
     worstGeneration,
     violations,
