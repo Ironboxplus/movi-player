@@ -17,6 +17,7 @@ import { describe, expect, it } from "vitest";
 import recorded from "./fixtures/blackbox-recorded-windows.json";
 import {
   byteBudget,
+  generationAllowance,
   classifyWindow,
   isSteady,
   progression,
@@ -102,36 +103,139 @@ describe("classifyWindow", () => {
   });
 });
 
+const MIB = 1024 * 1024;
+
+describe("generationAllowance", () => {
+  it("is playback consumption plus two chunks plus one window", () => {
+    // 10s x 3MB/s x 2.5 slack, 4MiB first chunk, 8MiB fill, 250MiB window.
+    expect(
+      generationAllowance({
+        bitrate: 3_000_000,
+        ms: 10_000,
+        windowBytes: 250 * MIB,
+      }),
+    ).toBe(75_000_000 + 12 * MIB + 250 * MIB);
+  });
+
+  it("is just the fixed part for a generation that lived no time", () => {
+    expect(generationAllowance({ bitrate: 3_000_000, ms: 0, windowBytes: 0 })).toBe(
+      12 * MIB,
+    );
+  });
+});
+
 describe("byteBudget", () => {
-  it("derives a ceiling from bitrate, generations and the read-ahead window", () => {
-    // The 19.6GB MPEG-2 remux: 5432s, so ~3.6MB/s average.
+  // The 19.6GB MPEG-2 remux: 5432s, so ~3.6MB/s average.
+  const base = { sizeBytes: 19_600_000_000, durationSeconds: 5432 };
+  const window = 250 * MIB;
+
+  it("sums per-generation allowances into the budget", () => {
+    const generationBytes = [
+      { generation: 1, startOffset: 0, bytes: 100 * MIB, ms: 20_000 },
+      { generation: 2, startOffset: 9e9, bytes: 200 * MIB, ms: 40_000 },
+    ];
     const budget = byteBudget({
-      sizeBytes: 19_600_000_000,
-      durationSeconds: 5432,
-      wallSeconds: 120,
-      generations: 3,
-      windowBytes: 250 * 1024 * 1024,
+      ...base,
+      totalBytes: 300 * MIB,
+      generationBytes,
+      windowBytes: window,
     });
     expect(budget.bitrateBytesPerSecond).toBe(3_608_247);
-    // 120s x 3.6MB/s x 2.5 VBR slack
-    expect(budget.streamedTerm).toBe(1_082_474_100);
-    // 3 generations x (4MiB first chunk + 8MiB in-flight fill)
-    expect(budget.generationTerm).toBe(3 * 12 * 1024 * 1024);
-    expect(budget.windowTerm).toBe(250 * 1024 * 1024);
-    expect(budget.budgetBytes).toBe(
-      budget.streamedTerm + budget.generationTerm + budget.windowTerm,
+    const expected = generationBytes.map((g) =>
+      Math.round(
+        generationAllowance({ bitrate: 3_608_247, ms: g.ms, windowBytes: window }),
+      ),
     );
+    expect(budget.perGeneration.map((g) => g.allowance)).toEqual(expected);
+    expect(budget.budgetBytes).toBe(expected[0] + expected[1]);
+    expect(budget.violations).toEqual([]);
+    expect(budget.worstGeneration?.generation).toBe(2);
+  });
+
+  it("names the generation that outgrew its window", () => {
+    const budget = byteBudget({
+      ...base,
+      totalBytes: 700 * MIB,
+      generationBytes: [
+        { generation: 4, startOffset: 0, bytes: 100 * MIB, ms: 20_000 },
+        { generation: 5, startOffset: 7_000_000_000, bytes: 600 * MIB, ms: 1_000 },
+      ],
+      windowBytes: window,
+    });
+    expect(budget.violations).toHaveLength(1);
+    expect(budget.violations[0]).toMatchObject({
+      kind: "generation-over-allowance",
+      generation: 5,
+      startOffset: 7_000_000_000,
+      bytes: 600 * MIB,
+      ms: 1_000,
+    });
+    expect(budget.worstGeneration?.generation).toBe(5);
+    expect(budget.worstGeneration?.ratio).toBeGreaterThan(1);
+  });
+
+  it("fails when the per-generation counters do not add up to the total", () => {
+    const budget = byteBudget({
+      ...base,
+      totalBytes: 300 * MIB,
+      generationBytes: [
+        { generation: 1, startOffset: 0, bytes: 100 * MIB, ms: 60_000 },
+      ],
+      windowBytes: window,
+    });
+    expect(budget.violations).toEqual([
+      { kind: "counter-mismatch", totalBytes: 300 * MIB, generationSum: 100 * MIB },
+    ]);
+  });
+
+  it("tolerates a sub-MiB difference between the two counters", () => {
+    const budget = byteBudget({
+      ...base,
+      totalBytes: 100 * MIB + 1000,
+      generationBytes: [
+        { generation: 1, startOffset: 0, bytes: 100 * MIB, ms: 60_000 },
+      ],
+      windowBytes: window,
+    });
+    expect(budget.violations).toEqual([]);
+  });
+
+  it("does not demand a sum once the source has dropped old generations", () => {
+    const generationBytes = Array.from({ length: 64 }, (_, i) => ({
+      generation: i + 10,
+      startOffset: i,
+      bytes: MIB,
+      ms: 10_000,
+    }));
+    const budget = byteBudget({
+      ...base,
+      totalBytes: 100 * MIB,
+      generationBytes,
+      windowBytes: window,
+    });
+    expect(budget.violations).toEqual([]);
   });
 
   it("stays finite for a zero-duration file rather than dividing by it", () => {
     const budget = byteBudget({
       sizeBytes: 1_000,
       durationSeconds: 0,
-      wallSeconds: 10,
-      generations: 1,
+      totalBytes: 0,
+      generationBytes: [{ generation: 1, startOffset: 0, bytes: 0, ms: 10_000 }],
       windowBytes: 0,
     });
     expect(budget.bitrateBytesPerSecond).toBe(0);
     expect(Number.isFinite(budget.budgetBytes)).toBe(true);
+  });
+
+  it("has no worst generation when none was recorded", () => {
+    const budget = byteBudget({
+      ...base,
+      totalBytes: 0,
+      generationBytes: [],
+      windowBytes: window,
+    });
+    expect(budget.worstGeneration).toBeNull();
+    expect(budget.budgetBytes).toBe(0);
   });
 });

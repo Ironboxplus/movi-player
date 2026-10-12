@@ -77,29 +77,98 @@ export function summarizeDisturbances(disturbances) {
   return disturbances.map((d) => d.kind).join(", ");
 }
 
+// What one stream generation may download. A generation is one HttpSource
+// stream opened by startStream(): it is bounded to a single read-ahead window,
+// opens with a FIRST_RANGE_CHUNK and can have one MAX_RANGE_CHUNK fill in
+// flight when it is superseded, and while it lives the player consumes
+// ms x bitrate (VBR_SLACK covers stretches above the average and the container
+// index reads on top of the picture). A generation that exceeds this was not
+// held by its window, which is the prefetch running away.
+//
+// The allowance is per generation rather than one window for the whole
+// session because every seek outside the window abandons the old stream and
+// the new one refills a window from the new position: N generations can
+// legitimately move N windows. How many bytes that is depends on how fast the
+// link refills the window, so the session total scales with link speed while
+// the per-generation bound does not.
+export function generationAllowance({ bitrate, ms, windowBytes }) {
+  return (
+    (ms / 1000) * bitrate * VBR_SLACK +
+    FIRST_RANGE_CHUNK_BYTES +
+    MAX_RANGE_CHUNK_BYTES +
+    windowBytes
+  );
+}
+
+// Largest gap between the source-wide byte counter and the sum of the
+// per-generation counters before the accounting is declared leaky.
+const COUNTER_DRIFT_BYTES = 1024 * 1024;
+
+// The source keeps only this many generations, so once it has reached it the
+// sum can no longer be expected to match the total.
+const GENERATION_LOG_CAPACITY = 64;
+
 export function byteBudget({
   sizeBytes,
   durationSeconds,
-  wallSeconds,
-  generations,
+  totalBytes,
+  generationBytes,
   windowBytes,
 }) {
-  // Round the bitrate before it feeds the streamed-bytes term. The budget is
-  // a ceiling meant to be read alongside `bitrateBytesPerSecond` in a report;
-  // deriving streamedTerm from the unrounded fraction would make the two
-  // numbers disagree by the rounding error times wallSeconds, for no benefit
-  // (nothing here needs sub-byte-per-second precision).
+  // Round the bitrate before it feeds the allowances. The budget is a ceiling
+  // meant to be read alongside `bitrateBytesPerSecond` in a report; deriving it
+  // from the unrounded fraction would make the two numbers disagree by the
+  // rounding error, for no benefit.
   const rawBitrate = durationSeconds > 0 ? sizeBytes / durationSeconds : 0;
   const bitrate = Math.round(rawBitrate);
-  const streamed = wallSeconds * bitrate * VBR_SLACK;
-  const perGeneration =
-    Math.max(1, generations) * (FIRST_RANGE_CHUNK_BYTES + MAX_RANGE_CHUNK_BYTES);
-  const total = streamed + perGeneration + windowBytes;
+  const perGeneration = generationBytes.map((generation) => {
+    const allowance = Math.round(
+      generationAllowance({ bitrate, ms: generation.ms, windowBytes }),
+    );
+    return {
+      generation: generation.generation,
+      startOffset: generation.startOffset,
+      bytes: generation.bytes,
+      ms: generation.ms,
+      allowance,
+      ratio: allowance > 0 ? generation.bytes / allowance : 0,
+    };
+  });
+  let worstGeneration = null;
+  for (const entry of perGeneration) {
+    if (worstGeneration === null || entry.ratio > worstGeneration.ratio) {
+      worstGeneration = entry;
+    }
+  }
+  const summed = generationBytes.reduce((sum, g) => sum + g.bytes, 0);
+  const violations = [];
+  for (const entry of perGeneration) {
+    if (entry.bytes > entry.allowance) {
+      violations.push({
+        kind: "generation-over-allowance",
+        generation: entry.generation,
+        startOffset: entry.startOffset,
+        bytes: entry.bytes,
+        allowance: entry.allowance,
+        ms: entry.ms,
+      });
+    }
+  }
+  const logTruncated = generationBytes.length >= GENERATION_LOG_CAPACITY;
+  if (!logTruncated && Math.abs(totalBytes - summed) > COUNTER_DRIFT_BYTES) {
+    violations.push({
+      kind: "counter-mismatch",
+      totalBytes,
+      generationSum: summed,
+    });
+  }
   return {
     bitrateBytesPerSecond: bitrate,
-    streamedTerm: Math.round(streamed),
-    generationTerm: perGeneration,
     windowTerm: windowBytes,
-    budgetBytes: Math.round(total),
+    budgetBytes: perGeneration.reduce((sum, g) => sum + g.allowance, 0),
+    generationSum: summed,
+    perGeneration,
+    worstGeneration,
+    violations,
   };
 }

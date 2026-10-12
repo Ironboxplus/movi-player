@@ -154,10 +154,6 @@ async function snapshot(page) {
       webCodecsAvailable: typeof globalThis.VideoDecoder === "function",
       sharedSourceBuffer: Boolean(source?.getSharedBuffer?.()),
       network: source?.getNetworkStats?.() ?? null,
-      // The sliding window's capacity, read from the source rather than
-      // re-derived here: it is 8% of the file clamped to the configured cache
-      // cap, and the byte budget needs the real number, not a guess at it.
-      sourceBufferBytes: Number(source?.bufferSize ?? 0),
       paused: Boolean(element && !element.playing),
       backgrounded: Boolean(player?.isBackgrounded),
       visibilityState: String(document.visibilityState),
@@ -385,32 +381,28 @@ function assertHealthyInner(label, before, after, phase, options = {}) {
 // in the report and never asserted. This is the assertion.
 //
 // The ceiling is derived from the source's own fetching strategy rather than
-// picked:
+// picked, and it is kept PER STREAM GENERATION (the arithmetic lives in
+// blackbox-metrics.mjs, the counting in HttpSource.getNetworkStats()): a seek
+// outside the window abandons the running stream and the new one refills a
+// window from the new position, so a session of N generations can move N
+// windows without anything being wrong. What would be wrong is one generation
+// not held by its own window. Each generation is therefore checked against
+// what it could have used while alive: its lifetime of playback consumption,
+// one window, the opening chunk and one in-flight fill. The session total is
+// the sum of those allowances, and the per-generation counters must add up to
+// the source-wide counter or some download went unrecorded.
 //
-//   * Streaming at ~1x for W wall-seconds consumes about W x (size/duration)
-//     bytes. `VBR_SLACK` covers the fact that any given stretch of a
-//     variable-bitrate file runs above the file's average — a dialogue-free
-//     action sequence on the MPEG-2 sample is the worst case — and covers the
-//     container index / Cues / moov reads the demuxer makes on top of the
-//     picture.
-//   * Each stream generation opens with a FIRST_RANGE_CHUNK (4MiB) and can
-//     have at most one MAX_RANGE_CHUNK (8MiB) fill in flight when it is
-//     superseded, so a generation costs at most 12MiB of waste.
-//   * The source holds one sliding window of read-ahead. `bufferSize` is 8% of
-//     the file clamped to the configured cache cap, and is read live off the
-//     source instead of being re-derived here.
-//
-// Paused time only reduces consumption, so wall-clock is a sound upper bound
-// for the streaming term.
+// Paused time only reduces consumption, so a generation's lifetime is a
+// sound upper bound for its streaming term.
 function assertByteBudget(label, { sizeBytes, durationSeconds, wallSeconds, snapshot: final }) {
   const totalBytes = numeric(final.network?.totalBytes);
   const generations = numeric(final.network?.streamGeneration);
-  const windowBytes = numeric(final.sourceBufferBytes);
+  const windowBytes = numeric(final.network?.streamWindowBytes);
   const budget = byteBudget({
     sizeBytes,
     durationSeconds,
-    wallSeconds,
-    generations,
+    totalBytes,
+    generationBytes: final.network?.generationBytes ?? [],
     windowBytes,
   });
   const detail = {
@@ -422,9 +414,9 @@ function assertByteBudget(label, { sizeBytes, durationSeconds, wallSeconds, snap
     ...budget,
     headroom: budget.budgetBytes > 0 ? totalBytes / budget.budgetBytes : 0,
   };
-  if (totalBytes > budget.budgetBytes) {
+  if (budget.violations.length > 0) {
     throw new Error(
-      `${label} downloaded ${totalBytes} bytes, over the derived budget of ${budget.budgetBytes}: ${JSON.stringify(detail)}`,
+      `${label} broke its byte budget: ${JSON.stringify(budget.violations)}: ${JSON.stringify(detail)}`,
     );
   }
   // Independent of the derivation: a session this short must not have pulled

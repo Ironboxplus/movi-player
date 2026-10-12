@@ -21,6 +21,8 @@ const BUFFER_PERCENTAGE = 0.08; // 8% of file size — covers ~60-90s of content
 // the window is how far ahead we are willing to hold, the chunk is how much we
 // ask for at a time while getting there.
 const MAX_STREAM_BUFFER_SIZE = 512 * 1024 * 1024;
+// How many stream generations getNetworkStats() reports; older ones are dropped.
+const MAX_GENERATION_RECORDS = 64;
 // Largest bytes= range asked for in ONE request. The window a stream fills is
 // still MAX_STREAM_BUFFER_SIZE / the whole file; this only splits it into
 // chunks, which the loop fetches back to back.
@@ -301,6 +303,17 @@ export class HttpSource implements SourceAdapter {
 
   // Network stats tracking
   private totalBytesDownloaded: number = 0;
+  // Per-stream byte accounting for the black-box budget (statistics only; no
+  // read or prefetch decision looks at it). Every startStream() that opens a
+  // new generation appends a record, and the download loops charge the bytes
+  // they receive to the newest one. Bounded so a long session cannot grow it.
+  private generationLog: Array<{
+    generation: number;
+    startOffset: number;
+    bytes: number;
+    startedAt: number;
+    endedAt: number | null;
+  }> = [];
   private streamStartTime: number = 0;
   private lastSpeedBytes: number = 0;
   private lastSpeedTime: number = 0;
@@ -1070,6 +1083,7 @@ export class HttpSource implements SourceAdapter {
     this.atomicSetWritePos(0);
     this.atomicSetStreaming(true);
     this.atomicIncrementVersion();
+    this.beginGenerationRecord(fromOffset);
 
     // Starting a new stream means old full-cache is invalid
     this.fullyBuffered = false;
@@ -1089,6 +1103,28 @@ export class HttpSource implements SourceAdapter {
       Logger.error(TAG, "Background stream failed fatally", err);
       this.atomicSetStreaming(false);
     });
+  }
+
+  private beginGenerationRecord(startOffset: number): void {
+    const now = Date.now();
+    const previous = this.generationLog[this.generationLog.length - 1];
+    if (previous && previous.endedAt === null) previous.endedAt = now;
+    this.generationLog.push({
+      generation: this.atomicGetVersion(),
+      startOffset,
+      bytes: 0,
+      startedAt: now,
+      endedAt: null,
+    });
+    if (this.generationLog.length > MAX_GENERATION_RECORDS) {
+      this.generationLog.shift();
+    }
+  }
+
+  private countDownloaded(bytes: number): void {
+    this.totalBytesDownloaded += bytes;
+    const current = this.generationLog[this.generationLog.length - 1];
+    if (current) current.bytes += bytes;
   }
 
   // The forward-download window: how many bytes we keep buffered AHEAD of the
@@ -1503,7 +1539,7 @@ export class HttpSource implements SourceAdapter {
             downloadedBytes += value.length;
 
             // Track global network stats
-            this.totalBytesDownloaded += value.length;
+            this.countDownloaded(value.length);
             const now = Date.now();
             // Active (unparked) time only — see gateMsWindow above.
             const speedElapsed = (now - this.lastSpeedTime - gateMsWindow) / 1000;
@@ -1879,7 +1915,7 @@ export class HttpSource implements SourceAdapter {
         const { done, value } = await reader.read();
         if (done) break;
         if (!value || value.length === 0) continue;
-        this.totalBytesDownloaded += value.length;
+        this.countDownloaded(value.length);
         await this.writeSequential(value, buffer, fullFit);
       }
     } catch (err) {
@@ -2779,7 +2815,15 @@ export class HttpSource implements SourceAdapter {
     bufferWaiters: number;
     oldestPendingReadWaitMs: number;
     lastProgressAt: number;
+    streamWindowBytes: number;
+    generationBytes: Array<{
+      generation: number;
+      startOffset: number;
+      bytes: number;
+      ms: number;
+    }>;
   } {
+    const now = Date.now();
     const timeSinceLastRead = this.lastSpeedTime > 0 ? (Date.now() - this.lastSpeedTime) / 1000 : 0;
     const speed = timeSinceLastRead > 1 ? 0 : this.currentSpeed;
     return {
@@ -2799,6 +2843,13 @@ export class HttpSource implements SourceAdapter {
           )
         : 0,
       lastProgressAt: this.lastProgressAt,
+      streamWindowBytes: this.streamWindowBytes(),
+      generationBytes: this.generationLog.map((record) => ({
+        generation: record.generation,
+        startOffset: record.startOffset,
+        bytes: record.bytes,
+        ms: (record.endedAt ?? now) - record.startedAt,
+      })),
     };
   }
 }
