@@ -53,6 +53,12 @@ const traceTransitions =
 // must never set this flag.
 const allowNoPreference =
   process.env.MOVI_BLACKBOX_ALLOW_NO_PREFERENCE === "1";
+// Optional downlink cap in bytes per second, applied through CDP to the page.
+// Total bytes downloaded scale with how fast the link refills the window after
+// every seek, so a run on a fast link and a run on a slow one are not
+// comparable; this pins the link so player behaviour can be told apart from
+// network speed. Unset means no throttling.
+const throttleBps = Number(process.env.MOVI_BLACKBOX_THROTTLE_BPS ?? 0);
 const mediaPaths = required("OPENLIST_MEDIA_PATHS")
   .split("\n")
   .map((path) => path.trim())
@@ -1755,6 +1761,16 @@ async function runOne(browser, token, mediaPath) {
   const context = await browser.newContext();
   const page = await context.newPage();
   const pageGuard = createPageGuard(page);
+  if (throttleBps > 0) {
+    const session = await context.newCDPSession(page);
+    await session.send("Network.enable");
+    await session.send("Network.emulateNetworkConditions", {
+      offline: false,
+      latency: 0,
+      downloadThroughput: throttleBps,
+      uploadThroughput: -1,
+    });
+  }
   const decoderDiagnostics = [];
   page.on("console", (message) => {
     const text = message
@@ -1976,6 +1992,16 @@ async function runOne(browser, token, mediaPath) {
   // snapshot to drive the rest of the session — the seek matrix needs
   // `duration` whether or not the content assertion above passed.
   const postStartupSnapshot = (await snapshot(page).catch(() => null)) ?? {};
+  if (throttleBps > 0) {
+    // A throttle that silently did not apply would make the whole run
+    // meaningless, so prove it took effect before spending the rest of it.
+    const measured = numeric(postStartupSnapshot.network?.lastSpeed);
+    if (!(measured > 0) || measured > throttleBps * 1.2) {
+      throw new Error(
+        `${label} throttle of ${throttleBps} B/s did not take effect: measured lastSpeed ${measured} B/s`,
+      );
+    }
+  }
   const playAfter = steadyResult?.playAfter ?? postStartupSnapshot;
   const playProgress = steadyResult?.playProgress;
   const pictureEvidence = steadyResult?.pictureEvidence;
