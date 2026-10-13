@@ -126,6 +126,7 @@ export class WorkerSoftwareAudioDecoder {
   private completedFrameRequests = new Set<number>();
   private droppedStaleMessages = 0;
   private configureState: AudioWorkerStats["configureState"] = "idle";
+  private configureCount = 0;
   private configureStartedAt = 0;
   private configureMs = 0;
   private wasmLoadMs: number | undefined;
@@ -138,42 +139,11 @@ export class WorkerSoftwareAudioDecoder {
     return typeof Worker !== "undefined";
   }
 
-  /**
-   * One worker started ahead of need. Starting a worker means fetching and
-   * evaluating the whole WASM glue, which took 3.5s in the black-box browser
-   * (the WASM instance itself 66ms) and sat on the critical path of every
-   * audio track switch: silence for that long, because the new track's decoder
-   * is a new worker. A host with several audio tracks keeps one idle here, and
-   * the next decoder takes it instead of spawning.
-   */
-  private static spare: Worker | null = null;
-
-  private static spawnWorker(): Worker {
-    return new Worker(
+  constructor() {
+    this.worker = new Worker(
       new URL("./SoftwareAudioDecoder.worker.ts", import.meta.url),
       { type: "module" },
     );
-  }
-
-  static prewarm(): void {
-    if (!WorkerSoftwareAudioDecoder.isSupported()) return;
-    if (WorkerSoftwareAudioDecoder.spare) return;
-    try {
-      WorkerSoftwareAudioDecoder.spare = WorkerSoftwareAudioDecoder.spawnWorker();
-    } catch {
-      // Only an optimisation; the constructor spawns on demand.
-    }
-  }
-
-  static discardSpare(): void {
-    WorkerSoftwareAudioDecoder.spare?.terminate();
-    WorkerSoftwareAudioDecoder.spare = null;
-  }
-
-  constructor() {
-    this.worker =
-      WorkerSoftwareAudioDecoder.spare ?? WorkerSoftwareAudioDecoder.spawnWorker();
-    WorkerSoftwareAudioDecoder.spare = null;
     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       this.handleMessage(event.data);
     };
@@ -226,7 +196,23 @@ export class WorkerSoftwareAudioDecoder {
     return this.brokenFlag;
   }
 
+  /**
+   * May be called again on the same instance to move the worker to another
+   * track. The worker is the expensive part (a 14MB script that embeds the
+   * decoder, seconds to start), so a track switch keeps it and only bumps the
+   * generation: output still in flight for the previous track arrives with the
+   * old generation and is dropped by handleMessage, and the cancel buffer
+   * (shared with the worker) makes it stop decoding that track's packets.
+   */
   configure(track: AudioTrack): Promise<boolean> {
+    if (this.configureCount++ > 0) {
+      this.rejectAll(new Error("Audio worker reconfigured"));
+      this.generation++;
+      this.publishCancelGeneration(this.generation);
+      this.queueDepth = 0;
+      this.inFlight = 0;
+      this.clearFrameReorder();
+    }
     this.trackId = track.id;
     const codecId = this.resolveCodecId(track);
     if (!codecId) {

@@ -145,6 +145,10 @@ export async function makePipelinePlayer(
     getStats: () => (audio.worker ? { worker: { queueDepth: 0 } } : {}),
     canBatch: () => false,
     close: vi.fn(),
+    // An audio track switch keeps the decoder object and reconfigures it.
+    reset: vi.fn(),
+    setDownmix: vi.fn(),
+    configure: vi.fn(async () => true),
     flush: vi.fn(async () => {}),
     decode: vi.fn(() => {
       audioDecoder.queueSize++;

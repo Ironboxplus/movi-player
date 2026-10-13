@@ -41,17 +41,10 @@ afterEach(() => {
  * are not touched, so the picture never notices.
  */
 async function switching(opts: Parameters<typeof makePipelinePlayer>[0] = {}) {
-  const { MoviAudioDecoder } = await import("../../src/decode/AudioDecoder");
   let finishConfigure: (ok: boolean) => void = () => {};
   const configuring = new Promise<boolean>((resolve) => {
     finishConfigure = resolve;
   });
-  vi.spyOn(MoviAudioDecoder.prototype, "configure").mockReturnValue(configuring);
-  const decode = vi
-    .spyOn(MoviAudioDecoder.prototype, "decode")
-    .mockImplementation(() => {});
-  vi.spyOn(MoviAudioDecoder.prototype, "canBatch").mockReturnValue(false);
-
   const f = await makePipelinePlayer({
     ...opts,
     tracks: [
@@ -61,6 +54,13 @@ async function switching(opts: Parameters<typeof makePipelinePlayer>[0] = {}) {
       flacTrack,
       aacTrack,
     ] as never,
+  });
+  // The switch reconfigures the player's decoder rather than building a new
+  // one, so the stub is the thing to steer.
+  const decode = vi.fn(() => {});
+  Object.assign(f.audioDecoder, {
+    configure: vi.fn(() => configuring),
+    decode,
   });
   f.player.trackManager.selectAudioTrack(flacTrack.id);
   const demuxerSeek = f.player.demuxer.seek as ReturnType<typeof vi.fn>;
@@ -103,6 +103,17 @@ describe("audio track switch: the demuxer refreshes, the picture does not", () =
     expect(discard.mock.invocationCallOrder[0]).toBeLessThan(
       f.demuxerSeek.mock.invocationCallOrder[0],
     );
+    await f.settle();
+  }, 20_000);
+
+  it("keeps the audio decoder object, and with it the worker, across the switch", async () => {
+    const f = await switching();
+    f.player.clock.seek(10);
+    const before = f.player.audioDecoder;
+    f.switchNow();
+    expect(f.player.audioDecoder).toBe(before);
+    expect(before.reset).toHaveBeenCalledTimes(1);
+    expect(before.close).not.toHaveBeenCalled();
     await f.settle();
   }, 20_000);
 

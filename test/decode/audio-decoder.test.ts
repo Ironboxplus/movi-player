@@ -944,41 +944,246 @@ describe("merge: worker-decoded DTS still engages cold-prime", () => {
   });
 });
 
-describe("WorkerSoftwareAudioDecoder spare worker", () => {
-  afterEach(() => {
-    MoviAudioDecoder.discardWarmWorker();
-  });
+describe("audio track switch reuses the decoder worker", () => {
+  const ac3Track: AudioTrack = { ...dtsTrack, id: 9, codec: "ac3", codecId: 86019 };
+  const aacTrack: AudioTrack = { ...dtsTrack, id: 11, codec: "aac", codecId: 86018, channels: 2 };
 
-  it("hands the worker started ahead of need to the next decoder instead of spawning", () => {
+  async function configureOn(
+    decoder: MoviAudioDecoder,
+    track: AudioTrack,
+    workerIndex = 0,
+  ): Promise<void> {
+    const countConfigures = () =>
+      (FakeWorker.instances[workerIndex]?.messages ?? []).filter(
+        (m) => (m as { type?: string }).type === "configure",
+      ).length;
+    const before = countConfigures();
+    const configured = decoder.configure(track);
+    await Promise.resolve();
+    await Promise.resolve();
+    const worker = FakeWorker.instances[workerIndex]!;
+    const configures = worker.messages.filter(
+      (m) => (m as { type?: string }).type === "configure",
+    ) as Array<{ requestId: number; generation: number; trackId: number }>;
+    expect(configures).toHaveLength(before + 1);
+    const message = configures[configures.length - 1]!;
+    worker.emit({
+      type: "configured",
+      requestId: message.requestId,
+      generation: message.generation,
+      trackId: message.trackId,
+      success: true,
+      queueDepth: 0,
+      inFlight: 0,
+    });
+    await expect(configured).resolves.toBe(true);
+  }
+
+  it("creates one worker for two consecutive switches", async () => {
     vi.stubGlobal("Worker", FakeWorker);
-    MoviAudioDecoder.prewarmWorker();
-    MoviAudioDecoder.prewarmWorker();
-    expect(FakeWorker.instances).toHaveLength(1);
+    const { bindings } = makeBindings();
+    const decoder = new MoviAudioDecoder();
+    decoder.setBindings(bindings);
 
-    const first = new WorkerSoftwareAudioDecoder();
-    expect(FakeWorker.instances).toHaveLength(1);
-    expect(FakeWorker.instances[0].onmessage).not.toBeNull();
+    await configureOn(decoder, dtsTrack);
+    await configureOn(decoder, ac3Track);
+    await configureOn(decoder, aacTrack);
 
-    // The spare is spent: the next decoder starts its own.
-    const second = new WorkerSoftwareAudioDecoder();
-    expect(FakeWorker.instances).toHaveLength(2);
-    first.close();
-    second.close();
-  });
-
-  it("spawns on demand when nothing was started ahead", () => {
-    vi.stubGlobal("Worker", FakeWorker);
-    const decoder = new WorkerSoftwareAudioDecoder();
     expect(FakeWorker.instances).toHaveLength(1);
+    expect(FakeWorker.instances[0]!.terminated).toBe(false);
     decoder.close();
   });
 
-  it("terminates an unused spare when it is discarded", () => {
+  it("gives each reconfigure a higher generation and a new track id", async () => {
     vi.stubGlobal("Worker", FakeWorker);
-    MoviAudioDecoder.prewarmWorker();
-    MoviAudioDecoder.discardWarmWorker();
-    expect(FakeWorker.instances[0].terminated).toBe(true);
-    new WorkerSoftwareAudioDecoder().close();
+    const { bindings } = makeBindings();
+    const decoder = new MoviAudioDecoder();
+    decoder.setBindings(bindings);
+    await configureOn(decoder, dtsTrack);
+    await configureOn(decoder, ac3Track);
+    await configureOn(decoder, aacTrack);
+
+    const configures = FakeWorker.instances[0]!.messages.filter(
+      (m) => (m as { type?: string }).type === "configure",
+    ) as Array<{ generation: number; trackId: number; controlBuffer?: unknown }>;
+    const generations = configures.map((m) => m.generation);
+    expect(generations).toEqual([...generations].sort((x, y) => x - y));
+    expect(new Set(generations).size).toBe(3);
+    expect(configures.map((m) => m.trackId)).toEqual([7, 9, 11]);
+    // One cancel buffer for the worker, not one per track.
+    expect(new Set(configures.map((m) => m.controlBuffer)).size).toBe(1);
+    decoder.close();
+  });
+
+  it("drops output that arrives for the previous track", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const decoder = new WorkerSoftwareAudioDecoder();
+    const frames: PCMFrame[] = [];
+    decoder.setOnData((frame) => frames.push(frame));
+    const worker = FakeWorker.instances[0]!;
+
+    const first = decoder.configure(dtsTrack);
+    worker.emit({ type: "configured", requestId: 1, generation: 1, trackId: dtsTrack.id, success: true });
+    await first;
+    decoder.decode(new Uint8Array([1]), 0, true);
+    const oldDecode = worker.messages[worker.messages.length - 1] as {
+      requestId: number;
+      generation: number;
+      trackId: number;
+    };
+
+    const second = decoder.configure(ac3Track);
+    const reconfigure = worker.messages[worker.messages.length - 1] as {
+      requestId: number;
+      generation: number;
+    };
+    expect(reconfigure.generation).toBeGreaterThan(oldDecode.generation);
+
+    worker.emit({
+      type: "frame",
+      requestId: oldDecode.requestId,
+      generation: oldDecode.generation,
+      trackId: oldDecode.trackId,
+      pts: 0,
+      timeBase: 1,
+      frame: makeFrame(),
+    });
+    worker.emit({
+      type: "decoded",
+      requestId: oldDecode.requestId,
+      generation: oldDecode.generation,
+      trackId: oldDecode.trackId,
+    });
+    expect(frames).toHaveLength(0);
+    expect(decoder.getStats().droppedStaleMessages).toBe(2);
+
+    worker.emit({
+      type: "configured",
+      requestId: reconfigure.requestId,
+      generation: reconfigure.generation,
+      trackId: ac3Track.id,
+      success: true,
+    });
+    await expect(second).resolves.toBe(true);
+    decoder.decode(new Uint8Array([2]), 0, true);
+    const fresh = worker.messages[worker.messages.length - 1] as {
+      requestId: number;
+      generation: number;
+      trackId: number;
+    };
+    worker.emit({
+      type: "frame",
+      requestId: fresh.requestId,
+      generation: fresh.generation,
+      trackId: fresh.trackId,
+      pts: 0,
+      timeBase: 1,
+      frame: makeFrame(),
+    });
+    worker.emit({
+      type: "decoded",
+      requestId: fresh.requestId,
+      generation: fresh.generation,
+      trackId: fresh.trackId,
+    });
+    expect(frames).toHaveLength(1);
+    decoder.close();
+  });
+
+  it("terminates the worker when the decoder is closed", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const { bindings } = makeBindings();
+    const decoder = new MoviAudioDecoder();
+    decoder.setBindings(bindings);
+    await configureOn(decoder, dtsTrack);
+    await configureOn(decoder, ac3Track);
+
+    decoder.close();
+
+    expect(FakeWorker.instances).toHaveLength(1);
+    expect(FakeWorker.instances[0]!.terminated).toBe(true);
+  });
+
+  it("closes the worker when a configure leaves for WebCodecs and starts one when it comes back", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const hardware: Array<{ closed: boolean }> = [];
+    class FakeHardwareAudioDecoder {
+      static isConfigSupported = vi.fn(async () => ({ supported: true }));
+      state = "configured";
+      decodeQueueSize = 0;
+      constructor() {
+        hardware.push(this as unknown as { closed: boolean });
+      }
+      configure(): void {}
+      close(): void {
+        (this as unknown as { closed: boolean }).closed = true;
+      }
+    }
+    vi.stubGlobal("AudioDecoder", FakeHardwareAudioDecoder);
+    vi.stubGlobal("window", { AudioDecoder: FakeHardwareAudioDecoder });
+    const { bindings } = makeBindings();
+    const decoder = new MoviAudioDecoder();
+    decoder.setBindings(bindings);
+    const forceSoftware = vi.spyOn(
+      MoviAudioDecoder.prototype as unknown as {
+        needsSoftwareDecoding(codec: string): boolean;
+      },
+      "needsSoftwareDecoding",
+    );
+
+    forceSoftware.mockReturnValue(true);
+    await configureOn(decoder, dtsTrack);
+    expect(FakeWorker.instances).toHaveLength(1);
+
+    forceSoftware.mockReturnValue(false);
+    await expect(decoder.configure(aacTrack)).resolves.toBe(true);
+    expect(FakeWorker.instances[0]!.terminated).toBe(true);
+    expect(hardware).toHaveLength(1);
+    expect(decoder.isSoftware).toBe(false);
+
+    forceSoftware.mockReturnValue(true);
+    await configureOn(decoder, ac3Track, 1);
     expect(FakeWorker.instances).toHaveLength(2);
+    expect(hardware[0]!.closed).toBe(true);
+    expect(FakeWorker.instances[1]!.terminated).toBe(false);
+
+    decoder.close();
+    expect(FakeWorker.instances[1]!.terminated).toBe(true);
+    forceSoftware.mockRestore();
+  });
+
+  it("starts a fresh worker after the previous one was closed on leaving the software path", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("AudioDecoder", undefined);
+    const { bindings } = makeBindings();
+    const decoder = new MoviAudioDecoder();
+    decoder.setBindings(bindings);
+    await configureOn(decoder, dtsTrack);
+
+    // A worker that fails to configure is closed and the main-thread decoder
+    // takes over; a later configure builds a new worker rather than reusing a
+    // dead one.
+    const failing = decoder.configure(ac3Track);
+    await Promise.resolve();
+    FakeWorker.instances[0]!.emitError({ message: "boom" });
+    await expect(failing).resolves.toBe(true);
+    expect(FakeWorker.instances[0]!.terminated).toBe(true);
+    expect(decoder.getStats().decoderType).toBe("Software (FFmpeg)");
+
+    const next = decoder.configure(aacTrack);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(FakeWorker.instances).toHaveLength(2);
+    FakeWorker.instances[1]!.emit({
+      type: "configured",
+      requestId: 1,
+      generation: 1,
+      trackId: aacTrack.id,
+      success: true,
+    });
+    await expect(next).resolves.toBe(true);
+    expect(FakeWorker.instances[1]!.terminated).toBe(false);
+    decoder.close();
+    expect(FakeWorker.instances[1]!.terminated).toBe(true);
   });
 });

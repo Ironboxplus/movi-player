@@ -224,7 +224,9 @@ async function configure(
   }
 
   const wasmStartedAt = performance.now();
-  moduleRef = await loadWasmModuleNew();
+  // A reconfigure on a live worker (audio track switch) keeps the instance it
+  // already has; closeDecoder() above released the previous track's decoder.
+  moduleRef = moduleRef ?? (await loadWasmModuleNew());
   const wasmLoadMs = performance.now() - wasmStartedAt;
 
   let extradataPtr = 0;

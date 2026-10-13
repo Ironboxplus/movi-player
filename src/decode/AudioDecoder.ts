@@ -89,11 +89,9 @@ export class MoviAudioDecoder {
     this.softwareFallbackReason = "";
     this.hasTriedSoftwareFallback = false; // Reset fallback flag on new configuration
     this.swFramesProduced = 0;
-
-    if (this.swDecoder) {
-      this.swDecoder.close();
-      this.swDecoder = null;
-    }
+    this.isConfigured = false;
+    // The software worker is kept across configure(): see createSoftwareDecoder.
+    this.closeHardwareDecoder();
 
     // Check if we should force software decoding for this codec
     if (this.needsSoftwareDecoding(track.codec)) {
@@ -157,6 +155,7 @@ export class MoviAudioDecoder {
     }
 
     // Create decoder
+    this.closeSoftwareDecoder();
     this.decoder = new AudioDecoder({
       output: (data) => {
         if (this.onData) {
@@ -284,10 +283,7 @@ export class MoviAudioDecoder {
       );
       const track = this.currentTrack;
       const extradata = this.currentExtradata;
-      if (this.swDecoder) {
-        this.swDecoder.close();
-        this.swDecoder = null;
-      }
+      this.closeSoftwareDecoder();
       this.useSoftware = false;
       // configure() resets hasTriedSoftwareFallback (used by the dormant
       // hardware path below) and swFramesProduced, so a fresh instance gets
@@ -315,12 +311,7 @@ export class MoviAudioDecoder {
     Logger.info(TAG, "Initializing software decoder fallback");
     this.useSoftware = true;
 
-    if (this.decoder) {
-      try {
-        this.decoder.close();
-      } catch (e) {}
-      this.decoder = null;
-    }
+    this.closeHardwareDecoder();
 
     // Worker-first, main-thread fallback (createSoftwareDecoder), with a
     // second fallback here if the worker decoder is created but fails to
@@ -336,7 +327,7 @@ export class MoviAudioDecoder {
       this.softwareFallbackReason =
         workerStats.lastError ||
         `Worker configure returned false (${workerStats.configureState})`;
-      decoder.close();
+      this.closeSoftwareDecoder();
       Logger.warn(
         TAG,
         `Worker software audio decoder unavailable, falling back to main thread: ${this.softwareFallbackReason}`,
@@ -400,9 +391,22 @@ export class MoviAudioDecoder {
     }
   }
 
+  /**
+   * The only place a software worker is created. It lives as long as this
+   * decoder stays on the software path: a second configure() (audio track
+   * switch, rendition change) reconfigures the same worker instead of paying
+   * for a new one, whose 14MB script took seconds to start on every switch.
+   * It is closed by closeSoftwareDecoder() only: on close(), when a configure
+   * leaves the software path, when the worker fails or breaks and a fresh one
+   * (or the main-thread decoder) is wanted.
+   */
   private async createSoftwareDecoder(): Promise<
     SoftwareAudioDecoder | WorkerSoftwareAudioDecoder | null
   > {
+    if (this.swDecoder instanceof WorkerSoftwareAudioDecoder) {
+      return this.swDecoder;
+    }
+    this.closeSoftwareDecoder();
     if (WorkerSoftwareAudioDecoder.isSupported()) {
       try {
         const workerDecoder = new WorkerSoftwareAudioDecoder();
@@ -421,6 +425,21 @@ export class MoviAudioDecoder {
 
     if (!this.bindings) return null;
     return new SoftwareAudioDecoder(this.bindings);
+  }
+
+  private closeSoftwareDecoder(): void {
+    this.swDecoder?.close();
+    this.swDecoder = null;
+  }
+
+  private closeHardwareDecoder(): void {
+    if (!this.decoder) return;
+    try {
+      this.decoder.close();
+    } catch (error) {
+      // Ignore close errors
+    }
+    this.decoder = null;
   }
 
   /**
@@ -697,19 +716,8 @@ export class MoviAudioDecoder {
   close(): void {
     this.reset();
 
-    if (this.swDecoder) {
-      this.swDecoder.close();
-      this.swDecoder = null;
-    }
-
-    if (this.decoder) {
-      try {
-        this.decoder.close();
-      } catch (error) {
-        // Ignore close errors
-      }
-      this.decoder = null;
-    }
+    this.closeSoftwareDecoder();
+    this.closeHardwareDecoder();
 
     this.isConfigured = false;
     this.onData = null;
@@ -737,15 +745,6 @@ export class MoviAudioDecoder {
    */
   get isSoftware(): boolean {
     return this.useSoftware;
-  }
-
-  /** Start a software-decoder worker ahead of an audio track switch. */
-  static prewarmWorker(): void {
-    WorkerSoftwareAudioDecoder.prewarm();
-  }
-
-  static discardWarmWorker(): void {
-    WorkerSoftwareAudioDecoder.discardSpare();
   }
 
   /**

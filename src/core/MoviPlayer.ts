@@ -1009,18 +1009,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     );
   }
 
-  /**
-   * With more than one audio track a switch is likely, and the new track's
-   * decoder starts a worker (seconds). Have one ready; see
-   * WorkerSoftwareAudioDecoder.spare.
-   */
-  private prewarmAudioSwitchWorker(): void {
-    if (this.disableAudio || this.trackManager.getAudioTracks().length < 2) {
-      return;
-    }
-    MoviAudioDecoder.prewarmWorker();
-  }
-
   private beginAudioSwitchTrace(): void {
     if (!this.audioSwitchTraceEnabled) return;
     if (this._switchTraceTimer !== null) clearInterval(this._switchTraceTimer);
@@ -1374,14 +1362,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         `Audio track changed to track ${track.id}, reconfiguring decoder`,
       );
 
-      // Close current audio decoder immediately
-      if (this.audioDecoder) {
-        this.audioDecoder.close();
-      }
+      // Drop what the old track left in the decoder. The decoder object (and
+      // the software worker inside it) is kept: it is reconfigured below, not
+      // rebuilt, so the switch does not pay the worker start-up again.
+      this.audioDecoder.reset();
 
       // Re-anchor AudioRenderer/Clock at the current position BEFORE the new
       // decoder starts producing output — see realignAudioTimelineForTrackSwitch's
-      // doc comment. Must happen here (old decoder closed, new one not yet
+      // doc comment. Must happen here (old decoder reset, new track not yet
       // configured) so the old track's already-scheduled audio is dropped
       // cleanly and the new track's first buffer lands on a fresh anchor.
       this.realignAudioTimelineForTrackSwitch();
@@ -1394,28 +1382,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this._audioStartAlign = true;
       }
 
-      // Recreate audio decoder for new track
-      this.traceAudioSwitch("decoder-create", {});
-      this.audioDecoder = new MoviAudioDecoder();
-
-      // Set bindings
-      if (this.demuxer) {
-        const bindings = this.demuxer.getBindings();
-        if (bindings) {
-          this.audioDecoder.setBindings(bindings);
-        }
-      }
-
-      this.audioDecoder.setOnData((data) => this.renderDecodedAudio(data));
-
-      this.audioDecoder.setOnPCM((frame) => this.renderDecodedPCM(frame));
-
-      this.audioDecoder.setOnError((error) => {
-        Logger.error(TAG, "Audio decoder error", error);
-        // Audio errors are less fatal - video can continue, just emit the error
-        this.emit("error", error);
-      });
-      this.audioDecoder.setOnBroken(() => void this.recoverBrokenAudio());
+      this.traceAudioSwitch("decoder-reset", {});
 
       // Re-apply demuxer discard: re-enable the newly-selected audio track and
       // discard the previously-active one (issue #11) — and in the same breath
@@ -1442,7 +1409,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           const extradata = this.demuxer.getExtradata(track.id) ?? undefined;
           this.traceAudioSwitch("decoder-configure-start", {});
           configured = await this.audioDecoder.configure(track, extradata);
-          if (configured) this.prewarmAudioSwitchWorker();
           if (this.switchTraceActive) {
             const worker = this.audioDecoder.getStats().worker;
             this.traceAudioSwitch("decoder-configured", {
@@ -3725,7 +3691,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           TAG,
           `Audio decoder configured: ${audioTrack.codec} ${audioTrack.sampleRate}Hz ${audioTrack.channels}ch`,
         );
-        this.prewarmAudioSwitchWorker();
         // Pre-initialize AudioContext during load (created suspended, no audio plays).
         // Moves ~500ms creation cost from play() to load() for instant playback start.
         // init() no longer resumes — play() handles resume on user gesture.
@@ -11942,7 +11907,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // player does rather than finishing into a void. The sources are closed
     // further down as well; that is belt and braces, not the mechanism.
     this._lifetimeAbort.abort();
-    MoviAudioDecoder.discardWarmWorker();
     if (this._switchTraceTimer !== null) {
       clearInterval(this._switchTraceTimer);
       this._switchTraceTimer = null;
