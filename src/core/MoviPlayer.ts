@@ -4913,6 +4913,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       });
     }
     this.audioRenderer.reset();
+    this.videoRenderer?.releaseAudioSync();
     this.clock.seek(currentTime);
   }
 

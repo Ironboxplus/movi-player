@@ -181,6 +181,7 @@ export async function makePipelinePlayer(
       stopPresentationLoop: vi.fn(),
       startPresentationLoop: vi.fn(),
       clearQueue: vi.fn(),
+      releaseAudioSync: vi.fn(),
       getHeadFrameTime: () => 12,
       getStats: () => ({ framesPresented: 0 }),
     },

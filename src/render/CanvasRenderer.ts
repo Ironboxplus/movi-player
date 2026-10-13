@@ -4482,6 +4482,22 @@ export class CanvasRenderer {
   }
 
   /**
+   * Forget the audio clock this renderer was following, keeping the frames and
+   * the presentation anchor. For an audio track switch: the old track's clock
+   * is void and the new one is being built, which is not the audio dropping
+   * out. Left alone, getCurrentPlaybackTime reads the silence as an outage and
+   * holds the picture at the old track's last time plus 0.15s until the new
+   * sound arrives (seconds), then discards the frames it was held behind. With
+   * the sync released the picture runs on its wall clock, and the first
+   * healthy audio sync takes the usual path (hard re-anchor beyond 0.4s,
+   * otherwise soft). A real outage never calls this, so the cap still holds.
+   */
+  releaseAudioSync(): void {
+    this.syncedToAudio = false;
+    this.lastKnownAudioTime = -1;
+  }
+
+  /**
    * Set playback rate
    */
   setPlaybackRate(rate: number): void {

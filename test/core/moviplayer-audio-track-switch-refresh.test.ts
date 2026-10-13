@@ -106,6 +106,14 @@ describe("audio track switch: the demuxer refreshes, the picture does not", () =
     await f.settle();
   }, 20_000);
 
+  it("releases the renderer's audio sync together with the audio and clock resets", async () => {
+    const f = await switching();
+    f.player.clock.seek(10);
+    f.switchNow();
+    expect(f.player.videoRenderer.releaseAudioSync).toHaveBeenCalledTimes(1);
+    await f.settle();
+  }, 20_000);
+
   it("never refreshes to before the start of the file", async () => {
     const f = await switching();
     f.player.clock.seek(0.4);
