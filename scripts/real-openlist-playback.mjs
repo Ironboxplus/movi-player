@@ -1184,6 +1184,14 @@ async function runAudioTrackSwitch(page, label) {
   // (seconds, not frames) because a legitimate flush/re-buffer can cost some
   // ground, but an order-of-magnitude clock displacement is not that.
   const AUDIO_SWITCH_MAX_DISPLACEMENT_S = 1;
+  // How far the playhead may go back from the furthest it had reached, and how
+  // long the picture may stand still, anywhere between issuing the switch and
+  // the end of the measurement window. The forward-jump check below cannot see
+  // either: the master clock runs on the wall clock, so it never disagrees with
+  // free-running playback even while the picture is held at the old track's
+  // time (which is why displacementS read 0 in every report).
+  const AUDIO_SWITCH_MAX_BACKWARD_S = 0.5;
+  const AUDIO_SWITCH_MAX_FREEZE_S = 1;
 
   const switched = [];
   let preSwitchTime = start.currentTime;
@@ -1191,6 +1199,19 @@ async function runAudioTrackSwitch(page, label) {
   for (const track of start.audioTracks) {
     if (track.id === start.activeAudioTrackId) continue;
     const switchIssuedAt = Date.now();
+    await page.evaluate(() => {
+      const element = document.querySelector("movi-player");
+      const rows = [];
+      globalThis.__moviSwitchWatch = rows;
+      const timer = setInterval(() => {
+        rows.push({
+          t: performance.now(),
+          clock: Number(element?.currentTime ?? 0),
+          picture: Number(element?.player?.videoRenderer?.currentTime ?? -1),
+        });
+      }, 50);
+      globalThis.__moviSwitchWatchTimer = timer;
+    });
     const accepted = await page.evaluate(
       (trackId) =>
         Boolean(
@@ -1266,6 +1287,34 @@ async function runAudioTrackSwitch(page, label) {
         `${label} dropped ${after.audioWorkerStaleDrops - before.audioWorkerStaleDrops} stale worker frames after switching to track ${track.id}; the generation gate is letting the old track's work through`,
       );
     }
+    const watch = await page.evaluate(() => {
+      clearInterval(globalThis.__moviSwitchWatchTimer);
+      return globalThis.__moviSwitchWatch ?? [];
+    });
+    let furthest = -Infinity;
+    let backwardS = 0;
+    let pictureAt = -Infinity;
+    let pictureSince = watch[0]?.t ?? 0;
+    let freezeS = 0;
+    for (const row of watch) {
+      furthest = Math.max(furthest, row.clock);
+      backwardS = Math.max(backwardS, furthest - row.clock);
+      if (row.picture > pictureAt + 1e-6) {
+        pictureAt = row.picture;
+        pictureSince = row.t;
+      }
+      freezeS = Math.max(freezeS, (row.t - pictureSince) / 1_000);
+    }
+    if (backwardS > AUDIO_SWITCH_MAX_BACKWARD_S) {
+      throw new Error(
+        `${label} playhead went back ${backwardS.toFixed(3)}s after switching to audio track ${track.id} (${track.codec}); a track switch must not pull the clock back`,
+      );
+    }
+    if (freezeS > AUDIO_SWITCH_MAX_FREEZE_S) {
+      throw new Error(
+        `${label} picture frozen ${freezeS.toFixed(1)}s after switching to audio track ${track.id} (${track.codec}) while the clock ran on`,
+      );
+    }
     const trace = traceTransitions
       ? await page.evaluate(
           () => document.querySelector("movi-player")?.player?.audioSwitchTrace ?? [],
@@ -1277,6 +1326,8 @@ async function runAudioTrackSwitch(page, label) {
       trace,
       audioDecoder: after.audioDecoder,
       displacementS: Number(displacement.toFixed(3)),
+      clockBackwardS: Number(backwardS.toFixed(3)),
+      pictureFreezeS: Number(freezeS.toFixed(2)),
       settleElapsedS: Number(elapsedS.toFixed(3)),
       ...progress,
     });
@@ -1394,6 +1445,37 @@ async function runVisibilityCycle(page, label) {
     );
   }
 
+  if (traceTransitions) {
+    // The picture's own state around the return, so a low foreground rate can
+    // be told apart as the audio-clock cap, a refill after the cleared queue,
+    // or something else.
+    await page.evaluate(() => {
+      const player = document.querySelector("movi-player")?.player;
+      const t0 = performance.now();
+      const rows = [];
+      globalThis.__moviForegroundTrace = rows;
+      const timer = setInterval(() => {
+        const r = player?.videoRenderer;
+        const a = player?.audioRenderer;
+        const stats = r?.getFrameStats?.() ?? {};
+        rows.push({
+          t: Math.round(performance.now() - t0),
+          clock: player?.clock?.getTime?.() ?? -1,
+          audioClock: a?.getAudioClock?.() ?? -1,
+          audioHealthy: a?.hasHealthyBuffer?.() ?? null,
+          lastKnownAudio: r?.lastKnownAudioTime ?? null,
+          synced: r?.syncedToAudio ?? null,
+          lastPts: stats.lastPts ?? -1,
+          frameQueue: stats.queued ?? -1,
+          presented: stats.presented ?? -1,
+          skipped: stats.skipped ?? -1,
+          videoPackets: player?.videoQueue?.length ?? -1,
+          state: player?.getState?.() ?? "",
+        });
+        if (performance.now() - t0 > 8000) clearInterval(timer);
+      }, 250);
+    });
+  }
   await page.evaluate(() => {
     Object.defineProperty(document, "visibilityState", {
       configurable: true,
@@ -1420,10 +1502,14 @@ async function runVisibilityCycle(page, label) {
     "returned to foreground",
     { generationBudget: numeric(visibleBefore.network?.streamGeneration) + 2 },
   );
+  const foregroundTrace = traceTransitions
+    ? await page.evaluate(() => globalThis.__moviForegroundTrace ?? [])
+    : undefined;
   return {
     backgroundedAt: Number(before.currentTime.toFixed(2)),
     hidden: hiddenProgress,
     foreground: visibleProgress,
+    foregroundTrace,
   };
 }
 
