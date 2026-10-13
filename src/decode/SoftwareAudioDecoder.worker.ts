@@ -43,6 +43,8 @@ type WorkerResponse =
       trackId: number;
       success: boolean;
       error?: string;
+      wasmLoadMs?: number;
+      workerAgeMs?: number;
       queueDepth: number;
       inFlight: number;
     }
@@ -194,6 +196,9 @@ async function configure(
   extradata: Uint8Array | undefined,
   controlBuffer: SharedArrayBuffer | undefined,
 ): Promise<void> {
+  // Worker clock origin is the worker's creation: how long it took to be able
+  // to handle this request at all (script fetch and evaluation).
+  const workerAgeMs = performance.now();
   cancelGeneration = controlBuffer ? new Int32Array(controlBuffer) : null;
   generation = nextGeneration;
   trackId = nextTrackId;
@@ -218,7 +223,9 @@ async function configure(
     return;
   }
 
+  const wasmStartedAt = performance.now();
   moduleRef = await loadWasmModuleNew();
+  const wasmLoadMs = performance.now() - wasmStartedAt;
 
   let extradataPtr = 0;
   try {
@@ -257,6 +264,8 @@ async function configure(
       generation,
       trackId,
       success: true,
+      wasmLoadMs,
+      workerAgeMs,
       queueDepth,
       inFlight,
     });

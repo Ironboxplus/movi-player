@@ -40,6 +40,8 @@ type WorkerResponse =
       trackId: number;
       success: boolean;
       error?: string;
+      wasmLoadMs?: number;
+      workerAgeMs?: number;
       queueDepth?: number;
       inFlight?: number;
     }
@@ -96,6 +98,10 @@ export interface AudioWorkerStats {
   droppedStaleMessages: number;
   configureState: "idle" | "configuring" | "configured" | "failed";
   configureMs: number;
+  /** How long the worker spent loading its own WASM instance for the last configure. */
+  wasmLoadMs?: number;
+  /** Worker age when it first handled the configure: script fetch and start-up. */
+  workerAgeMs?: number;
   configureTimeoutMs: number;
   lastError: string;
 }
@@ -122,6 +128,8 @@ export class WorkerSoftwareAudioDecoder {
   private configureState: AudioWorkerStats["configureState"] = "idle";
   private configureStartedAt = 0;
   private configureMs = 0;
+  private wasmLoadMs: number | undefined;
+  private workerAgeMs: number | undefined;
   private lastError = "";
   private readonly timeBase = 1;
   private readonly cancelGeneration = WorkerSoftwareAudioDecoder.createCancelGeneration();
@@ -130,11 +138,42 @@ export class WorkerSoftwareAudioDecoder {
     return typeof Worker !== "undefined";
   }
 
-  constructor() {
-    this.worker = new Worker(
+  /**
+   * One worker started ahead of need. Starting a worker means fetching and
+   * evaluating the whole WASM glue, which took 3.5s in the black-box browser
+   * (the WASM instance itself 66ms) and sat on the critical path of every
+   * audio track switch: silence for that long, because the new track's decoder
+   * is a new worker. A host with several audio tracks keeps one idle here, and
+   * the next decoder takes it instead of spawning.
+   */
+  private static spare: Worker | null = null;
+
+  private static spawnWorker(): Worker {
+    return new Worker(
       new URL("./SoftwareAudioDecoder.worker.ts", import.meta.url),
       { type: "module" },
     );
+  }
+
+  static prewarm(): void {
+    if (!WorkerSoftwareAudioDecoder.isSupported()) return;
+    if (WorkerSoftwareAudioDecoder.spare) return;
+    try {
+      WorkerSoftwareAudioDecoder.spare = WorkerSoftwareAudioDecoder.spawnWorker();
+    } catch {
+      // Only an optimisation; the constructor spawns on demand.
+    }
+  }
+
+  static discardSpare(): void {
+    WorkerSoftwareAudioDecoder.spare?.terminate();
+    WorkerSoftwareAudioDecoder.spare = null;
+  }
+
+  constructor() {
+    this.worker =
+      WorkerSoftwareAudioDecoder.spare ?? WorkerSoftwareAudioDecoder.spawnWorker();
+    WorkerSoftwareAudioDecoder.spare = null;
     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       this.handleMessage(event.data);
     };
@@ -342,6 +381,8 @@ export class WorkerSoftwareAudioDecoder {
           ? this.elapsedConfigureMs()
           : this.configureMs,
       ),
+      wasmLoadMs: this.wasmLoadMs,
+      workerAgeMs: this.workerAgeMs,
       configureTimeoutMs: WorkerSoftwareAudioDecoder.CONFIGURE_TIMEOUT_MS,
       lastError: this.lastError,
     };
@@ -407,6 +448,8 @@ export class WorkerSoftwareAudioDecoder {
     this.configured = message.success;
     this.configureMs = this.elapsedConfigureMs();
     this.configureState = message.success ? "configured" : "failed";
+    this.wasmLoadMs = message.wasmLoadMs;
+    this.workerAgeMs = message.workerAgeMs;
     this.lastError = message.error ?? "";
     if (message.success) {
       this.clearFrameReorder();

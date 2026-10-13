@@ -1009,6 +1009,18 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     );
   }
 
+  /**
+   * With more than one audio track a switch is likely, and the new track's
+   * decoder starts a worker (seconds). Have one ready; see
+   * WorkerSoftwareAudioDecoder.spare.
+   */
+  private prewarmAudioSwitchWorker(): void {
+    if (this.disableAudio || this.trackManager.getAudioTracks().length < 2) {
+      return;
+    }
+    MoviAudioDecoder.prewarmWorker();
+  }
+
   private beginAudioSwitchTrace(): void {
     if (!this.audioSwitchTraceEnabled) return;
     if (this._switchTraceTimer !== null) clearInterval(this._switchTraceTimer);
@@ -1383,6 +1395,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
 
       // Recreate audio decoder for new track
+      this.traceAudioSwitch("decoder-create", {});
       this.audioDecoder = new MoviAudioDecoder();
 
       // Set bindings
@@ -1427,7 +1440,19 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       try {
         if (this.demuxer && !this.disableAudio) {
           const extradata = this.demuxer.getExtradata(track.id) ?? undefined;
+          this.traceAudioSwitch("decoder-configure-start", {});
           configured = await this.audioDecoder.configure(track, extradata);
+          if (configured) this.prewarmAudioSwitchWorker();
+          if (this.switchTraceActive) {
+            const worker = this.audioDecoder.getStats().worker;
+            this.traceAudioSwitch("decoder-configured", {
+              ok: configured,
+              workerConfigureMs: worker?.configureMs ?? -1,
+              wasmLoadMs: worker?.wasmLoadMs ?? -1,
+              workerAgeMs: worker?.workerAgeMs ?? -1,
+              queuedAudioPackets: this.audioQueue.length,
+            });
+          }
           if (configured) {
             Logger.info(
               TAG,
@@ -3700,6 +3725,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           TAG,
           `Audio decoder configured: ${audioTrack.codec} ${audioTrack.sampleRate}Hz ${audioTrack.channels}ch`,
         );
+        this.prewarmAudioSwitchWorker();
         // Pre-initialize AudioContext during load (created suspended, no audio plays).
         // Moves ~500ms creation cost from play() to load() for instant playback start.
         // init() no longer resumes — play() handles resume on user gesture.
@@ -6390,6 +6416,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   /** The seek bookkeeping that hangs off audio reaching the seek target. */
   private noteAudioFed(packet: Packet): void {
+    if (this.switchTraceActive) {
+      this.traceAudioSwitch(
+        "first-audio-fed",
+        { pts: packet.timestamp, clock: this.clock.getTime() },
+        true,
+      );
+    }
     if (this.seekTargetTime === -1 || packet.timestamp < this.seekTargetTime) {
       return;
     }
@@ -11909,6 +11942,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // player does rather than finishing into a void. The sources are closed
     // further down as well; that is belt and braces, not the mechanism.
     this._lifetimeAbort.abort();
+    MoviAudioDecoder.discardWarmWorker();
     if (this._switchTraceTimer !== null) {
       clearInterval(this._switchTraceTimer);
       this._switchTraceTimer = null;

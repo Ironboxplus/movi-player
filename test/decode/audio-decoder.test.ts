@@ -943,3 +943,42 @@ describe("merge: worker-decoded DTS still engages cold-prime", () => {
     expect(bindings.enableDecoder).not.toHaveBeenCalled();
   });
 });
+
+describe("WorkerSoftwareAudioDecoder spare worker", () => {
+  afterEach(() => {
+    MoviAudioDecoder.discardWarmWorker();
+  });
+
+  it("hands the worker started ahead of need to the next decoder instead of spawning", () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    MoviAudioDecoder.prewarmWorker();
+    MoviAudioDecoder.prewarmWorker();
+    expect(FakeWorker.instances).toHaveLength(1);
+
+    const first = new WorkerSoftwareAudioDecoder();
+    expect(FakeWorker.instances).toHaveLength(1);
+    expect(FakeWorker.instances[0].onmessage).not.toBeNull();
+
+    // The spare is spent: the next decoder starts its own.
+    const second = new WorkerSoftwareAudioDecoder();
+    expect(FakeWorker.instances).toHaveLength(2);
+    first.close();
+    second.close();
+  });
+
+  it("spawns on demand when nothing was started ahead", () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const decoder = new WorkerSoftwareAudioDecoder();
+    expect(FakeWorker.instances).toHaveLength(1);
+    decoder.close();
+  });
+
+  it("terminates an unused spare when it is discarded", () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    MoviAudioDecoder.prewarmWorker();
+    MoviAudioDecoder.discardWarmWorker();
+    expect(FakeWorker.instances[0].terminated).toBe(true);
+    new WorkerSoftwareAudioDecoder().close();
+    expect(FakeWorker.instances).toHaveLength(2);
+  });
+});

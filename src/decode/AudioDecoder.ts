@@ -739,6 +739,15 @@ export class MoviAudioDecoder {
     return this.useSoftware;
   }
 
+  /** Start a software-decoder worker ahead of an audio track switch. */
+  static prewarmWorker(): void {
+    WorkerSoftwareAudioDecoder.prewarm();
+  }
+
+  static discardWarmWorker(): void {
+    WorkerSoftwareAudioDecoder.discardSpare();
+  }
+
   /**
    * Get decoder stats for nerd stats overlay
    */
