@@ -1266,9 +1266,15 @@ async function runAudioTrackSwitch(page, label) {
         `${label} dropped ${after.audioWorkerStaleDrops - before.audioWorkerStaleDrops} stale worker frames after switching to track ${track.id}; the generation gate is letting the old track's work through`,
       );
     }
+    const trace = traceTransitions
+      ? await page.evaluate(
+          () => document.querySelector("movi-player")?.player?.audioSwitchTrace ?? [],
+        )
+      : undefined;
     switched.push({
       trackId: track.id,
       codec: track.codec,
+      trace,
       audioDecoder: after.audioDecoder,
       displacementS: Number(displacement.toFixed(3)),
       settleElapsedS: Number(elapsedS.toFixed(3)),
@@ -1901,6 +1907,7 @@ async function runOne(browser, token, mediaPath) {
     const states = player?.stateManager;
     if (!clock || !states || clock.__blackboxTraced) return;
     clock.__blackboxTraced = true;
+    player.audioSwitchTraceEnabled = true;
     for (const method of ["start", "pause"]) {
       const original = clock[method].bind(clock);
       clock[method] = (...args) => {

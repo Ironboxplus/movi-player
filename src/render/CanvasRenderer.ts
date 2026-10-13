@@ -206,10 +206,26 @@ export class CanvasRenderer {
    *  to bound how long the picture may be held while pre-roll is dropped. */
   private _lastPresentAt = 0;
   private framesDropped: number = 0;
+  /** Frames discarded for being behind the clock when a later one was due,
+   *  kept apart from framesDropped so getVideoPlaybackQuality() is unchanged. */
+  private framesSkippedLate: number = 0;
   /** Frames presented and dropped since this renderer was built, for
-   *  getVideoPlaybackQuality() on the element. */
-  getFrameStats(): { presented: number; dropped: number } {
-    return { presented: this.framesPresented, dropped: this.framesDropped };
+   *  getVideoPlaybackQuality() on the element; skipped, queued and lastPts are
+   *  for the audio-switch trace. */
+  getFrameStats(): {
+    presented: number;
+    dropped: number;
+    skipped: number;
+    queued: number;
+    lastPts: number;
+  } {
+    return {
+      presented: this.framesPresented,
+      dropped: this.framesDropped,
+      skipped: this.framesSkippedLate,
+      queued: this.frameQueue.length,
+      lastPts: this.lastPresentedPts,
+    };
   }
   /** Called for every frame that reaches the screen — drives the element's
    *  requestVideoFrameCallback. */
@@ -2895,7 +2911,10 @@ export class CanvasRenderer {
       // worse than a late one — so past this the stale frame goes up anyway.
       const held = performance.now() - this._lastPresentAt;
       if (behind > tolerance && held < 500) {
-        for (const f of this.frameQueue.splice(0, bestIndex + 1)) f.close();
+        for (const f of this.frameQueue.splice(0, bestIndex + 1)) {
+          f.close();
+          this.framesSkippedLate++;
+        }
         return null;
       }
     }
@@ -2917,6 +2936,7 @@ export class CanvasRenderer {
 
       if (currentTime - oldestFrameTime > maxBehind) {
         this.frameQueue.shift()?.close();
+        this.framesSkippedLate++;
       } else {
         break;
       }
@@ -2930,6 +2950,7 @@ export class CanvasRenderer {
         for (const f of removed) {
           f.close();
         }
+        this.framesSkippedLate += removed.length;
       }
 
       // Update tracking

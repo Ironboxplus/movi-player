@@ -1833,6 +1833,10 @@ export class AudioRenderer {
    * Returns -1 if audio hasn't started yet
    * Clamps to maxScheduledMediaTime when audio has ended
    */
+  getAnchorMediaTime(): number {
+    return this.hasFirstBuffer ? this.firstBufferMediaTime : -1;
+  }
+
   getAudioClock(): number {
     if (
       this.audioContext &&

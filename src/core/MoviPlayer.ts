@@ -979,6 +979,87 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  `start_ts -= 1.0`, "small offset to get correct overlap"). */
   private static readonly AUDIO_SWITCH_REFRESH_BACK_S = 1.0;
 
+  /**
+   * Debug-only event ring around an audio track switch, off unless the host
+   * sets it (the black-box harness does with MOVI_BLACKBOX_TRACE_TRANSITIONS).
+   * From the switch it records the clock, the refresh seek, the first packets
+   * and decoded buffers of the new track, and a 250 ms sample of clock, audio
+   * anchor and picture, for audioSwitchTraceWindowMs. Read it back through
+   * audioSwitchTrace.
+   */
+  audioSwitchTraceEnabled = false;
+  private static readonly AUDIO_SWITCH_TRACE_WINDOW_MS = 8000;
+  private static readonly AUDIO_SWITCH_TRACE_SAMPLE_MS = 250;
+  private _switchTrace: Record<string, number | string | boolean>[] = [];
+  private _switchTraceT0 = 0;
+  private _switchTraceTimer: ReturnType<typeof setInterval> | null = null;
+  private _switchTraceSeen = new Set<string>();
+  private _switchTraceAlignDrops = 0;
+
+  get audioSwitchTrace(): Record<string, number | string | boolean>[] {
+    return this._switchTrace.slice();
+  }
+
+  private get switchTraceActive(): boolean {
+    return (
+      this.audioSwitchTraceEnabled &&
+      this._switchTraceT0 > 0 &&
+      performance.now() - this._switchTraceT0 <=
+        MoviPlayer.AUDIO_SWITCH_TRACE_WINDOW_MS
+    );
+  }
+
+  private beginAudioSwitchTrace(): void {
+    if (!this.audioSwitchTraceEnabled) return;
+    if (this._switchTraceTimer !== null) clearInterval(this._switchTraceTimer);
+    this._switchTrace = [];
+    this._switchTraceSeen.clear();
+    this._switchTraceAlignDrops = 0;
+    this._switchTraceT0 = performance.now();
+    this._switchTraceTimer = setInterval(() => {
+      if (!this.switchTraceActive) {
+        if (this._switchTraceTimer !== null) clearInterval(this._switchTraceTimer);
+        this._switchTraceTimer = null;
+        return;
+      }
+      const video = this.videoRenderer?.getFrameStats();
+      this.traceAudioSwitch("sample", {
+        clock: this.clock.getTime(),
+        anchor: this.audioRenderer.getAnchorMediaTime(),
+        audioClock: this.audioRenderer.getAudioClock(),
+        lastPts: video?.lastPts ?? -1,
+        frameQueue: video?.queued ?? -1,
+        videoPackets: this.videoQueue.length,
+        audioPackets: this.audioQueue.length,
+        presented: video?.presented ?? -1,
+        skipped: video?.skipped ?? -1,
+        dropped: video?.dropped ?? -1,
+        alignDrops: this._switchTraceAlignDrops,
+        state: this.stateManager.getState(),
+      });
+    }, MoviPlayer.AUDIO_SWITCH_TRACE_SAMPLE_MS);
+  }
+
+  /** once: record only the first event of this name since the switch. */
+  private traceAudioSwitch(
+    event: string,
+    detail: Record<string, number | string | boolean>,
+    once = false,
+  ): void {
+    if (!this.switchTraceActive) return;
+    if (once) {
+      if (this._switchTraceSeen.has(event)) return;
+      this._switchTraceSeen.add(event);
+    }
+    const entry = {
+      t: Number((performance.now() - this._switchTraceT0).toFixed(1)),
+      event,
+      ...detail,
+    };
+    this._switchTrace.push(entry);
+    Logger.debug(TAG, `audio-switch trace ${JSON.stringify(entry)}`);
+  }
+
   // Playback Loop
   private animationFrameId: number | null = null;
   private backgroundIntervalId: number | null = null;
@@ -4230,6 +4311,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * guarded at the final renderer boundary, mirroring the video-frame guard.
    */
   private renderDecodedAudio(data: AudioData): void {
+    this.traceDecodedAudio(data.timestamp / 1_000_000);
     if (this.dropsBeforeAudioStart(data.timestamp / 1_000_000)) {
       try {
         data.close();
@@ -4253,6 +4335,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   private renderDecodedPCM(frame: PCMFrame): void {
+    this.traceDecodedAudio(frame.timestamp / 1_000_000);
     if (this.dropsBeforeAudioStart(frame.timestamp / 1_000_000)) {
       return;
     }
@@ -4282,6 +4365,25 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * sync point cannot leave the gate latched. That frame is also the sound
    * being back, which is what ends _audioSwitching.
    */
+  private traceDecodedAudio(ptsSeconds: number): void {
+    if (!this.switchTraceActive) return;
+    const clock = this.clock.getTime();
+    this.traceAudioSwitch(
+      "first-decoded-audio",
+      { pts: ptsSeconds, clock, aligning: this._audioStartAlign },
+      true,
+    );
+    if (this._audioStartAlign && ptsSeconds < clock) {
+      this._switchTraceAlignDrops++;
+    } else {
+      this.traceAudioSwitch(
+        "first-rendered-audio",
+        { pts: ptsSeconds, clock, aligning: this._audioStartAlign },
+        true,
+      );
+    }
+  }
+
   private dropsBeforeAudioStart(ptsSeconds: number): boolean {
     if (!this._audioStartAlign) return false;
     if (ptsSeconds < this.clock.getTime()) return true;
@@ -4800,6 +4902,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   private realignAudioTimelineForTrackSwitch(): void {
     const currentTime = this.clock.getTime();
+    if (this.audioSwitchTraceEnabled) {
+      this.beginAudioSwitchTrace();
+      const video = this.videoRenderer?.getFrameStats();
+      this.traceAudioSwitch("switch", {
+        clock: currentTime,
+        lastPts: video?.lastPts ?? -1,
+        frameQueue: video?.queued ?? -1,
+        videoPackets: this.videoQueue.length,
+      });
+    }
     this.audioRenderer.reset();
     this.clock.seek(currentTime);
   }
@@ -4838,8 +4950,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this._refreshingVideo = Number.isFinite(this.videoQueue.lastDts);
     this._refreshingSubtitle = Number.isFinite(this._lastSubtitleDts);
     const session = this.seekSessionId;
+    if (this.switchTraceActive) {
+      this.traceAudioSwitch("refresh-seek", {
+        target,
+        clock: this.clock.getTime(),
+      });
+    }
     return demuxer.seek(target, 1, this.getSeekStreamIndex()).then(
       () => {
+        if (this.switchTraceActive) {
+          this.traceAudioSwitch("refresh-landed", { clock: this.clock.getTime() });
+        }
         // A real seek since then owns the cursor and the EOF flag.
         if (session !== this.seekSessionId) return;
         // The cursor is no longer where the read-ahead found the end of the
@@ -5963,6 +6084,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * here, which is what lets the first two stop keeping stashes of their own.
    */
   private enqueuePacket(packet: Packet, stale = false): void {
+    if (this.switchTraceActive && !stale) {
+      this.traceAudioSwitch(
+        "first-packet",
+        {
+          stream: packet.streamIndex,
+          pts: packet.timestamp,
+          clock: this.clock.getTime(),
+        },
+        true,
+      );
+    }
     // Track how far past the seek target we've demuxed so the read-ahead
     // cap can halt a frame-starved seek before it downloads forever.
     if (
@@ -5993,6 +6125,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const activeAudio = this.trackManager.getActiveAudioTrack();
     if (activeAudio && activeAudio.id === packet.streamIndex) {
       if (this.disableAudio) return;
+      if (this.switchTraceActive && !stale) {
+        this.traceAudioSwitch(
+          "first-audio-packet",
+          {
+            pts: packet.timestamp,
+            clock: this.clock.getTime(),
+            seekTarget: this.seekTargetTime,
+          },
+          true,
+        );
+      }
       // Audio before the seek target is never wanted: FFmpeg lands on the
       // keyframe before the target, and the audio interleaved up to it would
       // otherwise anchor the renderer early.
@@ -11765,6 +11908,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // player does rather than finishing into a void. The sources are closed
     // further down as well; that is belt and braces, not the mechanism.
     this._lifetimeAbort.abort();
+    if (this._switchTraceTimer !== null) {
+      clearInterval(this._switchTraceTimer);
+      this._switchTraceTimer = null;
+    }
 
     // Stop driving a host subtitle renderer, but DON'T destroy it — the renderer
     // is owned by whoever registered it (the element re-applies it to the fresh
