@@ -3491,6 +3491,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.seekKeyframeOffset = 0;
       this.clock.setDuration(this.mediaInfo.duration + this.startTime);
       this.clock.seek(this.startTime);
+      this.declareStreamEnds();
 
       // Emit duration
       this.emit("durationChange", this.mediaInfo.duration);
@@ -4071,8 +4072,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // held read in HttpSource), and carried across the swap that verdict
     // stopped the loop reading the new rung at all: fully downloaded, under a
     // spinner, until a seek happened to clear it.
-    this.eofReached = false;
-    this.eofSince = 0;
+    this.resetEof();
 
     // The video decoder's software path reads through the demuxer's WASM module.
     const bindings = newDemuxer.getBindings();
@@ -6284,8 +6284,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // so queued packets are stale (would feed later timestamps into the
       // decoder, making first frame jump ahead instead of starting at targetTime).
       this.clearPacketQueues();
-      this.eofReached = false;
-      this.eofSince = 0;
+      this.resetEof();
     } else {
       if (!this.disableAudio) {
         await this.audioRenderer.play();
@@ -6522,6 +6521,151 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  wait is measured from then and not from a much earlier EOF. */
   private _eofPictureDrainSince = 0;
 
+  // ── Where each stream ends ─────────────────────────────────
+  // Some files carry sound past the end of their picture (a phone recording
+  // whose camera stopped at 80s while the mic ran to 161s) and some the other
+  // way round (a 4K MKV whose Opus ends at 193s of a 243s film). Nothing in an
+  // empty queue tells that apart from a stream that is merely late, so the
+  // stall detector, the resume gate and the ending all waited for packets that
+  // do not exist (upstream 27e9dab, 6043339, f0953e8, 775fa9d, b11f19a).
+  //
+  // Two sources, never a gap between the cursors (we read each stream to its own
+  // readahead, so a sparse interleave puts video seconds ahead of audio on any
+  // ordinary file): the container's own per-stream duration, known before
+  // playback starts; and the end of file, where the read pass has covered
+  // everything from where it began and "no audio packet in it" is simply true.
+  /** Media time from which the file has audio but no video. */
+  private _declaredVideoEnd = Number.POSITIVE_INFINITY;
+  /** Media time from which the file has video but no audio. */
+  private _declaredAudioEnd = Number.POSITIVE_INFINITY;
+  private _learnedVideoEnd = Number.POSITIVE_INFINITY;
+  private _learnedAudioEnd = Number.POSITIVE_INFINITY;
+  /** Where the current read pass began, and the furthest end (pts + duration)
+   *  of each stream's packets it has produced; -1 for none. */
+  private _passStart = 0;
+  private _passVideoEnd = -1;
+  private _passAudioEnd = -1;
+  /** A stream must stop at least this long before the file to count as a tail. */
+  private static readonly STREAM_END_GAP_S = 1;
+
+  private videoEnd(): number {
+    return Math.min(this._declaredVideoEnd, this._learnedVideoEnd);
+  }
+
+  private audioEnd(): number {
+    return Math.min(this._declaredAudioEnd, this._learnedAudioEnd);
+  }
+
+  /** The playhead is past the last picture of a file whose sound runs on. */
+  private videoFinished(): boolean {
+    return this.clock.getTime() >= this.videoEnd() - 0.05;
+  }
+
+  /** The playhead is past the last sound of a file whose picture runs on. */
+  private audioFinished(): boolean {
+    return this.clock.getTime() >= this.audioEnd() - 0.05;
+  }
+
+  /** For the element: past the picture there are no frames to count. */
+  isPastVideoEnd(): boolean {
+    return this.videoFinished();
+  }
+
+  /** A tail needs both streams, a real picture, and a muxed audio track. */
+  private tailCapable(): boolean {
+    const v = this.trackManager.getActiveVideoTrack();
+    return (
+      !!v &&
+      !v.isAttachedPic &&
+      !!this.trackManager.getActiveAudioTrack() &&
+      !this.audioDemuxer
+    );
+  }
+
+  private tailOrNone(end: number): number {
+    const fileEnd = this.startTime + (this.mediaInfo?.duration ?? 0);
+    return fileEnd - end > MoviPlayer.STREAM_END_GAP_S
+      ? end
+      : Number.POSITIVE_INFINITY;
+  }
+
+  /** Read the per-stream durations the container declared. */
+  private declareStreamEnds(): void {
+    this._declaredVideoEnd = Number.POSITIVE_INFINITY;
+    this._declaredAudioEnd = Number.POSITIVE_INFINITY;
+    this._learnedVideoEnd = Number.POSITIVE_INFINITY;
+    this._learnedAudioEnd = Number.POSITIVE_INFINITY;
+    this._passStart = this.startTime;
+    this._passVideoEnd = -1;
+    this._passAudioEnd = -1;
+    if (!this.tailCapable()) return;
+    const vd = this.trackManager.getActiveVideoTrack()?.duration ?? 0;
+    const ad = this.trackManager.getActiveAudioTrack()?.duration ?? 0;
+    if (vd > 0) this._declaredVideoEnd = this.tailOrNone(this.startTime + vd);
+    if (ad > 0) this._declaredAudioEnd = this.tailOrNone(this.startTime + ad);
+    if (this._declaredVideoEnd < Number.POSITIVE_INFINITY) {
+      Logger.info(TAG, `Video track ends at ${this._declaredVideoEnd.toFixed(2)}s — the sound plays on past the last frame`);
+    }
+    if (this._declaredAudioEnd < Number.POSITIVE_INFINITY) {
+      Logger.info(TAG, `Audio track ends at ${this._declaredAudioEnd.toFixed(2)}s — the picture plays on past the last sample`);
+    }
+  }
+
+  /** A read pass starts here (a seek, a re-read): forget what the last one saw. */
+  private beginReadPass(from: number): void {
+    this._passStart = from;
+    this._passVideoEnd = -1;
+    this._passAudioEnd = -1;
+  }
+
+  /** Note the extent of each stream's packets as the pass produces them. */
+  private notePassPacket(packet: Packet): void {
+    const end = packet.timestamp + (packet.duration > 0 ? packet.duration : 0);
+    if (!Number.isFinite(end)) return;
+    const v = this.trackManager.getActiveVideoTrack();
+    if (v && v.id === packet.streamIndex) {
+      if (end > this._passVideoEnd) this._passVideoEnd = end;
+    } else if (
+      this.trackManager.getActiveAudioTrack()?.id === packet.streamIndex
+    ) {
+      if (end > this._passAudioEnd) this._passAudioEnd = end;
+    }
+  }
+
+  /**
+   * The demuxer ran out: the pass has covered everything from where it began
+   * to the end of the file, so a stream with packets in it ended where its last
+   * one did, and a stream with none ended before the pass began — which is all
+   * that may be claimed, so the tail starts there. A later pass sharpens it: a
+   * bound learned from a seek past the sound gives way to the exact end once a
+   * pass runs through the sound, and never moves the other way.
+   */
+  private learnStreamEnds(): void {
+    if (!this.tailCapable()) return;
+    const learn = (seen: number, prev: number) =>
+      seen >= 0 ? seen : Math.min(prev, this._passStart);
+    this._learnedVideoEnd = this.tailOrNone(
+      learn(this._passVideoEnd, this._learnedVideoEnd),
+    );
+    this._learnedAudioEnd = this.tailOrNone(
+      learn(this._passAudioEnd, this._learnedAudioEnd),
+    );
+  }
+
+  /** The demuxer reached the end of the file. */
+  private markEof(): void {
+    if (!this.eofReached) this.eofSince = performance.now();
+    this.eofReached = true;
+    this.learnStreamEnds();
+  }
+
+  /** Back to reading: the end of file no longer holds, and a pass begins. */
+  private resetEof(passStart = this.clock.getTime()): void {
+    this.eofReached = false;
+    this.eofSince = 0;
+    this.beginReadPass(passStart);
+  }
+
   /**
    * Keep decoded audio from rewinding the renderer during a seek. FFmpeg seeks
    * to a point before the requested timestamp and decoder flushes may also
@@ -6653,6 +6797,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this._blackFrameWatchdog = setTimeout(() => {
       this._blackFrameWatchdog = null;
       if (this.seekSessionId !== session) return; // a newer seek owns recovery
+      // A black screen is a decode failure; a finished video track is not.
+      if (this.videoFinished()) return;
       const nowFrames = this.videoRenderer?.getStats?.().framesPresented ?? 0;
       if (nowFrames > baseFrames) {
         this._blackRecoverySeeks = 0; // a frame decoded on its own — recovered
@@ -6806,7 +6952,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // background auto-advance sat silent in buffering until the viewer came
       // back). PiP is not backgrounded in this sense.
       pictureIsBeingDecoded &&
-      !!this.trackManager.getActiveVideoTrack();
+      !!this.trackManager.getActiveVideoTrack() &&
+      // Past the last frame of the file nothing is coming to wait for.
+      !this.videoFinished();
 
     // The restart barrier (P3, ours). With a video track present, a seek is not
     // complete until a presentable frame exists — so the forced timeout does NOT
@@ -7241,8 +7389,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // The cursor is no longer where the read-ahead found the end of the
         // file, and processLoop reads nothing while eofReached is up. Without
         // this a switch within the last seconds of a file stayed silent.
-        this.eofReached = false;
-        this.eofSince = 0;
+        this.resetEof();
       },
       (error) => {
         Logger.error(TAG, "Audio track switch: demuxer refresh seek failed", error);
@@ -7419,7 +7566,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // At least one frame to show: resuming the clock over a black picture
       // is the one thing no amount of queued packets excuses.
       const videoReady =
-        !this.videoRenderer || this.videoRenderer.getQueueSize() >= 1;
+        !this.videoRenderer ||
+        this.videoFinished() ||
+        this.videoRenderer.getQueueSize() >= 1;
       const aheadReady =
         this.eofReached ||
         this.bufferedAheadSeconds() >= MoviPlayer.RESUME_SECS ||
@@ -7472,6 +7621,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Emit periodic time update for UI
     this.emit("timeUpdate", this.getCurrentTime());
 
+    // The sound has played out for good: let go of the audio clock, which would
+    // otherwise stay clamped to the last sample and hold the picture with it.
+    if (this.audioFinished() && !this.audioRenderer.isStreamEnded()) {
+      Logger.info(TAG, `Sound ends at ${this.audioEnd().toFixed(2)}s — the picture plays the rest out without it`);
+      this.audioRenderer.endOfStream();
+    }
+
     // Stall detection: if playing but both video and audio buffers are critically low
     // Skip near end of video to avoid false stall at EOF
     const nearEnd = this.mediaInfo && this.clock.getTime() >= (this.mediaInfo.duration + this.startTime) - 3;
@@ -7490,7 +7646,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       !this._audioOnly &&
       // Sound the browser refuses to start cannot walk away from anything.
       !this.audioRenderer.isDroppingAudio() &&
-      (!!this.trackManager.getActiveAudioTrack() || !!this.audioDemuxer);
+      (!!this.trackManager.getActiveAudioTrack() || !!this.audioDemuxer) &&
+      !this.audioFinished();
     // Grace period after play() starts: allow decode pipeline to fill before stall detection.
     // Without this, clicking play on a poster triggers a false stall → buffering → loading spinner.
     //
@@ -7574,6 +7731,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // Sound being rebuilt for a track switch is not sound that ran out —
         // the picture plays on over it (see _audioSwitching).
         !this._audioSwitching &&
+        !this.audioFinished() &&
         !this.audioRenderer.isDroppingAudio();
       const audioLow = !hasAudio || this.audioRenderer.getBufferedDuration() < 0.05;
       // Suppress the underrun→buffering path briefly after returning from
@@ -7604,6 +7762,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // make it later.
       const videoStalled =
         videoEmpty &&
+        !this.videoFinished() &&
         (audioLow || this._bindAV) &&
         !decoderRecovering &&
         this.videoSourceStarved();
@@ -7819,7 +7978,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         currentTime >= duration + this.startTime - 0.5 || duration === 0;
 
       const hasAudioTrack =
-        !!this.trackManager?.getActiveAudioTrack() && !this.disableAudio;
+        !!this.trackManager?.getActiveAudioTrack() &&
+        !this.disableAudio &&
+        // Sound that ended before the file did is not one to wait to play out.
+        !this.audioFinished();
 
       if (hasAudioTrack) {
         const decodersDone =
@@ -8026,8 +8188,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           }
           // EOF reached - mark it but don't stop immediately
           // Let the decoders finish processing
-          if (!this.eofReached) this.eofSince = performance.now();
-          this.eofReached = true;
+          this.markEof();
 
           // Clear seeking flag if we hit EOF before finding keyframe
           if (this.seekingToKeyframe) {
@@ -8327,6 +8488,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     return (
       !!this.trackManager.getActiveVideoTrack() &&
       !this._audioOnly &&
+      !this.videoFinished() &&
       !(this.isBackgrounded && !this.isPiPActive)
     );
   }
@@ -8352,6 +8514,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // The sound is being rebuilt for a track switch: what the buffer holds
       // says nothing about the link, so nothing waits on it.
       !this._audioSwitching &&
+      // …and sound that has played out for good (a track that ends before the
+      // file does) is not sound that is late: nothing waits for it.
+      !this.audioFinished() &&
       !this.audioRenderer.isDroppingAudio()
     );
   }
@@ -8453,6 +8618,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
 
     if (!this.trackManager.isActiveStream(packet.streamIndex)) return;
+    this.notePassPacket(packet);
 
     const activeVideo = this.trackManager.getActiveVideoTrack();
     if (activeVideo && activeVideo.id === packet.streamIndex) {
@@ -8675,7 +8841,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     maxAudioBuffered: number;
   }): void {
     if (this.audioQueue.length === 0) return;
-    if (this.waitingForVideoSync && this.trackManager.getActiveVideoTrack()) {
+    if (
+      this.waitingForVideoSync &&
+      this.trackManager.getActiveVideoTrack() &&
+      // A seek past the last frame has no picture to wait for.
+      !this.videoFinished()
+    ) {
       return;
     }
     // The new decoder of an audio track switch is still being configured; a
@@ -8750,7 +8921,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       TAG,
       `Audio reached seek target: ${packet.timestamp.toFixed(3)}s (target: ${this.seekTargetTime.toFixed(3)}s)`,
     );
-    const hasVideo = !!this.trackManager.getActiveVideoTrack();
+    const hasVideo =
+      !!this.trackManager.getActiveVideoTrack() && !this.videoFinished();
     if (!hasVideo) {
       this.notifySeekCompletion(packet.timestamp);
     }
@@ -8992,8 +9164,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.seekTargetTime = -1;
       this.clock.seek(t + this.startTime);
       this.seekKeyframeOffset = 0;
-      this.eofReached = false;
-      this.eofSince = 0;
+      this.resetEof(t + this.startTime);
       // Honor a resume intent, mirroring what the video path does in
       // notifySeekCompletion. play()'s first-play (and replay) branch sets
       // wasPlayingBeforeSeek before calling seek(0); in audio-only there are no
@@ -9269,8 +9440,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.clock.seek(seconds + this.startTime);
 
       // Reset EOF flag after seek - we're now at a new position
-      this.eofReached = false;
-      this.eofSince = 0;
+      this.resetEof(seconds + this.startTime);
       // A seek re-aligns the audio source too, so the automatic-recovery budget
       // starts fresh — a failure burst earlier in the file shouldn't leave a
       // later stretch permanently silent.
@@ -13197,8 +13367,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       await this.demuxer.seek(resumeTime, 1, this.getSeekStreamIndex());
       this.clock.seek(resumeTime);
       this.clearPacketQueues();
-      this.eofReached = false;
-      this.eofSince = 0;
+      this.resetEof();
     } catch (err) {
       Logger.error(TAG, "Subtitle prefetch failed", err);
     } finally {
@@ -14220,8 +14389,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // Reset EOF flag — demuxer is being repositioned. For audio-less
       // video, background processLoop may have raced to EOF; without this
       // reset, processLoop would early-return and playback stalls.
-      this.eofReached = false;
-      this.eofSince = 0;
+      this.resetEof();
 
       // Seek demuxer to nearest keyframe before current audio position
       if (this.demuxer) {
@@ -14494,7 +14662,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         const readEpoch = this._refreshEpoch;
         const packet = await this.demuxer.readPacket();
         if (!packet) {
-          this.eofReached = true;
+          this.markEof();
           break;
         }
         this.enqueuePacket(packet, readEpoch !== this._refreshEpoch);

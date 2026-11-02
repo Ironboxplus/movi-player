@@ -12841,11 +12841,15 @@ export class MoviElement extends HTMLElement {
     // climbs, and audio at non-1x is time-stretched cleanly). Covers BOTH a
     // pure audio file (mp3/m4a — no video track at all) and data-saver
     // audio-only mode (video track dropped). Skip entirely.
+    // …and the same for a file whose video track ends before its audio does:
+    // past the last frame there is nothing left to present, so counting
+    // presented frames reads a finished picture as a broken one.
     const hasVideoTrack =
       !!this.player?.trackManager?.getActiveVideoTrack?.();
     if (
       !hasVideoTrack ||
-      this.player?.isAudioOnly?.()
+      this.player?.isAudioOnly?.() ||
+      this.player?.isPastVideoEnd?.()
     ) {
       this._stutterHistory.length = 0;
       this._judderSeconds = 0;
@@ -35921,10 +35925,15 @@ export class MoviElement extends HTMLElement {
       return this._moving;
     }
     const fps = (drawn * 1000) / Math.max(1, elapsed);
+    // Past the end of the video track the frame reading is not a reading of
+    // anything: the clock alone is the whole truth about whether playback is
+    // happening. Asking for frames there put a spinner over sound that was
+    // playing perfectly well.
+    const pictureFinished = !!this.player?.isPastVideoEnd?.();
     this._moving =
       !first &&
       drawn >= 0 &&
-      fps >= MoviElement.MOVING_FPS &&
+      (pictureFinished || fps >= MoviElement.MOVING_FPS) &&
       time > this._movingTime + 0.05;
     this._movingAt = now;
     this._movingFrames = frames;
