@@ -2317,6 +2317,22 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  attributable to the flush/re-anchor that operation performed itself. */
   private static readonly SELF_INFLICTED_STALL_WINDOW_MS = 1500;
   /**
+   * A speed change held back until the audio can carry it (upstream 181ee7a,
+   * 8e77c8a). The rate the viewer asked for, or 0.
+   *
+   * AudioRenderer re-anchors a rate change in place when it holds a cushion
+   * (canCarryRateChange); without one the only way to keep the clock honest is
+   * the corrective seek, which flushes both decoders and throws the frame
+   * queue away — the dead stop on a machine that plays the file perfectly well
+   * at 1x. The cushion is usually a few hundred milliseconds away (right after a
+   * seek, a start or an underrun), so wait for it instead of paying for the stop.
+   */
+  private _pendingRate = 0;
+  private _pendingRateSince = 0;
+  private _applyingPendingRate = false;
+  /** How long a held speed change waits before it takes the seek anyway. */
+  private static readonly RATE_PREPARE_MAX_MS = 1500;
+  /**
    * The picture running behind the sound, and staying there.
    *
    * Frame selection normally makes this self-healing: the presentation loop
@@ -6446,6 +6462,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (!this.disableAudio) this.audioRenderer.pause();
       if (this.videoRenderer) this.videoRenderer.stopPresentationLoop();
       this.stateManager.setState("paused");
+      // No tick will run for a held speed change once paused.
+      this.maybeApplyPendingRate();
       if (this.animationFrameId !== null) {
         cancelAnimationFrame(this.animationFrameId);
         this.animationFrameId = null;
@@ -6470,6 +6488,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
 
     this.stateManager.setState("paused");
+    // No tick will run for a held speed change once paused.
+    this.maybeApplyPendingRate();
 
     if (this.animationFrameId !== null) {
       cancelAnimationFrame(this.animationFrameId);
@@ -7620,6 +7640,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     // Emit periodic time update for UI
     this.emit("timeUpdate", this.getCurrentTime());
+
+    // A speed change waiting for the audio to be able to carry it.
+    this.maybeApplyPendingRate();
 
     // The sound has played out for good: let go of the audio clock, which would
     // otherwise stay clamped to the last sample and hold the picture with it.
@@ -11842,7 +11865,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // that as "no healthy audio anchor" and took the corrective-seek path:
     // full decoder flush, HEVC decoder recreate, frame-queue clear. That is
     // the second-plus freeze on every speed change.
-    if (this.clock.getPlaybackRate() === rate) return;
+    if (this.clock.getPlaybackRate() === rate) {
+      this._pendingRate = 0; // asked to go back to where it already is
+      return;
+    }
 
     // Stamp the change so the stall detector can tell an underrun caused by our
     // own audio re-anchor from a genuine one (see SELF_INFLICTED_STALL_WINDOW_MS).
@@ -11867,6 +11893,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // guard exists to prevent. Read it while the pre-change audio state is
     // still intact.
     const audioAnchored = this.hasHealthyAudioAnchor();
+    // Is there sound whose read-ahead a rate change could pivot? With none (a
+    // video-only file, a track that has ended, audio the browser will not play)
+    // there is nothing for the corrective seek to undo.
+    const audioPlayable = this.audioIsPlayable();
+
+    // Sound that cannot carry the change yet: hold it and let the pipeline
+    // fill, rather than take the stop. Applied from processLoop the moment the
+    // cushion exists, or after RATE_PREPARE_MAX_MS regardless — which is the
+    // path taken today. Coming back DOWN is held the same way: the question is
+    // only ever what the audio is holding, not which way the rate moves.
+    if (
+      !this._applyingPendingRate &&
+      this.stateManager.getState() === "playing" &&
+      audioPlayable &&
+      !audioAnchored &&
+      !this.audioDemuxer &&
+      !this.isLinearPlayback()
+    ) {
+      if (this._pendingRate !== rate) {
+        this._pendingRate = rate;
+        this._pendingRateSince = performance.now();
+        Logger.info(TAG, `Speed ${rate}x: the audio cannot carry it yet — filling first`);
+      }
+      return;
+    }
+    this._pendingRate = 0;
 
     this.clock.setPlaybackRate(rate);
 
@@ -11918,12 +11970,36 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (
       playingNow &&
       !this.isLinearPlayback() &&
-      !audioAnchored
+      !audioAnchored &&
+      audioPlayable
     ) {
       this.seek(savedTime, {
         suppressSpinner: true,
         preservePlaying: true,
       }).catch(() => {});
+    }
+  }
+
+  /**
+   * Hand a held speed change back to setPlaybackRate once the audio can carry
+   * it, or once waiting has gone on long enough. Called every tick; a no-op when
+   * nothing is held.
+   */
+  private maybeApplyPendingRate(): void {
+    const rate = this._pendingRate;
+    if (!rate) return;
+    const stillFilling =
+      this.stateManager.getState() === "playing" &&
+      this.audioIsPlayable() &&
+      !this.hasHealthyAudioAnchor() &&
+      performance.now() - this._pendingRateSince < MoviPlayer.RATE_PREPARE_MAX_MS;
+    if (stillFilling) return;
+    this._applyingPendingRate = true;
+    try {
+      this.setPlaybackRate(rate);
+    } finally {
+      this._applyingPendingRate = false;
+      this._pendingRate = 0;
     }
   }
 
