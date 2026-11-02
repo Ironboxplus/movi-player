@@ -61,6 +61,14 @@ async function tailFile(opts: {
 /** Ticks with the wall clock moved on, enough for the stall window to elapse. */
 async function tickThroughStallWindow(f: Awaited<ReturnType<typeof tailFile>>) {
   const base = performance.now();
+  // The fixture's demuxer is empty, so the first pass would hit the end of the
+  // file having seen no packet of either stream, and the player rightly learns
+  // that both ended before the pass began (learnStreamEnds). That would make
+  // every case below "finished" from the first tick and turn the controls into
+  // passes for the wrong reason. Keep the read in flight, as it is while a slow
+  // source is still delivering, so only the declared ends are in play.
+  f.player.demuxInFlight = true;
+  f.player.demuxInFlightStartTime = base + 1_000_000;
   let off = 0;
   vi.spyOn(performance, "now").mockImplementation(() => base + off);
   // Stops right after the window: one more tick would see the buffering it

@@ -93,8 +93,10 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
     const d = makeDecoder({
       lastConfig: { codec: "avc1.640028" },
     });
-    // NAL type 1 = non-IDR coded slice (not a real sync point).
-    const nonIdr = new Uint8Array([0, 0, 1, 0x01]);
+    // NAL type 1 = non-IDR coded slice (not a real sync point). Upstream's
+    // 1249b3d walk reads two header bytes per NAL, so a bare one-byte NAL has
+    // no verdict and the packet is let through; give it a payload byte.
+    const nonIdr = new Uint8Array([0, 0, 1, 0x01, 0x88]);
     expect(d.shouldRetryHardware(nonIdr, true)).toBe(false);
   });
 
@@ -103,7 +105,7 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
       lastConfig: { codec: "avc1.640028" },
     });
     // NAL type 5 = IDR slice.
-    const idr = new Uint8Array([0, 0, 1, 0x65]);
+    const idr = new Uint8Array([0, 0, 1, 0x65, 0x88]);
     expect(d.shouldRetryHardware(idr, true)).toBe(true);
   });
 });
