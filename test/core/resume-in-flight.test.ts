@@ -34,7 +34,13 @@ async function resumeInFlight() {
   f.player.play = vi.fn(() => new Promise<void>(() => {}));
   f.player.videoRenderer.queueFrame = vi.fn();
   let onFrame: (frame: any) => void = () => {};
-  f.player.wireVideoDecoder({ setOnFrame: (cb: any) => (onFrame = cb) });
+  f.player.wireVideoDecoder({
+    setOnFrame: (cb: any) => (onFrame = cb),
+    setOnError: vi.fn(),
+    setOnRecovering: vi.fn(),
+    setBindings: vi.fn(),
+    setPlaybackRate: vi.fn(),
+  });
   await f.tick();
   return { f, onFrame: (frame: any) => onFrame(frame) };
 }
@@ -65,7 +71,13 @@ describe("a resume out of buffering", () => {
     const f = await makePipelinePlayer({ rendererQueue: 1 });
     f.player.videoRenderer.queueFrame = vi.fn();
     let onFrame: (frame: any) => void = () => {};
-    f.player.wireVideoDecoder({ setOnFrame: (cb: any) => (onFrame = cb) });
+    f.player.wireVideoDecoder({
+      setOnFrame: (cb: any) => (onFrame = cb),
+      setOnError: vi.fn(),
+      setOnRecovering: vi.fn(),
+      setBindings: vi.fn(),
+      setPlaybackRate: vi.fn(),
+    });
     f.player.stateManager.setState("paused");
     const fr = frame();
     onFrame(fr);

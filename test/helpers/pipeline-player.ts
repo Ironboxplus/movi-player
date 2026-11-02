@@ -207,6 +207,9 @@ export async function makePipelinePlayer(
       setOutputChannelCount: vi.fn(),
       render: vi.fn(),
       renderPCM: vi.fn(),
+      // The tail detection ends the sound's clock once its last sample played.
+      isStreamEnded: () => false,
+      endOfStream: vi.fn(),
     },
   });
   for (const p of opts.queuedVideo ?? []) player.videoQueue.push(p);

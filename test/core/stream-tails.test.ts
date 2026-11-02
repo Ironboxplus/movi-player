@@ -63,7 +63,9 @@ async function tickThroughStallWindow(f: Awaited<ReturnType<typeof tailFile>>) {
   const base = performance.now();
   let off = 0;
   vi.spyOn(performance, "now").mockImplementation(() => base + off);
-  for (const step of [0, 700, 1400]) {
+  // Stops right after the window: one more tick would see the buffering it
+  // just entered and let the resume gate leave it again.
+  for (const step of [0, 700]) {
     off = step;
     await f.tick();
   }
@@ -86,12 +88,14 @@ describe("declared stream ends", () => {
 describe("picture ends before the sound", () => {
   it("is not a stall: an empty video queue past the last frame leaves playback running", async () => {
     const f = await tailFile({ videoDuration: 80, at: 85, audioBuffered: 1 });
+    f.player._bindAV = true;
     await tickThroughStallWindow(f);
     expect(f.player.stateManager.getState()).toBe("playing");
   }, 20_000);
 
   it("is a stall for a picture that is merely late (control)", async () => {
     const f = await tailFile({ at: 85, audioBuffered: 1 });
+    f.player._bindAV = true;
     await tickThroughStallWindow(f);
     expect(f.player.stateManager.getState()).toBe("buffering");
   }, 20_000);
