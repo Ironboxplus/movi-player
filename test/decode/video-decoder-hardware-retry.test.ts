@@ -13,7 +13,7 @@ import type { WasmBindings } from "../../src/wasm/bindings";
  */
 function makeDecoder(overrides: Record<string, unknown>) {
   const d = Object.create(MoviVideoDecoder.prototype) as unknown as {
-    shouldRetryHardware(data: Uint8Array): boolean;
+    shouldRetryHardware(data: Uint8Array, isIdr: boolean): boolean;
   };
   Object.assign(d, {
     useSoftware: true,
@@ -26,27 +26,30 @@ function makeDecoder(overrides: Record<string, unknown>) {
   return d;
 }
 
+// Upstream 1249b3d: the demuxer classifies IDR C-side and that is the primary
+// authority (a CRA is what the hardware decoder refused in the first place),
+// so every caller passes `isIdr`; the NAL walk is only the second opinion.
 const anyKeyframeBytes = new Uint8Array([0, 0, 1, 0x65]);
 
 describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
   it("does not retry when not currently on the software fallback path", () => {
     const d = makeDecoder({ useSoftware: false });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(false);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(false);
   });
 
   it("does not retry without a current track (nothing configured to retry against)", () => {
     const d = makeDecoder({ currentTrack: null });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(false);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(false);
   });
 
   it("caps at hardwareRetryCount >= 10 regardless of cooldown/sync-frame state", () => {
     const d = makeDecoder({ hardwareRetryCount: 10 });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(false);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(false);
   });
 
   it("allows retry #9 (count=9 is still under the cap)", () => {
     const d = makeDecoder({ hardwareRetryCount: 9 });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(true);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(true);
   });
 
   it("first retry (count=0) is blocked before the 10s cooldown elapses", () => {
@@ -54,7 +57,7 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
       hardwareRetryCount: 0,
       lastHardwareRetryTime: performance.now() - 5_000,
     });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(false);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(false);
   });
 
   it("first retry (count=0) is allowed once the 10s cooldown elapses", () => {
@@ -62,7 +65,7 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
       hardwareRetryCount: 0,
       lastHardwareRetryTime: performance.now() - 10_001,
     });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(true);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(true);
   });
 
   it("a later retry (count>0) uses the longer 30s cooldown, not the first-retry 10s one", () => {
@@ -70,7 +73,7 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
       hardwareRetryCount: 1,
       lastHardwareRetryTime: performance.now() - 15_000, // past 10s, short of 30s
     });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(false);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(false);
   });
 
   it("a later retry (count>0) is allowed once the 30s cooldown elapses", () => {
@@ -78,7 +81,12 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
       hardwareRetryCount: 1,
       lastHardwareRetryTime: performance.now() - 30_001,
     });
-    expect(d.shouldRetryHardware(anyKeyframeBytes)).toBe(true);
+    expect(d.shouldRetryHardware(anyKeyframeBytes, true)).toBe(true);
+  });
+
+  it("refuses a keyframe the demuxer did not classify as IDR, whatever the bytes look like", () => {
+    const d = makeDecoder({});
+    expect(d.shouldRetryHardware(anyKeyframeBytes, false)).toBe(false);
   });
 
   it("refuses to retry on a non-IDR H.264 NAL even though every other gate is open", () => {
@@ -87,7 +95,7 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
     });
     // NAL type 1 = non-IDR coded slice (not a real sync point).
     const nonIdr = new Uint8Array([0, 0, 1, 0x01]);
-    expect(d.shouldRetryHardware(nonIdr)).toBe(false);
+    expect(d.shouldRetryHardware(nonIdr, true)).toBe(false);
   });
 
   it("retries on a genuine H.264 IDR NAL", () => {
@@ -96,7 +104,7 @@ describe("VideoDecoder.shouldRetryHardware — resurrection gating", () => {
     });
     // NAL type 5 = IDR slice.
     const idr = new Uint8Array([0, 0, 1, 0x65]);
-    expect(d.shouldRetryHardware(idr)).toBe(true);
+    expect(d.shouldRetryHardware(idr, true)).toBe(true);
   });
 });
 
