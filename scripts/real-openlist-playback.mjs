@@ -1585,14 +1585,14 @@ const SUBTITLE_END_TOLERANCE_S = 2;
  * (video) stream: passing -select_streams here makes ffprobe seek on the sparse
  * subtitle stream, which started ~580s early and crawled on a remux.
  */
-async function probeSubtitleGroundTruth(rawUrl, durationS) {
+async function probeSubtitleGroundTruth(rawUrl) {
   const startedAt = Date.now();
   const header = JSON.parse(
     await runFfprobe([
       "-v", "error",
       "-select_streams", "s",
       "-show_entries",
-      "stream=index,codec_name:stream_disposition=forced:stream_tags=language,title,NUMBER_OF_FRAMES:format=start_time",
+      "stream=index,codec_name:stream_disposition=forced:stream_tags=language,title,NUMBER_OF_FRAMES:format=start_time,duration",
       "-of", "json",
       rawUrl,
     ]),
@@ -1614,6 +1614,10 @@ async function probeSubtitleGroundTruth(rawUrl, durationS) {
     return { absent: true, probeMs: Date.now() - startedAt };
   }
   const startTime = Number(header.format?.start_time) || 0;
+  const durationS = Number(header.format?.duration);
+  if (!(durationS > 0)) {
+    throw new Error(`ffprobe reported no usable duration: ${JSON.stringify(header.format ?? null)}`);
+  }
 
   const languageRank = (stream) => {
     const language = stream.language.toLowerCase();
@@ -1947,6 +1951,23 @@ async function runOne(browser, token, mediaPath) {
   );
   if (!media.raw_url || !(media.size > 0)) {
     throw new Error(`${label} did not resolve to a raw media object`);
+  }
+
+  // The subtitle ground truth is read BEFORE the page exists, and every ffprobe
+  // process has exited by the time this await returns. The upstream behind the
+  // OpenList proxy allows only two concurrent connections per file (measured
+  // 2026-11-02: eight ranged GETs gave 206, 206, then 403 x6), and the player
+  // holds one or two of them from the moment it loads the file, so an ffprobe
+  // overlapping it gets rejected and the player's own reconnects get rejected
+  // in turn. A failure is kept and thrown inside the "subtitle ground truth"
+  // phase below, once runPhase exists, so it fails the sample without
+  // aborting the other checks.
+  let subtitleTruthResult;
+  let subtitleTruthError = null;
+  try {
+    subtitleTruthResult = await probeSubtitleGroundTruth(media.raw_url);
+  } catch (error) {
+    subtitleTruthError = error;
   }
 
   // Wall-clock baseline for the byte budget: everything this sample downloads
@@ -2406,13 +2427,14 @@ async function runOne(browser, token, mediaPath) {
 
   const duration = playAfter.duration;
 
-  // Subtitle ground truth comes from the file itself, before any seek, so the
-  // one seek this harness makes can be aimed at a cue that is known to exist.
-  // Failing here fails the sample (runPhase records it) rather than silently
-  // skipping the subtitle check; the track is selected BEFORE the seek so the
-  // stream the seek restarts already carries its packets.
+  // The ground truth (read from the file before the page loaded) lets the one
+  // seek this harness makes be aimed at a cue that is known to exist. Failing
+  // here fails the sample (runPhase records it) rather than silently skipping
+  // the subtitle check; the track is selected BEFORE the seek so the stream the
+  // seek restarts already carries its packets.
   const subtitleTruth = await runPhase("subtitle ground truth", async () => {
-    const truth = await probeSubtitleGroundTruth(media.raw_url, duration);
+    if (subtitleTruthError) throw subtitleTruthError;
+    const truth = subtitleTruthResult;
     if (!truth.absent) {
       const configured = await page.evaluate(
         (trackId) => document.querySelector("movi-player")?.player?.selectSubtitleTrack(trackId),
