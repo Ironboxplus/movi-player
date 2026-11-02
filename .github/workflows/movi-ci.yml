@@ -75,6 +75,13 @@ jobs:
           key: wasm-libs-${{ steps.emsdk.outputs.digest }}-${{ hashFiles('docker/Dockerfile', 'docker/build-ffmpeg.sh') }}
       - run: npm run build:wasm
       - run: npm run build:ts
+      # The unit job has no WASM, so the tests that drive the real FFmpeg build
+      # skip there. This is where they run; MOVI_REQUIRE_WASM turns a missing
+      # artifact into a failure instead of a silent skip.
+      - name: Run the real-WASM tests against the freshly built WASM
+        run: npm run test:run
+        env:
+          MOVI_REQUIRE_WASM: "1"
       - run: npm run pack:verify
       - name: Create npm tarball
         run: |

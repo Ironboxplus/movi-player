@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hasWasm } from "../helpers/wasm-available";
 import type { AudioTrack } from "../../src/types";
 
 /**
@@ -144,7 +145,7 @@ afterEach(() => {
   WorkerBridge.current = null;
 });
 
-describe("SoftwareAudioDecoder.worker: decode generation gating (isStale — exact match)", () => {
+describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: decode generation gating (isStale — exact match)", () => {
   it("drops a decode carrying a generation the worker has already moved past", async () => {
     const bridge = await bootWorker();
     bridge.postMessage(configureMessage({ generation: 1 }));
@@ -195,7 +196,7 @@ describe("SoftwareAudioDecoder.worker: decode generation gating (isStale — exa
   }, 30_000);
 });
 
-describe("SoftwareAudioDecoder.worker: flush/reset generation gating (isOlderGeneration — strictly-less-than)", () => {
+describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: flush/reset generation gating (isOlderGeneration — strictly-less-than)", () => {
   it("drops a flush for a strictly older generation, without regressing the worker's own generation", async () => {
     const bridge = await bootWorker();
     bridge.postMessage(configureMessage({ generation: 3 }));

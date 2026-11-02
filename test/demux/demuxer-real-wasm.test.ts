@@ -11,14 +11,24 @@
  * seeks through (pcm_s16le is in the build's decoder list).
  *
  * Requires `dist/wasm/movi.js`, which `npm run build:wasm` produces. It is
- * present in the working tree and on the `.88` gate host; the suite is not
- * written to tolerate its absence, the same way the audio worker and video
- * decoder WASM suites are not.
+ * present in the working tree, on the `.88` gate host and in the CI job that
+ * builds the WASM. Elsewhere (the plain unit job) the suite is skipped via
+ * `hasWasm`, like the audio worker and video decoder WASM suites.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { hasWasm } from "../helpers/wasm-available";
 import { Demuxer } from "../../src/demux/Demuxer";
 import { HttpSource } from "../../src/source/HttpSource";
 import { startHttpFixture, type HttpFixture } from "../source/http-test-server";
+
+// Demuxer imports FFmpegLoader eagerly, so without the build:wasm artifact the
+// file would fail to even load and skipIf would never get a say. Resolve the
+// import to an inert stub in that case; with the artifact present the real
+// module is used untouched.
+vi.mock("../../dist/wasm/movi.js", async (importOriginal) => {
+  const { hasWasm } = await import("../helpers/wasm-available");
+  return hasWasm ? importOriginal() : { default: vi.fn(async () => ({})) };
+});
 
 const MIB = 1024 * 1024;
 const SAMPLE_RATE = 48_000;
@@ -113,7 +123,7 @@ function delay(ms: number): { promise: Promise<"timeout">; cancel: () => void } 
 
 // ─── Serialization, as the player actually issues it ───────────────────────
 
-describe("Demuxer against real WASM: back-to-back seeks", () => {
+describe.skipIf(!hasWasm)("Demuxer against real WASM: back-to-back seeks", () => {
   it("lands on the LAST target when two seeks are issued without awaiting", async () => {
     const wav = makeWav(120);
     const { demuxer } = await openDemuxer({
@@ -143,7 +153,7 @@ describe("Demuxer against real WASM: back-to-back seeks", () => {
 
 // ─── M1: a seek must not inherit a read's unbounded wait ───────────────────
 
-describe("Demuxer against real WASM: a seek queued behind a stalled read", () => {
+describe.skipIf(!hasWasm)("Demuxer against real WASM: a seek queued behind a stalled read", () => {
   it("cuts the read short and completes instead of waiting it out", async () => {
     const wav = makeWav(120);
     // Everything from 8 MiB on is answered with headers and then silence, with

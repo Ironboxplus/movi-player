@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hasWasm } from "../helpers/wasm-available";
 import type { AudioTrack } from "../../src/types";
 import type { WasmBindings } from "../../src/wasm/bindings";
 
@@ -173,7 +174,7 @@ afterEach(() => {
   WorkerBridge.current = null;
 });
 
-describe("SoftwareAudioDecoder.worker: real circuit-breaker over real FFmpeg", () => {
+describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: real circuit-breaker over real FFmpeg", () => {
   it("really trips after 50 consecutive libavcodec failures and stops calling WASM", async () => {
     const bridge = await bootWorker();
     const { WorkerSoftwareAudioDecoder } = await import(

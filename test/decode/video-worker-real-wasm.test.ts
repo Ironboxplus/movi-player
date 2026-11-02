@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hasWasm } from "../helpers/wasm-available";
 
 /**
  * Real end-to-end coverage for `src/decode/SoftwareVideoDecoder.worker.ts`,
@@ -187,7 +188,7 @@ afterEach(() => {
   WorkerBridge.current = null;
 });
 
-describe("SoftwareVideoDecoder.worker: real configure/decode over real FFmpeg", () => {
+describe.skipIf(!hasWasm)("SoftwareVideoDecoder.worker: real configure/decode over real FFmpeg", () => {
   it("builds a real libavcodec MPEG-2 decoder and reports success", async () => {
     const bridge = await bootWorker();
     const msg = configureMessage();
