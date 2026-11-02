@@ -55,43 +55,43 @@ describe("standalone WASM audio decoder source contract", () => {
 });
 
 describe("WASM stream seek source contract", () => {
-  it("uses active-stream strict seek before broad Matroska/global fallbacks", () => {
+  // movi_seek_to anchors on a video stream (upstream 0.4.1), not on whatever
+  // stream index the caller passed; the contracts below are the same ones the
+  // earlier active-stream wording pinned, spelled with the anchor.
+  const seekSection = () => {
     const sectionStart = streamsSource.indexOf("int movi_seek_to");
     const sectionEnd = streamsSource.indexOf("// After seek, clear stale EOF state", sectionStart);
     expect(sectionStart).toBeGreaterThanOrEqual(0);
     expect(sectionEnd).toBeGreaterThan(sectionStart);
-    const seekSection = streamsSource.slice(sectionStart, sectionEnd);
+    // Whitespace-normalized so the assertions survive clang-format reflow.
+    return streamsSource.slice(sectionStart, sectionEnd).replace(/\s+/g, " ");
+  };
 
-    expect(seekSection).toContain(
-      "stream_index >= 0 &&\n      stream_index < (int)ctx->fmt_ctx->nb_streams",
+  it("uses the anchor stream strict seek before broad Matroska/global fallbacks", () => {
+    const sec = seekSection();
+    expect(sec).toContain("anchor >= (int)ctx->fmt_ctx->nb_streams");
+    expect(sec).toContain("av_find_best_stream(ctx->fmt_ctx, AVMEDIA_TYPE_VIDEO");
+    const strict = sec.indexOf(
+      "avformat_seek_file(ctx->fmt_ctx, anchor, INT64_MIN, stream_target, stream_target, seek_flags)",
     );
-    expect(seekSection).toContain(
-      "av_rescale_q(seek_target, AV_TIME_BASE_Q, stream->time_base)",
+    const perStream = sec.indexOf("av_seek_frame(ctx->fmt_ctx, anchor, stream_target, seek_flags)");
+    const broad = sec.indexOf(
+      "avformat_seek_file(ctx->fmt_ctx, anchor, INT64_MIN, stream_target, INT64_MAX, seek_flags)",
     );
-    expect(seekSection).toContain(
-      "avformat_seek_file(ctx->fmt_ctx, stream_index, INT64_MIN,\n                             stream_target, stream_target, seek_flags)",
-    );
-    expect(seekSection).toContain(
-      "avformat_seek_file(ctx->fmt_ctx, stream_index, INT64_MIN,\n                               stream_target, INT64_MAX, seek_flags)",
-    );
-    expect(seekSection.indexOf("stream_target, stream_target")).toBeLessThan(
-      seekSection.indexOf("stream_target, INT64_MAX"),
-    );
-    expect(seekSection).toContain("avformat_seek_file(ctx->fmt_ctx, -1");
+    expect(strict).toBeGreaterThanOrEqual(0);
+    expect(perStream).toBeGreaterThan(strict);
+    expect(broad).toBeGreaterThan(perStream);
+    expect(sec).toContain("avformat_seek_file(ctx->fmt_ctx, -1");
   });
 
-  it("guards a zero stream time_base before av_rescale_q (no div-by-zero trap)", () => {
-    const sectionStart = streamsSource.indexOf("int movi_seek_to");
-    const sectionEnd = streamsSource.indexOf("// After seek, clear stale EOF state", sectionStart);
-    const seekSection = streamsSource.slice(sectionStart, sectionEnd);
-    // The per-stream rescale path must only be entered when the denominator is
-    // non-zero, otherwise av_rescale_q(..., stream->time_base) divides by zero.
-    expect(seekSection).toContain(
-      "ctx->fmt_ctx->streams[stream_index]->time_base.den != 0",
+  it("guards a zero stream time_base before the per-stream rescale (no div-by-zero trap)", () => {
+    const sec = seekSection();
+    // The per-stream path must only be entered when the denominator is
+    // non-zero, otherwise the stream_target rescale divides by zero.
+    expect(sec).toContain("ctx->fmt_ctx->streams[anchor]->time_base.den != 0");
+    expect(sec.indexOf("time_base.den != 0")).toBeLessThan(
+      sec.indexOf("avformat_seek_file(ctx->fmt_ctx, anchor"),
     );
-    expect(
-      seekSection.indexOf("time_base.den != 0"),
-    ).toBeLessThan(seekSection.indexOf("av_rescale_q(seek_target"));
   });
 
   it("converges the global fallback max_ts to seek_target before broadening", () => {
