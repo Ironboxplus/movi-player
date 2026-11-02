@@ -7188,7 +7188,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
 
 
-      Logger.info(TAG, "Resuming playback after seek");
+      // The queue depth is the evidence upstream 5a12a30 argues from: a resume
+      // on the first frame back starts the clock against a queue of one.
+      Logger.info(
+        TAG,
+        `Resuming playback after seek (renderer queue=${this.videoRenderer?.getQueueSize() ?? 0})`,
+      );
       // Playback is starting; if the tab is hidden this is the only thing that
       // will feed the renderer.
       this.ensureBackgroundPump();
