@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { hasWasm } from "../helpers/wasm-available";
+import { waitForReply } from "../helpers/worker-bridge-wait";
 import type { AudioTrack } from "../../src/types";
 
 /**
@@ -126,6 +127,15 @@ function configureMessage(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+/** Send a configure and wait for ITS reply (see waitForReply for why not settle()). */
+async function configureAndWait(
+  bridge: WorkerBridge,
+  message: ReturnType<typeof configureMessage>,
+) {
+  bridge.postMessage(message);
+  await waitForReply(bridge, "configured", message.requestId);
+}
+
 function decodeMessage(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     type: "decode" as const,
@@ -148,12 +158,10 @@ afterEach(() => {
 describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: decode generation gating (isStale — exact match)", () => {
   it("drops a decode carrying a generation the worker has already moved past", async () => {
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 1 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 1 }));
 
     // Track switch / seek: worker moves on to generation 2.
-    bridge.postMessage(configureMessage({ generation: 2, requestId: 999 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 2, requestId: 999 }));
 
     const postedBefore = bridge.posted.length;
     // A decode still labeled generation 1 — e.g. one queued on the main
@@ -167,10 +175,8 @@ describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: decode generation gating
 
   it("still processes a decode for the CURRENT generation after the same switch", async () => {
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 1 }));
-    await settle();
-    bridge.postMessage(configureMessage({ generation: 2, requestId: 999 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 1 }));
+    await configureAndWait(bridge, configureMessage({ generation: 2, requestId: 999 }));
 
     bridge.postMessage(decodeMessage({ generation: 2 }));
     await settle();
@@ -185,8 +191,7 @@ describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: decode generation gating
     // decode that somehow arrived tagged for a generation the worker hasn't
     // configured into yet is just as wrong to process as a stale one.
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 1 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 1 }));
 
     const postedBefore = bridge.posted.length;
     bridge.postMessage(decodeMessage({ generation: 5 }));
@@ -199,8 +204,7 @@ describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: decode generation gating
 describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: flush/reset generation gating (isOlderGeneration — strictly-less-than)", () => {
   it("drops a flush for a strictly older generation, without regressing the worker's own generation", async () => {
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 3 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 3 }));
 
     // A dropped flush posts nothing on its own — that alone isn't enough to
     // prove it was REJECTED rather than applied (a successful flush doesn't
@@ -221,8 +225,7 @@ describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: flush/reset generation g
 
   it("applies a flush for the SAME generation, unlike decode's exact-match gate", async () => {
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 3 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 3 }));
 
     // Prove it actually ran (not just "didn't crash"): trip the circuit
     // breaker with real failures, then confirm the same-generation flush
@@ -249,8 +252,7 @@ describe.skipIf(!hasWasm)("SoftwareAudioDecoder.worker: flush/reset generation g
     // of its matching "configure" (e.g. arrives first on the message queue)
     // must still land, or the re-align it performs never happens.
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 1 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 1 }));
 
     bridge.postMessage({ type: "reset", generation: 4, trackId: 5 });
     await settle();

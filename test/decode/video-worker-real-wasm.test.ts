@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { hasWasm } from "../helpers/wasm-available";
+import { waitForReply } from "../helpers/worker-bridge-wait";
 
 /**
  * Real end-to-end coverage for `src/decode/SoftwareVideoDecoder.worker.ts`,
@@ -169,6 +170,15 @@ function configureMessage(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+/** Send a configure and wait for ITS reply (see waitForReply for why not settle()). */
+async function configureAndWait(
+  bridge: WorkerBridge,
+  message: ReturnType<typeof configureMessage>,
+) {
+  bridge.postMessage(message);
+  await waitForReply(bridge, "configured", message.requestId);
+}
+
 function decodeMessage(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     type: "decode" as const,
@@ -193,8 +203,7 @@ describe.skipIf(!hasWasm)("SoftwareVideoDecoder.worker: real configure/decode ov
     const bridge = await bootWorker();
     const msg = configureMessage();
 
-    bridge.postMessage(msg);
-    await settle();
+    await configureAndWait(bridge, msg);
 
     expect(bridge.latest("configured")).toMatchObject({
       requestId: msg.requestId,
@@ -220,8 +229,7 @@ describe.skipIf(!hasWasm)("SoftwareVideoDecoder.worker: real configure/decode ov
    */
   it("cleanly acks a packet the real MPEG-2 decoder accepts but produces no frame from", async () => {
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage());
-    await settle();
+    await configureAndWait(bridge, configureMessage());
 
     bridge.postMessage(decodeMessage());
     await settle();
@@ -235,12 +243,10 @@ describe.skipIf(!hasWasm)("SoftwareVideoDecoder.worker: real configure/decode ov
 
   it("ignores a decode for a generation the worker has already moved past", async () => {
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 1 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 1 }));
 
     // Reconfigure onto generation 2 (a track switch / re-open).
-    bridge.postMessage(configureMessage({ generation: 2, requestId: 999 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 2, requestId: 999 }));
     expect(bridge.posted.filter((m) => m.type === "configured")).toHaveLength(2);
 
     const postedBefore = bridge.posted.length;
@@ -257,10 +263,8 @@ describe.skipIf(!hasWasm)("SoftwareVideoDecoder.worker: real configure/decode ov
 
   it("processes a decode for the CURRENT generation normally after a reconfigure", async () => {
     const bridge = await bootWorker();
-    bridge.postMessage(configureMessage({ generation: 1 }));
-    await settle();
-    bridge.postMessage(configureMessage({ generation: 2, requestId: 999 }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ generation: 1 }));
+    await configureAndWait(bridge, configureMessage({ generation: 2, requestId: 999 }));
 
     bridge.postMessage(decodeMessage({ generation: 2 }));
     await settle();
@@ -276,8 +280,7 @@ describe.skipIf(!hasWasm)("SoftwareVideoDecoder.worker: real configure/decode ov
     const bridge = await bootWorker();
     // Not a real libavcodec codec id — decoder creation must fail, not crash
     // the worker.
-    bridge.postMessage(configureMessage({ codecId: -1, codec: "bogus" }));
-    await settle();
+    await configureAndWait(bridge, configureMessage({ codecId: -1, codec: "bogus" }));
 
     const configured = bridge.latest("configured");
     expect(configured).toMatchObject({ success: false });
