@@ -100,6 +100,17 @@ function basename(path) {
   return path.split("/").filter(Boolean).at(-1) ?? "unknown";
 }
 
+// HttpSource.readStalls only ever grows, and one 6s silent-stream reconnect
+// (READ_STALL_TIMEOUT_MS) is recoverable behaviour. Asserting the cumulative
+// value made that single stall fail every later phase of the sample too (5/7
+// samples on 2026-11-02). Each phase is judged on the stalls it added itself:
+// runPhase moves `base` to the counter at the start of every phase, and every
+// readStalls assertion goes through readStallsInPhase so there is one definition.
+const readStallLedger = { base: 0 };
+function readStallsInPhase(network) {
+  return Math.max(0, Number(network?.readStalls ?? 0) - readStallLedger.base);
+}
+
 function numeric(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -346,8 +357,12 @@ function assertHealthyInner(label, before, after, phase, options = {}) {
     throw new Error(`${label} ran without the browser WebCodecs API`);
   }
   if (after.network) {
-    if (Number(after.network.readStalls ?? 0) !== 0) {
-      throw new Error(`${label} recorded HTTP source stalls during ${phase}`);
+    const phaseStalls = readStallsInPhase(after.network);
+    if (phaseStalls !== 0) {
+      throw new Error(
+        `${label} recorded ${phaseStalls} HTTP source stall(s) during ${phase} ` +
+          `(${Number(after.network.readStalls ?? 0)} cumulative)`,
+      );
     }
     // bufferWaiters is a LIVE GAUGE, not a leak counter: HttpSource reports
     // `this.bufferWaiters.size` (HttpSource.ts:2774), the number of reads
@@ -2038,8 +2053,15 @@ async function runOne(browser, token, mediaPath) {
   // that COULD run still did, and the report keeps its result.
   const completed = {};
   const stepFailures = [];
+  // Stalls each phase added to HttpSource.readStalls, next to the cumulative
+  // total in `network.readStalls`, so a report shows which phase stalled.
+  const readStallsByPhase = {};
   // Once the page is lost, later steps would only measure a fresh page (or
   // none) and each burn its own timeout; record them as skipped with the cause.
+  const recordPhaseStalls = async (name) => {
+    const now = await snapshot(page).catch(() => null);
+    readStallsByPhase[name] = readStallsInPhase(now?.network);
+  };
   const runPhase = async (name, fn) => {
     const lostBefore = pageGuard.lostReason();
     if (lostBefore !== null) {
@@ -2047,12 +2069,15 @@ async function runOne(browser, token, mediaPath) {
       process.stderr.write(`  [${label}] step "${name}" skipped: ${lostBefore}\n`);
       return null;
     }
+    readStallLedger.base = numeric((await snapshot(page).catch(() => null))?.network?.readStalls);
     try {
       const value = await fn();
       completed[name] = value;
+      await recordPhaseStalls(name);
       return value;
     } catch (error) {
       const current = await snapshot(page).catch(() => null);
+      readStallsByPhase[name] = readStallsInPhase(current?.network);
       const lost = pageGuard.lostReason();
       const message =
         (error instanceof Error ? error.message : String(error)) +
@@ -2559,8 +2584,12 @@ async function runOne(browser, token, mediaPath) {
       throw new Error(`${label} emitted player errors during subtitle-integrated playback`);
     }
     if (check.network) {
-      if (Number(check.network.readStalls ?? 0) !== 0) {
-        throw new Error(`${label} recorded HTTP source stalls after subtitle testing`);
+      const phaseStalls = readStallsInPhase(check.network);
+      if (phaseStalls !== 0) {
+        throw new Error(
+          `${label} recorded ${phaseStalls} HTTP source stall(s) in the final state check ` +
+            `(${Number(check.network.readStalls ?? 0)} cumulative)`,
+        );
       }
       // Same gauge-vs-counter problem as assertHealthy's copy of this check
       // (see the long note there). Here there IS a page to poll, so measure
@@ -2635,6 +2664,7 @@ async function runOne(browser, token, mediaPath) {
           streamGeneration: numeric(finalSnapshot.network.streamGeneration),
           rangeOpenEndedSwitches: numeric(finalSnapshot.network.rangeOpenEndedSwitches),
           readStalls: numeric(finalSnapshot.network.readStalls),
+          readStallsByPhase,
           supersededStreams: numeric(finalSnapshot.network.supersededStreams),
         }
       : null,
