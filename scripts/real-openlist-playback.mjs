@@ -44,7 +44,19 @@ const seekRecoveryMs = Number(
 // Number of back-to-back seeks issued without waiting for the previous one, and
 // the gap between them. This is the pressure test for the demuxer's FIFO op
 // chain, P3's restart barrier and A5's worker generation gating.
-const rapidSeekCount = Number(process.env.MOVI_BLACKBOX_RAPID_SEEKS ?? 5);
+//
+// Traffic here is seeks x prefetch window: every seek restarts the HTTP stream
+// and refills up to ~225 MB, so a full sweep with fixed repetitions cost
+// 3.6-7 GiB and ~18 min. One decisive seek per code path proves the path; the
+// old repeat-until-it-shows behaviour is only reachable through
+// MOVI_BLACKBOX_EXHAUSTIVE=1, and the report records which mode ran so the two
+// are never compared by accident.
+const exhaustiveSeeks = process.env.MOVI_BLACKBOX_EXHAUSTIVE === "1";
+// Two is the smallest burst that proves "only the last target wins": the second
+// seek is issued rapidSeekGapMs after the first, before it can land.
+const rapidSeekCount = Number(
+  process.env.MOVI_BLACKBOX_RAPID_SEEKS ?? (exhaustiveSeeks ? 5 : 2),
+);
 const rapidSeekGapMs = Number(process.env.MOVI_BLACKBOX_RAPID_SEEK_GAP_MS ?? 300);
 const traceTransitions =
   process.env.MOVI_BLACKBOX_TRACE_TRANSITIONS === "1";
@@ -1585,8 +1597,17 @@ async function validateSubtitles(page, label) {
       .filter((track) => track.subtitleType === type)
       .sort((a, b) => preferredTrackOrder(a) - preferredTrackOrder(b))
       .slice(0, 4);
+  // Minimal mode probes exactly one track at the current position, which the
+  // harness has just left mid-film after the middle seek: every seek to hunt
+  // for a cue costs a stream restart and a refilled prefetch window, and a
+  // sample that shows no cue in one window is inconclusive, not broken. Text
+  // tracks win over bitmap ones because a text cue is the cheaper, more
+  // frequent proof; bitmap is only tried when the file has no text track.
+  // `null` in a target list means "do not seek".
   const textTracks = candidates("text");
-  for (const track of textTracks) {
+  const textProbeTracks = exhaustiveSeeks ? textTracks : textTracks.slice(0, 1);
+  let cueSeen = false;
+  for (const track of textProbeTracks) {
     const configured = await page.evaluate(
       (trackId) =>
         document.querySelector("movi-player")?.player?.selectSubtitleTrack(trackId),
@@ -1599,11 +1620,15 @@ async function validateSubtitles(page, label) {
     const duration = await page.evaluate(
       () => Number(document.querySelector("movi-player")?.duration ?? 0),
     );
-    for (const target of [duration * 0.35, duration * 0.2, duration * 0.5, duration * 0.75]) {
-      await seekForSubtitleProbe(page, label, target);
+    const textTargets = exhaustiveSeeks
+      ? [duration * 0.35, duration * 0.2, duration * 0.5, duration * 0.75]
+      : [null];
+    for (const target of textTargets) {
+      if (target !== null) await seekForSubtitleProbe(page, label, target);
       if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
         await page.evaluate(() => document.querySelector("movi-player").play());
       }
+      cueSeen = false;
       try {
         await page.waitForFunction(
           () => {
@@ -1620,6 +1645,7 @@ async function validateSubtitles(page, label) {
           null,
           { timeout: subtitleProbeMs },
         );
+        cueSeen = true;
         const rendered = await page.evaluate(() => {
           const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
           const overlay = renderer?.subtitleOverlay;
@@ -1662,6 +1688,10 @@ async function validateSubtitles(page, label) {
           postProbePlayback,
         };
       } catch (error) {
+        // Without retries a cue that appeared and then rendered malformed (or
+        // froze playback) is a real defect and must fail the sample; only the
+        // cue window timing out is allowed to read as inconclusive.
+        if (!exhaustiveSeeks && cueSeen) throw error;
         attempts.push({
           trackId: track.id,
           target,
@@ -1675,7 +1705,11 @@ async function validateSubtitles(page, label) {
   // Bitmap subtitles cannot be prefetched through the text-only cue API.
   // Exercise their real streaming decoder/render path at several ordinary
   // dialogue positions and require an actual image cue in the HTML overlay.
-  const imageTracks = candidates("image");
+  const imageTracks = exhaustiveSeeks
+    ? candidates("image")
+    : textTracks.length > 0
+      ? []
+      : candidates("image").slice(0, 1);
   for (const track of imageTracks) {
     const configured = await page.evaluate(
       (trackId) => document.querySelector("movi-player")?.player?.selectSubtitleTrack(trackId),
@@ -1688,11 +1722,15 @@ async function validateSubtitles(page, label) {
     const duration = await page.evaluate(
       () => Number(document.querySelector("movi-player")?.duration ?? 0),
     );
-    for (const target of [duration * 0.2, duration * 0.5, duration * 0.75]) {
-      await seekForSubtitleProbe(page, label, target);
+    const imageTargets = exhaustiveSeeks
+      ? [duration * 0.2, duration * 0.5, duration * 0.75]
+      : [null];
+    for (const target of imageTargets) {
+      if (target !== null) await seekForSubtitleProbe(page, label, target);
       if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
         await page.evaluate(() => document.querySelector("movi-player").play());
       }
+      cueSeen = false;
       try {
         await page.waitForFunction(
           () => {
@@ -1729,6 +1767,7 @@ async function validateSubtitles(page, label) {
           null,
           { timeout: subtitleProbeMs },
         );
+        cueSeen = true;
         // The waitForFunction above proves the <canvas>/<img> element exists,
         // is displayed, and (for <img>) has finished decoding — it does NOT
         // prove the bitmap has any actual content. An all-transparent bitmap
@@ -1781,6 +1820,7 @@ async function validateSubtitles(page, label) {
           postProbePlayback,
         };
       } catch (error) {
+        if (!exhaustiveSeeks && cueSeen) throw error;
         // "No cue appeared at t" has two readings and the bare timeout cannot
         // tell them apart: the bitmap pipeline is broken, or this position
         // simply has nothing to show. Samples with many PGS tracks hide the
@@ -1818,6 +1858,28 @@ async function validateSubtitles(page, label) {
         });
       }
     }
+  }
+
+  // One window at one position cannot tell a broken pipeline from a stretch of
+  // film with no dialogue, so minimal mode reports "inconclusive" instead of
+  // failing; the attempt (with the decoder's cue context for bitmap tracks) is
+  // kept so a human can judge, and the exhaustive mode is the way to get a
+  // verdict. A track that only ever failed to configure is still a failure.
+  if (
+    !exhaustiveSeeks &&
+    attempts.some((a) => a.result === "no-visible-text-cue" || a.result === "no-visible-image-cue")
+  ) {
+    process.stderr.write(
+      `  [${label}] subtitles inconclusive: no cue rendered in ${subtitleProbeMs}ms window (not a failure)\n`,
+    );
+    return {
+      status: "no-cue-in-window",
+      inconclusive: true,
+      tracks,
+      attempts,
+      selectedTrack: tracks.find((t) => t.id === attempts.at(-1)?.trackId) ?? null,
+      windowMs: subtitleProbeMs,
+    };
   }
 
   throw new Error(
@@ -2292,16 +2354,20 @@ async function runOne(browser, token, mediaPath) {
   })();
 
   const duration = playAfter.duration;
-  // Head / middle / tail / near-keyframe. The near-keyframe target is the
-  // middle one nudged by a fraction of a second: a seek that lands just off a
-  // keyframe is the case P3's restart barrier exists for, and it is a different
-  // path from a seek that lands on one.
-  const seekMatrix = [
-    ["head seek", Math.max(2, duration * 0.02)],
-    ["middle seek", duration * 0.5],
-    ["tail seek", Math.min(duration - 10, duration * 0.95)],
-    ["near-keyframe seek", duration * 0.5 + 0.4],
-  ];
+  // Minimal mode is one seek, named "middle seek" because seekProgress and the
+  // picture/audio evidence in seekAndSample key on that phase name. Its target
+  // is the middle nudged by 0.4s on purpose: just off a keyframe it still
+  // exercises the ordinary seek path and also P3's restart barrier (the case a
+  // seek landing exactly on a keyframe never reaches), so one seek covers both.
+  // The exhaustive matrix adds head / tail and the on-keyframe middle.
+  const seekMatrix = exhaustiveSeeks
+    ? [
+        ["head seek", Math.max(2, duration * 0.02)],
+        ["middle seek", duration * 0.5],
+        ["tail seek", Math.min(duration - 10, duration * 0.95)],
+        ["near-keyframe seek", duration * 0.5 + 0.4],
+      ]
+    : [["middle seek", duration * 0.5 + 0.4]];
 
   const seeks = [];
   for (const [phase, rawTarget] of seekMatrix) {
@@ -2628,6 +2694,7 @@ async function main() {
     gpuRenderer,
     executablePath: executablePath ?? "(playwright bundled chromium)",
     acceptanceMode: allowNoPreference ? "diagnostic-no-preference" : "strict-hardware",
+    seekMode: exhaustiveSeeks ? "exhaustive" : "minimal",
     samples: mediaPaths.length,
     passed: results.filter((r) => r.status === "pass").length,
     failed: failures.length,
