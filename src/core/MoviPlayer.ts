@@ -6503,6 +6503,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // playout head and the last video frame), force the ended transition
   // rather than freezing one frame short of the end forever.
   private eofSince = 0;
+  /** How long the picture-only ending waits for the renderer's queue to run
+   *  out once the clock has armed it (upstream f266004). Only ever runs at the
+   *  very end of a file. */
+  private static readonly EOF_PICTURE_DRAIN_MS = 2000;
+  /** How long the decoder must have emitted nothing before an empty renderer
+   *  queue is taken to mean the picture is finished rather than between
+   *  callbacks. Several frame intervals at any rate we play. */
+  private static readonly EOF_PICTURE_SETTLE_MS = 150;
+  /**
+   * The `eofSince` the one-shot work below was done for. Every place that
+   * clears eofReached also zeroes eofSince, so keying on it re-arms the flush
+   * and the drain wait for the next end of file without a reset at each site.
+   */
+  private _eofWorkFor = -1;
+  private _eofFlushed = false;
+  /** When the picture-only ending was armed (timeDone first true), so the drain
+   *  wait is measured from then and not from a much earlier EOF. */
+  private _eofPictureDrainSince = 0;
 
   /**
    * Keep decoded audio from rewinding the renderer during a seek. FFmpeg seeks
@@ -7774,6 +7792,27 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     // Check if we've reached EOF and decoders are empty - transition to ended
     if (this.eofReached) {
+      if (this._eofWorkFor !== this.eofSince) {
+        this._eofWorkFor = this.eofSince;
+        this._eofPictureDrainSince = 0;
+        this._eofFlushed = false;
+      }
+      // Ask the decoder for its tail, once. WebCodecs holds reordered frames in
+      // its DPB until a flush — on H.264 with B-frames, the last few pictures
+      // of the file — and no more packets are coming to push them out. Only
+      // once everything queued has been handed over (upstream 1147919: a flush
+      // with packets still queued makes the decoder wait for a keyframe that
+      // never comes).
+      if (
+        !this._eofFlushed &&
+        this.videoQueue.length === 0 &&
+        !this.videoDecoder.isWaitingForKeyframe
+      ) {
+        this._eofFlushed = true;
+        this.videoDecoder.flush().catch(() => {
+          /* a decoder that cannot flush has nothing left to give */
+        });
+      }
       const currentTime = this.clock.getTime();
       const duration = this.mediaInfo?.duration ?? 0;
       const timeDone =
@@ -7855,10 +7894,40 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         }
       } else {
         // Video-only: WebCodecs decodeQueueSize drops to 0 before all output
-        // callbacks fire, making queue-based end unreliable. Use clock only.
+        // callbacks fire, so the decoder's queue cannot say when the picture is
+        // finished. The clock ARMS the ending half a second before the end and
+        // the picture running out FINISHES it — ending on the clock alone threw
+        // away thirty frames at 60fps (upstream f266004).
+        //
+        // An empty renderer queue is necessary but not sufficient: it reads
+        // zero for an instant while output callbacks are in flight, so the
+        // decoder must also have been quiet for EOF_PICTURE_SETTLE_MS.
         if (timeDone) {
-          this.handleEnded();
-          return;
+          const pictureLeft = (this.videoRenderer?.getQueueSize() ?? 0) > 0;
+          const decoderQuiet =
+            (this.videoDecoder?.msSinceLastFrame?.() ??
+              Number.POSITIVE_INFINITY) > MoviPlayer.EOF_PICTURE_SETTLE_MS;
+          if (!pictureLeft && decoderQuiet) {
+            this.handleEnded();
+            return;
+          }
+          // …and never wait forever: a last frame whose PTS sits past the
+          // container's duration can never come due against a clock clamped
+          // to that duration. Measured from when the ending was armed, not from
+          // eofSince, which a small fully-buffered file reaches seconds earlier.
+          if (this._eofPictureDrainSince === 0) {
+            this._eofPictureDrainSince = performance.now();
+          } else if (
+            performance.now() - this._eofPictureDrainSince >
+            MoviPlayer.EOF_PICTURE_DRAIN_MS
+          ) {
+            Logger.warn(
+              TAG,
+              `EOF watchdog: ${this.videoRenderer?.getQueueSize() ?? 0} frame(s) never came due; ending`,
+            );
+            this.handleEnded();
+            return;
+          }
         }
       }
       return; // Don't demux more, just wait for playback to finish
