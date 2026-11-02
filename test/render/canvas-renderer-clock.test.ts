@@ -24,6 +24,10 @@ describe("CanvasRenderer audio-clock guard", () => {
     };
 
     Object.assign(renderer, {
+      // A configured picture: upstream 0.4.1 answers the audio clock when there
+      // is no picture (isVideoConfigured false), which a bare prototype is.
+      isVideoConfigured: true,
+      subtitleClockTimer: null,
       isPlaying: true,
       presentationStartTime: 1_000,
       presentationStartPts: 5,
@@ -49,6 +53,10 @@ describe("CanvasRenderer releaseAudioSync", () => {
       [key: string]: unknown;
     };
     Object.assign(renderer, {
+      // A configured picture: upstream 0.4.1 answers the audio clock when there
+      // is no picture (isVideoConfigured false), which a bare prototype is.
+      isVideoConfigured: true,
+      subtitleClockTimer: null,
       isPlaying: true,
       presentationStartTime: 1_000,
       presentationStartPts: 5,

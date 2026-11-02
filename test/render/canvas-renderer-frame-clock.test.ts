@@ -56,7 +56,12 @@ type RendererInternals = CanvasRenderer & {
 };
 
 function makeRenderer(): RendererInternals {
-  return Object.create(CanvasRenderer.prototype) as RendererInternals;
+  // A configured picture: upstream 0.4.1 answers the audio clock when there is
+  // no picture (isVideoConfigured false), which a bare prototype is.
+  return Object.assign(Object.create(CanvasRenderer.prototype), {
+    isVideoConfigured: true,
+    subtitleClockTimer: null,
+  }) as RendererInternals;
 }
 
 describe("CanvasRenderer.clearQueue — seek/reset semantics", () => {
