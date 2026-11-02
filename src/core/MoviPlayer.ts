@@ -7025,7 +7025,19 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // First-play/replay seek has produced its first frame — drop spinner
     // suppression so any later genuine rebuffer shows the loading UI.
     //
-    this.suppressSeekSpinner = false;
+    // …but not when this same seek is about to buffer for its own cold prime:
+    // the state sequence is seeking -> buffering -> paused -> playing, and the
+    // buffering in the middle belongs to the seek, not to a later stall. Clearing
+    // here drew a loading ring over a picture that was already up (upstream
+    // a96c8d3, 8e77c8a). The resume gate clears it instead.
+    if (
+      !(
+        (this.wasPlayingBeforeSeek || this.wasPlayingBeforeRebuffer) &&
+        this.activeAudioNeedsColdPrime()
+      )
+    ) {
+      this.suppressSeekSpinner = false;
+    }
 
     // How far past the requested target did the first frame actually land?
     // Long-GOP .ts files can land seconds late; subtract that in
@@ -7622,6 +7634,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           this.audioRenderer.resumeFromBuffering();
         }
         Logger.info(TAG, "Buffers refilled, resuming playback");
+        // The seek that armed this buffering is finally done — see the note in
+        // notifySeekCompletion. Anything that stalls from here is genuinely new
+        // and deserves its spinner.
+        this.suppressSeekSpinner = false;
         this.play().catch((err) => {
           this._resumeToPlayPending = false;
           Logger.error(TAG, "Failed to resume playback after rebuffering:", err);
