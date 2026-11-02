@@ -13,6 +13,8 @@ type WorkerRequest =
       track: AudioTrack;
       extradata?: Uint8Array;
       downmix: boolean;
+      /** See setFailFast on the main-thread decoder; absent means false. */
+      failFast?: boolean;
       controlBuffer?: SharedArrayBuffer;
     }
   | {
@@ -31,6 +33,7 @@ type WorkerRequest =
       trackId: number;
       downmix: boolean;
     }
+  | { type: "setFailFast"; failFast: boolean }
   | { type: "flush"; generation: number; trackId: number }
   | { type: "reset"; generation: number; trackId: number }
   | { type: "close"; generation: number; trackId: number };
@@ -109,6 +112,12 @@ const pcmTimestampClock = new PCMFrameTimestampClock();
 // re-align the source. Cleared on configure/flush/reset (a fresh run, or the
 // re-align a caller does in response to "broken", deserves a clean slate).
 const MAX_CONSECUTIVE_FAILURES = 50;
+// Fifty is right for a passing corruption worth riding out, and a trap when the
+// audio cannot decode AT ALL (an encrypted source with no licence): nothing
+// decodes, the player stalls and stops feeding packets, so the count never
+// reaches fifty. A caller that already knows declares the first failure fatal.
+// Same policy as SoftwareAudioDecoder.setFailFast on the main-thread decoder.
+let failFast = false;
 let consecutiveFailures = 0;
 let isBroken = false;
 
@@ -373,7 +382,7 @@ function decode(message: Extract<WorkerRequest, { type: "decode" }>): void {
         queueDepth,
         inFlight,
       });
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      if (consecutiveFailures >= (failFast ? 1 : MAX_CONSECUTIVE_FAILURES)) {
         isBroken = true;
         post({
           type: "broken",
@@ -409,6 +418,7 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
     switch (message.type) {
       case "configure":
         downmix = message.downmix;
+        failFast = message.failFast === true;
         void configure(
           message.requestId,
           message.generation,
@@ -431,6 +441,9 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
         break;
       case "decode":
         decode(message);
+        break;
+      case "setFailFast":
+        failFast = message.failFast;
         break;
       case "setDownmix":
         if (isStale(message)) return;

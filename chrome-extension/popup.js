@@ -1,124 +1,120 @@
-// Paste & Play — read from clipboard
-document.getElementById("paste").addEventListener("click", async () => {
-  const hint = document.getElementById("paste-hint");
+/**
+ * The toolbar popup.
+ *
+ * Clicking the icon used to open the player straight away, which left no way
+ * to say "not on this site" — the thing an ad blocker's icon is for. So the
+ * icon opens this instead: the site you are on, one control that turns
+ * takeover off for it, and the button that does what the icon used to do.
+ *
+ * The per-site switch is stored as a list of hosts rather than a flag per
+ * site, so the content script can answer "am I exempt here" from one read.
+ */
+
+const TAKEOVER_KEY = "takeOverPageVideos";
+const EXEMPT_KEY = "takeoverExemptHosts";
+
+const els = {
+  host: document.getElementById("host"),
+  power: document.getElementById("power"),
+  title: document.getElementById("power-title"),
+  sub: document.getElementById("power-sub"),
+  open: document.getElementById("open"),
+  note: document.getElementById("note"),
+};
+
+/** The host a per-site decision is keyed by, or "" for a page that has none. */
+function hostOf(url) {
   try {
-    const text = await navigator.clipboard.readText();
-    const url = text.trim();
-    if (url && (url.startsWith("http://") || url.startsWith("https://"))) {
-      chrome.tabs.create({
-        url: chrome.runtime.getURL(`player.html?url=${encodeURIComponent(url)}`),
-      });
-      window.close();
-    } else {
-      hint.textContent = "No video link in clipboard";
-      hint.style.color = "#ef4444";
-      setTimeout(() => { hint.textContent = "Play a video link from clipboard"; hint.style.color = ""; }, 2000);
-    }
+    const u = new URL(url);
+    if (u.protocol === "http:" || u.protocol === "https:") return u.hostname;
   } catch {
-    hint.textContent = "Clipboard access needed";
-    hint.style.color = "#f59e0b";
-    setTimeout(() => { hint.textContent = "Play a video link from clipboard"; hint.style.color = ""; }, 2000);
+    /* a tab with no address yet */
+  }
+  return "";
+}
+
+const state = {
+  tabId: null,
+  host: "",
+  takeoverOn: false,
+  exempt: [],
+};
+
+function isExempt() {
+  return state.host !== "" && state.exempt.includes(state.host);
+}
+
+function render() {
+  els.host.textContent = state.host || "This page";
+
+  // Three things can be true, and they are not the same thing: takeover is
+  // off everywhere, it is on but not here, or it is on here. Saying which
+  // one is most of what this popup is for.
+  const usable = state.host !== "";
+  const on = state.takeoverOn && usable && !isExempt();
+  els.power.classList.toggle("on", on);
+  els.power.setAttribute("aria-pressed", String(on));
+  els.power.disabled = !usable || !state.takeoverOn;
+
+  if (!usable) {
+    els.title.textContent = "Take over videos";
+    els.sub.textContent = "Not available on this page";
+  } else if (!state.takeoverOn) {
+    els.title.textContent = "Take over videos here";
+    els.sub.textContent = "Turned off in settings";
+  } else if (isExempt()) {
+    els.title.textContent = "Off for this site";
+    els.sub.textContent = "Click to turn it back on";
+  } else {
+    els.title.textContent = "On for this site";
+    els.sub.textContent = "Click to turn it off here";
+  }
+
+  const show = state.takeoverOn && usable;
+  els.note.hidden = !show;
+  if (show) {
+    els.note.textContent = isExempt()
+      ? "Videos on this site play in the browser's own player."
+      : "Videos on this site open in MoviPlayer.";
+  }
+}
+
+async function load() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  state.tabId = tab?.id ?? null;
+  state.host = hostOf(tab?.url || "");
+  const data = await chrome.storage.local.get([TAKEOVER_KEY, EXEMPT_KEY]);
+  state.takeoverOn = !!data[TAKEOVER_KEY];
+  state.exempt = Array.isArray(data[EXEMPT_KEY]) ? data[EXEMPT_KEY] : [];
+  render();
+}
+
+els.power.addEventListener("click", async () => {
+  if (!state.host || !state.takeoverOn) return;
+  const turningOff = !isExempt();
+  state.exempt = turningOff
+    ? [...state.exempt, state.host]
+    : state.exempt.filter((h) => h !== state.host);
+  await chrome.storage.local.set({ [EXEMPT_KEY]: state.exempt });
+  render();
+
+  // Turning it ON reaches the page by itself: the content script is watching
+  // the same store and injects from there. Turning it OFF cannot — the page's
+  // own <video> elements were replaced and are gone, so there is nothing left
+  // to hand the page back. A reload is the only thing that restores them, and
+  // telling someone to do it themselves is asking them to finish the job.
+  if (turningOff && state.tabId != null) {
+    try {
+      await chrome.tabs.reload(state.tabId);
+    } catch {
+      /* the tab went away while the popup was open */
+    }
   }
 });
 
-// Play from Computer
-document.getElementById("file").addEventListener("click", () => {
-  chrome.tabs.create({
-    url: chrome.runtime.getURL("player.html"),
-  });
+els.open.addEventListener("click", async () => {
+  await chrome.tabs.create({ url: chrome.runtime.getURL("player.html") });
   window.close();
 });
 
-// ─── Detect-download-links toggle ───
-const PROBE_ORIGINS = { origins: ["<all_urls>"] };
-const probeToggle = document.getElementById("probe-toggle");
-const probeSub = document.getElementById("probe-sub");
-
-// Source of truth = storage flag (the user's preference). Permission is only
-// needed for HEAD requests to succeed; we don't try to revoke it on OFF
-// because Chrome refuses to revoke permissions that were granted as required
-// on an older install — would force a reinstall. The flag alone gates the
-// content script, which is enough to fully disable the feature.
-function syncProbeToggle() {
-  chrome.storage.local.get("probeBlankLinks", (data) => {
-    probeToggle.checked = !!data.probeBlankLinks;
-  });
-}
-syncProbeToggle();
-
-function flashProbeSub(text, color) {
-  probeSub.textContent = text;
-  probeSub.style.color = color;
-  setTimeout(() => {
-    probeSub.textContent = "Scan CDN / no-extension links for video";
-    probeSub.style.color = "";
-  }, 2000);
-}
-
-// ─── Experimental flag row ───
-const flagBtn = document.getElementById("open-flags");
-const flagSub = document.getElementById("flags-sub");
-
-// `window.chrome` is NOT a Chromium test inside an extension page — Firefox
-// defines a `chrome` alias for the WebExtension APIs too, so the flags row
-// would offer a chrome://flags link that Firefox can't open. The extension
-// URL scheme is the honest signal: chrome-extension:// vs moz-extension://.
-const isChromium = (() => {
-  try {
-    return chrome.runtime.getURL("").startsWith("chrome-extension://");
-  } catch {
-    return false;
-  }
-})();
-
-// Same probe as app/compare.html — try to set WebGL2 drawingBufferColorSpace
-// to rec2100-pq. Only succeeds when the experimental web platform features
-// flag is on in Chromium. Returns false on Safari/Firefox (where the
-// property is undefined) or when the assignment is rejected.
-function detectExperimentalFlag() {
-  if (!isChromium) return false;
-  try {
-    const c = document.createElement("canvas");
-    const gl = c.getContext("webgl2");
-    if (!gl || gl.drawingBufferColorSpace === undefined) return false;
-    gl.drawingBufferColorSpace = "rec2100-pq";
-    return gl.drawingBufferColorSpace === "rec2100-pq";
-  } catch {
-    return false;
-  }
-}
-
-if (detectExperimentalFlag()) {
-  // Flag already on — no action needed, show a check badge instead of a
-  // button to avoid suggesting the user has something to do.
-  flagSub.textContent = "Enabled — HDR & codecs unlocked";
-  flagSub.style.color = "#10b981";
-  flagBtn.outerHTML = `<span class="setting-badge" title="Experimental features enabled">✓</span>`;
-} else if (!isChromium) {
-  // Non-Chromium browsers can't toggle this flag — hide the action.
-  flagBtn.style.display = "none";
-  flagSub.textContent = "Chrome only";
-} else {
-  flagBtn.addEventListener("click", () => {
-    chrome.tabs.create({
-      url: "chrome://flags/#enable-experimental-web-platform-features",
-    });
-    window.close();
-  });
-}
-
-probeToggle.addEventListener("change", () => {
-  const wantOn = probeToggle.checked;
-  if (wantOn) {
-    // permissions.request returns granted=true instantly (no prompt) if the
-    // permission was already granted, so this handles both first-time and
-    // already-permitted cases.
-    chrome.permissions.request(PROBE_ORIGINS, (granted) => {
-      probeToggle.checked = granted;
-      chrome.storage.local.set({ probeBlankLinks: granted });
-      if (!granted) flashProbeSub("Permission denied", "#ef4444");
-    });
-  } else {
-    chrome.storage.local.set({ probeBlankLinks: false });
-  }
-});
+load();

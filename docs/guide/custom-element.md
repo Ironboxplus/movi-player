@@ -45,12 +45,15 @@ The `<movi-player>` custom element is a drop-in replacement for the native `<vid
 | `renderer`    | `string`            | `canvas` (only)                    | Rendering backend (HLS/DRM auto-pick separately)  |
 | `sw`          | `boolean`, `string` | `auto`                             | Decoder mode (`auto`, `true`/`software`, `false`) |
 | `fps`         | `number`            | -                                  | Custom frame rate override                        |
-| `thumb`       | `boolean`           | -                                  | Enable seek preview thumbnails                    |
+| `autopictureinpicture` | `boolean`  | -                                  | Auto-enter PiP when the tab hides (native-element playback only) |
+| `thumb`       | `boolean`, `string` | -                                  | Seek preview thumbnails; `thumb="precise"` decodes to the hovered frame instead of the keyframe before it |
 | `fastseek`    | `boolean`           | -                                  | Enable skip buttons and gestures                  |
 | `showtitle`   | `boolean`           | -                                  | Show video title bar                              |
-| `titlemode`   | `string`            | `both`                             | Where the title bar shows — `both`, `fullscreen`, `windowed`; add `back` for a back arrow that fires a `back` event (scope it with `back-mobile`, `back-fullscreen`, `back-mobile-fullscreen`) |
+| `titlemode`   | `string`            | `both`                             | Where the title bar shows — `both`, `fullscreen`, `windowed`; add `back` for a back arrow that fires a `back` event (scope it with `back-mobile`, `back-fullscreen`, `back-windowed`, `back-mobile-fullscreen`) |
+| `subtitlepicker` | `boolean` | `false` | Adds an "Add subtitle file…" row to the subtitle menu for picking a local SRT/VTT/TTML. Read in the page, never uploaded |
 | `chapters`    | `string`            | -                                  | Chapters from outside the media, as JSON `[{title, start}]` (or set the `chapters` property) |
 | `resume`      | `boolean`           | -                                  | Resume from last position                         |
+| `resumekey`   | `string`            | -                                  | Key the resume position is filed under            |
 | `stablevolume`| `boolean`           | -                                  | Loudness normalization                            |
 | `startat`     | `number`            | -                                  | Start at time (seconds)                           |
 | `playsinline` | `boolean`           | -                                  | Play inline (no iOS auto-fullscreen); on any touch device, suppress swipe/volume gestures while inline so they don't fight page scroll (fullscreen unaffected) |
@@ -112,6 +115,9 @@ Ship a full multi-quality + multi-language + multi-subtitle setup as plain HTML 
   <!-- Sidecar subtitles -->
   <track src="subs-en.vtt" srclang="en" label="English" kind="subtitles" default>
   <track src="subs-jp.srt" srclang="ja" label="Japanese" kind="subtitles" data-format="srt">
+
+  <!-- Storyboard: scrub previews cropped out of a sprite, no decode at all. -->
+  <track kind="metadata" label="thumbnails" src="thumbs.vtt">
 </movi-player>
 ```
 
@@ -178,6 +184,13 @@ player.muted = true;
 player.loop = true;
 player.playbackRate = 1.5;
 player.sw = "auto"; // "auto", true (software), false (hardware-first)
+
+// A storyboard built at runtime, rather than declared as a <track>. Takes a
+// VTT URL, or a tile spec — YouTube's shape, and videojs-sprite-thumbnails'.
+player.storyboard = {
+  columns: 5, rows: 5, width: 160, height: 90,
+  fragments: [{ url: "sb0.jpg", duration: 120 }],
+};
 
 // Read-only properties
 console.log(player.duration); // Total duration
@@ -297,8 +310,16 @@ movi-player {
   --movi-text-color: #ffffff;
   --movi-progress-color: #646cff;
   --movi-buffer-color: rgba(255, 255, 255, 0.3);
+  /* Dividers between control groups on the bar */
+  --movi-divider-color: rgba(255, 255, 255, 0.14);
+  --movi-divider-height: 20px;
 }
 ```
+
+Add a divider of your own between controls with
+`player.addControl({ id: "sep", divider: true, after: "cc" })`, or hide the
+built-in one with `controlslist="nodivider"` — see
+[`addControl`](../api/element.md#addcontrol-spec).
 
 ### Full Width Responsive
 

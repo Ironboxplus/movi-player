@@ -7,14 +7,14 @@
 
 [![npm version](https://img.shields.io/npm/v/movi-player.svg?style=flat-square&color=cb3837&logo=npm)](https://www.npmjs.com/package/movi-player)
 [![npm downloads](https://img.shields.io/npm/dm/movi-player.svg?style=flat-square&color=blue&logo=npm&label=npm%20downloads)](https://www.npmjs.com/package/movi-player)
-[![jsDelivr hits](https://img.shields.io/jsdelivr/npm/hy/movi-player?style=flat-square&color=ff5627&logo=jsdelivr&label=jsDelivr%2Fyear)](https://www.jsdelivr.com/package/npm/movi-player)
+[![jsDelivr hits](https://img.shields.io/jsdelivr/npm/hm/movi-player?style=flat-square&color=ff5627&logo=jsdelivr&label=jsDelivr%2Fmonth)](https://www.jsdelivr.com/package/npm/movi-player)
 [![TypeScript](https://img.shields.io/npm/types/movi-player?style=flat-square&logo=typescript&color=3178c6)](https://www.npmjs.com/package/movi-player)
 [![js bundle](https://img.shields.io/badge/js%20bundle-50--410KB-success?style=flat-square)](https://www.npmjs.com/package/movi-player)
 [![with wasm](https://img.shields.io/badge/with%20wasm-~1.8--3.2MB-orange?style=flat-square)](#modules)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/MrUjjwalG/movi-player?style=flat-square&color=yellow&logo=github)](https://github.com/MrUjjwalG/movi-player/stargazers)
 
-**[Web App](https://moviplayer.com)** &nbsp;·&nbsp; **[Documentation](https://moviplayer.com/docs/)** &nbsp;·&nbsp; **[Live Demo](https://movi-player-examples.vercel.app/element.html)** &nbsp;·&nbsp; **[Examples](https://moviplayer.com/examples)** &nbsp;·&nbsp; **[Changelog](CHANGELOG.md)**
+**[Web App](https://moviplayer.com)** &nbsp;·&nbsp; **[Documentation](https://moviplayer.com/docs/)** &nbsp;·&nbsp; **[Examples](https://moviplayer.com/examples)** &nbsp;·&nbsp; **[Changelog](CHANGELOG.md)**
 
 ![Movi Player](docs/images/element.gif)
 
@@ -32,6 +32,13 @@ One script tag, one element — this plays an MKV (or HEVC, AV1, HDR, multi-audi
 <script type="module" src="https://cdn.jsdelivr.net/npm/movi-player/dist/element.js"></script>
 
 <movi-player src="video.mkv" controls></movi-player>
+```
+
+A page that would rather not have a module — or that copies the line a CDN
+hands it — can use the `.global` build instead. Same element, plain script tag:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/movi-player/dist/element.global.js"></script>
 ```
 
 Or with npm:
@@ -53,7 +60,7 @@ npm i movi-player
 ## Contents
 
 - [Why Movi Player?](#why-movi-player)
-- [What's New in 0.4.0](#whats-new-in-040)
+- [What's New in 0.4.1](#whats-new-in-041)
 - [Getting Started](#getting-started)
 - [Common Use Cases](#common-use-cases)
 - [Advanced](#advanced)
@@ -93,11 +100,11 @@ npm i movi-player
 
 **Custom Headers** -- Send auth tokens / signed headers across the whole media flow (manifest, segments, progressive HTTP, thumbnails, encrypted source) via the `headers` attribute (JSON) or property (object).
 
-**Audio** -- AAC, MP3, Opus, FLAC, AC-3, E-AC-3. Multi-track switching. **Output-device routing** (`audiooutput` attribute / `setAudioOutput()` / right-click "Audio Output" menu, via `AudioContext.setSinkId`). Stable volume (loudness normalization). First-class audio-only mode with cover art extraction and a dedicated strip UI. Data-saver `audioonly` mode skips the video decode (and fetches an audio-only stream rendition). Perceptual (log) volume curve. Muted-autoplay fallback with tap-to-unmute.
+**Audio** -- AAC, MP3, Opus, FLAC, AC-3, E-AC-3. Multi-track switching. **Output-device routing** (`audiooutput` attribute / `setAudioOutput()` / right-click "Audio Output" menu, via `AudioContext.setSinkId`). Stable volume (loudness normalization). First-class audio-only mode with cover art extraction and a dedicated strip UI. Data-saver `audioonly` mode skips the video decode (and fetches an audio-only stream rendition). Perceptual (log) volume curve. Muted-autoplay fallback with tap-to-unmute — for the `autoplay` attribute and for a page that starts playback from script.
 
 **Non-Range Servers** -- Servers that ignore `Range` (respond `200`, not `206`) still play via a forward-only sliding-window "linear mode" with in-window seeking; the `linearmode` event lets your UI adapt.
 
-**Subtitles** -- SRT, ASS, WebVTT, PGS (image-based), DVB. Multi-track with on-the-fly switching. Per-source delay/offset (`Z` / `X` to nudge ±100ms), full transcript browser with search + click-to-seek, customizable size/color/background/edge (persisted), karaoke-aligned VTT. Pluggable `SubtitleRenderer` hook for full ASS/SSA styling via an external renderer (e.g. jassub).
+**Subtitles** -- SRT, ASS, WebVTT, PGS (image-based), DVB. Multi-track with on-the-fly switching. Per-source delay/offset (`Z` / `X` to nudge ±100ms), full transcript browser with search + click-to-seek, customizable size/color/background/edge (persisted), karaoke-aligned VTT. Captions can be dragged anywhere in the picture and stay put — across seeks, sources and sessions — with a double-click to reset (`controlslist="nosubtitledrag"` to switch that off). Pluggable `SubtitleRenderer` hook for full ASS/SSA styling via an external renderer (e.g. jassub).
 
 **HDR** -- BT.2020/PQ/HLG detection + Display-P3 rendering on supported browsers.
 
@@ -143,6 +150,8 @@ npm i movi-player
 
 **Host Error Screen** -- Restyle the built-in error overlay via `::part()`, replace it outright with `slot="error"`, and read the exact on-screen wording from the `errordisplay` event.
 
+**Host Chrome** -- Every button, the progress bar, the time, the centre play button, the title strip and the spinner carry a `part=` for `::part()` restyling. `setIcon()` swaps any of the player's 72 icons for your own. `slot="spinner"` swaps the loading ring for your own; `controlslist="nospinner"` takes it away entirely.
+
 </details>
 
 ### vs. Other Players
@@ -171,24 +180,23 @@ Evaluating Movi Player against the ecosystem:
 
 Movi Player's niche is that same WebCodecs + FFmpeg-WASM playback, delivered as a **drop-in `<movi-player>` web component** with a batteries-included UI — HDR, chapters, multi-audio, built-in subtitles, ambient mode, Document PiP and encrypted playback — so it's a practical **alternative to video.js / hls.js / Shaka Player** when your files aren't browser-native, and a friendlier, GPU-accelerated **alternative to ffmpeg.wasm / libmedia** when you want a player, not a toolkit.
 
-## What's New in 0.4.0
+## What's New in 0.4.1
 
 The headline changes — see the [full changelog](CHANGELOG.md) for everything:
 
-- **[Custom controls API](#custom-controls-and-overlays)** — `addControl()` puts your own buttons in the player's bar and context menu (toggles, hotkeys, nested submenus); `showOverlay()` layers your own panels (end screens, up-next) over the picture, including in fullscreen.
-- **[Engine selection](#engine-selection-and-native-fallback)** — the `engine` attribute picks which playback engine leads (`wasm`, `shaka`, `dashjs`, `hlsjs`, `native`) and what follows it; `fallback="native"` hands unplayable sources to a wrapped `<video>` instead of a dead end.
-- **Seamless quality switching + true Auto quality** — manual and adaptive rendition changes swap in place with no reload, no dropped playhead; Auto mode measures real link throughput and opens on the right rung, on HLS/DASH and plain multi-file ladders alike.
-- **Full native `<video>` parity** — all 78 `HTMLMediaElement`/`HTMLVideoElement` members answer, ten more standard events fire, and every documented attribute reflects as a JS property.
-- **[External chapters](#chapters)** — a `chapters` attribute/property for sources that keep chapters outside the container (CMS, watch page).
-- **`cropbars`** — strips letterbox/pillarbox padding baked into the source pixels before `cover`/`fill`/`zoom`.
-- **`titlemode` and granular `fastseek`** — control where the title bar appears (with an optional back arrow firing a cancelable `back` event), and which skip affordances (`buttons` / `keys` / `gestures`) are on.
-- **[Slim build](#slim-build)** — `movi-player/element/slim` ships the FFmpeg WASM as a separate cacheable `movi.wasm` (4.2MB JS vs. 11.4MB), with slim twins for the React/Vue/Svelte wrappers.
-- **Firefox extension** — the same player-in-a-tab experience as the Chrome extension, built from one shared codebase.
-- **Host-supplied error screen** — restyle via `::part()`, replace via `slot="error"`, observe via the `errordisplay` event.
-- **Pluggable `SubtitleRenderer`** — plug in a custom ASS/SSA renderer (e.g. jassub) for full styling.
-- **`registerSourceAdapter()`** — teach the player custom `src` schemes (`s3://`, `ipfs://`, `ws://`) globally.
-- **Settings-change events** — `aspectchange`, `loopchange`, `stablevolumechange`, `hdrchange`, `ambientchange`, `rotatechange`, `audioonlychange`.
-- **VS Code IntelliSense** — attribute/value completion with hover docs for `<movi-player>`, plus CSS completion for the `--movi-*` theme variables.
+- **[Playlists and queues](#playlists)** — `playlist` hands the element a list and an index: Next/Previous in the bar, `Shift+N`/`Shift+P`, and the skip pair on the lock screen and headset button, which a page could never draw for itself. `autoadvance` plays through, `shuffle` plays in a random order.
+- **[Take over the `<video>` a page already has](#existing-video-tags)** — `upgradeVideoElements()`, or a `data-upgrade` script tag, drops a `<movi-player>` in place of an existing element (including one driven by video.js) and keeps the original as a live proxy, so the page's own `video.play()` and listeners go on meaning what they meant. The browser extensions do it on any page — frames included — for a file at a URL, at the flick of a switch.
+- **Auto English captions, made in the browser** — `decodeAudio()` hands back the soundtrack as 16 kHz mono PCM without playing it, `addSubtitleTrack()` takes cues as they are heard, and the web app puts the two together.
+- **`smoothwarning` and `canPlaySmoothly()`** — tell a viewer that what is loaded will not play smoothly at this speed on this machine *before* it starts stuttering, or ask the question yourself and decide what to do about it. While it plays, the same notice speaks up from measurement: stutter the device cannot keep up with — named for what it is when the software decoder has taken over — or a link that cannot deliver the file fast enough ("This media needs about N Mbps to play").
+- **`thumb="precise"` and standard thumbnail tracks** — previews decode forward to the frame under the pointer instead of showing the keyframe before it, and a storyboard is read the way video.js and JW Player already write one (`<track kind="metadata" label="thumbnails">`).
+- **More places to put a control** — `placement: "top"` for the corner, `placement: "center"` for the middle of the bar, and `screen: "fullscreen" | "windowed"` for a control that belongs to only one of them.
+- **Subtitles the viewer owns** — an "Add subtitle file…" picker for a file sitting next to the video (`subtitlepicker`), and captions that can be dragged anywhere in the picture and stay there, with a double-click to reset.
+- **A build a plain `<script>` tag can load** — `dist/element.global.js` registers `<movi-player>` with no module anywhere in sight.
+- **A loop with no seam** — `loop` turns a file over without stopping first, and says so with a `looped` event.
+- **DRM-protected content says so** — "Protected Video" with a plain explanation instead of a generic loading error, and a packager's clear lead plays rather than stalling.
+- **`posterdelay` and a spinner that waits** — hold the opening poster back by a moment, and report a stall only once it is really a stall (`spinnerdelay`).
+- **Steadier streaming on a slow or busy link** — the next range is fetched while the current one arrives, Auto quality no longer sticks after a switch on 4K/8K, and a video-only file keeps its clock on the picture instead of running the bar over a frozen frame.
+- **`data-movi-ignore`** — a `<video>` (or a whole section) that should stay native says so, and the upgrade and the extensions leave it alone.
 
 ## Getting Started
 
@@ -216,6 +224,81 @@ Or with npm:
 </script>
 
 <movi-player src="video.mp4" controls autoplay muted></movi-player>
+```
+
+### Existing `<video>` Tags
+
+A page already built around `<video>` (or video.js, which is a `<video>` with a
+script on it) does not have to be rewritten — take the elements over:
+
+From a CDN, with no JavaScript of your own — `data-upgrade` on the script tag:
+
+```html
+<script type="module" src="https://cdn.jsdelivr.net/npm/movi-player/dist/element.js"
+        data-upgrade></script>
+
+<video src="movie.mkv" controls></video>
+```
+
+`data-upgrade="video.hero"` narrows it to a selector, `data-upgrade-watch` keeps
+upgrading elements added later, and `data-upgrade-attrs='{"thumb":""}'` puts
+attributes on every player it makes.
+
+Or call it yourself:
+
+```js
+import { upgradeVideoElements } from "movi-player";
+
+upgradeVideoElements();                 // every <video> on the page
+upgradeVideoElements("video.hero");     // only these
+upgradeVideoElements({ watch: true });  // …and any added later (SPA routes)
+```
+
+Each one is replaced by a `<movi-player>` carrying its attributes and children
+(sources, caption tracks, thumbnail tracks, poster, `data-setup`), and its `id`,
+so `getElementById` keeps finding the player. The original element stays hidden
+with its API pointed at the new one, so `video.play()`, `video.currentTime = 60`
+and `video.addEventListener(…)` in existing code keep working.
+
+It goes on answering like the `<video>` it was. Listeners the page attached
+*before* the upgrade — which is when a player skin attaches all of its own —
+still hear `playing`, `timeupdate`, `seeked` and the rest, and `timeupdate`
+comes at a `<video>`'s pace rather than every frame. Its size and position,
+`networkState`, `played`, `getVideoPlaybackQuality()`, `setAttribute("src")`,
+fullscreen (the `webkit*` pair included) and picture-in-picture all answer from
+the player, and a page's own click handler that toggles playback no longer
+undoes the player's toggle on the same click.
+
+Where the page drew a skin around its `<video>` — video.js, JW Player, Plyr —
+that skin stops drawing: its control bar, big play button, poster and spinner
+would otherwise sit on top of the player's own. Nothing is removed and no
+player is disposed, so the page's scripts keep working; they are simply no
+longer the thing on screen. The skin's quality ladder becomes the player's
+quality menu, so a skin switching rung behind the player's back — a new `src`,
+a `load()`, a seek back — no longer starts the film over.
+
+Other layers a page left over its `<video>` — its own big play button, a
+transparent click-catcher, a dimming overlay — are found once the player is in
+place and hidden, so clicks reach the player. `{ keepOverlays: true }` leaves
+them where they are.
+
+Only a `<video>` that is playing a **file at a URL** is taken over. A site that
+feeds its element from JavaScript — Media Source Extensions, a MediaStream, a
+DRM stream, or an element with no source yet — is left alone: there is no file
+behind those to open, so replacing the element would break a video that works.
+Pass `{ sources: "any" }` to upgrade them anyway, on a page you know.
+
+That answers what *can* be opened. On a page you do not control, what *should*
+be is a second question — a search page of stock footage is a grid of `<video>`
+thumbnails, a marketing page has one looping behind its headline — and
+`{ filter: (video) => … }` is where a caller answers it.
+
+The page gets a say too: `data-movi-ignore` on a `<video>` — or on anything
+around it — keeps it native. The upgrade and the browser extensions' takeover
+both leave it alone.
+
+```html
+<video data-movi-ignore src="clip.mp4" controls></video>
 ```
 
 ### Local File
@@ -281,6 +364,41 @@ Standard `<video>`-style markup, no JS wiring needed. Treats `kind="subtitles"`,
 </movi-player>
 ```
 
+### Storyboard Previews (`<track>`)
+
+Scrub previews normally cost a seek and a decode. A storyboard is the other
+way round: the frames were made once, ahead of time, and stitched into a
+mosaic — so hovering the bar costs a crop out of an image the browser already
+has. Declare one the way every other player does, as a thumbnail track:
+
+```html
+<movi-player controls>
+  <source src="video.mp4" type="video/mp4">
+  <track kind="metadata" label="thumbnails" src="thumbs.vtt">
+</movi-player>
+```
+
+`kind="metadata"` with a `thumbnails` label is video.js's spelling and the one
+read here — `kind` is a fixed HTML enum with no value of its own for this. The
+VTT's cues carry an image URL and the rectangle to take from it
+(`sprite.jpg#xywh=160,0,160,90`); one cue per whole image works as well. There
+is no attribute for this — a thumbnail track is a track.
+
+For a board worked out at runtime, set the `storyboard` PROPERTY to a tile
+spec instead — `{columns, rows, width, height, fragments}`, the shape YouTube
+publishes and yt-dlp reports, or the `videojs-sprite-thumbnails`
+`{url, width, height, columns, rows, interval}` form:
+
+```js
+player.storyboard = {
+  columns: 5, rows: 5, width: 160, height: 90,
+  fragments: [{ url: "sb0.jpg", duration: 120 }, { url: "sb1.jpg", duration: 120 }],
+};
+```
+
+Either way the decode pipeline is never started: no seek, no decode, and the
+second WASM module stays unopened.
+
 ### Split Video + Audio Sources
 
 Separate video and audio files via child `<source>` elements with `kind="audio"`:
@@ -340,6 +458,65 @@ player.chapters = [
 
 A URL that fails to load falls back to the same title-only tile a missing frame gets.
 
+### Playlists
+
+A list of things to play, and the bar grows the two buttons that walk it. `Shift+N` / `Shift+P` do the same, and so do the skip controls on the lock screen.
+
+```html
+<movi-player controls autoadvance
+  playlist='[
+    {"src":"ep1.mkv","title":"Pilot","poster":"1.jpg"},
+    {"src":"ep2.mkv","title":"The Return","startAt":92}
+  ]'>
+</movi-player>
+```
+
+Bare strings work where you have nothing but URLs — `playlist='["ep1.mkv","ep2.mkv"]'` — and anything that isn't a JSON array is read as a URL the array is fetched from (`playlist="/season-1.json"`, a bare array or `{ "items": [...] }`).
+
+Or as a property, which is where the rest of the API lives:
+
+```js
+player.playlist = [{ src: "ep1.mkv", title: "Pilot" }, { src: "ep2.mkv" }];
+
+player.next();            // false if there is nothing next
+player.previous();
+player.playItem(3);
+player.playlistIndex;     // where the queue is; writing it syncs, playItem() moves
+player.playlistItem;      // { src, title?, poster?, startAt? }
+player.hasNext;           // what the buttons grey out on
+
+player.addEventListener("itemchange", (e) => {
+  highlight(e.detail.index);            // also .previousIndex, .item
+});
+player.addEventListener("playlistend", () => showRecommendations());
+```
+
+An item owns four things — `src`, `title`, `poster`, `startAt` — and owns them strictly: an item without a title clears the title the last one set. Anything you set for the whole player is left alone.
+
+**Queues the host loads.** `src` is optional. Leave it off and the element never loads anything — it just owns the queue as a control surface (the two buttons, the keys, the lock-screen pair, which end is dead) and announces every move as a **cancelable** `itemchange`:
+
+```js
+player.playlist = videos.map(v => ({ id: v.id, title: v.title, poster: v.thumbnail }));
+
+player.addEventListener("itemchange", (e) => {
+  e.preventDefault();                        // the element writes nothing
+  router.push(`/watch/${e.detail.item.id}`);
+});
+```
+
+Use this whenever a source is more than a URL. A `<source>` quality ladder, per-language audio and `<track>` subtitles can't be said in one `src` — and an item that *has* a `src` would hide those children outright, since they're only read when the element has none. Swapping the children yourself from the handler keeps the ladder, and keeps fullscreen and the unlocked `AudioContext` with it. Opening such a queue is silent: the first item is adopted, not announced, because you're already showing it.
+
+`autoadvance` is off by default. Bare, the next item starts the moment one ends; `autoadvance="5"` waits five seconds; `autoadvance="loop"` joins the ends of the list, for the buttons as much as for the advance; `autoadvance="5 loop"` does both. The element's own `loop` is a different thing and wins over all of it — it repeats the item, so nothing ever ends.
+
+Setting a list opens its first item, *unless* the element is already playing one of them:
+
+```html
+<!-- opens on episode 2, and knows it is the second of three -->
+<movi-player src="ep2.mkv" playlist='["ep1.mkv","ep2.mkv","ep3.mkv"]' controls></movi-player>
+```
+
+Previous, play and next sit in one pill — they are one decision about what is on screen, not three. Trim an end with `controlslist="noprev"` / `"nonext"`: that takes the *button* and nothing else, so the key and the lock-screen pair carry on. `controlslist="noplaylist"` is the one that switches the whole feature off, keys and lock screen included.
+
 ### Remembering Viewer Settings
 
 By default the player remembers volume, mute, speed, and its toggles on its own. The `persist` attribute takes over that decision explicitly — an opt-in list of exactly what is remembered:
@@ -364,7 +541,7 @@ Settings: `loop`, `muted`, `volume`, `speed`, `ambient`, `stablevolume`, `hdr`, 
 
 ### Custom Controls and Overlays
 
-`addControl()` puts a control of your own in the player's chrome — the bottom bar, the right-click menu, or both — so it sits with the built-ins instead of beside them. Described once; the player builds the button and the menu row, keeps them in sync, and removes them together.
+`addControl()` puts a control of your own in the player's chrome — the bottom bar (either end, or the middle), the top-right corner, the right-click menu, or any combination — so it sits with the built-ins instead of beside them. Described once; the player builds the button and the menu row, keeps them in sync, and removes them together.
 
 ```js
 player.addControl({
@@ -379,7 +556,28 @@ player.addControl({
 });
 ```
 
-Controls can open nested submenus (`items` / `onPick`, any depth), persist their toggle state (`persist: true`), group into a bar capsule of their own (`group`), anchor differently per surface (`anchors: { bar, menu }` — an anchor can be a list for a neighbour that only sometimes exists), and declare `media: "video" | "audio" | "both"` to hide themselves for content they don't apply to. `updateControl(id, patch)` and `removeControl(id)` manage them afterwards.
+`placement: "top"` puts the control in the top-right corner instead, beside the three-dots that opens the context menu on touch — the corner for what is about the session rather than about playback (cast, share, close), and shown on every device. A list takes several surfaces at once: `placement: ["top", "menu"]`. The corner is ordered with `before` / `after` like the bar is, and the three-dots is one member of it named `"dots"` — so `after: "dots"` is how a control sits further right than it, and the arrangement is the same on touch and on desktop.
+
+`placement: "center"` is the middle of the bar — the free width between the left run and the settings run, which the player itself never fills. Paired with `screen: "fullscreen"`, that is the "Suggestions" / "Up next" affordance a full-screen player has the room for and a small embed does not:
+
+```js
+player.addControl({
+  id: "suggestions",
+  label: "Suggestions",
+  icon: '<svg viewBox="0 0 24 24">…</svg>',
+  placement: "center",     // the middle of the bar
+  screen: "fullscreen",    // …and only once there is a screen to fill
+  toggle: true,
+  onSelect: (on) =>
+    on
+      ? player.showOverlay({ id: "suggestions", content: panel, placement: "center", dismissOn: ["play", "escape"] })
+      : player.hideOverlay("suggestions"),
+});
+```
+
+The middle is the first thing to go when the bar runs out of room — the clusters grow towards each other as the player narrows and it steps aside rather than being drawn across the clock.
+
+Controls can open nested submenus (`items` / `onPick`, any depth), persist their toggle state (`persist: true`), group into a bar capsule of their own (`group`), anchor differently per surface (`anchors: { bar, center, menu, top }` — an anchor can be a list for a neighbour that only sometimes exists), and declare `media: "video" | "audio" | "both"` or `screen: "fullscreen" | "windowed" | "both"` to hide themselves where they don't apply — a scoped-out control leaves every surface *and* its hotkey stops firing. `updateControl(id, patch)` and `removeControl(id)` manage them afterwards.
 
 Host overlays put your own panel over the picture — including in fullscreen:
 
@@ -392,6 +590,8 @@ player.showOverlay({
 });
 // later: player.updateOverlay("up-next", { content }) / player.hideOverlay("up-next")
 ```
+
+While a `"fill"` overlay (an end screen) is up, the centre play button and the captions stand down so they do not show through behind your suggestions; `controlslist="nocenterplay"` takes the button away for good.
 
 Full spec: [Custom Controls](https://moviplayer.com/docs/api/element#custom-controls) in the docs.
 
@@ -495,13 +695,31 @@ await player.load();
 await player.play();
 ```
 
+Ask before playing whether it will be smooth on this device, at this speed:
+
+```typescript
+const a = await MoviPlayer.assessPlayback("film.mkv", { rate: 2 });
+if (!a.smooth) console.log(a.reasons);   // e.g. no hardware decoder, over the software budget
+```
+
+The same is `MoviElement.canPlaySmoothly()` and `element.canPlaySmoothly()` on the element.
+
+Read the soundtrack as samples without playing it, and write a subtitle track as you go — the two halves of in-browser auto captions:
+
+```typescript
+for await (const chunk of player.decodeAudio({ from: player.currentTime })) {
+  const cues = await whisper(chunk);   // 16 kHz mono Float32Array → [{ start, end, text }]
+  player.appendSubtitleCues(cues, { lang: "en-auto", label: "English (auto)", select: true });
+}
+```
+
 See the [Programmatic API guide](https://moviplayer.com/docs/guide/programmatic-api).
 
 ### Demuxer Only (50KB)
 
 ![Demuxer](docs/images/demuxer.webp)
 
-[Live Demo](https://movi-player-examples.vercel.app/demuxer.html) | [Source](https://github.com/MrUjjwalG/movi-player-examples/blob/main/demuxer.html)
+[Source](https://github.com/MrUjjwalG/movi-player-examples/blob/main/demuxer.html)
 
 Extract metadata, tracks, HDR info, and thumbnails without playing the video.
 
@@ -550,6 +768,9 @@ See [Sources](https://moviplayer.com/docs/api/sources) in the docs.
 - **Host fullscreen handoff** — a cancelable `movi-fullscreen-request` event plus `setHostFullscreen()` let embedders (VS Code webview, custom apps) take over fullscreen and keep the player's UI in sync; `exitFullscreen()` covers all fullscreen routes.
 - **Host error screen** — every piece of the built-in error overlay carries a `part=` for `::part()` restyling; `slot="error"` replaces it outright; the `errordisplay` event (and `errorTitle` / `errorMessage` properties) carries the exact wording on screen, including format/codec failures that never raise a runtime `error`. See [Customizing the Error Screen](https://moviplayer.com/docs/api/element#customizing-the-error-screen).
 - **`noerrorscreen`** — suppress the built-in error overlays entirely and render your own.
+- **Host chrome** — forty-five pieces of the shadow tree carry a `part=`: every bar button (`::part(button)` reaches all of them at once), the progress track and its buffered/played/handle, the time, the centre play button, the title strip, the poster, the OSD, caption lines and the spinner's box. See [Restyle the chrome](https://moviplayer.com/docs/api/element#restyle-the-chrome-part).
+- **Host icons** — `player.setIcon(name, svg)` replaces any of the player's 72 marks, `null` restores it; one swap changes the bar, the centre button, the menu row and the OSD together, and `::part(icon)` sizes and colours them all. See [Replace an icon](https://moviplayer.com/docs/api/element#replace-an-icon-seticon).
+- **Host spinner** — `slot="spinner"` replaces the built-in loading ribbon while the player keeps deciding when it is on screen and where it sits; `controlslist="nospinner"` removes it entirely and leaves the `is-buffering` / `is-spinner-pending` host classes for a page drawing its own.
 
 ## Reference
 
@@ -588,12 +809,13 @@ Every attribute can also be read and set as a JS property (`el.rotate = 90`). Gr
 | `controls` | `controls` | Show the built-in UI controls |
 | `autoplay` | `autoplay` | Start playback automatically when loaded |
 | `muted` | `muted` | Start muted |
-| `loop` | `loop` | Restart playback when the video ends |
+| `loop` | `loop`, `loop="all"`, `loop="all 5"` | Repeat. Bare (or `one`) repeats the **item**, seamlessly — no black frame at the join; `all` repeats the **queue**, wrapping the last item back to the first, and turns `autoadvance` on with it. A number is the gap in seconds between items, which implies `all` |
 | `volume` | `volume="0.8"` | Initial volume 0..1 (a persisted user choice overrides it) |
 | `playbackrate` | `playbackrate="1.25"` | Initial playback speed |
 | `startat` | `startat="30"` | Start playback at this time, in seconds |
 | `playsinline` | `playsinline` | Play inline (no auto-fullscreen on iOS); on touch devices, suppresses swipe/volume gestures while inline so they don't fight page scroll |
 | `resume` | `resume` | Save position to localStorage; show a resume dialog on reload |
+| `resumekey` | `resumeKey` | What that position is filed under (default: the title) |
 
 </details>
 
@@ -609,7 +831,7 @@ Every attribute can also be read and set as a JS property (`el.rotate = 90`). Gr
 | `postertime` | `postertime="10%"` | Generate a native-resolution poster frame from a timestamp (`"5"`, `"1:30"`, `"10%"`) |
 | `width` / `height` | `width="640"` | Element dimensions (CSS preferred) |
 | `theme` | `theme="dark"` | UI theme: `dark` \| `light` |
-| `themecolor` | `themecolor="#8B5CF6 #22D3EE"` | Accent colour — one or two, space-separated (secondary drives the centre play/pause flash) |
+| `themecolor` | `themecolor="#7c75ff #4f86ff"` | Accent — one or two, space-separated (secondary drives the centre play/pause flash). The primary may be a **gradient**: it then paints the scrubber's fill, switches and the resume button, while text and borders use its first colour |
 | `objectfit` | `objectfit="contain"` | `contain` \| `cover` \| `fill` \| `zoom` \| `control` |
 | `rotate` | `rotate="90"` | Rotate the video: `0` \| `90` \| `180` \| `270` degrees |
 | `cropbars` | `cropbars` | Crop letterbox/pillarbox bars baked into the picture, so `cover`/`fill`/`zoom` size the image, not its padding |
@@ -619,7 +841,12 @@ Every attribute can also be read and set as a JS property (`el.rotate = 90`). Gr
 | `ambientwrapper` | `ambientwrapper="#wrap"` | CSS selector for an external element to receive the ambient glow |
 | `title` | `title="My Video"` | Video title (in-player overlay only — no native tooltip) |
 | `showtitle` | `showtitle` | Show the title bar overlay at the top |
-| `titlemode` | `titlemode="fullscreen back"` | Where the title bar may show: `both` (default) \| `fullscreen` \| `windowed`; add `back` (or `back-mobile`, `back-fullscreen`, `back-mobile-fullscreen`) for a back arrow that fires a cancelable `back` event |
+| `subtitlepicker` | `subtitlepicker` | Add an "Add subtitle file…" row to the subtitle menu — picks a local SRT/VTT/TTML and shows it straight away. The file is read in the page (a `blob:` URL), never uploaded. Also exposed as `player.addSubtitleFile(file)` for a host with its own button |
+| `titlemode` | `titlemode="fullscreen back"` | Where the title bar may show: `both` (default) \| `fullscreen` \| `windowed`; add `back` (or `back-mobile`, `back-fullscreen`, `back-windowed`, `back-mobile-fullscreen`) for a back arrow that fires a cancelable `back` event. The placement tokens gate the whole bar; the `back-*` scopes gate only the arrow, so `back-windowed` keeps the title in fullscreen and drops just the arrow |
+| `spinnerdelay` | `spinnerdelay="0.4"`, `spinnerdelay="0.25 1"` | Seconds an interruption must last before the loading spinner appears. Defaults to `"1 2"` — a mid-play stall after a second, an opening after two — so anything the player sorts out inside that passes in silence. A second number is the wait the *opening* gets, which is usually worth more patience than a mid-play stall; `0` shows the spinner at once |
+| `posterdelay` | `posterdelay="600"` | Milliseconds to wait before putting the OPENING poster up. Defaults to `0` — paint it at once. For a host that prefetches: a load that finishes inside the wait shows no poster at all, so the picture is simply there instead of being preceded by a cover that appears and is replaced before it has been read. Only the opening poster waits; one replacing a picture already on screen is unaffected |
+| `smoothwarning` | `smoothwarning` | Show a notice when the loaded video or audio is not expected to play smoothly on this device at the current speed, in plain language (e.g. "It plays fine at normal speed — switch back to 1×"). Rechecked on every speed change; a cancelable `smoothwarning` event fires first |
+| `nolinkwarning` | `nolinkwarning` | Keep `smoothwarning` on but never raise the link-speed notice ("This media needs about N Mbps"). For hosts that serve local files over HTTP (a desktop shell, a LAN server on `127.0.0.1`), where the player would probe loopback and blame a connection that doesn't exist. Decode notices stay |
 
 </details>
 
@@ -632,10 +859,11 @@ Every attribute can also be read and set as a JS property (`el.rotate = 90`). Gr
 |---|---|---|
 | `fastseek` | `fastseek="keys gestures"` | ±10s skip affordances. Bare = all; or narrow to `buttons`, `keys`, `gestures` (aliases: `touch`, `nontouch`, `keyonly`, `controls`, `none`) |
 | `doubletap` | `doubletap="true"` | Double-tap to seek ±10s |
-| `thumb` | `thumb` | Generate on-demand thumbnails for seek-bar previews |
+| `thumb` | `thumb` | Generate on-demand thumbnails for seek-bar previews. `thumb="precise"` decodes forward from the keyframe to the frame under the pointer — exact, at the cost of a run of frames per preview |
 | `nohotkeys` | `nohotkeys` | Disable all keyboard shortcuts |
 | `controlslist` | `controlslist="nofullscreen nopip nospeed"` | Switch built-in controls off, as `no<name>` tokens (`noplay`, `nocc`, `noquality`, `nosettings`, … or the `id` of an `addControl()` control) |
 | `noerrorscreen` | `noerrorscreen` | Suppress the built-in error overlays (host renders its own) |
+| `autopictureinpicture` | `autopictureinpicture` | Enter Picture-in-Picture by itself when the tab is hidden, like `<video autopictureinpicture>` (native-element playback only) |
 | `disablepictureinpicture` | `disablepictureinpicture` | Refuse Picture-in-Picture, like `<video disablepictureinpicture>` |
 | `disableremoteplayback` | `disableremoteplayback` | Turn off remote playback targets (AirPlay, Cast) |
 | `gesturefs` | — | **Deprecated** — use `playsinline` |
@@ -671,13 +899,17 @@ Every attribute can also be read and set as a JS property (`el.rotate = 90`). Gr
 </details>
 
 <details>
-<summary><b>Chapters & persistence</b> — <code>chapters</code>, <code>persist</code>, <code>persistkey</code></summary>
+<summary><b>Chapters, playlists & persistence</b> — <code>chapters</code>, <code>playlist</code>, <code>autoadvance</code>, <code>persist</code>, <code>persistkey</code></summary>
 
 <br />
 
 | Attribute | Example | Description |
 |---|---|---|
 | `chapters` | `chapters='[{"title":"Intro","start":0}]'` | Chapters from outside the media file — JSON array of `{title, start, end?, image?}` (seconds); `image` is artwork for the timeline tile, in place of a decoded frame. The property takes the array directly |
+| `playlist` | `playlist='[{"src":"ep1.mkv","title":"Pilot"}]'` | A queue — JSON array of `{src, title?, poster?, startAt?}`, of bare source strings, or a URL to fetch that array from. Adds Previous/Next to the bar, `Shift+P`/`Shift+N`, and the lock screen's skip pair. See [Playlists](#playlists) |
+| `playlistindex` | `playlistindex="2"` | Which item to open on. Default 0 |
+| `autoadvance` | `autoadvance="5 loop"` | Let the end of one item start the next. Off by default; a number is the gap in seconds, `loop` joins the ends of the queue. `loop="all"` asks for the same thing and turns this on by itself; bare `loop` wins over it — it repeats the item, so nothing ends |
+| `shuffle` | `shuffle` | Play the queue in a random order. Off by default. Each pass draws its own order, with the item playing kept where it is; `reshuffle()` draws a new one |
 | `persist` | `persist="volume speed audiolang"` | Which settings to remember across loads — space-separated, opt-in per setting; see [Remembering Viewer Settings](#remembering-viewer-settings) |
 | `persistkey` | `persistkey="my-app"` | Namespace for everything `persist` stores |
 
@@ -746,7 +978,9 @@ The standard `HTMLMediaElement` events all fire (`loadedmetadata`, `canplay`, `p
 | `audiotrackchange` / `subtitletrackchange` | — | Active audio / subtitle track switched |
 | `qualitychange` | `{ trackId }` | Active video quality / track switched |
 | `subtitledelaychange` | `{ subtitleDelay }` | Subtitle offset changed |
-| `aspectchange`, `loopchange`, `stablevolumechange`, `hdrchange`, `ambientchange`, `rotatechange`, `audioonlychange` | setting-specific | A viewer changed a setting — persist it host-side if you want |
+| `smoothwarning` | `PlaybackAssessment & { media, message }` | Cancelable — not expected to play smoothly at this speed; `preventDefault()` hides the built-in notice |
+| `loop` | `{ count }` | The item started over on a seamless [`loop`](#attributes) — `count` is which turn this is, from 1 |
+| `aspectchange`, `loopchange`, `shufflechange`, `stablevolumechange`, `hdrchange`, `ambientchange`, `cropbarschange`, `rotatechange`, `audioonlychange` | setting-specific | A viewer changed a setting — persist it host-side if you want |
 | `fullscreenchange` | `{ fullscreen }` | Entered/exited fullscreen |
 | `movi-fullscreen-request` | cancelable | Before `requestFullscreen()` — `preventDefault()` to take over via `setHostFullscreen()` |
 | `back` | cancelable | The `titlemode` back arrow was pressed |
@@ -754,7 +988,7 @@ The standard `HTMLMediaElement` events all fire (`loadedmetadata`, `canplay`, `p
 | `titlechange` | `{ title }` | Displayed title changed |
 | `coverart` | `ImageBitmap \| null` | Embedded cover art extracted |
 | `audiooutputchange` | `{ deviceId }` | Audio routed to a different output device |
-| `audiostripchange` | `{ active }` | Audio-only strip layout entered/left |
+| `audiostripchange` | `{ strip }` | Audio-only strip layout entered/left (windowed layout — a fullscreen trip does not fire it) |
 | `preloadcomplete` | — | Initial preload buffer filled |
 | `linearmode` | — | Server ignores `Range` — playback is forward-only; hide seek-dependent UI |
 | `nativefallback` | `{ src }` | Source handed to a native `<video>` (`fallback="native"`) |

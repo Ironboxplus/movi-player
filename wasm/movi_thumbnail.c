@@ -19,7 +19,11 @@ struct MoviThumbnailContext {
 
   int video_stream_index;
   AVPacket *pkt;
-  
+  // Has this context seeked even once? Matroska only parses its Cues on the
+  // first seek, so until then an indexed file looks unindexed. See the priming
+  // seek in movi_thumbnail_read_keyframe.
+  int index_primed;
+
   // Decoding support (Software fallback)
   AVCodecContext *dec_ctx;
   AVFrame *frame;
@@ -31,6 +35,13 @@ struct MoviThumbnailContext {
   // Result storage
   int last_packet_size;
   double last_packet_pts;
+  // …and its decode timestamp. PTS is presentation order; in a stream with
+  // B-frames the packets arrive in DECODE order, so a reader walking forward
+  // to a hovered moment cannot tell from PTS alone when it has passed that
+  // moment — a later picture can be handed over before an earlier one. DTS is
+  // monotonic in the order packets arrive, which is the order the reader sees
+  // them in, so it is the one that answers "am I there yet".
+  double last_packet_dts;
 };
 
 extern int js_read_async(uint8_t *buffer, int offset_low, int offset_high,
@@ -38,7 +49,7 @@ extern int js_read_async(uint8_t *buffer, int offset_low, int offset_high,
 extern int64_t js_seek_async(int offset_low, int offset_high, int whence);
 
 // JS callback declaration
-extern void js_thumbnail_packet_ready(int size, double pts);
+extern void js_thumbnail_packet_ready(int size, double pts, double dts);
 
 static int thumbnail_avio_read(void *opaque, uint8_t *buf, int buf_size) {
   struct MoviThumbnailContext *ctx = (struct MoviThumbnailContext *)opaque;
@@ -98,6 +109,7 @@ struct MoviThumbnailContext *movi_thumbnail_create(int file_size_low,
   ctx->pkt = av_packet_alloc();
   ctx->last_packet_size = 0;
   ctx->last_packet_pts = 0.0;
+  ctx->last_packet_dts = 0.0;
 
   return ctx;
 }
@@ -237,13 +249,13 @@ void movi_thumbnail_read_keyframe(struct MoviThumbnailContext *ctx,
 
   if (!ctx || !ctx->fmt_ctx || !ctx->pkt) {
     av_log(NULL, AV_LOG_ERROR, "[THUMB] ERROR: null context\n");
-    js_thumbnail_packet_ready(-1, 0.0);
+    js_thumbnail_packet_ready(-1, 0.0, 0.0);
     return;
   }
   if (ctx->video_stream_index < 0) {
     av_log(NULL, AV_LOG_ERROR, "[THUMB] ERROR: video_stream_index=%d\n",
             ctx->video_stream_index);
-    js_thumbnail_packet_ready(-2, 0.0);
+    js_thumbnail_packet_ready(-2, 0.0, 0.0);
     return;
   }
 
@@ -262,6 +274,29 @@ void movi_thumbnail_read_keyframe(struct MoviThumbnailContext *ctx,
       seek_target += ctx->fmt_ctx->start_time;
   }
 
+  // The same offset again, in SECONDS, for the index helpers below.
+  //
+  // `timestamp` arrives as media time from zero — the hover — and the two
+  // targets above have each had start_time added because the demuxer's own
+  // timestamps carry it. The index helpers were the one caller left reading
+  // the bare hover: movi_index_misses and movi_ts_seek_to_rap both convert
+  // their `target_sec` straight to stream ticks with no offset, and search an
+  // index whose entries are absolute. On a stream starting at zero the two are
+  // the same number and it never showed.
+  //
+  // Measured on a 28.6s 4K120 DoVi P8 transport stream starting at 4200s: a
+  // hover at 5.73s searched the index for tick 515700 against entries around
+  // 378000000, found nothing at or before it, and movi_ts_seek_to_rap gave up
+  // — so every hover fell back to the generic seek, and the first keyframe
+  // read back was the one AFTER the hover (6.25s for 5.73s, 24.50s for
+  // 22.92s). Precise previews cannot walk backwards, so the walk never ran and
+  // the mode quietly did nothing. The bisection that stands in for a missing
+  // index was being pointed 4194 seconds before the content as well.
+  double start_sec = 0.0;
+  if (st->start_time != AV_NOPTS_VALUE)
+    start_sec = st->start_time * av_q2d(st->time_base);
+  const double index_sec = timestamp + start_sec;
+
   av_log(NULL, AV_LOG_DEBUG, "[THUMB] Seeking to ts=%lld (AV_TIME_BASE=%lld)\n", 
          (long long)target_ts, (long long)seek_target);
 
@@ -270,9 +305,64 @@ void movi_thumbnail_read_keyframe(struct MoviThumbnailContext *ctx,
     avio_flush(ctx->avio_ctx);
   }
 
+  // A Matroska with no usable index has nothing for the demuxer to look up, so
+  // its seek reads FORWARD from wherever the file happens to be — for a preview
+  // strip that is a gigabyte of download per hovered second. The player's own
+  // seek builds the missing index by bisecting clusters; the previews open
+  // their own AVFormatContext over the same file, so they have to ask for it
+  // too (movi_mkv_index_near_fmt).
+  if (movi_fmt_is_matroska(ctx->fmt_ctx) &&
+      movi_mkv_index_misses(st, index_sec)) {
+    // …but ask the file for its OWN index before deciding it hasn't got one.
+    //
+    // Matroska parses its Cues lazily, inside the first matroska_read_seek —
+    // not at open. So on the first hover the index is legitimately empty for a
+    // file that ships a perfectly good one, and the bisection below rebuilds by
+    // hand what was there all along: measured on a 17.8GB WEB-DL over a CDN,
+    // nine 2MB probes (~22MB, 36s for one thumbnail) before the real seek
+    // finally read the Cues at EOF and landed in a single fetch. The main
+    // player never shows this — it seeks to 0 once during load, which resolves
+    // its Cues by accident; the preview context never seeks until it is asked
+    // to, which is the very hover that pays for it.
+    //
+    // A seek to the start is the cheapest way to ask. With Cues it is one
+    // small read at EOF and a rewind; without them the generic fallback
+    // bisects toward timestamp 0, which converges immediately at the head —
+    // bytes the source already holds. Either way we then know whether the
+    // index is real, and the bisection is left for the files that need it.
+    if (!ctx->index_primed) {
+      ctx->index_primed = 1;
+      avformat_seek_file(ctx->fmt_ctx, -1, INT64_MIN, 0, 0,
+                         AVSEEK_FLAG_BACKWARD);
+    }
+    if (movi_mkv_index_misses(st, index_sec)) {
+      movi_mkv_index_near_fmt(ctx->fmt_ctx, ctx->file_size,
+                              ctx->video_stream_index, index_sec);
+    }
+  }
+
+  // A transport stream has the same problem for a different reason: it has no
+  // index either, and the timestamp bisection that stands in for one lands
+  // past the random-access point as often as on it — which for a preview means
+  // decoding a GOP to reach a frame, per hover. Same answer, same shared
+  // helper (movi_ts_index_near_fmt).
+  int ts_landed = -1;
+  if (movi_fmt_is_mpegts(ctx->fmt_ctx)) {
+    if (movi_index_misses(st, index_sec, MOVI_TS_INDEX_TOLERANCE_S)) {
+      movi_ts_index_near_fmt(ctx->fmt_ctx, ctx->file_size,
+                             ctx->video_stream_index, index_sec);
+    }
+    // …and land ON the point rather than at the target, which for a preview is
+    // the difference between decoding a few frames and decoding a whole GOP.
+    ts_landed = movi_ts_seek_to_rap(ctx->fmt_ctx, ctx->video_stream_index,
+                                    index_sec);
+  }
+
   // Use avformat_seek_file like the main player does - it's more robust
-  int ret = avformat_seek_file(ctx->fmt_ctx, -1, INT64_MIN, seek_target,
-                               seek_target, AVSEEK_FLAG_BACKWARD);
+  int ret = ts_landed == 0
+                ? 0
+                : avformat_seek_file(ctx->fmt_ctx, -1, INT64_MIN, seek_target,
+                                     seek_target, AVSEEK_FLAG_BACKWARD);
   
   if (ret < 0) {
     av_log(NULL, AV_LOG_WARNING, "[THUMB] avformat_seek_file failed, trying av_seek_frame\n");
@@ -282,7 +372,7 @@ void movi_thumbnail_read_keyframe(struct MoviThumbnailContext *ctx,
 
   if (ret < 0) {
     av_log(NULL, AV_LOG_ERROR, "[THUMB] ERROR: seek failed\n");
-    js_thumbnail_packet_ready(-3, 0.0);
+    js_thumbnail_packet_ready(-3, 0.0, 0.0);
     return;
   }
 
@@ -304,7 +394,7 @@ void movi_thumbnail_read_keyframe(struct MoviThumbnailContext *ctx,
   AVPacket *best_pkt = av_packet_alloc();
   if (!best_pkt) {
       av_log(NULL, AV_LOG_ERROR, "[THUMB] ERROR: OOM for best_pkt\n");
-      js_thumbnail_packet_ready(-4, 0.0);
+      js_thumbnail_packet_ready(-4, 0.0, 0.0);
       return;
   }
 
@@ -368,20 +458,76 @@ void movi_thumbnail_read_keyframe(struct MoviThumbnailContext *ctx,
     else if (ctx->pkt->dts != AV_NOPTS_VALUE)
         pts = ctx->pkt->dts * av_q2d(st->time_base);
         
+    double dts = pts;
+    if (ctx->pkt->dts != AV_NOPTS_VALUE)
+        dts = ctx->pkt->dts * av_q2d(st->time_base);
+
     ctx->last_packet_size = ctx->pkt->size;
     ctx->last_packet_pts = pts;
+    ctx->last_packet_dts = dts;
 
     av_log(NULL, AV_LOG_DEBUG,
-            "[THUMB] SUCCESS: returning keyframe size=%d, pts=%.2f\n",
-            ctx->pkt->size, pts);
-            
-    js_thumbnail_packet_ready(ctx->pkt->size, pts);
+            "[THUMB] SUCCESS: returning keyframe size=%d, pts=%.2f dts=%.2f\n",
+            ctx->pkt->size, pts, dts);
+
+    js_thumbnail_packet_ready(ctx->pkt->size, pts, dts);
   } else {
       av_log(NULL, AV_LOG_ERROR, "[THUMB] No valid keyframe found after search\n");
-      js_thumbnail_packet_ready(-6, 0.0);
+      js_thumbnail_packet_ready(-6, 0.0, 0.0);
   }
 
   av_packet_free(&best_pkt);
+}
+
+/**
+ * The next VIDEO packet after the one just handed over.
+ *
+ * The keyframe reader answers with the keyframe at or before the hovered time,
+ * which is the frame the preview shows — on a long-GOP source that can be
+ * seconds away from where the pointer actually is. Walking forward from there
+ * needs the packets in between, so this hands them over one at a time and lets
+ * the caller stop when it reaches the frame it wanted. Reports through the same
+ * callback as the keyframe read: size and pts, or a negative size at EOF.
+ */
+EMSCRIPTEN_KEEPALIVE
+void movi_thumbnail_read_next_packet(struct MoviThumbnailContext *ctx) {
+  if (!ctx || !ctx->fmt_ctx || !ctx->pkt || ctx->video_stream_index < 0) {
+    js_thumbnail_packet_ready(-1, 0.0, 0.0);
+    return;
+  }
+  AVStream *st = ctx->fmt_ctx->streams[ctx->video_stream_index];
+  av_packet_unref(ctx->pkt);
+
+  // Non-video packets are skipped rather than returned: an interleaved file
+  // hands over audio and subtitles here too, and the caller only counts video.
+  int guard = 256;
+  while (guard-- > 0) {
+    int ret = av_read_frame(ctx->fmt_ctx, ctx->pkt);
+    if (ret < 0) {
+      js_thumbnail_packet_ready(-6, 0.0, 0.0);
+      return;
+    }
+    if (ctx->pkt->stream_index == ctx->video_stream_index && ctx->pkt->size > 0)
+      break;
+    av_packet_unref(ctx->pkt);
+    if (guard == 0) {
+      js_thumbnail_packet_ready(-6, 0.0, 0.0);
+      return;
+    }
+  }
+
+  double pts = 0.0;
+  if (ctx->pkt->pts != AV_NOPTS_VALUE)
+    pts = ctx->pkt->pts * av_q2d(st->time_base);
+  else if (ctx->pkt->dts != AV_NOPTS_VALUE)
+    pts = ctx->pkt->dts * av_q2d(st->time_base);
+  double dts = pts;
+  if (ctx->pkt->dts != AV_NOPTS_VALUE)
+    dts = ctx->pkt->dts * av_q2d(st->time_base);
+  ctx->last_packet_size = ctx->pkt->size;
+  ctx->last_packet_pts = pts;
+  ctx->last_packet_dts = dts;
+  js_thumbnail_packet_ready(ctx->pkt->size, pts, dts);
 }
 
 EMSCRIPTEN_KEEPALIVE

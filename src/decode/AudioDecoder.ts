@@ -58,6 +58,18 @@ export class MoviAudioDecoder {
     if (this.swDecoder) this.swDecoder.setDownmix(downmix);
   }
 
+  /**
+   * Declare the audio broken on its FIRST failed packet instead of riding out a
+   * run of them — for a caller that already knows recovery is impossible. See
+   * SoftwareAudioDecoder.maxConsecutiveFailures for why waiting can never
+   * finish in that case. Remembered so it survives a decoder rebuild.
+   */
+  private _failFast = false;
+  setFailFast(on: boolean): void {
+    this._failFast = on;
+    this.swDecoder?.setFailFast(on);
+  }
+
   setBindings(bindings: WasmBindings) {
     this.bindings = bindings;
   }
@@ -94,7 +106,7 @@ export class MoviAudioDecoder {
     this.closeHardwareDecoder();
 
     // Check if we should force software decoding for this codec
-    if (this.needsSoftwareDecoding(track.codec)) {
+    if (MoviAudioDecoder.needsSoftwareDecoding(track.codec)) {
       Logger.info(TAG, `Forcing software decoding for codec: ${track.codec}`);
       return this.initSoftwareDecoder();
     }
@@ -219,28 +231,44 @@ export class MoviAudioDecoder {
   }
 
   /**
-   * Every codec, in software. FFmpeg WASM decodes all of them; WebCodecs is no
-   * longer asked for any.
+   * Every codec, in software. FFmpeg WASM decodes all of them; WebCodecs is not
+   * asked for any.
    *
-   * It used to be a list — eac3, ac3, dts, dca, truehd, mlp, opus, flac — each
-   * added after its own WebCodecs failure: packet gaps it choked on, a FLAC
-   * description it would not accept, channel layouts it dropped. What that list
-   * really recorded is that the browser's audio decoders disagree with each
-   * other and with the demuxer feeding them, and that every disagreement was
-   * found by a user hearing it rather than by a test.
+   * This is where it started, and it is where it has come back to. The reasons
+   * on both legs of that trip are worth keeping, because the trip will look
+   * tempting again.
    *
-   * The split had a second cost that only showed up once audio gained a
-   * bitrate ladder: with AAC native and opus in WASM, choosing a rung meant
-   * choosing a decoder, so a cheaper stream could cost more CPU than the
-   * expensive one and the ladder could not simply follow the link. One path
-   * makes bitrate the only variable again.
+   * The software side used to be a list — eac3, ac3, dts, dca, truehd, mlp,
+   * opus, flac — and each entry was added after its own WebCodecs failure:
+   * packet gaps it choked on, a FLAC description it would not accept, channel
+   * layouts it dropped. What the list really recorded is that the browser's
+   * audio decoders disagree with each other and with the demuxer feeding them,
+   * and that every disagreement was found by a user HEARING it rather than by
+   * a test. It only ever grew, so eventually it swallowed everything.
    *
-   * The price is real and worth saying: AAC now decodes in WASM rather than in
-   * the browser's own code, which is more CPU per packet on exactly the phones
-   * where audio is already tight. Multi-channel and the error path came here
-   * anyway, so this is the same code that was already carrying the hard cases.
+   * It was then opened back up, offering each codec to WebCodecs and letting it
+   * fall through to WASM only on failure. The motivation was real and still is:
+   * WASM audio decode runs on the same thread as demux and render, and on a
+   * heavy source that thread is the scarce one — measured on 4K60 HEVC at 74
+   * Mbps, software AAC left the audio buffer oscillating against its starve
+   * line and each dip cost the picture a couple of seconds of dropped video.
+   *
+   * What the reopening got wrong is the shape of the evidence. FLAC failed
+   * immediately and audibly, in all three browsers, so it went back at once.
+   * Opus passed everything put to it — three real music-video MKVs with seeks,
+   * across Chrome, Firefox and Safari, thousands of decodes, not one error —
+   * and broke in the owner's hands within hours. The tests used well-formed
+   * local files; the failure the original note described was packet gaps in
+   * this player's TYPICAL inputs, which is the split-audio path those tests
+   * never touched. Clean files passing said nothing about the files that
+   * matter.
+   *
+   * So: one path again, for every codec. If audio CPU becomes the problem, the
+   * lever is not putting WebCodecs back — it is fewer live source nodes, or
+   * moving software decode off the main thread. Anyone reopening this owes a
+   * reproduction of the failure case, not another sweep of the files to hand.
    */
-  private needsSoftwareDecoding(_codec: string): boolean {
+  static needsSoftwareDecoding(_codec: string): boolean {
     return true;
   }
 
@@ -274,6 +302,10 @@ export class MoviAudioDecoder {
     if (
       producedNothing &&
       this.currentTrack &&
+      // Fail-fast means the caller already knows why nothing decoded, and it is
+      // not a decoder that picked wrong. Reverting to hardware just rebuilds a
+      // decoder to fail on the next packet — the cycle the log filled up with.
+      !this._failFast &&
       this.swRevertAttempts < MoviAudioDecoder.MAX_SW_REVERTS
     ) {
       this.swRevertAttempts++;
@@ -363,6 +395,10 @@ export class MoviAudioDecoder {
     // (e.g. an audio-track switch) doesn't snap back to stereo while
     // the renderer is still wired for multi-channel output.
     decoder.setDownmix(this._downmix);
+    // Upstream a303aa3: a source known to be undecodable (encrypted, no licence)
+    // must declare the decoder broken on the first failure. Set on either
+    // decoder type here so the worker path honours it too.
+    decoder.setFailFast(this._failFast);
     decoder.setOnData((frame) => {
       // Counts frames from THIS decoder instance (reset to 0 in configure());
       // handleSoftwareBroken() reads it to tell "misaligned stream, already

@@ -6,7 +6,7 @@
  * wires up file opening from three sources: the in-app dialog, drag & drop
  * (handled in the renderer), and OS "open with" / double-click (here).
  */
-const { app, BrowserWindow, dialog, ipcMain, shell, Menu, clipboard, session } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell, Menu, clipboard, session, screen } = require("electron");
 const fs = require("fs");
 const path = require("path");
 const { createLocalServer } = require("./local-server");
@@ -92,6 +92,7 @@ let mainWindow = null;
 let serverPort = 0;
 let rendererReady = false;
 const pendingPaths = []; // OS-open paths that arrived before the renderer was wired
+let pendingFocusUrl = false; // Open URL… asked for before the renderer was wired
 
 /** Bring the whole app (not just the window) to the foreground — needed on
  *  macOS when a file is opened while the app is in the background. */
@@ -143,9 +144,32 @@ function sendPaths(paths) {
   }
 }
 
+/** File ▸ Open URL… (Cmd/Ctrl+L). The prompt lives in the renderer, so with
+ *  the window closed (macOS keeps the app running) the menu item used to
+ *  no-op silently — the one moment a keyboard way to open something matters
+ *  most. Same slope as sendPaths: recreate the window, ask once its renderer
+ *  signals ready. */
+function openUrlPrompt() {
+  if (!mainWindow) {
+    pendingFocusUrl = true;
+    if (serverPort) {
+      createWindow();
+      app.focus({ steal: true });
+    }
+    return;
+  }
+  if (rendererReady) {
+    mainWindow.webContents.send("focus-url");
+    foreground();
+  } else {
+    pendingFocusUrl = true;
+  }
+}
+
 async function openViaDialog() {
-  if (!mainWindow) return;
-  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+  // No window is not "no": the dialog can stand on its own, and sendPaths
+  // recreates the window for whatever is picked.
+  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow ?? undefined, {
     title: "Open video or audio",
     properties: ["openFile", "multiSelections"],
     filters: [
@@ -167,19 +191,94 @@ function chromeOptions() {
   if (process.platform === "win32") {
     return {
       titleBarStyle: "hidden",
-      titleBarOverlay: { color: "#0c0c11", symbolColor: "#cfcfe0", height: 40 },
+      titleBarOverlay: { color: "#0a0f1e", symbolColor: "#c9d2e6", height: 40 },
     };
   }
   return {}; // Linux: keep the standard frame
 }
 
+/**
+ * Closing should sound like a door, not a plug being pulled.
+ *
+ * Audio stops dead the moment a window's web contents go, on whatever sample
+ * it happened to be on — a click, and then nothing. So the close is held open
+ * for the length of a short fade while every window takes its sound down a
+ * slope. Held for that and no longer: the wait is a timer, not an
+ * acknowledgement, so a renderer that is wedged or has no sound at all delays
+ * the quit by the same fifth of a second and never blocks it.
+ */
+// Short enough that the app is gone while the hand is still on the key, long
+// enough that the sound stops on a slope instead of a click — a click is what
+// this was fixing, and anything past about this reads as the app taking its
+// time to leave.
+const AUDIO_FADE_MS = 140;
+/**
+ * The window goes faster than the sound, and front-loaded.
+ *
+ * Matched to the gain ramp and run linear, the window read as a slow one —
+ * held at a visible opacity for most of its length, which is the shape of an
+ * app labouring to shut, not one closing. A close has to LOOK instant and only
+ * sound gentle: the picture is most of the way gone before the eye has
+ * followed the click, while the sound is still on its way down behind it,
+ * which is what an unhurried exit sounds like.
+ */
+const WINDOW_FADE_MS = 120;
+// Plus the margin between a ramp ending and the sound being gone from the
+// device — see the slope's own duration in AudioRenderer.fadeOut.
+const AUDIO_FADE_WAIT_MS = AUDIO_FADE_MS + 40;
+let audioFaded = false;
+
+/**
+ * The picture goes before the sound, and quickly.
+ *
+ * On the window itself rather than on anything the page draws: the frame, the
+ * background and the title bar are not the renderer's to fade, and a page that
+ * dimmed itself inside a window that did not would look like a fault.
+ *
+ * Cubic, so most of the window is gone in the first third of the fade — the
+ * eye gets its answer at once and the last of it is a soft edge rather than a
+ * wait. See WINDOW_FADE_MS.
+ */
+function fadeWindowsOut(ms) {
+  const windows = BrowserWindow.getAllWindows();
+  const startedAt = Date.now();
+  const step = () => {
+    const through = Math.min(1, (Date.now() - startedAt) / ms);
+    const left = (1 - through) ** 3;
+    for (const w of windows) {
+      try {
+        if (!w.isDestroyed()) w.setOpacity(left);
+      } catch {
+        /* a window that has gone, or a platform without window opacity */
+      }
+    }
+    if (through < 1) setTimeout(step, 8);
+  };
+  step();
+}
+
+function fadeAudioThen(finish) {
+  audioFaded = true;
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      w.webContents.send("app:fade-out", AUDIO_FADE_MS);
+    } catch {
+      /* a window already on its way out */
+    }
+  }
+  fadeWindowsOut(WINDOW_FADE_MS);
+  setTimeout(finish, AUDIO_FADE_WAIT_MS);
+}
+
 function createWindow() {
+  // A new window is a new run of the player, with its own sound to let out.
+  audioFaded = false;
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 760,
     minWidth: 680,
     minHeight: 460,
-    backgroundColor: "#0c0c11",
+    backgroundColor: "#0a0f1e",
     title: "MoviPlayer",
     icon: process.platform === "linux" ? path.join(__dirname, "..", "build", "icon.png") : undefined,
     ...chromeOptions(),
@@ -209,6 +308,12 @@ function createWindow() {
   mainWindow.on("enter-full-screen", () => mainWindow.webContents.send("window-fullscreen", true));
   mainWindow.on("leave-full-screen", () => mainWindow.webContents.send("window-fullscreen", false));
 
+  mainWindow.on("close", (e) => {
+    if (audioFaded) return;
+    e.preventDefault();
+    fadeAudioThen(() => mainWindow && mainWindow.close());
+  });
+
   mainWindow.on("closed", () => {
     mainWindow = null;
     rendererReady = false;
@@ -216,10 +321,21 @@ function createWindow() {
 }
 
 // --- IPC from renderer ---
+// Asked before the first paint: was this window opened with a file? The
+// welcome screen must not flash up for the second the media takes to open —
+// see the head script in index.html.
+ipcMain.on("boot:pending-open", (e) => {
+  e.returnValue = pendingPaths.length > 0;
+});
 ipcMain.on("renderer-ready", () => {
   rendererReady = true;
   if (pendingPaths.length && mainWindow) {
     mainWindow.webContents.send("load-paths", pendingPaths.splice(0));
+    foreground();
+  }
+  if (pendingFocusUrl && mainWindow) {
+    pendingFocusUrl = false;
+    mainWindow.webContents.send("focus-url");
     foreground();
   }
 });
@@ -230,6 +346,93 @@ ipcMain.on("window:toggle-fullscreen", () => {
   if (mainWindow) mainWindow.setFullScreen(!mainWindow.isFullScreen());
 });
 ipcMain.handle("dialog:open", () => openViaDialog());
+
+// --- Window follows the video, the way QuickTime Player does ---
+//
+// A video opens at its own size, scaled down to fit the screen when it is
+// bigger, with the window's centre kept where it was. Resizing afterwards keeps
+// the picture's shape, so there are no black bars to drag away. The welcome
+// screen keeps the window's own minimum; a video may go smaller, down to what
+// the controls still fit in.
+const WELCOME_MIN = { width: 680, height: 460 };
+const VIDEO_MIN_WIDTH = 400;
+const SCREEN_FILL = 0.9;
+let videoAspect = 0; // width / height of the picture being shown, or 0
+let playlistExtra = 0; // px the open playlist panel adds beside the picture
+
+function applyAspectLock() {
+  if (!mainWindow) return;
+  // Only the picture keeps its shape — the panel beside it is a fixed width.
+  mainWindow.setAspectRatio(videoAspect || 0, { width: playlistExtra, height: 0 });
+}
+
+function fitWindowToVideo(width, height) {
+  if (!mainWindow || !(width > 0) || !(height > 0)) return;
+  videoAspect = width / height;
+  // Smaller than the old minimum is fine for a picture (a portrait phone clip
+  // is narrower than 680px at any sensible height), just not unusably small.
+  const minH = Math.round(VIDEO_MIN_WIDTH / Math.max(videoAspect, 1));
+  mainWindow.setMinimumSize(VIDEO_MIN_WIDTH + playlistExtra, Math.max(minH, 225));
+  applyAspectLock();
+
+  // A maximised or fullscreen window is a size the viewer chose for the whole
+  // screen; leave it, and let the lock apply when they come back out of it.
+  if (mainWindow.isFullScreen() || mainWindow.isMaximized()) return;
+
+  const current = mainWindow.getContentBounds();
+  const { workArea } = screen.getDisplayMatching(mainWindow.getBounds());
+  const maxW = Math.floor(workArea.width * SCREEN_FILL) - playlistExtra;
+  const maxH = Math.floor(workArea.height * SCREEN_FILL);
+  const scale = Math.min(1, maxW / width, maxH / height);
+  let w = Math.round(width * scale);
+  let h = Math.round(height * scale);
+  if (w < VIDEO_MIN_WIDTH) {
+    h = Math.round(h * (VIDEO_MIN_WIDTH / w));
+    w = VIDEO_MIN_WIDTH;
+  }
+  w += playlistExtra;
+  if (Math.abs(w - current.width) <= 2 && Math.abs(h - current.height) <= 2) return;
+
+  // Grow from the centre, then keep the whole window on screen.
+  const cx = current.x + current.width / 2;
+  const cy = current.y + current.height / 2;
+  let x = Math.round(cx - w / 2);
+  let y = Math.round(cy - h / 2);
+  x = Math.min(Math.max(x, workArea.x), workArea.x + workArea.width - w);
+  y = Math.min(Math.max(y, workArea.y), workArea.y + workArea.height - h);
+  mainWindow.setContentBounds({ x, y, width: w, height: h }, process.platform === "darwin");
+}
+
+ipcMain.on("window:fit-video", (_e, size) => {
+  fitWindowToVideo(Number(size && size.width), Number(size && size.height));
+});
+// No picture (an audio file, or back to nothing): the window is free again.
+ipcMain.on("window:release-video", () => {
+  videoAspect = 0;
+  if (!mainWindow) return;
+  mainWindow.setAspectRatio(0);
+  mainWindow.setMinimumSize(WELCOME_MIN.width, WELCOME_MIN.height);
+});
+// The playlist panel sits beside the picture at a fixed width. Opening it
+// widens the window by that much instead of squeezing the video, and closing
+// it gives the width back.
+ipcMain.on("window:playlist-panel", (_e, { open, width }) => {
+  if (!mainWindow) return;
+  const extra = open ? Math.max(0, Number(width) || 0) : 0;
+  if (extra === playlistExtra) return;
+  const delta = extra - playlistExtra;
+  playlistExtra = extra;
+  applyAspectLock();
+  if (videoAspect && !mainWindow.isFullScreen() && !mainWindow.isMaximized()) {
+    const b = mainWindow.getContentBounds();
+    const { workArea } = screen.getDisplayMatching(mainWindow.getBounds());
+    const w = b.width + delta;
+    const x = Math.min(Math.max(b.x, workArea.x), workArea.x + workArea.width - w);
+    const [, minH] = mainWindow.getMinimumSize();
+    mainWindow.setMinimumSize(VIDEO_MIN_WIDTH + playlistExtra, minH);
+    mainWindow.setContentBounds({ x, y: b.y, width: w, height: b.height }, process.platform === "darwin");
+  }
+});
 ipcMain.handle("recents:get", () => listRecents());
 ipcMain.handle("recents:clear", () => writeRecents([]));
 ipcMain.on("recents:open", (_e, p) => sendPaths([p]));
@@ -395,7 +598,7 @@ if (!gotLock) {
     Menu.setApplicationMenu(
       buildMenu({
         onOpen: openViaDialog,
-        onOpenUrl: () => mainWindow && mainWindow.webContents.send("focus-url"),
+        onOpenUrl: openUrlPrompt,
       })
     );
 
@@ -405,6 +608,14 @@ if (!gotLock) {
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
+  });
+
+  // Cmd+Q / the menu / the OS asking us to go: same slope, and the same
+  // single flag, so a quit that follows a window close does not wait twice.
+  app.on("before-quit", (e) => {
+    if (audioFaded) return;
+    e.preventDefault();
+    fadeAudioThen(() => app.quit());
   });
 
   app.on("window-all-closed", () => {

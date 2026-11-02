@@ -12,6 +12,7 @@ import {
 import { CanvasRenderer } from "./CanvasRenderer";
 import { TrackManager } from "../core/TrackManager";
 import { Logger } from "../utils/Logger";
+import { loadPersistedLinkBps, raiseLinkBps } from "../utils/LinkRate";
 
 const TAG = "ShakaPlayerWrapper";
 
@@ -522,6 +523,17 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
     this.player.addEventListener("adaptation", repaint);
     this.player.addEventListener("variantchanged", repaint);
 
+    // Start from what this device measured last time, not from Shaka's blind
+    // 1 Mbps guess.
+    const seed = loadPersistedLinkBps();
+    if (seed > 0) {
+      this.player.configure({ abr: { defaultBandwidthEstimate: seed } });
+      Logger.info(
+        TAG,
+        `Seeding ABR with the last measured throughput: ${(seed / 1e6).toFixed(1)} Mbps`,
+      );
+    }
+
     try {
       await this.player.load(url);
     } catch (e: any) {
@@ -547,8 +559,40 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
     // Apply audio-only data-saver if requested at load time.
     if (this.config.audioOnly) this.setAudioOnly(true);
 
+    this.startBandwidthPersistence();
+
     this.setState("ready");
     this.emit("loadEnd", undefined);
+  }
+
+  // --- Link rate -----------------------------------------------------------
+  // Shaka's stock abr.defaultBandwidthEstimate is 1 Mbps, and against that it
+  // can afford 850 kbps (the 0.85 upgrade target) — on a real ladder, the
+  // second rung from the bottom. The shared record (see LinkRate) replaces that
+  // guess, and Shaka's own measurement feeds back into it for the next load.
+  private bwTimer: number | null = null;
+  private bwPeak = 0; // best estimate seen this session, bits per second
+
+  /**
+   * The session PEAK, and only ever raising the shared record — see
+   * raiseLinkBps(). Shaka's estimate decays once the buffer is full and it
+   * stops pulling, so the latest reading is a floor, not a capability.
+   */
+  private saveBandwidth(): void {
+    const bps = this.player?.getBandwidthEstimate?.();
+    if (typeof bps !== "number" || !(bps > 0) || bps <= this.bwPeak) return;
+    this.bwPeak = bps;
+    raiseLinkBps(bps);
+  }
+
+  /**
+   * Write the measurement down periodically, not only on teardown: a tab closed
+   * or killed outright never runs destroy(), and those are exactly the sessions
+   * worth learning from. Long interval — the value only has to be roughly right.
+   */
+  private startBandwidthPersistence(): void {
+    if (this.bwTimer !== null) return;
+    this.bwTimer = window.setInterval(() => this.saveBandwidth(), 15000);
   }
 
   /**
@@ -624,14 +668,52 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
         (a.bandwidth || 0) - (b.bandwidth || 0),
     );
 
-    // --- Distinct audio tracks (by audioId; fall back to language/label). ---
+    // --- Distinct audio tracks. ---
+    // Keyed on what the viewer can tell apart, NOT on audioId. Shaka gives
+    // every representation in an audio AdaptationSet its own audioId, so a
+    // manifest offering one language at five bitrates keyed as five separate
+    // tracks — five rows reading "en 6ch / EN · MP4A.40.5 5.1", identical down
+    // to the badge. Bitrate is ABR's business; it is not a choice to put in
+    // front of anyone.
+    //
+    // Collapsing them loses no reachable option, and the key is exactly the set
+    // of fields the switch can act on: audioTrackChange calls
+    // selectAudioLanguage(language, role, channelsCount, …, label), so any rows
+    // agreeing on those all issue the SAME call — whichever the viewer picked,
+    // the result was the same.
+    //
+    // Codec is deliberately NOT part of the key, even though the badge prints
+    // it. A manifest publishing each language in both AAC and Opus would
+    // otherwise list every language twice, and since selectAudioLanguage is
+    // never passed a codec, both rows resolve to the same audio — the same
+    // phantom choice as the bitrate rows, only wearing a badge that makes it
+    // look real. Which codec gets used is ABR's call, like bitrate.
+    //
+    // The highest-bitrate representation stands for the group, so the track's
+    // reported bitRate is the best the stream offers rather than whichever
+    // representation the manifest happened to list first.
     const seenAudio = new Map<string, ShakaTrack>();
     for (const v of this.variants) {
-      const key =
-        v.audioId != null
-          ? `a${v.audioId}`
-          : `${v.language || ""}/${v.label || ""}/${v.channelsCount || ""}`;
-      if (!seenAudio.has(key)) seenAudio.set(key, v);
+      // An AdaptationSet carrying no Role IS the main one, so an absent role and
+      // an explicit "main" name the same track. Manifests are inconsistent about
+      // this within a single file — one test stream declares Role=main on its
+      // Opus sets and nothing on its AAC ones — and taken literally that listed
+      // English twice over a difference in how the manifest was written, not in
+      // what the viewer would hear. A real alternate (commentary, description)
+      // still has its own role and stays its own row.
+      const roles = ((v.roles ?? []) as string[]).filter(
+        (r) => r && r !== "main",
+      );
+      const key = [
+        v.language || "",
+        roles.join(","),
+        v.channelsCount || "",
+        v.label || "",
+      ].join("/");
+      const prev = seenAudio.get(key);
+      if (!prev || (v.audioBandwidth ?? 0) > (prev.audioBandwidth ?? 0)) {
+        seenAudio.set(key, v);
+      }
     }
     this.audioRenditions = [...seenAudio.values()];
 
@@ -1115,6 +1197,14 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
   destroy(): void {
     this.lifetimeAbort.abort();
     this.stopFrameLoop();
+
+    // Last word on this session's throughput, taken before the player goes —
+    // getBandwidthEstimate() needs it alive.
+    if (this.bwTimer !== null) {
+      clearInterval(this.bwTimer);
+      this.bwTimer = null;
+    }
+    this.saveBandwidth();
 
     // Release cached thumbnail sprite sheets.
     for (const p of this.spriteCache.values()) {

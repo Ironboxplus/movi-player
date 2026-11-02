@@ -20,6 +20,8 @@ import {
   ThumbnailBindings,
   loadWasmModule,
   loadWasmModuleNew,
+  claimSharedModule,
+  releaseSharedModule,
   type MoviWasmModule,
   type StreamInfo,
   type DataSource,
@@ -28,6 +30,28 @@ import { CodecParser } from "../decode/CodecParser";
 import { Logger } from "../utils/Logger";
 
 const TAG = "Demuxer";
+
+// Wall-clock ceiling for the missing-duration packet scan, per source class.
+//
+// Local is disk-bound and the bytes are free: a 5.5MB Matroska demuxes in ~4ms,
+// so a second is already far more rope than any sane file needs. Remote is
+// bandwidth-bound and the bytes cost the viewer something, so it gets a longer
+// clock (a network round trip alone can eat a local budget) but a hard size gate
+// in front of it.
+const DURATION_SCAN_BUDGET_MS = { local: 1000, remote: 3000 };
+
+// Don't even start a remote scan above this. The scan has to pull the whole file
+// to see the last packet, and past this point it's downloading more than a
+// duration is worth — at ordinary broadband it couldn't finish inside the budget
+// anyway, so it would just burn bandwidth on its way to giving up.
+const REMOTE_DURATION_SCAN_MAX_BYTES = 64 * 1024 * 1024;
+
+// …and the same idea for the background rescan, which is allowed to read a
+// local file end to end. The bytes are free but the pass is not: it is real
+// disk and real battery for a number the viewer may never look at. A file this
+// size finishes in about a minute at a pessimistic 10MB/s; past it, the scan
+// would spend minutes to time out anyway.
+const LOCAL_DURATION_RESCAN_MAX_BYTES = 1536 * 1024 * 1024;
 
 /**
  * Adapter to convert SourceAdapter to DataSource interface
@@ -59,6 +83,8 @@ export class Demuxer {
   private bindings: WasmBindings | null = null;
   private tracks: Track[] = [];
   private duration: number = 0;
+  /** This demuxer holds the shared main-playback module — see claimSharedModule. */
+  private _holdsSharedModule = false;
   private isOpened: boolean = false;
   private wasmBinary?: Uint8Array;
   private useNewWasmInstance: boolean = false;
@@ -128,8 +154,20 @@ export class Demuxer {
     if (this.useNewWasmInstance) {
       Logger.debug(TAG, "Using isolated WASM instance");
       this.module = await loadWasmModuleNew({ wasmBinary: this.wasmBinary });
-    } else {
+    } else if (this._holdsSharedModule || claimSharedModule()) {
+      // The shared module is ours (or already was, if this demuxer is being
+      // re-opened) — see claimSharedModule for why it can only have one user.
+      this._holdsSharedModule = true;
       this.module = await loadWasmModule({ wasmBinary: this.wasmBinary });
+    } else {
+      // Another player is demuxing through the shared module. Sharing it would
+      // cross the two players' reads (see claimSharedModule); take an isolated
+      // instance instead so both play.
+      Logger.info(
+        TAG,
+        "The shared WASM module is in use by another player — opening on an isolated instance",
+      );
+      this.module = await loadWasmModuleNew({ wasmBinary: this.wasmBinary });
     }
     this.bindings = new WasmBindings(this.module);
 
@@ -150,6 +188,9 @@ export class Demuxer {
 
     // Get duration and start time
     this.duration = this.bindings.getDuration();
+    if (this.duration <= 0) {
+      this.duration = await this.recoverMissingDuration();
+    }
     const startTime = this.bindings.getStartTime();
 
     // Enumerate streams
@@ -164,6 +205,20 @@ export class Demuxer {
     const title = this.bindings.getMetadataTitle();
     const metadata: Record<string, string> = {};
     if (title) metadata.title = title;
+    // The rest of what the container says about the recording. Only the title
+    // was ever read, so a cover-art view could name the track and not the
+    // artist. Cheap: a dictionary lookup each, once per open.
+    for (const key of [
+      "artist",
+      "album",
+      "album_artist",
+      "composer",
+      "date",
+      "genre",
+    ]) {
+      const value = this.bindings.getMetadataTag?.(key);
+      if (value) metadata[key] = value;
+    }
 
     // Get chapters
     const chapters = this.bindings.getChapters();
@@ -180,6 +235,148 @@ export class Demuxer {
       chapters: chapters,
       metadata: metadata,
     };
+  }
+
+  /**
+   * Last resort for a container that stores no duration — demux to EOF and take
+   * the largest packet end timestamp (see movi_scan_duration in the WASM layer).
+   *
+   * The files this rescues are downloads that were never finalised: a Matroska
+   * muxed in live mode has an unknown-size segment, no Duration element and no
+   * Cues, so FFmpeg reports AV_NOPTS_VALUE and the player shows 0:00 with a dead
+   * seek bar. Native `ffprobe` prints duration=N/A on the same file.
+   *
+   * The scan is only ever expensive in I/O, so what it costs depends entirely on
+   * where the bytes come from, and the gating splits three ways:
+   *
+   *  - Local (a File, an object URL, or the desktop shell's loopback server):
+   *    a disk read. Scan it, no size limit.
+   *  - Segmented (HLS/DASH): never. Those are assembled from a playlist whose
+   *    window slides, and the stream wrapper — not the container — is the
+   *    authority on their duration. Handing one a scanned window length would
+   *    clamp the clock to a number that goes stale as the window moves.
+   *  - Plain remote: only when the server declares a size and that size is small
+   *    enough to be worth the download. Requiring Content-Length is also what
+   *    keeps chunked/endless responses out.
+   */
+  private async recoverMissingDuration(): Promise<number> {
+    if (!this.bindings) return 0;
+
+    const key = this.source.getKey();
+    let budgetMs = DURATION_SCAN_BUDGET_MS.local;
+
+    if (!Demuxer.isLocallyBacked(key)) {
+      if (key.startsWith("hls-segments:")) {
+        Logger.debug(
+          TAG,
+          "Container reports no duration; segmented source owns its own duration",
+        );
+        return 0;
+      }
+
+      budgetMs = DURATION_SCAN_BUDGET_MS.remote;
+      const size = await this.source.getSize().catch(() => 0);
+      if (!Number.isFinite(size) || size <= 0) {
+        Logger.debug(
+          TAG,
+          "Container reports no duration and the source declares no size; skipping scan",
+        );
+        return 0;
+      }
+      if (size > REMOTE_DURATION_SCAN_MAX_BYTES) {
+        Logger.debug(
+          TAG,
+          `Container reports no duration, but ${Math.round(size / 1048576)}MB is too much to scan over the network`,
+        );
+        return 0;
+      }
+    }
+
+    Logger.info(TAG, "Container reports no duration, scanning packets...");
+    const started = performance.now();
+    try {
+      const scanned = await this.bindings.scanDuration(budgetMs);
+      const elapsed = Math.round(performance.now() - started);
+      if (scanned > 0) {
+        Logger.info(TAG, `Recovered duration=${scanned}s by scan (${elapsed}ms)`);
+        return scanned;
+      }
+      Logger.warn(TAG, `Duration scan found nothing usable (${elapsed}ms)`);
+    } catch (e) {
+      Logger.warn(TAG, `Duration scan failed: ${e}`);
+    }
+    return 0;
+  }
+
+  /**
+   * Are this source's bytes free to read end-to-end? These skip the size gate
+   * the missing-duration scan applies to everything else.
+   *
+   * A File or an object URL is disk- or memory-backed, so a full pass is free.
+   * Loopback HTTP counts too, and has to: the desktop shell can't use file://
+   * (the demuxer needs COOP/COEP, which file:// can't carry) so it serves
+   * OS-opened files from 127.0.0.1 as /_local?p=<path>. Those arrive here as an
+   * http: key even though every byte comes off the local disk — which is why
+   * the scan quietly did nothing in the desktop app while working in the web
+   * one on the same file.
+   *
+   * A loopback origin alone isn't sufficient, though: the same server also
+   * exposes /_proxy?url=<remote> to stream a *remote* URL past CORS. So reject
+   * any loopback URL that carries an absolute http(s) URL in its query — that's
+   * the network wearing a local address.
+   */
+  /**
+   * How long a BACKGROUND rescan may spend reading this source end to end, or
+   * null when it isn't worth attempting.
+   *
+   * The blocking scan above is capped in the single seconds because a load is
+   * waiting on it, and on anything but a small file it gives up having read a
+   * few percent (a 291MB Matroska got 14MB in). Off the load path there is
+   * nothing to hold up, so the budget can be the honest cost of one pass —
+   * what remains is deciding which sources are worth a pass at all.
+   *
+   * Local: bytes are free, but the pass is still real disk and real battery,
+   * so it is bounded by a size the scan can finish in about a minute at a
+   * pessimistic 10MB/s. Remote keeps the download gate it already had.
+   */
+  static durationRescanBudgetMs(key: string, size: number): number | null {
+    if (key.startsWith("hls-segments:")) return null;
+    if (!Number.isFinite(size) || size <= 0) return null;
+
+    if (Demuxer.isLocallyBacked(key)) {
+      if (size > LOCAL_DURATION_RESCAN_MAX_BYTES) return null;
+      // Assume 10MB/s — well under any real disk, so a file that fits the gate
+      // above finishes inside its budget rather than timing out at 99%.
+      return Math.min(120_000, Math.max(10_000, (size / (10 * 1024 * 1024)) * 1000));
+    }
+
+    if (size > REMOTE_DURATION_SCAN_MAX_BYTES) return null;
+    return 60_000;
+  }
+
+  static isLocallyBacked(key: string): boolean {
+    if (key.startsWith("file:") || key.startsWith("blob:")) return true;
+
+    try {
+      const base = typeof location !== "undefined" ? location.href : undefined;
+      const url = new URL(key, base);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+
+      const host = url.hostname;
+      const isLoopback =
+        host === "127.0.0.1" ||
+        host === "localhost" ||
+        host === "[::1]" ||
+        host === "::1";
+      if (!isLoopback) return false;
+
+      for (const value of url.searchParams.values()) {
+        if (/^https?:\/\//i.test(value)) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -381,6 +578,15 @@ export class Demuxer {
       track.extradata = extradata;
     }
 
+    // Per-stream duration, kept because it is the only place the container
+    // says a stream ENDS BEFORE THE FILE DOES — a recording whose camera cut
+    // out while the mic ran on has 80s of video inside a 161s file, and
+    // without this the pipeline has no way to tell that apart from video
+    // that simply stopped arriving. See MoviPlayer's audio-only tail.
+    if (track && info.duration > 0) {
+      track.duration = info.duration;
+    }
+
     return track;
   }
 
@@ -568,9 +774,23 @@ export class Demuxer {
    * Close and cleanup
    */
   close(): void {
+    // The shared module goes back only once this demuxer's context is really
+    // gone. A read still suspended in WASM defers the teardown, and Asyncify
+    // keeps that read's resume in ONE module-wide slot: handed straight to
+    // the next player, its open ran over the suspended read and was answered
+    // with the old read's bytes. Measured on setting the same source twice —
+    // the new open was fed 3.6MB into the file, took an AC3 frame there for
+    // the start of a raw AC3 stream, and opened a 1080p MKV as one audio track
+    // lasting 17 days, in strip mode. Until then the next player takes an
+    // isolated instance, as a second player on the page already does.
+    const releaseShared = this._holdsSharedModule;
+    this._holdsSharedModule = false;
     if (this.bindings) {
+      if (releaseShared) this.bindings.onTornDown = releaseSharedModule;
       this.bindings.destroy();
       this.bindings = null;
+    } else if (releaseShared) {
+      releaseSharedModule();
     }
 
     this.isOpened = false;

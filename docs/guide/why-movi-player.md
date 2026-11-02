@@ -137,6 +137,86 @@ player.addEventListener("ended", () => console.log("done"));
 
 The element implements the same `play()` / `pause()` / `currentTime` / events surface as `<video>`, so most existing logic carries over with a `getElementById` instead of a `videojs()` factory call.
 
+#### Or change nothing at all
+
+If the markup is not yours to edit — a CMS template, a third-party embed, a
+page you would rather not touch — take the `<video>` elements over instead:
+
+From a CDN this needs no JavaScript at all — `data-upgrade` on the script tag
+does it:
+
+```html
+<script type="module" src="https://cdn.jsdelivr.net/npm/movi-player/dist/element.js"
+        data-upgrade data-upgrade-watch></script>
+```
+
+Or call it:
+
+```js
+import { upgradeVideoElements } from "movi-player";
+
+upgradeVideoElements();                          // every <video> on the page
+upgradeVideoElements("video.hero");              // only these
+upgradeVideoElements({ watch: true });           // …and any added later
+upgradeVideoElements({ attributes: { thumb: "" } });   // with extras applied
+```
+
+Each `<video>` is replaced by a `<movi-player>` carrying its attributes and its
+children — sources, caption tracks, thumbnail tracks, poster, `data-setup`. The
+element's `id` moves too, so `getElementById` keeps finding "the player".
+
+The original element stays in the page, hidden, with its API pointed at the new
+one, so code that still holds it keeps working:
+
+```js
+const video = document.getElementById("hero-native"); // the old element
+video.play();                 // plays through movi-player
+video.currentTime = 60;       // seeks it
+video.addEventListener("ended", …);   // fires from the player
+```
+
+A `<video>` that should stay a `<video>` says so with `data-movi-ignore` — on
+the element, or on anything around it to leave a whole section alone. The
+upgrade skips it, and so does the browser extensions' takeover:
+
+```html
+<video data-movi-ignore src="clip.mp4" controls></video>
+```
+
+#### The markup carries over as-is
+
+The pieces video.js reads from the element are read here too, so a page can
+usually change `<video class="video-js">` to `<movi-player>` and stop:
+
+```html
+<movi-player class="video-js" controls preload="auto" width="640" height="360"
+             poster="poster.jpg" data-setup='{"muted": true}'>
+  <source src="movie.mp4" type="video/mp4">
+  <track kind="captions" src="en.vtt" srclang="en" label="English" default>
+  <track kind="metadata" label="thumbnails" src="thumbs.vtt">
+  <p class="vjs-no-js">To view this video please enable JavaScript…</p>
+</movi-player>
+```
+
+- `data-setup` is applied as attributes — `controls`, `autoplay`, `muted`,
+  `loop`, `poster`, `preload`, `width`, `height`, the first of `sources`, and
+  `spriteThumbnails`. An attribute written out longhand wins over the JSON.
+- `<track kind="captions">` / `kind="subtitles"` become subtitle tracks, and
+  `default` selects one.
+- `<track kind="metadata" label="thumbnails">` — video.js's spelling — becomes
+  scrub previews: a sprite VTT with `#xywh=` rectangles, or one image per cue.
+- Unslotted children like `<p class="vjs-no-js">` are not rendered.
+
+The `videojs-sprite-thumbnails` options work unchanged, either through
+`data-setup` or as a property:
+
+```js
+player.storyboard = {
+  url: "sprite-{index}.jpg",
+  width: 160, height: 90, columns: 5, rows: 5, interval: 3,
+};
+```
+
 #### Multiple sources / split source
 
 Movi Player accepts child `<source>` elements just like `<video>`, so the `<source>` fallback pattern keeps working:

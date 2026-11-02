@@ -6,13 +6,34 @@ import DRIVE_HTML from "./drive.html";
 import SITEMAP from "./sitemap.xml";
 import ROBOTS from "./robots.txt";
 import LLMS from "./llms.txt";
+import SHARED_CSS from "./shared.css";
+import CINEMATIC_HERO from "./cinematic-hero-v2.webp";
+import { WatchParty } from "./watch-party.js";
+
+// Re-exported because a Durable Object class has to be reachable from the
+// worker's entry module for the runtime to bind it to the namespace.
+export { WatchParty };
 
 const BUILD_VERSION = "__BUILD_VERSION__";
-const HTML_WITH_VERSION = HTML_RAW.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
-const TEST_NATIVE_WITH_VERSION = TEST_NATIVE_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
-const COMPARE_WITH_VERSION = COMPARE_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
-const EXAMPLES_WITH_VERSION = EXAMPLES_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
-const DRIVE_WITH_VERSION = DRIVE_HTML.replace(/__BUILD_VERSION__/g, BUILD_VERSION);
+
+// The shared design system (app/shared.css) is spliced into every page in
+// place of the <!--__SHARED_CSS__--> marker, which sits at the very end of
+// each <head> — i.e. AFTER that page's own <style>. Later wins, so one edit
+// to shared.css re-skins the whole site without any page having to give up
+// the layout rules its own JS depends on. Inlined rather than linked: it's a
+// few KB on the critical path to first paint, and a <link> would cost every
+// page an extra round trip before it could render.
+const SHARED_STYLE = "<style>" + SHARED_CSS + "</style>";
+const bake = (html) =>
+  html
+    .replace(/__BUILD_VERSION__/g, BUILD_VERSION)
+    .replace("<!--__SHARED_CSS__-->", SHARED_STYLE);
+
+const HTML_WITH_VERSION = bake(HTML_RAW);
+const TEST_NATIVE_WITH_VERSION = bake(TEST_NATIVE_HTML);
+const COMPARE_WITH_VERSION = bake(COMPARE_HTML);
+const EXAMPLES_WITH_VERSION = bake(EXAMPLES_HTML);
+const DRIVE_WITH_VERSION = bake(DRIVE_HTML);
 
 // Turnstile site key is injected per-request from env so it can be
 // rotated via wrangler secret without a redeploy. When empty the
@@ -61,6 +82,15 @@ const DRIVE_HEADERS = {
 };
 
 const CORS_HEADERS = {
+  // None of what these headers ride on is a page: the API endpoints answer
+  // JSON and the proxy streams somebody else's video. Googlebot found
+  // /api/comments on its own and filed it under "crawled — currently not
+  // indexed", which is noise in a report that should only be about pages, and
+  // the proxy would put a viewer's video under this domain if it were ever
+  // indexed. robots.txt keeps the crawler off /api/ and /proxy; this is what
+  // answers anything that reaches them anyway — and unlike robots.txt, it is
+  // a signal to DROP what was already crawled.
+  "X-Robots-Tag": "noindex",
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
   // Encrypted-playback headers must be listed here so the CORS preflight
@@ -296,9 +326,17 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+    const requestHost = (request.headers.get("host") || "").split(":")[0];
 
-    // Redirect www to non-www
-    if (url.hostname === "www.moviplayer.com") {
+    // One canonical origin: https, no www. The www half was already here; the
+    // http half was not, so http://moviplayer.com/ answered 200 with the page
+    // and Search Console filed it as a second copy that happened to carry the
+    // right canonical. A redirect says it once, at the door.
+    if (
+      !env.LOCAL_DEV &&
+      (requestHost === "www.moviplayer.com" ||
+        (requestHost === "moviplayer.com" && url.protocol === "http:"))
+    ) {
       return Response.redirect(`https://moviplayer.com${path}${url.search}`, 301);
     }
 
@@ -307,8 +345,32 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
+    // One URL per page.
+    //
+    // Every page answered 200 at three or four spellings — /compare,
+    // /compare.html and /compare/ all served the same bytes — so a crawler
+    // fetched each page several times and had only rel=canonical to tell it
+    // which one counted. Say it in the response instead: the spellings 301 to
+    // the canonical path, which is the one in the sitemap and in every link.
+    const CANONICAL_PATH = {
+      "/index.html": "/",
+      "/compare.html": "/compare",
+      "/compare/": "/compare",
+      "/examples.html": "/examples",
+      "/examples/": "/examples",
+      "/drive.html": "/drive",
+      "/drive/": "/drive",
+      "/test-native.html": "/test-native",
+    };
+    if (CANONICAL_PATH[path]) {
+      return Response.redirect(
+        `${url.origin}${CANONICAL_PATH[path]}${url.search}`,
+        301,
+      );
+    }
+
     // --- Serve app ---
-    if (path === "/" || path === "/index.html") {
+    if (path === "/") {
       return new Response(buildHtml(env), {
         headers: {
           "Content-Type": "text/html;charset=UTF-8",
@@ -319,18 +381,22 @@ export default {
     }
 
     // --- Test page for isolating native <video> playback issues ---
-    if (path === "/test-native.html" || path === "/test-native") {
+    if (path === "/test-native") {
       return new Response(TEST_NATIVE_WITH_VERSION, {
         headers: {
           "Content-Type": "text/html;charset=UTF-8",
           "Cache-Control": "no-store",
+          // A debugging page for native <video>, of no use to anyone
+          // searching — keep it out of the index rather than let it rank for
+          // the player's own terms.
+          "X-Robots-Tag": "noindex, nofollow",
           ...SECURITY_HEADERS,
         },
       });
     }
 
     // --- Side-by-side comparison: native <video> vs <movi-player> ---
-    if (path === "/compare" || path === "/compare.html" || path === "/compare/") {
+    if (path === "/compare") {
       return new Response(COMPARE_WITH_VERSION, {
         headers: {
           "Content-Type": "text/html;charset=UTF-8",
@@ -345,7 +411,7 @@ export default {
     // require-corp would fight their opaque/CORS fetches. The player needs no
     // SharedArrayBuffer (single-threaded WASM + Asyncify I/O), so dropping
     // cross-origin isolation costs nothing here. ---
-    if (path === "/examples" || path === "/examples.html" || path === "/examples/") {
+    if (path === "/examples") {
       return new Response(EXAMPLES_WITH_VERSION, {
         headers: {
           "Content-Type": "text/html;charset=UTF-8",
@@ -360,7 +426,7 @@ export default {
     // Integration Open URL: Drive appends ?state={ids,action} and the page
     // signs in + streams the picked file. Uses DRIVE_HEADERS (popup-safe COOP,
     // no COEP) so the GIS OAuth popup can return the token — see the note there.
-    if (path === "/drive" || path === "/drive.html" || path === "/drive/") {
+    if (path === "/drive") {
       return new Response(buildDriveHtml(env), { headers: DRIVE_HEADERS });
     }
 
@@ -388,6 +454,7 @@ export default {
       const parts = path.slice(6).split("/");
       // /dist/<version>/element.js → key = "element.js"
       const key = parts.length > 1 ? parts.slice(1).join("/") : parts[0];
+      recordDistHit(env, parts, key, request);
       return handleR2(env, key, request);
     }
 
@@ -419,8 +486,19 @@ export default {
     if (path === "/api/token" && request.method === "POST") {
       return handleEncToken(request, env);
     }
+    if (path === "/api/proxy-sign" && request.method === "POST") {
+      return handleProxySign(request, env);
+    }
     if (path === "/api/video") {
       return handleEncVideo(request, env);
+    }
+
+    // --- Watch party (unlisted; see app/watch-party.js) ---
+    if (path === "/api/party/host" && request.method === "POST") {
+      return handlePartyHost(request, env);
+    }
+    if (path === "/api/party/room") {
+      return handlePartyRoom(request, env, url);
     }
 
     // --- Visitor feedback wall (landing page, under the FAQ) ---
@@ -441,6 +519,14 @@ export default {
     if (path === "/llms.txt") {
       return new Response(LLMS, { headers: { "Content-Type": "text/plain;charset=UTF-8", "Cache-Control": "public, max-age=86400" } });
     }
+    if (path === "/cinematic-hero-v2.webp") {
+      return new Response(CINEMATIC_HERO, {
+        headers: {
+          "Content-Type": "image/webp",
+          "Cache-Control": "public, max-age=31536000, immutable",
+        },
+      });
+    }
 
     // --- Extension install/usage badges, proxied from upstream badge
     //     services. We can't <img> them directly: COEP require-corp on
@@ -452,6 +538,7 @@ export default {
     if (path === "/badge/vscode.svg") return handleBadge("vscode");
     if (path === "/badge/npm.svg") return handleBadge("npm");
     if (path === "/badge/jsdelivr.svg") return handleBadge("jsdelivr");
+    if (path === "/badge/github.svg") return handleBadge("github");
 
     // --- Serve static assets from R2 (favicons, etc.) ---
     if (path.startsWith("/favicon") || path === "/apple-touch-icon.png" || path === "/og-image.png") {
@@ -495,8 +582,21 @@ async function handleDocs(url) {
   // Text (HTML/JS/CSS/JSON/XML): rewrite the base path so /movi-player/ → /docs/.
   // The rel=canonical is an absolute moviplayer.com/docs URL (set in VitePress),
   // so it contains no "/movi-player/" and is left intact.
+  //
+  // Only where it STARTS a path, which is the only place the VitePress base
+  // appears: quoted in markup and JSON, or inside a CSS url(). A plain replace
+  // of every "/movi-player/" also caught the ones sitting in the middle of an
+  // absolute URL that has nothing to do with this site's base — the docs' own
+  // CDN examples became cdn.jsdelivr.net/npm/docs/dist/element.js, and every
+  // "Edit this page" link became github.com/MrUjjwalG/docs/edit/... — served
+  // that way to every reader while the GitHub Pages copy underneath was
+  // perfectly correct. Measured against the built site: 1873 references belong
+  // to the base and 54 do not.
   if (isText) {
-    const body = (await res.text()).split("/movi-player/").join("/docs/");
+    const body = (await res.text()).replace(
+      /(^|[\s"'`(=,;])\/movi-player\//g,
+      "$1/docs/",
+    );
     return new Response(body, {
       status: res.status,
       headers: {
@@ -532,6 +632,8 @@ const EMBED_ATTR_WHITELIST = new Set([
   "fps", "gesturefs", "nohotkeys", "fastseek", "doubletap", "themecolor",
   "buffersize", "title", "showtitle", "resume", "stablevolume", "audioonly",
   "vr", "vrpad", "renderer", "width", "height", "sw",
+  // Chooses which engine leads/trails — no URL, no headers, no credentials.
+  "fallback", "engine",
 ]);
 
 function escapeEmbedAttr(v) {
@@ -553,6 +655,12 @@ function buildEmbedPlayerAttrs(searchParams) {
     ["gesturefs", true],
     ["fastseek", true],
     ["stablevolume", true],
+    // See EMBED_DEFAULT_ATTRS in index.html: a host that sends no CORS headers
+    // blocks the fetch the WASM path needs, and the embedder rarely controls
+    // that host. The native element never needed CORS for the same file, and
+    // the bytes still travel from their host to their page — never through
+    // ours. `fallback=0` in the embed URL turns it off.
+    ["fallback", "native"],
   ]);
   for (const [rawName, value] of searchParams) {
     const name = rawName.toLowerCase();
@@ -571,13 +679,131 @@ function buildEmbedPlayerAttrs(searchParams) {
     .join(" ");
 }
 
+// The replacement this endpoint now hands out. Kept in step with
+// buildEmbedCode() in index.html — same document, same inline styles — so a
+// visitor gets the identical snippet whether they come from the Embed dialog
+// or from an old iframe that stopped working.
+const EMBED_PLAYER_CDN = "https://cdn.jsdelivr.net/npm/movi-player/dist/element.js";
+const EMBED_IFRAME_STYLE =
+  "display:block;box-sizing:border-box;border:0;margin:0;padding:0;" +
+  "width:100%;max-width:800px;aspect-ratio:16/9;height:auto;background:#000";
+
+function buildSrcdocEmbed(videoUrl, playerAttrs, wantAutoplay) {
+  const doc =
+    '<!doctype html><meta charset="utf-8">' +
+    "<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}" +
+    "movi-player{width:100%;height:100%}</style>" +
+    '<script type="module" src="' + EMBED_PLAYER_CDN + '"><\/script>' +
+    '<movi-player src="' + escapeEmbedAttr(videoUrl) + '" ' + playerAttrs +
+    "></movi-player>";
+  // srcdoc carries a whole document inside one attribute, so everything in it
+  // is unescaped a second time when parsed — hence the second pass.
+  const srcdoc = doc.replace(/&/g, "&amp;").replace(/'/g, "&#39;");
+  const allow = "fullscreen" + (wantAutoplay ? "; autoplay" : "");
+  return `<iframe srcdoc='${srcdoc}' style="${EMBED_IFRAME_STYLE}" width="800" ` +
+    `height="450" frameborder="0" allowfullscreen allow="${allow}"></iframe>`;
+}
+
+/**
+ * What an old /embed iframe shows now.
+ *
+ * This endpoint used to relay the media through our worker, which is the only
+ * reason it ever worked for a source that sends no CORS headers. It doesn't
+ * relay any more, so rather than let the player fail with a network error the
+ * page explains what happened — and builds the replacement snippet from the
+ * very parameters the old embed was called with, so the fix is a copy away.
+ */
+function embedDeprecatedNotice(videoUrl, playerAttrs, wantAutoplay) {
+  const snippet = buildSrcdocEmbed(videoUrl, playerAttrs, wantAutoplay);
+  const inTextarea = snippet.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Embed out of date — MoviPlayer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{font:13px/1.55 system-ui,-apple-system,sans-serif;background:#0e0e1a;color:#cfcfe6;
+     padding:16px;display:flex;align-items:center;justify-content:center;overflow:auto}
+.wrap{width:100%;max-width:620px}
+.brand{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.brand-name{font-size:15px;font-weight:700;letter-spacing:-0.02em;color:#fff}
+h1{font-size:15px;color:#fff;margin-bottom:6px}
+p{margin-bottom:10px;color:#a9a9c4}
+/* Wrapped, not scrolled sideways. The snippet is one very long line, and a
+   box that shows only its first few words reads as truncated — which is
+   exactly the doubt this page exists to remove. */
+textarea{width:100%;height:150px;background:#07070f;color:#c9c9e4;border:1px solid #26263c;
+         border-radius:8px;padding:8px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+         resize:vertical;white-space:pre-wrap;word-break:break-all;overflow:auto}
+.row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+button{background:#6c5dd3;color:#fff;border:0;border-radius:7px;padding:7px 14px;
+       font:600 12px system-ui;cursor:pointer}
+button:hover{background:#7d6ee0}
+a{color:#8b7bff;text-decoration:none}
+a:hover{text-decoration:underline}
+.ok{color:#7ddba0;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="brand">
+<svg viewBox="323 49 930 930" width="26" height="26" aria-hidden="true"><defs><clipPath id="logoL-0"><path clip-rule="evenodd" d="M383.55 222 C383.55 152.17 440.03 97.5 512 97.5 C543.4 97.5 559.7 101.8 590 117.5 L1100 381.5 C1174.55 414.03 1191.47 471.49 1193 512.5 C1192.29 590.19 1134.3 634.06 1100 646.5 C930.83 737.99 761.67 826.04 592.5 909 C571.47 917.98 554.22 929.25 512 930.3 C455.97 929.9 384.46 889.54 383.55 802 Z M614 360 L913 520 C686.95 641.07 614 666.34 614 669 Z"/></clipPath><linearGradient id="logoL-1" gradientUnits="userSpaceOnUse" x1="0" y1="97" x2="0" y2="360"><stop offset="0" stop-color="#737bfd"/><stop offset="0.5" stop-color="#6eb3fd"/><stop offset="1" stop-color="#81e1fe"/></linearGradient><radialGradient id="logoL-2" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(726.13 101.51) scale(218.96 701.75)"><stop offset="0" stop-color="#0c00fd"/><stop offset="0.12" stop-color="#0c00fd" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0c00fd" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0c00fd" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0c00fd" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0c00fd" stop-opacity="0.006"/><stop offset="1" stop-color="#0c00fd" stop-opacity="0"/></radialGradient><radialGradient id="logoL-3" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(255.4 225.67) scale(350.82 206.02)"><stop offset="0" stop-color="#4c00fd" stop-opacity="0.58"/><stop offset="0.12" stop-color="#4c00fd" stop-opacity="0.484"/><stop offset="0.24" stop-color="#4c00fd" stop-opacity="0.282"/><stop offset="0.36" stop-color="#4c00fd" stop-opacity="0.115"/><stop offset="0.48" stop-color="#4c00fd" stop-opacity="0.033"/><stop offset="0.64" stop-color="#4c00fd" stop-opacity="0.003"/><stop offset="1" stop-color="#4c00fd" stop-opacity="0"/></radialGradient><linearGradient id="logoL-4" gradientUnits="userSpaceOnUse" x1="0" y1="225" x2="0" y2="817"><stop offset="0" stop-color="#5143ff"/><stop offset="0.5" stop-color="#294cf6"/><stop offset="1" stop-color="#0437cc"/></linearGradient><radialGradient id="logoL-5" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(621.75 616.05) scale(192.93 939.93)"><stop offset="0" stop-color="#436eff"/><stop offset="0.12" stop-color="#436eff" stop-opacity="0.835"/><stop offset="0.24" stop-color="#436eff" stop-opacity="0.487"/><stop offset="0.36" stop-color="#436eff" stop-opacity="0.198"/><stop offset="0.48" stop-color="#436eff" stop-opacity="0.056"/><stop offset="0.64" stop-color="#436eff" stop-opacity="0.006"/><stop offset="1" stop-color="#436eff" stop-opacity="0"/></radialGradient><radialGradient id="logoL-6" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(637.74 314.49) scale(126.64 109.33)"><stop offset="0" stop-color="#0000ec"/><stop offset="0.12" stop-color="#0000ec" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0000ec" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0000ec" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0000ec" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0000ec" stop-opacity="0.006"/><stop offset="1" stop-color="#0000ec" stop-opacity="0"/></radialGradient><linearGradient id="logoL-7" gradientUnits="userSpaceOnUse" x1="0" y1="669" x2="0" y2="930"><stop offset="0" stop-color="#001fad"/><stop offset="0.5" stop-color="#2e50ff"/><stop offset="1" stop-color="#3d4eff"/></linearGradient><radialGradient id="logoL-8" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(367.66 690.91) scale(257.59 321.92)"><stop offset="0" stop-color="#0023ab"/><stop offset="0.12" stop-color="#0023ab" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0023ab" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0023ab" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0023ab" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0023ab" stop-opacity="0.006"/><stop offset="1" stop-color="#0023ab" stop-opacity="0"/></radialGradient><radialGradient id="logoL-9" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(554.73 904.5) scale(161.77 151.07)"><stop offset="0" stop-color="#564efc"/><stop offset="0.12" stop-color="#564efc" stop-opacity="0.835"/><stop offset="0.24" stop-color="#564efc" stop-opacity="0.487"/><stop offset="0.36" stop-color="#564efc" stop-opacity="0.198"/><stop offset="0.48" stop-color="#564efc" stop-opacity="0.056"/><stop offset="0.64" stop-color="#564efc" stop-opacity="0.006"/><stop offset="1" stop-color="#564efc" stop-opacity="0"/></radialGradient><linearGradient id="logoL-10" gradientUnits="userSpaceOnUse" x1="460" y1="0" x2="1185" y2="0"><stop offset="0" stop-color="#4442fc"/><stop offset="0.5" stop-color="#5800fd"/><stop offset="1" stop-color="#00c9ff"/></linearGradient><radialGradient id="logoL-11" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(918.16 679.1) scale(562.77 1104.38)"><stop offset="0" stop-color="#b3acfc" stop-opacity="0.732"/><stop offset="0.12" stop-color="#b3acfc" stop-opacity="0.611"/><stop offset="0.24" stop-color="#b3acfc" stop-opacity="0.356"/><stop offset="0.36" stop-color="#b3acfc" stop-opacity="0.145"/><stop offset="0.48" stop-color="#b3acfc" stop-opacity="0.041"/><stop offset="0.64" stop-color="#b3acfc" stop-opacity="0.004"/><stop offset="1" stop-color="#b3acfc" stop-opacity="0"/></radialGradient><linearGradient id="logoL-12" gradientUnits="userSpaceOnUse" x1="933.66" y1="4.95" x2="816.34" y2="695.05"><stop offset="0" stop-color="#ff3efc"/><stop offset=".25" stop-color="#6cb1fd"/><stop offset=".5" stop-color="#548cfd"/><stop offset=".75" stop-color="#295dfd"/><stop offset="1" stop-color="#0b07f8"/></linearGradient><radialGradient id="logoL-13" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(1255.8 459.16) rotate(22.04) scale(464.67 224.5)"><stop offset="0" stop-color="#00d4fe" stop-opacity="0.797"/><stop offset=".5" stop-color="#00d4fe" stop-opacity="0.246"/><stop offset="1" stop-color="#00d4fe" stop-opacity="0"/></radialGradient><radialGradient id="logoL-14" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(630 351) rotate(-113.37) scale(1399.91 230.15)"><stop offset="0" stop-color="#a0effd" stop-opacity="0.2"/><stop offset=".5" stop-color="#a0effd" stop-opacity="0"/><stop offset="1" stop-color="#a0effd" stop-opacity="0"/></radialGradient><path id="logoL-15" d="M350 80 H1220 V950 H350 Z"/><path id="logoL-16" d="M350 80 H614 V668.5 C394.51 759.97 395.83 810.57 384 817 H350 Z"/><path id="logoL-17" d="M384 817 C395.83 810.57 394.51 759.97 614 668.5 C601.76 795.98 495.68 900.62 460 920 L350 960 V817 Z"/><path id="logoL-18" d="M350 80 H1220 V545 L1184 558 C1091.75 639.78 1018.25 572.14 913 520 L614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/><path id="logoL-19" d="M350 80 H520 L539 100 C563.83 110.79 604.49 141.82 611.5 230 C614.03 257.11 613.18 307.14 614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/></defs><g clip-path="url(#logoL-0)"><g id="logoL-20"><use href="#logoL-15" fill="url(#logoL-10)"/><use href="#logoL-15" fill="url(#logoL-11)"/></g><g id="logoL-21"><use href="#logoL-16" fill="url(#logoL-4)"/><use href="#logoL-16" fill="url(#logoL-5)"/><use href="#logoL-16" fill="url(#logoL-6)"/></g><g id="logoL-22"><use href="#logoL-17" fill="url(#logoL-7)"/><use href="#logoL-17" fill="url(#logoL-8)"/><use href="#logoL-17" fill="url(#logoL-9)"/></g><g id="logoL-23"><use href="#logoL-18" fill="url(#logoL-12)"/><use href="#logoL-18" fill="url(#logoL-13)"/><use href="#logoL-18" fill="url(#logoL-14)"/></g><g id="logoL-24"><use href="#logoL-19" fill="url(#logoL-1)"/><use href="#logoL-19" fill="url(#logoL-2)"/><use href="#logoL-19" fill="url(#logoL-3)"/></g></g></svg>
+<span class="brand-name">MoviPlayer</span>
+</div>
+<h1>This embed is out of date</h1>
+<p>It played through moviplayer.com's servers. It no longer does, so the video
+has to be readable directly by the browser. Replace the old iframe on your page
+with the one below &mdash; it runs the player on your own site, and your options
+have been carried over.</p>
+<textarea readonly onclick="this.select()">${inTextarea}</textarea>
+<div class="row">
+<button id="c">Copy</button>
+<span id="s" class="ok"></span>
+<span style="margin-left:auto"><a href="https://moviplayer.com" target="_blank" rel="noopener">moviplayer.com</a></span>
+</div>
+</div>
+<script>
+document.getElementById("c").addEventListener("click", function () {
+  var t = document.querySelector("textarea");
+  var done = function () { document.getElementById("s").textContent = "Copied"; };
+  // Clipboard access needs a permission an old embed's iframe was never given,
+  // so fall back to the selection copy that has always worked.
+  t.select();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t.value).then(done, function () {
+      try { document.execCommand("copy"); done(); } catch (e) {
+        document.getElementById("s").textContent = "Press Ctrl/Cmd+C";
+      }
+    });
+  } else {
+    try { document.execCommand("copy"); done(); } catch (e) {
+      document.getElementById("s").textContent = "Press Ctrl/Cmd+C";
+    }
+  }
+});
+<\/script>
+</body>
+</html>`;
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html;charset=UTF-8",
+      "Cache-Control": "no-store",
+      Vary: "Sec-Fetch-Dest",
+    },
+  });
+}
+
 function handleEmbed(url, request) {
   // Embed-only: this page is meant to live inside an <iframe>, never opened
   // directly. Sec-Fetch-Dest tells us the request's destination — 'iframe' or
   // 'frame' when embedded, 'document' on a top-level navigation (typing the
   // URL, opening in a new tab). Block the top-level case. All current browsers
-  // send this header; when it's absent (older clients) we fall through and the
-  // client-side guard in the page below handles it.
+  // send this header; when it's absent (older clients) we fall through to the
+  // notice below, which is harmless to read directly.
   const dest = request && request.headers.get("Sec-Fetch-Dest");
   if (dest === "document") {
     return embedTopLevelBlock();
@@ -586,94 +812,13 @@ function handleEmbed(url, request) {
   const videoUrl = url.searchParams.get("url") || "";
   const playerAttrs = buildEmbedPlayerAttrs(url.searchParams);
 
-  const embedHTML = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%236c5dd3'/%3E%3Cstop offset='100%25' stop-color='%234a3bba'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='50' cy='50' r='45' fill='url(%23g)'/%3E%3Cpolygon points='39,29 39,71 74,50' fill='white'/%3E%3C/svg%3E"/>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-html,body{width:100%;height:100%;overflow:hidden;background:#000}
-movi-player{width:100%;height:100%;display:block}
-</style>
-<script>
-// Minimal __movilog shim for the embed. The bundled player is built
-// with terser drop_console:true, so any diagnostics it wants to emit
-// go through window.__movilog (the name survives minification). In
-// the embed we route them straight to the iframe's DevTools console
-// so users debugging an embed can still see player logs — and we
-// keep a small ring buffer for postMessage/inspection from the
-// parent. No on-page panel here (embed is meant to be invisible
-// chrome).
-(function () {
-  var MAX = 200;
-  var buf = [];
-  function push(level, args) {
-    var entry = { level: level, args: Array.prototype.slice.call(args), t: Date.now() };
-    buf.push(entry);
-    if (buf.length > MAX) buf.splice(0, buf.length - MAX);
-    try { (console[level] || console.log).apply(console, args); } catch (e) {}
-  }
-  function makeLogger(level) {
-    return function () { push(level, arguments); };
-  }
-  var movilog = makeLogger("log");
-  movilog.log = makeLogger("log");
-  movilog.info = makeLogger("info");
-  movilog.warn = makeLogger("warn");
-  movilog.error = makeLogger("error");
-  movilog.debug = makeLogger("debug");
-  window.__movilog = movilog;
-  window.__moviDevLog = { buffer: buf };
-})();
-</script>
-</head>
-<body>
-<movi-player id="p" ${playerAttrs}></movi-player>
-<script type="module">
-import "/dist/${BUILD_VERSION}/element.js";
-// Fallback for the rare browser that doesn't send Sec-Fetch-Dest (the worker
-// already blocks the top-level case for everyone else): if we're the top-level
-// document rather than framed, this embed URL was opened directly — show the
-// notice instead of the player. window.top vs window.self compares safely even
-// across origins (reference compare, no property access).
-if (window.top === window.self) {
-  // Build via DOM (not innerHTML) so there's zero markup-injection surface,
-  // even though the strings here are all static. Text nodes escape the literal
-  // "<iframe>" for us.
-  document.body.textContent = "";
-  const box = document.createElement("div");
-  box.setAttribute("style", "font:14px/1.5 system-ui,sans-serif;color:#cfcfe6;display:flex;align-items:center;justify-content:center;height:100%;text-align:center;padding:24px");
-  box.append("This is an embed-only page — open it inside an <iframe>. ");
-  const a = document.createElement("a");
-  a.href = "https://moviplayer.com";
-  a.textContent = "moviplayer.com";
-  a.setAttribute("style", "color:#8b7bff;margin-left:6px");
-  box.appendChild(a);
-  document.body.appendChild(box);
-} else {
-  const p=document.getElementById("p");
-  const url="${videoUrl.replace(/"/g, "&quot;")}";
-  // Adaptive-streaming manifests (HLS/DASH/Smooth) load directly — the player
-  // fetches their (relative-URL) segments itself, which /proxy?url= would break.
-  if(url) p.src=/\\.(m3u8|mpd|ism)($|\\?)/i.test(url)?url:"/proxy?url="+encodeURIComponent(url);
-}
-</script>
-</body>
-</html>`;
-
-  return new Response(embedHTML, {
-    headers: {
-      "Content-Type": "text/html;charset=UTF-8",
-      "Cache-Control": "public, max-age=3600",
-      // The response depends on Sec-Fetch-Dest (embed vs top-level block), so
-      // caches must key on it — otherwise a cached iframe copy could be served
-      // to a direct top-level open, or vice versa.
-      "Vary": "Sec-Fetch-Dest",
-      ...SECURITY_HEADERS,
-    },
-  });
+  // This endpoint no longer plays anything. Relaying the media was the only
+  // thing that made it work for a source without CORS headers, and it stopped
+  // relaying — so the player would fail with a network error that tells the
+  // site owner nothing. Hand them the replacement instead, built from the
+  // parameters this very embed was called with.
+  const wantsAutoplay = /(^|&)autoplay(=|&|$)/i.test(url.search);
+  return embedDeprecatedNotice(videoUrl, playerAttrs, wantsAutoplay);
 }
 
 // 403 shown when /embed is opened as a top-level document instead of inside an
@@ -701,7 +846,7 @@ a:hover{text-decoration:underline}
 <body>
 <div>
 <div class="brand">
-<svg width="40" height="40" viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#8a7cf2"/><stop offset="100%" stop-color="#6c5dd3"/></linearGradient></defs><circle cx="50" cy="50" r="46" fill="url(#g)"/><polygon points="40,29 40,71 73,50" fill="#ffffff"/></svg>
+<svg viewBox="323 49 930 930" width="40" height="40" aria-hidden="true"><defs><clipPath id="logoL-2-0"><path clip-rule="evenodd" d="M383.55 222 C383.55 152.17 440.03 97.5 512 97.5 C543.4 97.5 559.7 101.8 590 117.5 L1100 381.5 C1174.55 414.03 1191.47 471.49 1193 512.5 C1192.29 590.19 1134.3 634.06 1100 646.5 C930.83 737.99 761.67 826.04 592.5 909 C571.47 917.98 554.22 929.25 512 930.3 C455.97 929.9 384.46 889.54 383.55 802 Z M614 360 L913 520 C686.95 641.07 614 666.34 614 669 Z"/></clipPath><linearGradient id="logoL-2-1" gradientUnits="userSpaceOnUse" x1="0" y1="97" x2="0" y2="360"><stop offset="0" stop-color="#737bfd"/><stop offset="0.5" stop-color="#6eb3fd"/><stop offset="1" stop-color="#81e1fe"/></linearGradient><radialGradient id="logoL-2-2" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(726.13 101.51) scale(218.96 701.75)"><stop offset="0" stop-color="#0c00fd"/><stop offset="0.12" stop-color="#0c00fd" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0c00fd" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0c00fd" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0c00fd" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0c00fd" stop-opacity="0.006"/><stop offset="1" stop-color="#0c00fd" stop-opacity="0"/></radialGradient><radialGradient id="logoL-2-3" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(255.4 225.67) scale(350.82 206.02)"><stop offset="0" stop-color="#4c00fd" stop-opacity="0.58"/><stop offset="0.12" stop-color="#4c00fd" stop-opacity="0.484"/><stop offset="0.24" stop-color="#4c00fd" stop-opacity="0.282"/><stop offset="0.36" stop-color="#4c00fd" stop-opacity="0.115"/><stop offset="0.48" stop-color="#4c00fd" stop-opacity="0.033"/><stop offset="0.64" stop-color="#4c00fd" stop-opacity="0.003"/><stop offset="1" stop-color="#4c00fd" stop-opacity="0"/></radialGradient><linearGradient id="logoL-2-4" gradientUnits="userSpaceOnUse" x1="0" y1="225" x2="0" y2="817"><stop offset="0" stop-color="#5143ff"/><stop offset="0.5" stop-color="#294cf6"/><stop offset="1" stop-color="#0437cc"/></linearGradient><radialGradient id="logoL-2-5" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(621.75 616.05) scale(192.93 939.93)"><stop offset="0" stop-color="#436eff"/><stop offset="0.12" stop-color="#436eff" stop-opacity="0.835"/><stop offset="0.24" stop-color="#436eff" stop-opacity="0.487"/><stop offset="0.36" stop-color="#436eff" stop-opacity="0.198"/><stop offset="0.48" stop-color="#436eff" stop-opacity="0.056"/><stop offset="0.64" stop-color="#436eff" stop-opacity="0.006"/><stop offset="1" stop-color="#436eff" stop-opacity="0"/></radialGradient><radialGradient id="logoL-2-6" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(637.74 314.49) scale(126.64 109.33)"><stop offset="0" stop-color="#0000ec"/><stop offset="0.12" stop-color="#0000ec" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0000ec" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0000ec" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0000ec" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0000ec" stop-opacity="0.006"/><stop offset="1" stop-color="#0000ec" stop-opacity="0"/></radialGradient><linearGradient id="logoL-2-7" gradientUnits="userSpaceOnUse" x1="0" y1="669" x2="0" y2="930"><stop offset="0" stop-color="#001fad"/><stop offset="0.5" stop-color="#2e50ff"/><stop offset="1" stop-color="#3d4eff"/></linearGradient><radialGradient id="logoL-2-8" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(367.66 690.91) scale(257.59 321.92)"><stop offset="0" stop-color="#0023ab"/><stop offset="0.12" stop-color="#0023ab" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0023ab" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0023ab" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0023ab" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0023ab" stop-opacity="0.006"/><stop offset="1" stop-color="#0023ab" stop-opacity="0"/></radialGradient><radialGradient id="logoL-2-9" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(554.73 904.5) scale(161.77 151.07)"><stop offset="0" stop-color="#564efc"/><stop offset="0.12" stop-color="#564efc" stop-opacity="0.835"/><stop offset="0.24" stop-color="#564efc" stop-opacity="0.487"/><stop offset="0.36" stop-color="#564efc" stop-opacity="0.198"/><stop offset="0.48" stop-color="#564efc" stop-opacity="0.056"/><stop offset="0.64" stop-color="#564efc" stop-opacity="0.006"/><stop offset="1" stop-color="#564efc" stop-opacity="0"/></radialGradient><linearGradient id="logoL-2-10" gradientUnits="userSpaceOnUse" x1="460" y1="0" x2="1185" y2="0"><stop offset="0" stop-color="#4442fc"/><stop offset="0.5" stop-color="#5800fd"/><stop offset="1" stop-color="#00c9ff"/></linearGradient><radialGradient id="logoL-2-11" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(918.16 679.1) scale(562.77 1104.38)"><stop offset="0" stop-color="#b3acfc" stop-opacity="0.732"/><stop offset="0.12" stop-color="#b3acfc" stop-opacity="0.611"/><stop offset="0.24" stop-color="#b3acfc" stop-opacity="0.356"/><stop offset="0.36" stop-color="#b3acfc" stop-opacity="0.145"/><stop offset="0.48" stop-color="#b3acfc" stop-opacity="0.041"/><stop offset="0.64" stop-color="#b3acfc" stop-opacity="0.004"/><stop offset="1" stop-color="#b3acfc" stop-opacity="0"/></radialGradient><linearGradient id="logoL-2-12" gradientUnits="userSpaceOnUse" x1="933.66" y1="4.95" x2="816.34" y2="695.05"><stop offset="0" stop-color="#ff3efc"/><stop offset=".25" stop-color="#6cb1fd"/><stop offset=".5" stop-color="#548cfd"/><stop offset=".75" stop-color="#295dfd"/><stop offset="1" stop-color="#0b07f8"/></linearGradient><radialGradient id="logoL-2-13" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(1255.8 459.16) rotate(22.04) scale(464.67 224.5)"><stop offset="0" stop-color="#00d4fe" stop-opacity="0.797"/><stop offset=".5" stop-color="#00d4fe" stop-opacity="0.246"/><stop offset="1" stop-color="#00d4fe" stop-opacity="0"/></radialGradient><radialGradient id="logoL-2-14" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(630 351) rotate(-113.37) scale(1399.91 230.15)"><stop offset="0" stop-color="#a0effd" stop-opacity="0.2"/><stop offset=".5" stop-color="#a0effd" stop-opacity="0"/><stop offset="1" stop-color="#a0effd" stop-opacity="0"/></radialGradient><path id="logoL-2-15" d="M350 80 H1220 V950 H350 Z"/><path id="logoL-2-16" d="M350 80 H614 V668.5 C394.51 759.97 395.83 810.57 384 817 H350 Z"/><path id="logoL-2-17" d="M384 817 C395.83 810.57 394.51 759.97 614 668.5 C601.76 795.98 495.68 900.62 460 920 L350 960 V817 Z"/><path id="logoL-2-18" d="M350 80 H1220 V545 L1184 558 C1091.75 639.78 1018.25 572.14 913 520 L614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/><path id="logoL-2-19" d="M350 80 H520 L539 100 C563.83 110.79 604.49 141.82 611.5 230 C614.03 257.11 613.18 307.14 614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/></defs><g clip-path="url(#logoL-2-0)"><g id="logoL-2-20"><use href="#logoL-2-15" fill="url(#logoL-2-10)"/><use href="#logoL-2-15" fill="url(#logoL-2-11)"/></g><g id="logoL-2-21"><use href="#logoL-2-16" fill="url(#logoL-2-4)"/><use href="#logoL-2-16" fill="url(#logoL-2-5)"/><use href="#logoL-2-16" fill="url(#logoL-2-6)"/></g><g id="logoL-2-22"><use href="#logoL-2-17" fill="url(#logoL-2-7)"/><use href="#logoL-2-17" fill="url(#logoL-2-8)"/><use href="#logoL-2-17" fill="url(#logoL-2-9)"/></g><g id="logoL-2-23"><use href="#logoL-2-18" fill="url(#logoL-2-12)"/><use href="#logoL-2-18" fill="url(#logoL-2-13)"/><use href="#logoL-2-18" fill="url(#logoL-2-14)"/></g><g id="logoL-2-24"><use href="#logoL-2-19" fill="url(#logoL-2-1)"/><use href="#logoL-2-19" fill="url(#logoL-2-2)"/><use href="#logoL-2-19" fill="url(#logoL-2-3)"/></g></g></svg>
 <span class="brand-name">MoviPlayer</span>
 </div>
 <h1>This is an embed-only page</h1>
@@ -728,6 +873,9 @@ const MIME_TYPES = {
   map: "application/json",
   svg: "image/svg+xml",
   png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
   ico: "image/x-icon",
   mp4: "video/mp4",
   m4v: "video/mp4",
@@ -736,6 +884,58 @@ const MIME_TYPES = {
   mov: "video/quicktime",
   ts: "video/mp2t",
 };
+
+/**
+ * Note which SITE loaded a player bundle from this origin.
+ *
+ * The documented embed points at jsdelivr, so this does not see most adoption
+ * and is not meant to — it answers one question: of the loads that DO come
+ * here, whose page were they on. The referring HOST is the whole record. No
+ * path, no query, no IP, no cookie: a cross-origin script load already sends
+ * only the origin under the default referrer policy, and the origin is the
+ * answer, so there is nothing further worth keeping.
+ *
+ * Own traffic is recorded too rather than filtered out — moviplayer.com is a
+ * row like any other, and telling it apart is a WHERE clause at query time,
+ * while dropping it here would make "is anyone else using this" unanswerable
+ * against a baseline.
+ *
+ * Fall-open, like every other optional binding in this worker: with no
+ * ANALYTICS dataset bound (a fork, `wrangler dev`) it does nothing at all.
+ *
+ * What it CANNOT tell you: how many people watched. /dist is served
+ * `immutable` for a year, so a browser asks once and never again — these are
+ * first fetches, not views.
+ */
+function recordDistHit(env, parts, key, request) {
+  if (!env.DIST_HITS) return;
+  try {
+    const ref = request.headers.get("Referer") || "";
+    let site = "(none)";
+    if (ref) {
+      try {
+        site = new URL(ref).host;
+      } catch {
+        site = "(unparseable)";
+      }
+    }
+    // The version is the first path segment when there is more than one —
+    // /dist/0.4.1/element.js — and absent on a bare /dist/element.js.
+    const version = parts.length > 1 ? parts[0] : "(unversioned)";
+    env.DIST_HITS.writeDataPoint({
+      // One index — that is the documented maximum — and the site is the thing
+      // worth grouping by. Clamped to 96 bytes because that is the documented
+      // index limit and a hostname may be up to 253 characters; an over-long
+      // index loses the whole datapoint, so a truncated host is strictly better
+      // than no row. Hostnames are ASCII (an IDN arrives punycoded), so the
+      // character count is the byte count here.
+      indexes: [site.slice(0, 96)],
+      blobs: [site, version, key],
+    });
+  } catch {
+    /* analytics must never be able to fail a file the page is waiting for */
+  }
+}
 
 async function handleR2(env, key, request) {
   if (!env.ASSETS) {
@@ -834,9 +1034,11 @@ const BADGE_SOURCES = {
   chrome:
     "https://img.shields.io/chrome-web-store/users/ckleeigcopjnpehkjokijokjegknfgej?label=Chrome%20Web%20Store&color=7c6cf0&labelColor=23232e",
   vscode:
-    "https://vsmarketplacebadges.dev/downloads-short/mrujjwalg.movi-player-vscode.svg?label=VS%20Code&color=7c6cf0",
+    "https://vsmarketplacebadges.dev/downloads-short/mrujjwalg.movi-player-vscode.svg?label=VS%20Code&color=7c6cf0&labelColor=23232e",
   npm:
     "https://img.shields.io/npm/dt/movi-player?label=npm%20downloads&color=7c6cf0&labelColor=23232e",
+  github:
+    "https://img.shields.io/github/stars/mrujjwalg/movi-player?label=GitHub%20stars&color=7c6cf0&labelColor=23232e",
 };
 
 async function handleBadge(which) {
@@ -877,7 +1079,7 @@ async function handleBadge(which) {
     // Upstream down/changed → serve a static badge so the <img> never
     // renders broken. Short cache so it self-heals when upstream returns.
     const label =
-      { chrome: "Chrome Web Store", vscode: "VS Code", npm: "npm downloads", jsdelivr: "jsDelivr" }[which] ||
+      { chrome: "Chrome Web Store", vscode: "VS Code", npm: "npm downloads", jsdelivr: "jsDelivr", github: "GitHub stars" }[which] ||
       "extension";
     const w = Math.max(60, label.length * 7 + 16);
     const fallback =
@@ -938,7 +1140,14 @@ async function handleStaticAsset(env, key) {
   return new Response(object.body, {
     headers: {
       "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
-      "Cache-Control": "public, max-age=31536000, immutable",
+      // A day, not a year, and not immutable: everything this serves is a
+      // MUTABLE file at a fixed URL — the favicons, the touch icon, the social
+      // card. `immutable` told every browser that had ever loaded the site to
+      // keep the old mark for a year and never ask again, which is exactly
+      // what a new logo runs into. The pages carry ?v=<build> on the icons a
+      // tab shows, so a deploy still lands instantly; this header is for the
+      // ones whose URL has to stay put (the 192/512 the crawler remembers).
+      "Cache-Control": "public, max-age=86400",
     },
   });
 }
@@ -959,6 +1168,123 @@ const PROXY_ALLOWED_REFERER_ORIGINS = new Set([
   "http://localhost:8787",
   "http://127.0.0.1:8787",
 ]);
+
+// ─── Signed proxy URLs ─────────────────────────────────────────────────
+//
+// The Referer allowlist above only constrains *browsers* — a browser won't
+// let script forge Referer, so it stops hotlinking. It stops nothing else:
+// `curl -H "Referer: https://moviplayer.com"` walks straight through, and
+// without a second gate /proxy is an open, anonymising media relay running
+// on our bandwidth and our reputation.
+//
+// So every /proxy request must now carry an HMAC over the exact target URL.
+// Signatures come from /api/proxy-sign, which is rate-limited and (when
+// Turnstile is configured) requires a session JWT. A leaked signature is
+// worth little: it is bound to one URL, so it can't be repointed at
+// anything else, and it expires.
+//
+// The TTL is long because a <video> element re-requests the same signed URL
+// for every range as playback proceeds — a short window would break seeking
+// in a two-hour film, not just the initial load.
+const PROXY_SIG_TTL_MS = 12 * 60 * 60 * 1000;   // 12h
+const PROXY_SIGN_RATE_WINDOW_MS = 10 * 60 * 1000;
+const PROXY_SIGN_RATE_MAX = 40;                 // signatures per IP per window
+const PROXY_MAX_REDIRECTS = 4;
+
+// Hosts serving the fixed demo clips on /examples. Those pages carry no
+// Turnstile widget, and gating a handful of public sample files behind a
+// bot challenge would buy nothing — the set is closed, so the worst case
+// is someone relaying five well-known test videos.
+// Hosts we've been asked to stop relaying, per the takedown process in the
+// terms. Checked when a signature is minted *and* again on every /proxy
+// request — a signature stays valid for 12 hours, so verifying only at
+// minting time would leave a blocked host playing for the rest of the day.
+//
+// Entries match the host and everything under it: "example.com" also blocks
+// "cdn.example.com". Add them here, or without redeploying via the
+// PROXY_BLOCKED_HOSTS var in wrangler.toml (comma-separated).
+const PROXY_BLOCKED_HOSTS = new Set([
+  // e.g. "piracy.example",
+]);
+
+function isBlockedProxyHost(env, hostname) {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  const extra = (env?.PROXY_BLOCKED_HOSTS || "")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+
+  for (const blocked of [...PROXY_BLOCKED_HOSTS, ...extra]) {
+    if (host === blocked || host.endsWith("." + blocked)) return true;
+  }
+  return false;
+}
+
+const PROXY_UNGATED_HOSTS = new Set([
+  "interactive-examples.mdn.mozilla.net",
+  "raw.githubusercontent.com",
+  "storage.googleapis.com",
+  "test-streams.mux.dev",
+  "www.soundhelix.com",
+]);
+
+function proxySigMessage(targetUrl, expiresAt) {
+  return `proxy:${expiresAt}:${targetUrl}`;
+}
+
+async function signProxyTarget(env, targetUrl, expiresAt) {
+  return hmacSha256Hex(env.ENC_SERVER_SECRET, proxySigMessage(targetUrl, expiresAt));
+}
+
+/**
+ * Verify the ?exp/?sig pair against the ?url the caller is asking us to
+ * fetch. Returns a reason string on failure so the caller can pick a status.
+ */
+async function verifyProxySignature(env, targetUrl, expRaw, sigGiven) {
+  if (!expRaw || !sigGiven) return "missing";
+  const expiresAt = Number(expRaw);
+  if (!Number.isSafeInteger(expiresAt)) return "malformed";
+  if (Date.now() > expiresAt) return "expired";
+  // Don't honour a far-future expiry even if it verifies — that would turn a
+  // single leaked signature into a permanent one.
+  if (expiresAt > Date.now() + PROXY_SIG_TTL_MS) return "malformed";
+  const expected = await signProxyTarget(env, targetUrl, expiresAt);
+  if (!constantTimeEqual(sigGiven, expected)) return "bad-signature";
+  return null;
+}
+
+/**
+ * fetch() with redirects followed by hand so every hop is re-validated.
+ * `redirect: "follow"` checks the host we were given and then quietly goes
+ * wherever that host points — a public URL that 302s to a private address
+ * defeats isPrivateHost entirely.
+ */
+async function fetchWithGuardedRedirects(env, targetUrl, init) {
+  let current = targetUrl;
+  for (let hop = 0; hop <= PROXY_MAX_REDIRECTS; hop++) {
+    const res = await fetch(current, { ...init, redirect: "manual" });
+    if (res.status < 300 || res.status >= 400) return { res };
+    const location = res.headers.get("Location");
+    if (!location) return { res };
+    let next;
+    try {
+      next = new URL(location, current);
+    } catch {
+      return { error: "Invalid redirect target" };
+    }
+    if (!["http:", "https:"].includes(next.protocol)) {
+      return { error: "Invalid redirect target" };
+    }
+    if (isPrivateHost(next.hostname)) {
+      return { error: "Redirect to a private address" };
+    }
+    if (isBlockedProxyHost(env, next.hostname)) {
+      return { error: "Redirect to a blocked host" };
+    }
+    current = next.toString();
+  }
+  return { error: "Too many redirects" };
+}
 
 function isAllowedProxyReferer(request) {
   const referer = request.headers.get("Referer");
@@ -1031,17 +1357,18 @@ async function sniffAndPassthrough(stream) {
 // upstreams that ignore Range and return 200 with the full body.
 // Retries once to smooth over transient subrequest failures (CF→CF
 // fetches occasionally flake on cold paths).
-async function preflightSignatureCheck(targetUrl) {
+async function preflightSignatureCheck(env, targetUrl) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(targetUrl, {
+      const hopped = await fetchWithGuardedRedirects(env, targetUrl, {
         method: "GET",
         headers: {
           "Range": `bytes=0-${MAGIC_SNIFF_SIZE - 1}`,
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         },
-        redirect: "follow",
       });
+      if (hopped.error) return { ok: false, reason: "network" };
+      const res = hopped.res;
       if (!res.ok && res.status !== 206) {
         if (attempt === 0) continue;
         return { ok: false, reason: "network" };
@@ -1072,6 +1399,69 @@ async function preflightSignatureCheck(targetUrl) {
   return { ok: false, reason: "network" };
 }
 
+/**
+ * POST /api/proxy-sign — mint a signed /proxy URL for one specific target.
+ *
+ * This is the choke point that /proxy itself can't be: a browser sends a real
+ * Origin here and can't forge it, and when Turnstile is configured the caller
+ * must also hold a session JWT, so a script can't mint signatures in bulk.
+ * Everything downstream is then just signature verification — no per-range
+ * database work while a video plays.
+ */
+async function handleProxySign(request, env) {
+  if (!isAllowedEncOrigin(request)) {
+    return jsonResponse({ error: "Origin not allowed" }, 403);
+  }
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON" }, 400);
+  }
+
+  const targetUrl = typeof payload?.url === "string" ? payload.url.trim() : "";
+  if (!targetUrl) {
+    return jsonResponse({ error: "url required" }, 400);
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return jsonResponse({ error: "Invalid URL" }, 400);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    return jsonResponse({ error: "Only HTTP(S) URLs allowed" }, 400);
+  }
+  if (isPrivateHost(parsed.hostname)) {
+    return jsonResponse({ error: "Private URLs not allowed" }, 403);
+  }
+  if (isBlockedProxyHost(env, parsed.hostname)) {
+    return jsonResponse({ error: "This host is blocked" }, 451);
+  }
+
+  // Bot gate. Same fall-open behaviour as /api/token and /api/comments so a
+  // fork without a Turnstile secret still runs — it just has no gate.
+  if (env.TURNSTILE_SECRET_KEY && !PROXY_UNGATED_HOSTS.has(parsed.hostname)) {
+    const auth = request.headers.get("Authorization") || "";
+    const jwt = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const ip = request.headers.get("CF-Connecting-IP") || "";
+    if (!(await verifySessionJwt(env, jwt, ip))) {
+      return jsonResponse({ error: "Session required" }, 401);
+    }
+  } else if (!env.TURNSTILE_SECRET_KEY) {
+    console.warn("TURNSTILE_SECRET_KEY missing — /api/proxy-sign has no bot gate");
+  }
+
+  const expiresAt = Date.now() + PROXY_SIG_TTL_MS;
+  const sig = await signProxyTarget(env, targetUrl, expiresAt);
+  return jsonResponse({
+    url: `/proxy?url=${encodeURIComponent(targetUrl)}&exp=${expiresAt}&sig=${sig}`,
+    expiresAt,
+  });
+}
+
 async function handleProxy(request, url, env) {
   if (!isAllowedProxyReferer(request)) {
     return jsonResponse({ error: "Referer not allowed" }, 403);
@@ -1080,6 +1470,20 @@ async function handleProxy(request, url, env) {
   const targetUrl = url.searchParams.get("url");
   if (!targetUrl) {
     return jsonResponse({ error: "url parameter required" }, 400);
+  }
+
+  // The signature is the real gate — see the note above the helpers. It has
+  // to be checked before anything else, so no unsigned request can reach an
+  // upstream fetch, an R2 read, or a redirect.
+  const sigFailure = await verifyProxySignature(
+    env,
+    targetUrl,
+    url.searchParams.get("exp"),
+    url.searchParams.get("sig"),
+  );
+  if (sigFailure) {
+    const status = sigFailure === "expired" ? 410 : 403;
+    return jsonResponse({ error: `Proxy signature ${sigFailure}` }, status);
   }
 
   // Validate URL
@@ -1106,6 +1510,12 @@ async function handleProxy(request, url, env) {
     return jsonResponse({ error: "Private URLs not allowed" }, 403);
   }
 
+  // Re-checked here, not just at signing, so a takedown takes effect the
+  // moment it lands rather than when the last signature expires.
+  if (isBlockedProxyHost(env, parsed.hostname)) {
+    return jsonResponse({ error: "This host is blocked" }, 451);
+  }
+
   // Only allow http/https
   if (!["http:", "https:"].includes(parsed.protocol)) {
     return jsonResponse({ error: "Only HTTP(S) URLs allowed" }, 400);
@@ -1122,11 +1532,14 @@ async function handleProxy(request, url, env) {
   headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
   try {
-    const response = await fetch(targetUrl, {
+    const hopped = await fetchWithGuardedRedirects(env, targetUrl, {
       method: request.method === "HEAD" ? "HEAD" : "GET",
       headers,
-      redirect: "follow",
     });
+    if (hopped.error) {
+      return jsonResponse({ error: hopped.error }, 403);
+    }
+    const response = hopped.res;
 
     if (!response.ok && response.status !== 206) {
       return jsonResponse({ error: `Upstream returned ${response.status}` }, response.status);
@@ -1162,7 +1575,7 @@ async function handleProxy(request, url, env) {
     let body = response.body;
     if (request.method !== "HEAD") {
       if (!startsAtZero) {
-        const result = await preflightSignatureCheck(targetUrl);
+        const result = await preflightSignatureCheck(env, targetUrl);
         if (!result.ok) {
           const status = result.reason === "format" ? 415 : 502;
           const message = result.reason === "format"
@@ -1199,8 +1612,10 @@ async function handleProxy(request, url, env) {
       if (val) respHeaders.set(h, val);
     }
 
-    // Cache video responses
-    respHeaders.set("Cache-Control", "public, max-age=86400");
+    // Never cache third-party media on our edge. The proxy exists only to
+    // solve CORS for a URL the visitor typed; storing a copy of someone
+    // else's video for a day makes us a host rather than a conduit.
+    respHeaders.set("Cache-Control", "private, no-store");
 
     // Stream the response body (no buffering)
     return new Response(body, {
@@ -2440,20 +2855,74 @@ async function handleEncVideo(request, env) {
   });
 }
 
-function isPrivateHost(hostname) {
-  // Block localhost and private IPs
-  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return true;
-  if (hostname.endsWith(".local") || hostname.endsWith(".internal")) return true;
+/**
+ * Parse the many legal spellings of an IPv4 literal into four octets, or
+ * return null when the host isn't one. Parts may be decimal, hex (0x…) or
+ * octal (leading 0), and there may be one to four of them.
+ */
+function ipv4Octets(host) {
+  const parts = host.split(".");
+  if (parts.length < 1 || parts.length > 4) return null;
 
-  // Check private IP ranges
-  const parts = hostname.split(".");
-  if (parts.length === 4) {
-    const [a, b] = parts.map(Number);
+  const values = [];
+  for (const part of parts) {
+    if (part === "") return null;
+    let value;
+    if (/^0[xX][0-9a-fA-F]+$/.test(part)) value = parseInt(part.slice(2), 16);
+    else if (/^0[0-7]+$/.test(part)) value = parseInt(part.slice(1), 8);
+    else if (/^\d+$/.test(part)) value = Number(part);
+    else return null;
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    values.push(value);
+  }
+
+  // Every part but the last must fit in one octet; the last absorbs the rest.
+  const head = values.slice(0, -1);
+  const tail = values[values.length - 1];
+  if (head.some((v) => v > 255)) return null;
+  const tailMax = Math.pow(256, 4 - head.length);
+  if (tail >= tailMax) return null;
+
+  let n = 0;
+  for (const v of head) n = n * 256 + v;
+  n = n * tailMax + tail;
+  return [(n / 16777216) & 255, (n / 65536) & 255, (n / 256) & 255, n & 255];
+}
+
+function isPrivateHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+
+  // Block localhost and private IPs
+  if (host === "localhost" || host === "::1" || host === "::") return true;
+  if (host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".localhost")) return true;
+
+  // IPv6 loopback/link-local/unique-local. Anything with a colon is IPv6;
+  // fc00::/7 (fc,fd), fe80::/10 (fe8-feb) and ::ffff:… mapped v4 are all
+  // ways to reach something we shouldn't be fetching for a visitor.
+  if (host.includes(":")) {
+    if (/^f[cd]/.test(host)) return true;
+    if (/^fe[89ab]/.test(host)) return true;
+    if (host.startsWith("::ffff:")) return isPrivateHost(host.slice(7));
+    return false;
+  }
+
+  // Dotted-quad is only one of the ways to write an IPv4 address. "127.1",
+  // "2130706433" and "0x7f.1" all reach 127.0.0.1, and a check that only
+  // understands a.b.c.d waves every one of them through. Normalise to a
+  // 32-bit value first, following the same 1-to-4-part rule resolvers use:
+  // the last part fills all remaining low octets.
+  const octets = ipv4Octets(host);
+
+  if (octets) {
+    const [a, b] = octets;
     if (a === 10) return true;                          // 10.0.0.0/8
+    if (a === 127) return true;                         // 127.0.0.0/8 — all of it
     if (a === 172 && b >= 16 && b <= 31) return true;   // 172.16.0.0/12
-    if (a === 192 && b === 168) return true;             // 192.168.0.0/16
-    if (a === 169 && b === 254) return true;             // 169.254.0.0/16
-    if (a === 0) return true;                            // 0.0.0.0/8
+    if (a === 192 && b === 168) return true;            // 192.168.0.0/16
+    if (a === 169 && b === 254) return true;            // 169.254.0.0/16
+    if (a === 0) return true;                           // 0.0.0.0/8
+    if (a === 100 && b >= 64 && b <= 127) return true;  // 100.64.0.0/10 (CGNAT)
+    if (a >= 224) return true;                          // multicast + reserved
   }
 
   return false;
@@ -2464,6 +2933,7 @@ function jsonResponse(data, status = 200) {
     status,
     headers: {
       "Content-Type": "application/json",
+      // X-Robots-Tag: noindex rides along in CORS_HEADERS.
       ...CORS_HEADERS,
     },
   });
@@ -2972,4 +3442,170 @@ function timingSafeEqualStr(a, b) {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+// ---------------------------------------------------------------------------
+// Watch party
+//
+// Two doors, different sizes. The room code is what people share and is not a
+// credential — anyone may open ?party=movie and will land in it as a
+// follower, able to do nothing. Claiming the chair in that room means
+// presenting a six-digit code from an authenticator app, and only the first
+// claim on a room is honoured.
+//
+// The code never reaches the Durable Object. It is checked here, and what
+// travels onward is a short-lived HMAC over (code, expiry) — so a token
+// lifted from one room's URL opens neither another room nor the same one
+// tomorrow.
+// ---------------------------------------------------------------------------
+
+const PARTY_TOKEN_TTL_MS = 10 * 60 * 1000;
+const PARTY_CODE_RE = /^[A-Za-z0-9][A-Za-z0-9 _-]{2,39}$/;
+
+function partyCodeKey(code) {
+  // "Chai Party", "chai-party" and "CHAI PARTY" are one room. People retype a
+  // code from a phone screen and they will not match its punctuation; a room
+  // nobody can land in is worse than a slightly smaller code space.
+  return code.trim().toLowerCase().replace(/[\s_-]+/g, "-");
+}
+
+// --- TOTP (RFC 6238), so the thing a host types is a code that expires ---
+//
+// Checked against RFC 6238 Appendix B's published vectors before being
+// trusted: all six match at 8 digits, which is the same computation the 6
+// digits below take the tail of.
+
+function base32Decode(str) {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const clean = String(str).toUpperCase().replace(/[\s-]+/g, "").replace(/=+$/, "");
+  if (!clean) return null;
+  let bits = 0;
+  let value = 0;
+  const out = [];
+  for (const ch of clean) {
+    const idx = A.indexOf(ch);
+    if (idx === -1) return null;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return out.length ? new Uint8Array(out) : null;
+}
+
+async function totpAt(keyBytes, counter) {
+  const buf = new ArrayBuffer(8);
+  const view = new DataView(buf);
+  view.setUint32(0, Math.floor(counter / 4294967296));
+  view.setUint32(4, counter >>> 0);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"],
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, buf));
+  const off = sig[sig.length - 1] & 0x0f;
+  const bin =
+    ((sig[off] & 0x7f) << 24) | (sig[off + 1] << 16) | (sig[off + 2] << 8) | sig[off + 3];
+  return String(bin % 1000000).padStart(6, "0");
+}
+
+// One step either side of now. Phones and Cloudflare do not agree to the
+// second, and a host whose clock is twenty seconds out should not be told
+// their code is wrong.
+const TOTP_SKEW_STEPS = 1;
+
+async function totpValid(secretBase32, given) {
+  const key = base32Decode(secretBase32);
+  if (!key || !/^[0-9]{6}$/.test(given)) return false;
+  const now = Math.floor(Date.now() / 1000 / 30);
+  for (let d = -TOTP_SKEW_STEPS; d <= TOTP_SKEW_STEPS; d++) {
+    if (constantTimeEqual(given, await totpAt(key, now + d))) return true;
+  }
+  return false;
+}
+
+async function signPartyToken(env, codeKey, expiresAt) {
+  return hmacSha256Hex(env.ENC_SERVER_SECRET, `party:${expiresAt}:${codeKey}`);
+}
+
+/**
+ * POST /api/party/host  { code, otp } -> { token, exp, code }
+ *
+ * The six digits from an authenticator app, not a password. Nothing to store
+ * and nothing to leak: the shared secret lives in PARTY_TOTP_SECRET and never
+ * leaves the worker, and what the host types stops working within the minute.
+ *
+ * Deliberately quiet about which half was wrong: a caller probing learns the
+ * same thing from a bad code as from a malformed room name, and the same
+ * again when no secret has been configured at all.
+ */
+async function handlePartyHost(request, env) {
+  if (!env.ENC_SERVER_SECRET) {
+    return jsonResponse({ error: "Watch party is not configured on this deployment" }, 503);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid request" }, 400);
+  }
+  const code = typeof body?.code === "string" ? body.code.trim() : "";
+  const otp = typeof body?.otp === "string" ? body.otp.replace(/\s+/g, "") : "";
+  if (!PARTY_CODE_RE.test(code) || !otp) {
+    return jsonResponse({ error: "Not allowed" }, 403);
+  }
+
+  // No secret configured means nobody can host, rather than everybody: a gate
+  // nobody has set up is shut.
+  if (!env.PARTY_TOTP_SECRET || !(await totpValid(env.PARTY_TOTP_SECRET, otp))) {
+    return jsonResponse({ error: "Not allowed" }, 403);
+  }
+
+  const codeKey = partyCodeKey(code);
+  const exp = Date.now() + PARTY_TOKEN_TTL_MS;
+  return jsonResponse({ token: await signPartyToken(env, codeKey, exp), exp, code: codeKey });
+}
+
+/**
+ * GET /api/party/room?code=… — WebSocket upgrade into the room's object.
+ *
+ * A guest arrives with no token and follows. A claim arrives with the token
+ * minted above; it is verified HERE, and the object is told the outcome in a
+ * URL only this worker can write.
+ */
+async function handlePartyRoom(request, env, url) {
+  if (!env.PARTY) {
+    return new Response("Watch party is not configured on this deployment", { status: 503 });
+  }
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return new Response("expected websocket", { status: 426 });
+  }
+  const code = url.searchParams.get("code") || "";
+  if (!PARTY_CODE_RE.test(code)) return new Response("bad code", { status: 400 });
+  const codeKey = partyCodeKey(code);
+
+  let asHost = false;
+  const token = url.searchParams.get("token");
+  const expRaw = url.searchParams.get("exp");
+  if (token && expRaw) {
+    const exp = Number(expRaw);
+    if (
+      Number.isSafeInteger(exp) &&
+      Date.now() <= exp &&
+      exp <= Date.now() + PARTY_TOKEN_TTL_MS &&
+      constantTimeEqual(token, await signPartyToken(env, codeKey, exp))
+    ) {
+      asHost = true;
+    }
+  }
+
+  const room = new URL("https://party.invalid/room");
+  room.searchParams.set("host", asHost ? "1" : "0");
+  room.searchParams.set("name", (url.searchParams.get("name") || "").slice(0, 24));
+  return env.PARTY.get(env.PARTY.idFromName(codeKey)).fetch(new Request(room, request));
 }

@@ -9,6 +9,7 @@
 #include <libavutil/display.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/spherical.h>
+#include <libavutil/time.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 #include <stdint.h>
@@ -84,10 +85,14 @@ typedef struct {
   // Growing the struct here bumps sizeof(PacketInfo) 40 -> 48 (double alignment
   // pads the trailing 44 to 48); PACKET_INFO_SIZE in types.ts must match.
   int is_rasl;
-  // 1 for a disposable (non-reference) frame — AV_PKT_FLAG_DISPOSABLE. Nothing
-  // in the stream references it, so it can be dropped without breaking decode.
+  // 1 for a disposable (non-reference) frame. Nothing in the stream references
+  // it, so it can be dropped without breaking decode. Taken from
+  // AV_PKT_FLAG_DISPOSABLE where the container carries the sample-dependency
+  // information, and otherwise derived from the bitstream — most plain MP4s
+  // have no sdtp box and flag nothing at all (see movi_packet_is_non_ref).
   // JS drops these before WebCodecs on the hardware/software-in-browser path
-  // when the renderer reports the device can't sustain the source rate. Fills
+  // when the renderer reports the device can't sustain the source rate, and
+  // spends them first when an audio starve forces it to skip video. Fills
   // the 4 padding bytes after is_rasl, so sizeof(PacketInfo) stays 48.
   int disposable;
 } PacketInfo;
@@ -100,6 +105,40 @@ typedef struct {
   double end_sec;
   char *text; // null-terminated, malloc-owned
 } PrefetchedSubCue;
+
+// Seeking a Matroska that carries no usable index: see movi_streams.c. Shared
+// with the thumbnail pipeline, which opens its own AVFormatContext over the
+// same file and would otherwise read forward from the start for every preview.
+int movi_fmt_is_matroska(const AVFormatContext *fmt);
+int movi_mkv_index_misses(AVStream *st, double target_sec);
+int movi_mkv_index_near_fmt(AVFormatContext *fmt, int64_t file_size, int anchor,
+                            double target_sec);
+
+// The same question, and the same answer, for a transport stream: no index,
+// and a timestamp bisection that lands past the random-access point the target
+// belongs to. See movi_streams.c.
+// How far behind the target an indexed point may sit before it is worth
+// scanning for a closer one. About a GOP: landing further back than that means
+// decoding a stretch of frames only to drop them, which is the cost the scan
+// exists to remove — and the scan is a few small reads, cheaper than the
+// decode it saves. Seeks inside the same GOP still answer from the index.
+#define MOVI_TS_INDEX_TOLERANCE_S 2.0
+// …but a point THIS far back is still worth landing on once the scan has said
+// there is nothing closer: decoding a few seconds of frames and dropping them
+// costs less than what the alternative does, which is to wait out a GOP and
+// then resume PAST the playhead. Two separate numbers because they answer two
+// separate questions — the first is "look again?", this one is "use it?".
+#define MOVI_TS_LAND_MAX_S 5.0
+int movi_fmt_is_mpegts(const AVFormatContext *fmt);
+int movi_ts_index_near_fmt(AVFormatContext *fmt, int64_t file_size, int anchor,
+                           double target_sec);
+// Can this stream's index answer a seek to `target_sec`, or is the nearest
+// entry so far behind that landing there means reading through the stretch the
+// index was meant to skip?
+int movi_index_misses(AVStream *st, double target_sec, double tolerance_s);
+// Move the demuxer onto the random-access point that owns `target_sec`, by the
+// byte offset the index holds for it. 0 when it moved.
+int movi_ts_seek_to_rap(AVFormatContext *fmt, int anchor, double target_sec);
 
 // Demuxer context with custom AVIO
 typedef struct {
@@ -254,6 +293,7 @@ EMSCRIPTEN_KEEPALIVE int movi_receive_frame(MoviContext *ctx, int stream_index);
 EMSCRIPTEN_KEEPALIVE double movi_get_start_time(MoviContext *ctx);
 EMSCRIPTEN_KEEPALIVE int movi_get_format_name(MoviContext *ctx, char *buffer, int buffer_size);
 EMSCRIPTEN_KEEPALIVE int movi_get_metadata_title(MoviContext *ctx, char *buffer, int buffer_size);
+EMSCRIPTEN_KEEPALIVE int movi_get_metadata_tag(MoviContext *ctx, const char *key, char *buffer, int buffer_size);
 
 // JS-WASM Bridge (defined in movi.c or other files with EM_JS)
 extern int js_read_async(uint8_t *buffer, int offset_low, int offset_high,

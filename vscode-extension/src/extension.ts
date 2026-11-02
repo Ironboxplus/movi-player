@@ -50,7 +50,7 @@ let commandPanel: vscode.WebviewPanel | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 
 function getLogChannel(): vscode.OutputChannel {
-  if (!logChannel) logChannel = vscode.window.createOutputChannel("Movi Player");
+  if (!logChannel) logChannel = vscode.window.createOutputChannel("MoviPlayer");
   return logChannel;
 }
 
@@ -660,7 +660,7 @@ async function openCommandPanelWithUrl(
 
   const panel = vscode.window.createWebviewPanel(
     "moviPlayer",
-    title + " — Movi Player",
+    title + " — MoviPlayer",
     column,
     {
       enableScripts: true,
@@ -797,7 +797,9 @@ function renderHtml(webview: vscode.Webview, webviewRoot: vscode.Uri): string {
       "%PLAYER_ATTRS%",
       [
         "controls",
-        "thumb",
+        // "precise": the seek-bar preview shows the frame the pointer is ON,
+        // not the keyframe before it — which on a long-GOP file is seconds away.
+        'thumb="precise"',
         "fastseek",
         "showtitle",
         settings.autoplay ? "autoplay" : "",
@@ -811,6 +813,9 @@ function renderHtml(webview: vscode.Webview, webviewRoot: vscode.Uri): string {
         `theme="${settings.theme}"`,
         settings.ambientMode ? "ambientmode" : "",
         settings.resume ? "resume" : "",
+        // Say so up front when a file won't keep up on this machine, rather
+        // than let the first sign of it be a stutter.
+        "smoothwarning",
       ]
         .filter(Boolean)
         .join(" ")

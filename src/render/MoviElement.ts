@@ -12,6 +12,7 @@
 
 import { MoviPlayer } from "../core/MoviPlayer";
 import { NativeVideoWrapper } from "./NativeVideoWrapper";
+import { loadingIndicatorMarkup, loadingIndicatorStyles } from "./LoadingIndicator";
 import type {
   SourceConfig,
   RendererType,
@@ -21,8 +22,15 @@ import type {
   SubtitleRenderer,
   DecoderType,
   PlayerState,
+  PlaybackAssessment,
+  PlaybackAssessmentOptions,
+  PlaybackQuery,
+  SubtitleCue,
+  DecodeAudioOptions,
+  DecodedAudioChunk,
 } from "../types";
 import { Logger, LogLevel } from "../utils/Logger";
+import type { StoryboardSpec, StoryboardTile } from "../utils/Storyboard";
 import type { SourceAdapter } from "../source/SourceAdapter";
 import { renderStatsPanel } from "./StatsPanel";
 import { HttpSource } from "../source/HttpSource";
@@ -36,112 +44,37 @@ import { IS_SLIM, BUILD } from "../build-flags";
 import { setWasmUrl } from "../wasm/FFmpegLoader";
 import { probeLinkBandwidth } from "../utils/bandwidthProbe";
 import { childAbort } from "../utils/abort";
+import {
+  linkSeedBps,
+  loadPersistedLinkBps,
+  persistLinkBps,
+} from "../utils/LinkRate";
+// Static, though it is used once and only on an encrypted source. It was a
+// dynamic import, and a dynamic import that saves nothing is worse than a
+// static one: the module is re-exported from the public API (src/element.ts and
+// src/source/index.ts both name generateFingerprint), so it is in the bundle
+// regardless, and these are single-chunk library builds with nowhere for it to
+// split off to. All the `await import()` bought was a rollup warning on every
+// one of the ten bundles, and a promise in front of sixty lines of navigator
+// reads.
+import { generateFingerprint } from "../utils/Fingerprint";
 
 const TAG = "MoviElement";
 
 /**
- * Last measured link rate, so the opening pick doesn't have to buy the same
- * number twice.
+ * Content types that mean "this is a playlist, not a file".
  *
- * The pre-play probe used to spend a request and ~3MB measuring a rung it
- * often wasn't going to play. A rate measured minutes ago describes the same
- * link, and the confirm pass — which reads the head of the rung we DO open and
- * keeps those bytes — re-measures it for free on every load. Stale entries are
- * ignored rather than trusted: a link changes (wifi → cellular), and the first
- * load after that should measure again.
+ * The ones servers actually send. Apple's own spelling is
+ * application/vnd.apple.mpegurl; application/x-mpegURL is what most CDNs
+ * emit; the audio/ pair is old but still in the wild.
  */
-const LINK_BPS_KEY = "movi:link-bps";
-// Generous, because a clock is the WEAK test here: an estimate goes stale when
-// the network changes, not when time passes. On the same wifi a day-old number
-// is still true; one minute after switching to cellular it is a lie. The
-// connection signature below is the real check; this is the fallback for
-// browsers that don't expose one (Safari, Firefox).
-const LINK_BPS_TTL_MS = 24 * 60 * 60 * 1000;
-let sessionLinkBps = 0;
-let sessionLinkBpsAt = 0;
-
-type NetInfo = {
-  effectiveType?: string;
-  downlink?: number;
-  addEventListener?: (t: string, fn: () => void) => void;
+const MANIFEST_CONTENT_TYPES: Record<string, "hls" | "dash"> = {
+  "application/vnd.apple.mpegurl": "hls",
+  "application/x-mpegurl": "hls",
+  "audio/mpegurl": "hls",
+  "audio/x-mpegurl": "hls",
+  "application/dash+xml": "dash",
 };
-
-function netInfo(): NetInfo | undefined {
-  return (navigator as unknown as { connection?: NetInfo }).connection;
-}
-
-/** What the link looks like right now — "4g/10" — or "" where unavailable. */
-function connectionSignature(): string {
-  const c = netInfo();
-  if (!c) return "";
-  const dl = typeof c.downlink === "number" ? Math.round(c.downlink) : "";
-  return `${c.effectiveType || ""}/${dl}`;
-}
-
-// Switching networks mid-session invalidates the estimate immediately — no
-// waiting for a TTL that was never measuring the right thing.
-if (typeof navigator !== "undefined") {
-  netInfo()?.addEventListener?.("change", () => {
-    sessionLinkBps = 0;
-    sessionLinkBpsAt = 0;
-    try {
-      localStorage.removeItem(LINK_BPS_KEY);
-    } catch {
-      /* nothing to clear */
-    }
-    Logger.info(TAG, "Connection changed — dropping the remembered link rate");
-  });
-}
-
-function loadPersistedLinkBps(): number {
-  const sig = connectionSignature();
-  if (
-    sessionLinkBps > 0 &&
-    Date.now() - sessionLinkBpsAt < LINK_BPS_TTL_MS &&
-    sessionLinkSig === sig
-  ) {
-    return sessionLinkBps;
-  }
-  try {
-    const raw = localStorage.getItem(LINK_BPS_KEY);
-    if (!raw) return 0;
-    const { bps, ts, sig: storedSig } = JSON.parse(raw) as {
-      bps: number;
-      ts: number;
-      sig?: string;
-    };
-    if (!(bps > 0) || bps > LINK_BPS_SANE_MAX) return 0;
-    if (Date.now() - ts > LINK_BPS_TTL_MS) return 0;
-    // A signature we can read and that disagrees means a different network.
-    // An absent one (either side) just falls back to the TTL.
-    if (sig && storedSig && storedSig !== sig) return 0;
-    return bps;
-  } catch {
-    return 0; // private mode / bad JSON — measure instead
-  }
-}
-
-let sessionLinkSig = "";
-
-// No home link delivers this. Anything above it is a measurement artefact —
-// a cache hit, a clock that barely moved — and remembering it would seed the
-// next load's pick with a number nothing can live up to.
-const LINK_BPS_SANE_MAX = 2_000_000_000;
-
-function persistLinkBps(bps: number): void {
-  if (!(bps > 0) || bps > LINK_BPS_SANE_MAX) return;
-  sessionLinkBps = bps;
-  sessionLinkBpsAt = Date.now();
-  sessionLinkSig = connectionSignature();
-  try {
-    localStorage.setItem(
-      LINK_BPS_KEY,
-      JSON.stringify({ bps, ts: Date.now(), sig: sessionLinkSig }),
-    );
-  } catch {
-    /* storage unavailable — the session value still holds */
-  }
-}
 
 /**
  * The engines that can play a source, in the order the `engine` attribute may
@@ -151,27 +84,243 @@ function persistLinkBps(bps: number): void {
 const ENGINE_NAMES = ["wasm", "shaka", "dashjs", "hlsjs", "native"] as const;
 type EngineName = (typeof ENGINE_NAMES)[number];
 
-// OSD icon constants — shared across keyboard, button, and context menu handlers
+// The controls use one custom symbol family rather than mixing filled Material
+// marks with sharp Feather-style outlines. 1.65px is deliberately between the
+// two old weights: it stays crisp at 16px in menus and calm at 24px in the bar.
+const SYMBOLS = {
+  play: `<path d="M8.66 4.99 L18.06 10.54 A1.7 1.7 0 0 1 18.06 13.46 L8.66 19.01 A1.7 1.7 0 0 1 6.10 17.55 L6.10 6.45 A1.7 1.7 0 0 1 8.66 4.99Z"/>`,
+  pause: `<rect x="6.4" y="4.75" width="3.8" height="14.5" rx="1.45"/><rect x="13.8" y="4.75" width="3.8" height="14.5" rx="1.45"/>`,
+  previous: `<rect x="5.25" y="5" width="2.4" height="14" rx="1.2"/><path d="M18.25 6.1v11.8a1 1 0 0 1-1.55.84l-8.85-5.9a1 1 0 0 1 0-1.68l8.85-5.9a1 1 0 0 1 1.55.84Z"/>`,
+  next: `<rect x="16.35" y="5" width="2.4" height="14" rx="1.2"/><path d="M5.75 6.1v11.8a1 1 0 0 0 1.55.84l8.85-5.9a1 1 0 0 0 0-1.68L7.3 5.26a1 1 0 0 0-1.55.84Z"/>`,
+  volume: `<path d="M4.25 9.2h3.2l4.3-3.55v12.7l-4.3-3.55h-3.2a1.5 1.5 0 0 1-1.5-1.5v-2.6a1.5 1.5 0 0 1 1.5-1.5Z"/>`,
+  volumeLow: `<path d="M15.15 9.05a4.2 4.2 0 0 1 0 5.9"/>`,
+  volumeHigh: `<path d="M15.15 9.05a4.2 4.2 0 0 1 0 5.9M18.15 6.15a8.25 8.25 0 0 1 0 11.7"/>`,
+  mute: `<path d="m16.2 9 5.1 5.1m0-5.1-5.1 5.1"/>`,
+  volumeFull: `<path d="M4.25 9.2h3.2l4.3-3.55v12.7l-4.3-3.55h-3.2a1.5 1.5 0 0 1-1.5-1.5v-2.6a1.5 1.5 0 0 1 1.5-1.5ZM15.15 9.05a4.2 4.2 0 0 1 0 5.9M18.15 6.15a8.25 8.25 0 0 1 0 11.7"/>`,
+  /** The middle step: speaker and ONE wave. Without it the icon jumped from
+   *  both waves to none, which says nothing about the volume in between. */
+  volumeOne: `<path d="M4.25 9.2h3.2l4.3-3.55v12.7l-4.3-3.55h-3.2a1.5 1.5 0 0 1-1.5-1.5v-2.6a1.5 1.5 0 0 1 1.5-1.5ZM15.15 9.05a4.2 4.2 0 0 1 0 5.9"/>`,
+  volumeMuted: `<path d="M4.25 9.2h3.2l4.3-3.55v12.7l-4.3-3.55h-3.2a1.5 1.5 0 0 1-1.5-1.5v-2.6a1.5 1.5 0 0 1 1.5-1.5Zm11.95-.2 5.1 5.1m0-5.1-5.1 5.1"/>`,
+  audio: `<path d="M9 17.4V6.7l10.5-2.15v10.7"/><ellipse cx="6.15" cy="18" rx="2.85" ry="2.35"/><ellipse cx="16.65" cy="15.85" rx="2.85" ry="2.35"/>`,
+  subtitles: `<rect x="2.75" y="4.75" width="18.5" height="14.5" rx="3"/><path d="M6.75 13.25h4.5m2.5 0h3.5M6.75 16.25h3m2.5 0h5"/>`,
+  /* The outline glyph's own silhouette, filled, with the caption rows cut out
+     of it (evenodd) rather than drawn on top: the two are the same icon in two
+     states, so the box must not appear to change size or shape when subtitles
+     come on. The box is grown by half the outline's stroke (0.825) on every
+     side, which is where that stroke's OUTER edge sits, and the rows are the
+     stroked lines' exact stadium silhouettes. */
+  subtitlesFilled: `<path fill-rule="evenodd" d="M5.75 3.93H18.25a3.83 3.83 0 0 1 3.83 3.82V16.25a3.83 3.83 0 0 1-3.83 3.83H5.75a3.83 3.83 0 0 1-3.82-3.83V7.75a3.83 3.83 0 0 1 3.82-3.82Z M6.75 12.425H11.25a.825.825 0 0 1 0 1.65H6.75a.825.825 0 0 1 0-1.65Z M13.75 12.425H17.25a.825.825 0 0 1 0 1.65H13.75a.825.825 0 0 1 0-1.65Z M6.75 15.425H9.75a.825.825 0 0 1 0 1.65H6.75a.825.825 0 0 1 0-1.65Z M12.25 15.425H17.25a.825.825 0 0 1 0 1.65H12.25a.825.825 0 0 1 0-1.65Z"/>`,
+  subtitlesOff: `<rect x="2.75" y="4.75" width="18.5" height="14.5" rx="3"/><path d="M6.75 13.25h4.5m2.5 0h3.5M6.75 16.25h3m2.5 0h5M4.25 3.25l15.5 17.5"/>`,
+  speed: `<path d="M4.7 18.1a9 9 0 1 1 14.6 0"/><path d="m12 12 4.65-3.35"/><circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/>`,
+  stable: `<rect x="2.75" y="4.75" width="18.5" height="14.5" rx="3"/><path d="M6.25 13.5v-3m3 5v-7m3 5.5v-4m3 6v-8m3 5.5v-3"/>`,
+  loop: `<path d="M17.4 5.25H8a4.75 4.75 0 0 0-4.75 4.75v.65M17 2.75l2.75 2.5L17 7.75M6.6 18.75H16A4.75 4.75 0 0 0 20.75 14v-.65M7 21.25l-2.75-2.5L7 16.25"/>`,
+  shuffle: `<path d="M3.5 6.25h2.2c4.8 0 7.05 11.5 12.6 11.5h2.2M17.35 14.6l3.15 3.15-3.15 3.15M3.5 17.75h2.2c2.05 0 3.6-2.1 5.1-4.45M14.1 8.1c1.2-1.1 2.55-1.85 4.2-1.85h2.2M17.35 3.1l3.15 3.15-3.15 3.15"/>`,
+  settings: `<path d="M4 7.25h5m3 0h8M4 16.75h8m3 0h5"/><circle cx="10.5" cy="7.25" r="1.75"/><circle cx="13.5" cy="16.75" r="1.75"/>`,
+  quality: `<rect x="2.75" y="4.25" width="18.5" height="13.5" rx="2.75"/><path d="M8.25 21h7.5M12 17.75V21"/>`,
+  qualityUp: `<rect x="2.75" y="4.25" width="18.5" height="13.5" rx="2.75"/><path d="M8.25 21h7.5M12 17.75V21m0-4.75V8m-2.5 2.5L12 8l2.5 2.5"/>`,
+  aspect: `<rect x="2.75" y="4.25" width="18.5" height="15.5" rx="3"/><rect class="movi-aspect-inner" x="6" y="8" width="12" height="8" rx="1.75"/>`,
+  aspectCover: `<rect x="2.75" y="4.25" width="18.5" height="15.5" rx="3"/><path d="M1.75 8.25h20.5v7.5H1.75z"/>`,
+  aspectFill: `<rect x="2.75" y="4.25" width="18.5" height="15.5" rx="3"/><path d="M6.25 8v8m11.5-8v8"/>`,
+  zoom: `<circle cx="10.75" cy="10.75" r="6.75"/><path d="m15.7 15.7 4.55 4.55M10.75 7.75v6m-3-3h6"/>`,
+  pip: `<rect x="2.75" y="4.25" width="18.5" height="15.5" rx="3"/><rect x="11.5" y="10.5" width="7.25" height="6.25" rx="1.5" fill="currentColor" stroke="none"/>`,
+  chevronLeft: `<path d="m14.5 5.75-6 6.25 6 6.25"/>`,
+  chevronRight: `<path d="m9.5 5.75 6 6.25-6 6.25"/>`,
+  fullscreen: `<path d="M9 3.75H5.75a2 2 0 0 0-2 2V9m11-5.25H18.25a2 2 0 0 1 2 2V9M15 20.25h3.25a2 2 0 0 0 2-2V15m-11 5.25H5.75a2 2 0 0 1-2-2V15"/>`,
+  fullscreenExit: `<path d="M9.25 3.75V8a1.25 1.25 0 0 1-1.25 1.25H3.75m16.5 0H16A1.25 1.25 0 0 1 14.75 8V3.75m0 16.5V16A1.25 1.25 0 0 1 16 14.75h4.25m-16.5 0H8A1.25 1.25 0 0 1 9.25 16v4.25"/>`,
+  more: `<circle cx="12" cy="12" r="9.25"/><circle cx="8" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="16" cy="12" r="1.1" fill="currentColor" stroke="none"/>`,
+  close: `<path d="m7 7 10 10M17 7 7 17"/>`,
+  crop: `<path d="M6.25 3.25v13a1.5 1.5 0 0 0 1.5 1.5h13M17.75 20.75v-13a1.5 1.5 0 0 0-1.5-1.5h-13"/>`,
+  ambient: `<circle cx="12" cy="12" r="4.25"/><path d="M12 2.5v2M12 19.5v2M5.3 5.3l1.4 1.4m10.6 10.6 1.4 1.4M2.5 12h2m15 0h2M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/>`,
+  snapshot: `<path d="M4.75 7.25h2.5l1.4-2h6.7l1.4 2h2.5a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H4.75a2 2 0 0 1-2-2v-8.5a2 2 0 0 1 2-2Z"/><circle cx="12" cy="13" r="3.75"/>`,
+  audioOutput: `<rect x="4.25" y="2.75" width="15.5" height="18.5" rx="3"/><circle cx="12" cy="14" r="3.5"/><circle cx="12" cy="7" r="1" fill="currentColor" stroke="none"/>`,
+  timeline: `<rect x="2.75" y="4" width="5.25" height="4.25" rx="1.25"/><rect x="9.4" y="4" width="5.25" height="4.25" rx="1.25"/><rect x="16" y="4" width="5.25" height="4.25" rx="1.25"/><path d="M3 12h18M3 16h12m-12 4h17"/>`,
+  stats: `<path d="M4.5 20V15m5 5V9.5m5 10.5V12m5 8V4"/>`,
+  keyboard: `<rect x="2.25" y="5.75" width="19.5" height="12.5" rx="2.75"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6.25 14h11.5"/>`,
+  transcript: `<path d="M8 6.5h12m-12 5.5h12M8 17.5h12"/><circle cx="3.75" cy="6.5" r="1" fill="currentColor" stroke="none"/><circle cx="3.75" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="3.75" cy="17.5" r="1" fill="currentColor" stroke="none"/>`,
+  backToTab: `<path d="M14.75 3.75h5.5v5.5m-11 11h-5.5v-5.5m16.5-11-7 7m-9.5 9.5 7-7"/>`,
+  rotate: `<path d="M20.25 8.5A8.75 8.75 0 1 0 20 16M20.25 3.75V8.5H15.5"/>`,
+  seekBackward: `<path d="M5.9 7.15A8.4 8.4 0 1 1 3.6 12M5.9 3.85 2.4 7.15l3.5 3.3"/><text x="12" y="14.5" font-size="6.3" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-weight="650" fill="currentColor" text-anchor="middle" stroke="none">10</text>`,
+  seekForward: `<path d="M18.1 7.15A8.4 8.4 0 1 0 20.4 12M18.1 3.85l3.5 3.3-3.5 3.3"/><text x="12" y="14.5" font-size="6.3" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-weight="650" fill="currentColor" text-anchor="middle" stroke="none">10</text>`,
+
+  /* The marks below were written inline at their one call site, in whatever
+     weight and box that spot wanted, before there was anywhere to put them.
+     They are here now for one reason: setIcon can only answer for a glyph that
+     has a NAME, and "any icon, anywhere" is not a promise a table can keep with
+     a third of the player's marks outside it. Each keeps the weight and box it
+     was drawn at — this move is a rehousing, not a redraw, and the two cards
+     below are 140x100 rather than 24-square because they are illustrations
+     rather than glyphs. */
+
+  /** The error screen's card stack: two cards and a warning badge. Its parts
+   *  are coloured by class from the stylesheet, so it takes no paint here. */
+  errorCards: {
+    viewBox: "0 0 140 100",
+    raw: true,
+    body: `<rect class="movi-broken-card-back" x="22" y="10" width="94" height="66" rx="14" transform="rotate(-13 69 43)"/><rect class="movi-broken-card-front" x="28" y="25" width="100" height="66" rx="15"/><rect class="movi-broken-card-badge" x="42" y="39" width="19" height="17" rx="4.5"/><path class="movi-broken-card-mark" d="M51.5 43.2v5M51.5 51.9h.01"/>`,
+  },
+  /** The same stack with a play mark instead of the warning: nothing loaded. */
+  emptyCards: {
+    viewBox: "0 0 140 100",
+    raw: true,
+    body: `<rect class="movi-empty-card-back" x="22" y="10" width="94" height="66" rx="14" transform="rotate(-13 69 43)"/><rect class="movi-empty-card-front" x="28" y="25" width="100" height="66" rx="15"/><rect class="movi-empty-card-detail" x="42" y="39" width="19" height="17" rx="4.5"/><path class="movi-empty-card-play" d="M49 43.5v8l6.5-4-6.5-4Z"/>`,
+  },
+  retry: {
+    stroke: 1.75,
+    size: 16,
+    body: `<path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/>`,
+  },
+  /** Four corners turning inward — the error screen's way out of fullscreen. */
+  collapse: {
+    stroke: 1.75,
+    size: 16,
+    body: `<path d="M8.5 3.5v3a2 2 0 0 1-2 2h-3M20.5 8.5h-3a2 2 0 0 1-2-2v-3M3.5 15.5h3a2 2 0 0 1 2 2v3M15.5 20.5v-3a2 2 0 0 1 2-2h3"/>`,
+  },
+  pipPlaceholder: {
+    stroke: 1.4,
+    body: `<rect x="2" y="4" width="20" height="16" rx="2"></rect><rect x="12" y="12" width="8" height="6" rx="1" fill="currentColor" stroke="none"></rect>`,
+  },
+  holdSpeed: {
+    filled: true,
+    body: `<path d="M4 5l8 7-8 7V5zm9 0l8 7-8 7V5z"/>`,
+  },
+  hdr: {
+    stroke: 1.75,
+    body: `<path d="M5 7v10M5 12h5M10 7v10M14 7h6a3 3 0 0 1 0 6h-6M17 13l3 4"></path>`,
+  },
+  /** Three stacked dots: the corner gear's own mark. */
+  dots: {
+    filled: true,
+    body: `<circle cx="12" cy="5.5" r="2.3"/><circle cx="12" cy="12" r="2.3"/><circle cx="12" cy="18.5" r="2.3"/>`,
+  },
+  chevronLeftBold: { stroke: 1.9, body: `<polyline points="15 18 9 12 15 6"/>` },
+  chevronRightBold: { stroke: 1.9, body: `<polyline points="9 18 15 12 9 6"/>` },
+  warning: {
+    stroke: 2,
+    body: `<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>`,
+  },
+  closeThin: {
+    stroke: 2.2,
+    body: `<line x1="6" y1="6" x2="18" y2="18"/><line x1="6" y1="18" x2="18" y2="6"/>`,
+  },
+  search: {
+    stroke: 1.75,
+    size: 14,
+    body: `<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>`,
+  },
+  chevronsLeft: { stroke: 1.75, body: `<path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/>` },
+  chevronsRight: { stroke: 1.75, body: `<path d="M13 17l5-5-5-5M6 17l5-5-5-5"/>` },
+  replay: {
+    stroke: 1.75,
+    body: `<path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>`,
+  },
+  /** The menus' back and forward chevrons. Lighter and squarer than the
+   *  chevronLeft/chevronRight pair the bar uses, which is why both exist. */
+  chevronBack: { stroke: 1.75, body: `<path d="M15 18l-6-6 6-6"/>` },
+  chevronForward: { stroke: 1.75, body: `<path d="M9 18l6-6-6-6"/>` },
+  /** The dot beside a track that is not the chosen one. */
+  trackItem: {
+    body: `<circle cx="12" cy="12" r="8.75"/><path d="M7.75 12h8.5"/>`,
+  },
+  check: { stroke: 2.1, body: `<path d="m5.25 12.25 4.15 4.15 9.35-9.35"/>` },
+  volumeOff: {
+    stroke: 1.75,
+    body: `<path d="M11 5L6 9H2v6h4l5 4V5z"></path><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line>`,
+  },
+  volumeWave: {
+    stroke: 1.75,
+    body: `<path d="M11 5L6 9H2v6h4l5 4V5z"></path><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>`,
+  },
+  volumeWaves: {
+    stroke: 1.75,
+    body: `<path d="M11 5L6 9H2v6h4l5 4V5z"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>`,
+  },
+  plus: { stroke: 1.75, size: 16, body: `<path d="M12 5v14M5 12h14"/>` },
+  info: {
+    stroke: 1.75,
+    body: `<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>`,
+  },
+  /** The speaker with a cross through it that the "Tap to unmute" pill wears.
+   *  Heavier than volumeOff beside it — the pill is the one mark on the picture
+   *  with nothing around it to be read against. */
+  unmute: {
+    stroke: 2,
+    body: `<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>`,
+  },
+  /** A dial with its needle: what a speed change puts on the OSD. */
+  stopwatch: {
+    stroke: 1.75,
+    body: `<path d="M5.64 18.36a9 9 0 1 1 12.72 0"></path><path d="m12 12 4-4"></path>`,
+  },
+} as const;
+
+type SymbolName = keyof typeof SYMBOLS;
+
+/** A mark that is not drawn the family's way: its own weight, box or size. */
+interface SymbolSpec {
+  body: string;
+  filled?: boolean;
+  stroke?: number;
+  viewBox?: string;
+  /** Painted by its own children, or by the stylesheet: give it neither fill
+   *  nor stroke of the player's choosing. */
+  raw?: boolean;
+  /** Laid out by attribute rather than by CSS, where the mark sits somewhere
+   *  the stylesheet does not size. */
+  size?: number;
+}
+
+const symbolSpec = (name: SymbolName): SymbolSpec => {
+  const entry = SYMBOLS[name] as string | SymbolSpec;
+  return typeof entry === "string" ? { body: entry } : entry;
+};
+
+const symbolSvg = (
+  name: SymbolName,
+  className = "",
+  options: { filled?: boolean; hidden?: boolean } = {},
+): string => {
+  const spec = symbolSpec(name);
+  const filled = options.filled ?? spec.filled ?? false;
+  const classes = ["movi-symbol", className].filter(Boolean).join(" ");
+  const paint = spec.raw
+    ? `fill="none"`
+    : filled
+      ? `fill="currentColor" stroke="none"`
+      : `fill="none" stroke="currentColor" stroke-width="${spec.stroke ?? 1.65}" stroke-linecap="round" stroke-linejoin="round"`;
+  const hidden = options.hidden ? ` style="display: none;"` : "";
+  // data-icon is how setIcon finds a glyph again — every one of these, wherever
+  // it ends up (the bar, a menu row, the OSD, the PiP window), says which
+  // symbol it is. data-filled records which of the two paint styles it was
+  // drawn with, so putting the built-in back is exact rather than a guess.
+  // part="icon" is the CSS half: a part is the END of a selector, so
+  // ::part(play-button) svg selects nothing and the glyphs need a part of
+  // their own to be sizeable or recolourable from the page at all.
+  const filledMark = filled ? ` data-filled=""` : "";
+  const size = spec.size ? ` width="${spec.size}" height="${spec.size}"` : "";
+  return `<svg class="${classes}" part="icon" data-icon="${name}"${filledMark} viewBox="${spec.viewBox ?? "0 0 24 24"}" ${paint}${size} aria-hidden="true"${hidden}>${spec.body}</svg>`;
+};
+
+// OSD icons share the exact geometry used by the controls, so a keyboard
+// action and the button that represents it never appear to be different tools.
 const OSD = {
-  loop: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>`,
-  stableAudio: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 15v-2M9 15v-4M12 15v-6M15 15v-4M18 15v-2"/></svg>`,
-  hdr: `<span style="font-weight:700;font-size:14px;letter-spacing:1px;padding:4px 10px;border:2px solid currentColor;border-radius:var(--movi-radius-tile,6px);">HDR</span>`,
-  speed: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5.64 18.36a9 9 0 1 1 12.72 0"/><path d="m12 12 4-4"/></svg>`,
-  audio: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`,
-  subOn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="14" x="3" y="5" rx="2"/><path d="M7 15h4M13 15h4"/></svg>`,
-  subOff: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="14" x="3" y="5" rx="2"/><path d="M7 15h4M13 15h4"/><line x1="3" y1="5" x2="21" y2="19" stroke-width="2.5"/></svg>`,
-  snapshot: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>`,
-  rotate: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>`,
-  muted: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`,
-  unmuted: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`,
-  crop: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>`,
-  ambient: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>`,
-  seekBackward: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /><text x="50%" y="54%" font-size="7" font-family="sans-serif" font-weight="bold" fill="currentColor" text-anchor="middle" dominant-baseline="middle" stroke="none">10</text></svg>`,
-  // Plain monitor: the picture's quality changed, without claiming a direction.
-  quality: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>`,
-  // The same monitor with the arrow reversed: the picture, stepped back up.
-  qualityUp: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8"/><path d="M12 13V7"/><path d="m9.5 9.5 2.5-2.5 2.5 2.5"/></svg>`,
-  seekForward: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" /><text x="50%" y="54%" font-size="7" font-family="sans-serif" font-weight="bold" fill="currentColor" text-anchor="middle" dominant-baseline="middle" stroke="none">10</text></svg>`,
+  loop: symbolSvg("loop"),
+  shuffle: symbolSvg("shuffle"),
+  stableAudio: symbolSvg("stable"),
+  hdr: `<span style="font-weight:650;font-size:13px;letter-spacing:.08em;padding:4px 9px;border:1.65px solid currentColor;border-radius:7px;">HDR</span>`,
+  speed: symbolSvg("speed"),
+  audio: symbolSvg("audio"),
+  subOn: symbolSvg("subtitles"),
+  subOff: symbolSvg("subtitlesOff"),
+  snapshot: symbolSvg("snapshot"),
+  rotate: symbolSvg("rotate"),
+  muted: symbolSvg("volumeMuted"),
+  unmuted: symbolSvg("volumeFull"),
+  crop: symbolSvg("crop"),
+  ambient: symbolSvg("ambient"),
+  seekBackward: symbolSvg("seekBackward"),
+  quality: symbolSvg("quality"),
+  qualityUp: symbolSvg("qualityUp"),
+  seekForward: symbolSvg("seekForward"),
 } as const;
 
 /**
@@ -223,6 +372,39 @@ export interface MoviOverlaySpec {
   onDismiss?: (reason: string, player: MoviElement) => void;
 }
 
+/**
+ * Where the pointer last was on screen, from every mousemove on the page.
+ *
+ * The browser fires mouseenter — and a mousemove — at a pointer that never
+ * moved when the page moves under it instead: a scroll, or a layout that
+ * shifts. A host that scrolls to the top when a new video is picked from a
+ * list below the player (MoviTube, on a narrow window) puts the player under a
+ * resting pointer, and the bar went up over an autoplay start as if the viewer
+ * had hovered it — or not, depending on where the pointer happened to be.
+ * Recorded in the capture phase, so it holds the position from BEFORE any
+ * boundary event the next real move produces (those are dispatched first).
+ */
+let lastPointerScreen: { x: number; y: number } | null = null;
+if (typeof document !== "undefined") {
+  document.addEventListener(
+    "mousemove",
+    (e) => {
+      lastPointerScreen = { x: e.screenX, y: e.screenY };
+    },
+    { capture: true, passive: true },
+  );
+}
+
+/** Did the pointer actually move to produce this event? See lastPointerScreen. */
+function pointerReallyMoved(e: MouseEvent): boolean {
+  if (e.type === "mousemove") return e.movementX !== 0 || e.movementY !== 0;
+  return (
+    !lastPointerScreen ||
+    e.screenX !== lastPointerScreen.x ||
+    e.screenY !== lastPointerScreen.y
+  );
+}
+
 /** "512kb" / "2mb" / "1048576" → bytes. Anything unreadable means the default. */
 function parseByteSize(value: string | null): number {
   if (!value) return 0;
@@ -232,6 +414,40 @@ function parseByteSize(value: string | null): number {
   const unit = m[2];
   const mult = unit?.startsWith("m") ? 1024 * 1024 : unit?.startsWith("k") ? 1024 : 1;
   return Math.max(0, Math.floor(n * mult));
+}
+
+/**
+ * One entry in a queue of things to play.
+ *
+ * `src` is the only part that must be there. The rest is what the PLAYER would
+ * otherwise have to guess between items — the heading over the picture, the
+ * still shown before the first frame, where in the video to come in — and each
+ * is owned by the item rather than the element, so it goes away again when the
+ * queue moves on to something that doesn't carry one.
+ *
+ * A bare string is accepted anywhere an item is, and means `{ src }`.
+ */
+export interface MoviPlaylistItem {
+  /**
+   * What to play. Optional, because a page whose sources are `<source>` /
+   * `<track>` children — a quality ladder, per-language audio, subtitle tracks
+   * — cannot say any of that in one URL, and neither can a page where each
+   * item is its own route. Those queues leave `src` off, cancel `itemchange`,
+   * and load the item themselves; see MoviElement.playlist.
+   */
+  src?: string | File;
+  /** The host's own name for this item, handed back on `itemchange`. The
+   *  element never reads it — it is there so a queue of src-less items has
+   *  something to be identified BY. */
+  id?: string;
+  /** Heading over the picture, and the name the OS media session announces. */
+  title?: string;
+  /** Still shown before this item's first frame. */
+  poster?: string;
+  /** Where to come in, in seconds. */
+  startAt?: number;
+  /** Anything else the host put on the item is carried through untouched. */
+  [key: string]: unknown;
 }
 
 /** One row of a custom control's submenu. */
@@ -287,6 +503,8 @@ export interface MoviControlSpec {
   anchors?: {
     bar?: { before?: string | string[]; after?: string | string[] };
     menu?: { before?: string | string[]; after?: string | string[] };
+    top?: { before?: string | string[]; after?: string | string[] };
+    center?: { before?: string | string[]; after?: string | string[] };
   };
   /** WHICH capsule it sits in — the bar draws one behind each group of
    *  controls, and this says which group this one belongs to.
@@ -306,8 +524,58 @@ export interface MoviControlSpec {
    *  what it belongs WITH. A control can sit beside the subtitles button and
    *  still be in nobody's capsule. */
   group?: "play" | "seek" | "volume" | "time" | "settings" | "none" | (string & {});
-  /** Where it appears. Default "bar". */
-  placement?: "bar" | "menu" | "both";
+  /** Which surface (or surfaces) it appears on. Default "bar".
+   *
+   *    "bar"   the control bar along the bottom
+   *    "center" the MIDDLE of that bar — the free width between the left run
+   *            and the settings run, which the player itself never puts
+   *            anything in. Its own surface and not a side of "bar", because
+   *            it is not one: `side`, `group` and every built-in anchor
+   *            describe the two runs, and the middle is neither of them. A
+   *            control here is ordered only against the host's OWN other
+   *            centre controls, by id.
+   *
+   *            The middle is also the first thing to go when the bar runs out
+   *            of room — the clusters grow towards each other and a control
+   *            drawn across the clock is worse than one that stepped aside —
+   *            so it suits a control that is an offer rather than a duty.
+   *            Paired with `screen: "fullscreen"` it is the "Suggestions" /
+   *            "Up next" affordance a full-screen player has the width for
+   *            and a 320px embed does not.
+   *    "top"   the top-right corner, beside the three-dots button that opens
+   *            the context menu on touch — the corner a player puts the things
+   *            that are ABOUT the session rather than about playback: cast,
+   *            share, close. Shown on every device, not only touch: the
+   *            three-dots is a touch affordance (a mouse has right-click), the
+   *            corner is not.
+   *    "menu"  a row in the context menu
+   *    "both"  bar and menu, which is what it has always meant
+   *
+   * A LIST puts one control on several surfaces — ["top", "menu"] is the
+   * arrangement a cast button wants, reachable in the corner while watching
+   * and still named in the long list. "both" stays exactly what it was, so
+   * nothing written against the old three values changes meaning.
+   *
+   * The corner is a row like the bar is, and it is ordered the same way: with
+   * `before`/`after`, against a built-in, against another of the host's
+   * controls by id, or against `"dots"` — the three-dots itself, which is one
+   * member of that row and not a fixture at its end. A control that names no
+   * anchor goes in front of the three-dots, so the corner still ENDS with it
+   * unless someone asks for otherwise; `after: "dots"` is that asking. The
+   * order holds on touch and on desktop alike — the three-dots is hidden where
+   * there is a right-click to open the menu with, and the row simply closes up
+   * around it.
+   *
+   * `group` and `side` describe the bar and are ignored there. Its tooltip is
+   * the browser's, like the three-dots' own — the player's tooltip belongs to
+   * the bar and points at it. */
+  placement?:
+    | "bar"
+    | "center"
+    | "menu"
+    | "top"
+    | "both"
+    | Array<"bar" | "center" | "menu" | "top">;
   /** WHICH kind of media it belongs to. Default "both".
    *
    *  The player collapses to an audio presentation when the media has no
@@ -324,6 +592,25 @@ export interface MoviControlSpec {
    *  Enforced in CSS against the host's audio class, so it follows a source
    *  swap from video to audio with no work from the host. */
   media?: "video" | "audio" | "both";
+  /** WHERE the player has to be for this control to exist. Default "both".
+   *
+   *    "fullscreen"  only while the player is fullscreen
+   *    "windowed"    only while it is not
+   *    "both"        always (the default)
+   *
+   *  The same words `titlemode` uses, and for the same reason: fullscreen is a
+   *  different amount of room and a different amount of attention. A control
+   *  that would crowd a 360px embed has a whole screen to sit in once the
+   *  viewer has committed to watching, and a control that only makes sense
+   *  beside the page it came from should not follow them out of it.
+   *
+   *  Every fullscreen route counts — native, a host-driven one (see
+   *  `setHostFullscreen`) and the iOS pseudo-fullscreen fallback — so the
+   *  control appears and disappears on its own with no work from the host.
+   *  Like `media`, a scoped-out control leaves the bar, the corner, the
+   *  context menu AND the shortcuts panel, and its hotkey stops firing: an
+   *  invisible control with a live key is worse than no control. */
+  screen?: "fullscreen" | "windowed" | "both";
   /** A toggle carries state: pressed styling, On/Off in the menu, and the
    *  boolean handed to onSelect. Without it, a plain button. */
   toggle?: boolean;
@@ -367,6 +654,39 @@ export interface MoviControlSpec {
   // and get a state-aware icon in the bar and in the menu with no help from
   // the player.
   onSelect?: (active: boolean, player: MoviElement) => void;
+}
+
+/**
+ * A divider the HOST adds — the same quiet line the player draws between its
+ * track controls and its viewing controls, put wherever the host's own
+ * controls want one. Passed to addControl like any control:
+ *
+ * ```ts
+ *   player.addControl({ id: "sep", divider: true, after: "cc" });
+ *   player.addControl({ id: "sep2", divider: true, group: "extras" });
+ * ```
+ *
+ * Placed, grouped, scoped and removed exactly as a control is — same anchors,
+ * same `group` (so it can sit INSIDE a capsule), same `controlslist` token by
+ * its id. On the bar, the centre or the corner it is a vertical line; in the
+ * context menu, the menu's own horizontal rule. A divider left with nothing
+ * visible on one side of it inside its row or capsule hides itself, so a
+ * control that is unavailable for this source doesn't strand a line at the
+ * end of a pill. Styled by --movi-divider-color / -width / -height / -gap and
+ * ::part(controls-divider), which reach the built-in one too.
+ */
+export interface MoviDividerSpec {
+  /** Unique; the handle for removeControl and the controlslist token. */
+  id: string;
+  divider: true;
+  side?: MoviControlSpec["side"];
+  before?: MoviControlSpec["before"];
+  after?: MoviControlSpec["after"];
+  anchors?: MoviControlSpec["anchors"];
+  group?: MoviControlSpec["group"];
+  placement?: MoviControlSpec["placement"];
+  media?: MoviControlSpec["media"];
+  screen?: MoviControlSpec["screen"];
 }
 
 /** How bright the ambient colour is allowed to READ, in luminance. Low on
@@ -454,6 +774,15 @@ const SHORTCUT_ACTIONS: Record<
   speedup: { keys: ["+", "="], canonical: "+", label: "Speed up" },
   speeddown: { keys: ["-"], canonical: "-", label: "Speed down" },
   shortcuts: { keys: ["?"], canonical: "?", label: "Shortcuts panel" },
+  /* Shift, because N and P on their own are worth more to a host than they are
+     to a queue most sources never have — and because Shift+N/Shift+P is what
+     every viewer who has used a playlist already has in their fingers. */
+  nexttrack: { keys: ["shift+n"], canonical: "shift+n", label: "Next in queue" },
+  prevtrack: {
+    keys: ["shift+p"],
+    canonical: "shift+p",
+    label: "Previous in queue",
+  },
 };
 
 /** Every key the table above claims by default, for deciding whether a press
@@ -545,7 +874,19 @@ export class MoviElement extends HTMLElement {
   // to sinks (and a `movi-qoe` DOM event). Heartbeats while playing.
   private _qoe = new QoECollector();
   private _qoeHeartbeat: number | null = null;
-  private player: MoviPlayer | null = null;
+  /**
+   * The engine behind the element: the `MoviPlayer` that loads, decodes and
+   * plays the current source. For what the element does not forward —
+   * `getPreviewFrame()`, `getMediaInfo()`, `getCacheStats()` and the rest of
+   * the core API.
+   *
+   * Read it, don't assign it, and don't keep it: the element builds a new one
+   * for every source (and on some recoveries) and destroys the old one, so a
+   * reference held across a `loadstart` points at a player that is gone. Take
+   * it after `loadeddata`. `null` before the first load and after `src` is
+   * cleared.
+   */
+  player: MoviPlayer | null = null;
   private isLoading: boolean = false;
   private _isUnsupported: boolean = false;
   private eventHandlers: Map<string, () => void> = new Map();
@@ -577,6 +918,12 @@ export class MoviElement extends HTMLElement {
   private coverArtOverlay: HTMLDivElement | null = null;
   private coverArtCanvas: HTMLCanvasElement | null = null;
   private coverArtBitmap: ImageBitmap | null = null;
+  /** The dotted level meter drawn along the scrubber in cover-art mode. */
+  private _eqCanvas: HTMLCanvasElement | null = null;
+  private _eqRaf: number | null = null;
+  private _eqSmoothed: Float32Array | null = null;
+  /** The loudest band seen lately — the meter is drawn relative to it. */
+  private _eqPeak = 0;
   // For an audio-only source with NO embedded album art but a `poster` URL, the
   // poster is loaded into a bitmap and painted through the same cover-art canvas
   // (blurred backdrop + centered) so it reads as album art instead of the bare
@@ -587,6 +934,14 @@ export class MoviElement extends HTMLElement {
   // Blurred-backdrop element behind the sharp-art canvas — CSS filter:blur()
   // (cross-browser Gaussian, unlike canvas ctx.filter).
   private _coverArtBgEl: HTMLDivElement | null = null;
+  // Palette sampled from the current sleeve. It colours only the ambient
+  // lighting (never controls/text), so contrast stays predictable while each
+  // record still gives the player its own visual temperature.
+  private _coverPaletteBitmap: ImageBitmap | null = null;
+  private _coverPalette: {
+    accent: [number, number, number];
+    secondary: [number, number, number];
+  } | null = null;
   // A small data URL of the embedded album art, generated once per source, so
   // the CSS-blurred backdrop can point at it too (background-image needs a URL;
   // the embedded art arrives as an ImageBitmap with none).
@@ -599,8 +954,16 @@ export class MoviElement extends HTMLElement {
   // load() (unlike the movi-audio-strip class) so a strip↔non-strip switch is
   // detected even across a source change. null = never told the page yet.
   private _lastStripDispatched: boolean | null = null;
+  // Whether the player last had sound alone. Survives load(), which clears the
+  // classes — see the fullscreen exit in updateAudioStripLayout.
+  private _lastAudioModeSeen: boolean | null = null;
   private controlsTimeout: number | null = null;
   private isOverControls: boolean = false;
+  /** Document-level "you tapped somewhere else" — see where it is set up. */
+  private _outsideTapHandler: ((e: Event) => void) | null = null;
+  private _settingsOutsideHandler: ((e: Event) => void) | null = null;
+  /** The bar's post-touch re-show, pending — cancellable by a tap elsewhere. */
+  private _barTouchReshowTimer: number | undefined;
   private isSeeking: boolean = false;
   private pendingSeekTarget: number | null = null; // Coalesces rapid currentTime sets while a seek is in flight
   private _pendingSeek: number | null = null; // Seek requested before the player was ready; applied on the next seekable state
@@ -608,6 +971,10 @@ export class MoviElement extends HTMLElement {
   /** The chapter section currently raised under the pointer, so the playback
    *  tick can keep its paint current without re-scanning every segment. */
   private _hoveredChapter: HTMLElement | null = null;
+  /** Media time the pointer is over on the seek bar, or -1 when it is off it.
+   *  Kept so the tick can repaint the hover range against a moving playhead —
+   *  see paintSeekRangeHover. */
+  private _hoverBarTime: number = -1;
   private isTouchDragging: boolean = false;
 
   // Gesture tracking
@@ -676,7 +1043,7 @@ export class MoviElement extends HTMLElement {
   // cooldown so it never nags.
   private _stutterInterval: number | null = null;
   private _stutterLastPresented: number = 0;
-  private _stutterSeconds: number = 0;
+  private _stutterHistory: boolean[] = [];
   private _stutterCooldown: boolean = false;
   private _stutterCooldownTimer: number | null = null;
   // Warm-up deadline after a rate change: the decoder needs a moment to ramp
@@ -738,9 +1105,37 @@ export class MoviElement extends HTMLElement {
   // over the first frame during the brief pre-play startup window even
   // though the player is about to start on its own.
   private _autoplayStarting: boolean = false;
+  /** Pending "did startup really stop?" check — see the paused branch in the
+   *  state handler. */
+  private _autoplayPausedTimer: number | undefined;
   /** Set when pause() lands before playback has started, so the pending
    *  autoplay/queued play doesn't fire once loading finishes. */
   private _startCancelled: boolean = false;
+  /** "The viewer asked for this pause." Set by pause(), cleared by play() and
+   *  by dispose(), which every source change runs through — so it never
+   *  carries a decision about one video over to the next. The unmute pill
+   *  reads it: unmuting must not restart a video someone stopped on purpose.
+   *  Separate from _startCancelled, which the autoplay path owns. */
+  private _pauseWasAskedFor: boolean = false;
+  /**
+   * "A seek is under way and playback is meant to continue through it."
+   *
+   * The play/pause glyph reads intent, not raw state, so a stall cannot bounce
+   * it — but intent is only reported for `playing`, `buffering` and `seeking`,
+   * and a seek does not always land back on one of those. seekFromEvent has
+   * known this all along: it checks whether the player came out of a seek NOT
+   * playing and puts it back 100ms later. For those 100ms, plus however long
+   * the resume itself takes, the state is `paused` or `ready` and every icon
+   * flipped to "play" and back — a blink after every scrub, on the bar and on
+   * the centre button together.
+   *
+   * Held from the seek that starts it until playback genuinely resumes, the
+   * viewer asks for a pause, or the source ends. Backstopped by a timer, so a
+   * resume that never comes leaves an honest "play" behind rather than a glyph
+   * that lies for the rest of the session.
+   */
+  private _iconHeldForSeek: boolean = false;
+  private _iconHoldTimer: number | null = null;
   /**
    * Bumped by every initializePlayer(), and only there — a load() that bumps
    * on its own can invalidate a live init without starting one to replace it.
@@ -774,7 +1169,31 @@ export class MoviElement extends HTMLElement {
   // for) from the synthetic "paused" state the initial poster seek
   // lands in before the user has even pressed play.
   private _hasEverPlayed: boolean = false;
+  /**
+   * Whether `play` has been announced and not yet answered by `pause` — the
+   * element's own idea of "currently playing", which keeps the pair ordered
+   * and stops a startup state change from reporting a pause nobody asked for.
+   */
+  private _playFired: boolean = false;
+  /**
+   * The paused flag, in the sense a media element means it: not "is a frame
+   * being painted right now" but "has playback been asked for and not
+   * stopped". It flips on play() and pause(), and at the end of the media —
+   * which is why buffering, seeking and a slow start all still read as
+   * playing, exactly as they do on a <video>.
+   */
+  private _playIntent: boolean = false;
+  /** A pause waiting to see whether it was really a seek — see the state handler. */
+  private _pauseAnnounceTimer: number | null = null;
+  /** The seek target already announced, so the same one is not announced twice. */
+  private _seekAnnouncedFor: number | null = null;
   private _pendingPlay: boolean = false;
+  /**
+   * The last play() came from a script with no gesture behind it — a page
+   * autoplaying by calling play() rather than by declaring `autoplay`. See
+   * play().
+   */
+  private _playUnprompted: boolean = false;
   // True while loading spinner + play() must wait for FileSource preload to
   // complete (mobile only, height >= 2160). Released by the player's
   // 'preloadcomplete' event, which always fires once preload settles.
@@ -790,17 +1209,79 @@ export class MoviElement extends HTMLElement {
   // poster (or flashing an old-source poster during a switch).
   private _posterGenId: number = 0;
   private _controls: boolean = false;
+  /** What `loop` was asked for. `_loop` is the ITEM half of it, kept as its
+   *  own boolean because everything that guards on "this never ends" — the
+   *  suppressed `ended`, the suppressed pause, the gapless turn — means the
+   *  item and not the queue. */
+  private _loopMode: "off" | "one" | "all" = "off";
   private _loop: boolean = false;
   private _muted: boolean = false;
   private _playsinline: boolean = false;
   private _preload: "none" | "metadata" | "auto" = "auto";
   private _poster: string = "";
+  /** Which of the two sizes this element wrote itself (see applySizeAttributes). */
+  private _sizedByAttr: { width: boolean; height: boolean } = {
+    width: false,
+    height: false,
+  };
   private _volume: number = 1.0;
   private _playbackRate: number = 1.0;
   // Subtitle delay in seconds (VLC/mpv sign convention). Not persisted to
   // SettingsStorage — sync drift is per-source, so a global value would
   // mis-shift unrelated videos.
   private _subtitleDelay: number = 0;
+  /**
+   * The wait a page gets without asking for one.
+   *
+   * A ring that comes and goes before it can be read is not information — it
+   * is a player reporting a fault over playback that is about to be fine, and
+   * opening a local file is the case where that happens every single time:
+   * the file is there, the open takes a few hundred milliseconds, and the
+   * viewer is shown a "something is wrong" for all of them. So the honest
+   * default is a wait, not an instant ring: anything the player sorts out
+   * inside it, the viewer never hears about.
+   *
+   * The opening gets longer than a mid-play stall, for the reason the two are
+   * separate at all — a video that has not started has its poster up and looks
+   * like it is starting, while one that stops mid-picture has frozen and wants
+   * reporting sooner.
+   *
+   * `spinnerdelay` overrides both, and `spinnerdelay="0"` is how a page asks
+   * for the ring the instant anything loads, which is what this did before.
+   */
+  private static readonly DEFAULT_SPINNER_DELAY_S = 1;
+  private static readonly DEFAULT_SPINNER_DELAY_OPENING_S = 2;
+
+  // How long an interruption has to last before the viewer is shown a spinner,
+  // in seconds. Not persisted and not a viewer setting: it describes what this
+  // page is serving, not what this viewer prefers. See spinnerDelayMs.
+  private _spinnerDelay: number = MoviElement.DEFAULT_SPINNER_DELAY_S;
+  // The same, for the stretch before this source has ever put a frame up.
+  // One number sets both; `spinnerdelay="1 2"` splits them. See spinnerDelayMs.
+  private _spinnerDelayOpening: number | null =
+    MoviElement.DEFAULT_SPINNER_DELAY_OPENING_S;
+
+  /**
+   * How long to wait before putting the OPENING poster up, in milliseconds.
+   *
+   * Zero — show it at once — is the default, because that is what every host
+   * using this today already gets and a poster is the honest thing to show
+   * while a video loads.
+   *
+   * It stops being honest when the video does not need loading. A host that
+   * prefetches (movi-tube warms the next video's first bytes, so the picture
+   * lands in ~300ms) shows a thumbnail that is gone again before it has been
+   * read: the viewer sees a flash where nothing was wrong. `posterdelay="600"`
+   * says "only cover this if it is actually going to take a moment" — under
+   * that, the poster never appears at all and the picture is simply there.
+   *
+   * The same shape as spinnerdelay above, and for the same reason: a wait that
+   * resolves inside the delay is a wait the viewer never needs to hear about.
+   */
+  private _posterDelayMs: number = 0;
+  // The pending opening poster, if one is waiting out `posterdelay`. Cleared
+  // when the frame beats it — see hidePoster.
+  private _posterDelayTimer: ReturnType<typeof setTimeout> | null = null;
   // Host-supplied pluggable subtitle renderer (e.g. jassub/libass). Stored so it
   // survives a source change: re-applied to each fresh player instance.
   private _subtitleRenderer: SubtitleRenderer | null = null;
@@ -812,11 +1293,22 @@ export class MoviElement extends HTMLElement {
     color: string;
     bgAlpha: number;
     edge: "none" | "shadow" | "outline" | "raised";
+    /**
+     * Where the viewer dragged the caption to, as a percentage of the overlay
+     * box — never pixels. The box is the picture, so a share of it means the
+     * same place on a phone, on a desktop and in fullscreen, and the caption
+     * does not have to be re-placed when any of those change. 0,0 is where the
+     * renderer puts it.
+     */
+    posX: number;
+    posY: number;
   } = {
     sizeMult: 1,
     color: "#FFFFFF",
     bgAlpha: 0.75,
     edge: "shadow",
+    posX: 0,
+    posY: 0,
   };
   private _ambientMode: boolean = false;
   private _renderer: RendererType = "canvas";
@@ -839,6 +1331,277 @@ export class MoviElement extends HTMLElement {
   private _rotate = 0;
   private _currentFit: "contain" | "cover" | "fill" | "zoom" = "contain"; // Actual fit being applied
   private _thumb: boolean = false;
+  /**
+   * thumb="precise": show the frame the pointer is ON rather than the keyframe
+   * before it. Opt-in, because it decodes the run of frames in between — see
+   * MoviPlayer.setPrecisePreviews.
+   */
+  private _thumbPrecise: boolean = false;
+
+  /**
+   * video.js's `data-setup`: the options a page would otherwise pass to a
+   * constructor, written on the element as JSON.
+   *
+   * Markup written for that player should work here with the tag name changed
+   * and nothing else, and `data-setup` is the one piece of it that is not an
+   * attribute this element already answers to. So the keys are turned into
+   * those attributes — and an attribute already written wins, since it is the
+   * more specific statement of the two.
+   */
+  private applyDataSetup(): void {
+    const raw = this.getAttribute("data-setup");
+    if (!raw || !raw.trim()) return;
+    let setup: Record<string, unknown>;
+    try {
+      setup = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      Logger.warn(TAG, "data-setup is not valid JSON — ignoring it");
+      return;
+    }
+    const put = (attr: string, value: unknown) => {
+      if (value === undefined || value === null || this.hasAttribute(attr)) return;
+      if (typeof value === "boolean") {
+        if (value) this.setAttribute(attr, "");
+        return;
+      }
+      this.setAttribute(attr, String(value));
+    };
+    put("controls", setup.controls);
+    put("autoplay", setup.autoplay);
+    put("loop", setup.loop);
+    put("muted", setup.muted);
+    put("poster", setup.poster);
+    put("preload", setup.preload);
+    put("playsinline", setup.playsinline);
+    put("width", setup.width);
+    put("height", setup.height);
+
+    // sources: [{ src, type }] — the first playable one, since the element
+    // takes a single src (a ladder goes in <source> children, as it does there).
+    const sources = setup.sources;
+    if (Array.isArray(sources) && sources.length > 0 && !this.hasAttribute("src")) {
+      const first = sources.find(
+        (s) => s && typeof (s as { src?: string }).src === "string",
+      ) as { src?: string } | undefined;
+      if (first?.src) this.setAttribute("src", first.src);
+    }
+
+    // spriteThumbnails: the videojs-sprite-thumbnails plugin's options, which
+    // this player takes as a storyboard spec unchanged.
+    const sprite = setup.spriteThumbnails as
+      | {
+          url?: string;
+          width?: number;
+          height?: number;
+          columns?: number;
+          rows?: number;
+          interval?: number;
+        }
+      | undefined;
+    if (sprite?.url && sprite.width && sprite.height && sprite.columns) {
+      this.storyboard = {
+        url: sprite.url,
+        width: sprite.width,
+        height: sprite.height,
+        columns: sprite.columns,
+        ...(sprite.rows ? { rows: sprite.rows } : {}),
+        ...(sprite.interval ? { interval: sprite.interval } : {}),
+      };
+    }
+  }
+
+  /**
+   * A thumbnail track declared the way other players declare it.
+   *
+   * video.js carries scrub previews on `<track kind="metadata"
+   * label="thumbnails">`, because `kind` is a fixed HTML enum with no value for
+   * this and `metadata` is the one it does have. That is the spelling read
+   * here, and the only way to DECLARE a board: there is no attribute of our
+   * own for it, because a thumbnail track is a track and the players that have
+   * them already write one. The `storyboard` PROPERTY takes a spec object, for
+   * a board worked out at runtime rather than written in the markup.
+   */
+  private static thumbnailTrackSrc(host: HTMLElement): string | null {
+    for (const track of Array.from(host.querySelectorAll("track"))) {
+      const src = track.getAttribute("src");
+      if (!src) continue;
+      const kind = (track.getAttribute("kind") || "").trim().toLowerCase();
+      const label = (track.getAttribute("label") || "").trim().toLowerCase();
+      const named = /thumbnail|storyboard|sprite/.test(label);
+      if (kind === "metadata" && named) return src;
+    }
+    return null;
+  }
+
+  /**
+   * The RemotePlayback object, when there is something that has one.
+   *
+   * Casting an AirPlay/Remote Playback target needs a real media element, and
+   * on the WASM path the picture is a canvas — there is nothing to hand over.
+   * In native fallback the `<video>` underneath is the real thing, so code
+   * written against `video.remote` reaches it. Null otherwise, which is what a
+   * caller has to handle anyway on a browser without the API.
+   */
+  get remote(): unknown {
+    return (this.video as unknown as { remote?: unknown } | null)?.remote ?? null;
+  }
+
+  /** thumb="precise" — anything else (including a bare `thumb`) is keyframes. */
+  private static wantsPrecisePreviews(value: string | null): boolean {
+    return (value || "").trim().toLowerCase() === "precise";
+  }
+
+  /**
+   * Scrub previews the source already has: a WebVTT thumbnail track (the
+   * attribute), or a tile spec (the property, which is the shape YouTube
+   * publishes). Either way the preview becomes a crop out of a mosaic instead
+   * of a seek and a decode — see MoviPlayer.setStoryboard.
+   */
+  private _storyboard: string | StoryboardSpec | null = null;
+  /** The task in which the board was set, against the counter below. */
+  private _storyboardTask = -1;
+  /** …and when, for the swaps that reach the load a microtask later. */
+  private _storyboardSetAt = 0;
+  /** How close to a source change a board still counts as having come with it. */
+  private static readonly STORYBOARD_TOGETHER_MS = 500;
+  /** The task the host last wrote a source in, and whether a load owes it an answer. */
+  private _srcAssignedTask = -2;
+  private _srcAssignedPending = false;
+  private _taskId = 0;
+  private _taskOpen = false;
+
+  /**
+   * An id for the run of code we are in — the same for everything up to the
+   * next microtask checkpoint, different after it. Enough to tell "these two
+   * lines were written together" from "this happened later", which is the only
+   * question asked of it.
+   */
+  private currentTaskId(): number {
+    if (!this._taskOpen) {
+      this._taskOpen = true;
+      this._taskId++;
+      queueMicrotask(() => {
+        this._taskOpen = false;
+      });
+    }
+    return this._taskId;
+  }
+
+  /**
+   * A new source arrives with no thumbnails of its own until it is given some.
+   *
+   * A board set through the PROPERTY is an object describing one video: the
+   * frames in it are that video's frames, so carrying it into the next source
+   * means hovering the new video and being shown the old one — which is what a
+   * page swapping `src` and then fetching the new board (a route change, then
+   * an API call) saw on every first hover. Unless the two were written
+   * together, in which case the board came WITH the source and stays.
+   *
+   * A board declared in the MARKUP is a different statement: the attribute (or
+   * a <track>) is still there, still says what it says, and is re-read here
+   * rather than thrown away.
+   */
+  /**
+   * The host has written a new source. Remembered rather than acted on: the
+   * load it starts runs a task later, and the question this answers is only
+   * legible now —
+   *
+   *   el.storyboard = board; el.src = url;          ← written together
+   *   el.src = url;          el.storyboard = board;  ← also together
+   *   el.src = url;          … an API call later …   ← the board is the old
+   *                                                    video's
+   *
+   * — which is a comparison of WHEN, not of order.
+   */
+  private noteSourceAssigned(): void {
+    this._srcAssignedTask = this.currentTaskId();
+    this._srcAssignedPending = true;
+  }
+
+  private dropStaleStoryboard(hadPreviousSource: boolean): void {
+    // Only a source the HOST wrote invalidates a board. The reloads the player
+    // does for itself — a rendition recreate, walking to the next <source> —
+    // are the same video, and its thumbnails are still its thumbnails.
+    if (!this._srcAssignedPending) return;
+    this._srcAssignedPending = false;
+    // Nothing to be stale against on a first load: there is no previous video
+    // whose pictures could be shown, so a board set well before the source —
+    // prepared, then started — is simply this video's board.
+    const cameWithIt =
+      !hadPreviousSource ||
+      this._storyboardTask === this._srcAssignedTask ||
+      // A swap declared through the CHILDREN reaches the reload a microtask
+      // later than the render that wrote them, so the task no longer matches
+      // even when the board was handed over in the same breath. Written within
+      // a moment of the source is the same statement; a board from the video
+      // before this one was written seconds ago, with that video.
+      performance.now() - this._storyboardSetAt <
+        MoviElement.STORYBOARD_TOGETHER_MS;
+    if (
+      !cameWithIt &&
+      typeof this._storyboard === "object" &&
+      this._storyboard !== null
+    ) {
+      this._storyboard = null;
+      this.player?.setStoryboard(null);
+    }
+    if (typeof this._storyboard !== "object" || this._storyboard === null) {
+      this._storyboard = MoviElement.thumbnailTrackSrc(this);
+    }
+  }
+
+  /**
+   * Wipe what is painted on the preview card.
+   *
+   * The tile layer keeps the mosaic it last painted as a background, and the
+   * frame beside it keeps its object URL, so both survive a source change and
+   * the first hover on the new video answered with the old one's picture. The
+   * card is only ever repainted by a hover, so it has to be emptied here.
+   */
+  private clearPreviewSurfaces(): void {
+    const sr = this.shadowRoot;
+    if (!sr) return;
+    const tile = sr.querySelector(".movi-thumbnail-tile") as HTMLElement | null;
+    if (tile) {
+      tile.style.removeProperty("background-image");
+      tile.style.display = "none";
+    }
+    const img = sr.querySelector(".movi-thumbnail-img") as HTMLImageElement | null;
+    if (img) {
+      img.removeAttribute("src");
+      img.style.display = "none";
+    }
+    const placeholder = sr.querySelector(
+      ".movi-thumbnail-placeholder",
+    ) as HTMLElement | null;
+    if (placeholder) placeholder.style.display = "none";
+    // The mosaics of a video nobody is watching any more. Keyed by URL, so
+    // they were never going to be painted by mistake — they were just held
+    // decoded, one set per video, for as long as the page lived.
+    this._sheetWarm.clear();
+  }
+
+  get storyboard(): string | StoryboardSpec | null {
+    return this._storyboard;
+  }
+
+  set storyboard(value: string | StoryboardSpec | null) {
+    this._storyboard = value ?? null;
+    // Which source this board was meant for. A board handed over as an object
+    // describes one particular video, and the only thing tying it to that
+    // video is when it was set — so remember the moment, and let a source
+    // change decide from that whether the board came with it or belongs to the
+    // video before it (see dropStaleStoryboard).
+    this._storyboardTask = this.currentTaskId();
+    this._storyboardSetAt = performance.now();
+    this.player?.setStoryboard(this._storyboard);
+    this.warmStoryboardSheets();
+    // A board is cheap enough to be worth showing without `thumb` being asked
+    // for; the decode pipeline behind that attribute is what was expensive.
+    this.player?.setPreviewsEnabled(
+      (this._thumb || !!this._storyboard) && !this._audioOnly,
+    );
+  }
   // True once the source falls back to linear (forward-only) playback: server
   // has no Range support and the file is too big to cache whole. Hides the
   // timeline and disables seeking + thumbnails.
@@ -876,6 +1639,11 @@ export class MoviElement extends HTMLElement {
   // escalation walks the author's list once instead of retrying the same one.
   private _engineTried = new Set<EngineName>();
   private _streamEngineNext: "dashjs" | "hlsjs" | null = null;
+  // A manifest whose URL never admitted to being one. `_forcedStreamTried` is
+  // the one-shot guard (reset on a new source); `_forcedStreamNext` is
+  // consumed into the next load's config, exactly like the pair above.
+  private _forcedStreamTried = false;
+  private _forcedStreamNext: "hls" | "dash" | null = null;
   // Video Representation URL the user picked in the demuxer-mode DASH quality
   // menu. Carried into the next initializePlayer() as config.forceVideoRendition
   // so the re-load lands on that rendition. Reset on a genuine src change.
@@ -915,6 +1683,58 @@ export class MoviElement extends HTMLElement {
   private _bufferSize: number = 0; // Custom buffer size in seconds
   private _title: string | null = null; // Video title to display
   private _showTitle: boolean = false; // Show title at top if true
+  /** `subtitlepicker` — offer "Add subtitle…" in the subtitle menu. */
+  private _subtitlePicker: boolean = false;
+  /** `smoothwarning` — say so when this source is not expected to play
+   *  smoothly here. See checkSmoothPlayback. */
+  private _smoothWarning: boolean = false;
+  /** `nolinkwarning` — keep smoothwarning on but never raise the link-budget
+   *  notice ("this media needs about N Mbps"). For hosts that serve local
+   *  files over HTTP — the desktop shell streams the user's own disk from
+   *  127.0.0.1, so the player sees a sized HTTP source, probes loopback, and
+   *  blames a connection that doesn't exist. The decode notices stay. */
+  private _noLinkWarning: boolean = false;
+  /** The source and speed last judged, so the same question is not asked —
+   *  or answered with a popup — twice. */
+  private _smoothWarnKey: string | null = null;
+  /** Whether the MEASURED notice has been shown for the source now loaded — see
+   *  the decode-bound branch in sampleStutter. Cleared with the source. */
+  private _smoothWarnedByMeasurement = false;
+  private _warnedLinkBudget = false;
+  private _linkProbeAbort: AbortController | null = null;
+  /** Buffering episodes since this source started — see sampleLinkBudget. */
+  private _linkStalls = 0;
+  /** Of those, the stalls with a read parked on the network — evidence about
+   *  the delivery that holds even when the device reads slow too. */
+  private _deliveryStalls = 0;
+  /** How many stalls before a low reading is allowed to become a verdict. One
+   *  is a hiccup; a file the link cannot carry does it again and again. */
+  private static readonly LINK_BUDGET_STALLS = 2;
+  /** How many probes to take the best of — see bestLinkBps. */
+  private static readonly LINK_PROBE_TRIES = 3;
+  /** Spacing between them, long enough that two do not measure the same dip. */
+  private static readonly LINK_PROBE_GAP_MS = 1500;
+
+  /** The rounding step at a given speed, so the figure lands where connection
+   *  speeds actually land: singles below 10, fives to 50, tens above. */
+  private static mbpsStep(mbps: number): number {
+    return mbps < 10 ? 1 : mbps < 50 ? 5 : 10;
+  }
+
+  /** Bits per second as a round number of Mbps. Never zero — a link too slow to
+   *  round to one is still "about 1", and "about 0 Mbps" is not a sentence. */
+  private static niceMbps(bps: number): number {
+    const m = bps / 1_000_000;
+    const step = MoviElement.mbpsStep(m);
+    return Math.max(Math.round(m / step) * step, 1);
+  }
+
+  private _smoothWarnTimer: number | null = null;
+  /** Bumped per check: a slower answer for a source or speed that has since
+   *  changed must not put up a popup about the old one. */
+  private _smoothCheckSeq = 0;
+  /** Object URLs minted for picked subtitle files, revoked on teardown. */
+  private _pickedSubtitleUrls: string[] = [];
   /** Where the title bar is allowed to appear — see `applyTitleMode`. */
   private _titleMode: "both" | "fullscreen" | "windowed" = "both";
   /** Whether the title bar carries a back arrow (`titlemode` "back" token). */
@@ -923,7 +1743,23 @@ export class MoviElement extends HTMLElement {
   private _titleBackMobileOnly: boolean = false;
   /** Back arrow restricted to fullscreen (`titlemode` "back-fullscreen"). */
   private _titleBackFullscreenOnly: boolean = false;
+  /** Back arrow dropped in fullscreen (`titlemode` "back-windowed"). */
+  private _titleBackWindowedOnly: boolean = false;
   private _resume: boolean = false; // Resume playback from last position (opt-in)
+  // What the saved position is filed under, when the host would rather say so
+  // itself than let the title decide (see getResumeKey).
+  private _resumeKey: string = "";
+  /**
+   * Where the outgoing media was when the host swapped the `<source>` children,
+   * filed under its `resumekey`. Taken by the next load if the key still
+   * matches — see _reloadFromSourceChildren.
+   */
+  private _refreshCarry: {
+    key: string;
+    t: number;
+    playing: boolean;
+    rate: number;
+  } | null = null;
   /** Crop the black bars that are baked into the picture — see `cropbars`. */
   private _cropBars = false;
   /** Let autoplay start while the tab is hidden — see `backgroundplay`. */
@@ -1046,6 +1882,8 @@ export class MoviElement extends HTMLElement {
 
   private _onVisibilityChange = () => {
     if (document.visibilityState === "hidden") {
+      // The tab may be discarded from here on — see saveDiscardState.
+      this.saveDiscardState();
       // Capture last visible frame BEFORE the OS may kill the GL context.
       if (this.canvas) {
         try {
@@ -1090,6 +1928,296 @@ export class MoviElement extends HTMLElement {
    * `VERSION` export from `movi-player/element`.
    */
   static readonly version: string = VERSION;
+
+  /**
+   * Will this play smoothly on this device, in this browser, at this speed —
+   * asked before committing to playing it.
+   *
+   *   const a = await MoviElement.canPlaySmoothly("https://cdn.example/film.mkv");
+   *   if (!a.smooth) showLowerQualityOption(a.reasons);
+   *
+   *   await MoviElement.canPlaySmoothly(file, { rate: 2 });   // a File, at 2x
+   *   await MoviElement.canPlaySmoothly({ codec: "av1", width: 3840, height: 2160, fps: 60 });
+   *
+   * A URL or File is opened just long enough to read its tracks, on its own
+   * WASM instance, so a player already playing is not disturbed. A
+   * PlaybackQuery needs no file at all. Resolves — never rejects — with
+   * `playable`, `smooth`, `powerEfficient`, which decoder would carry the
+   * video, and plain-language `reasons` for anything short of smooth.
+   *
+   * This is the same judgement the player acts on when it picks a rendition,
+   * so the answer and the behaviour cannot disagree. See
+   * MoviPlayer.assessPlayback for how it is reached.
+   */
+  static canPlaySmoothly(
+    input: string | File | Blob | PlaybackQuery,
+    options?: PlaybackAssessmentOptions,
+  ): Promise<PlaybackAssessment> {
+    return MoviPlayer.assessPlayback(input, options);
+  }
+
+  /**
+   * The same question about what this element is playing — or about to play.
+   *
+   * Uses the tracks already open when there are any, and opens `src` when there
+   * are not. Judged at the element's own current speed unless `rate` says
+   * otherwise, since that is the speed the viewer will actually get.
+   */
+  /**
+   * Decode the audio of a URL or File to mono PCM chunks (16 kHz by default),
+   * without playing it. See MoviPlayer.decodeAudio.
+   */
+  static decodeAudio(
+    input: string | File | Blob,
+    options?: DecodeAudioOptions,
+  ): AsyncGenerator<DecodedAudioChunk> {
+    return MoviPlayer.decodeAudio(input, options);
+  }
+
+  /** The same, for what this element has loaded. Empty if nothing is. */
+  decodeAudio(options?: DecodeAudioOptions): AsyncGenerator<DecodedAudioChunk> {
+    const src = this._src;
+    if (!src) {
+      return (async function* () {})();
+    }
+    return MoviPlayer.decodeAudio(src, options);
+  }
+
+  /**
+   * Add cues to a generated subtitle track — "English (auto)" written by speech
+   * recognition as it goes. The first call for a `lang` puts the track in the
+   * subtitle menu; later calls extend it, in any order. `select: true` switches
+   * it on, without recording it as the viewer's own subtitle choice.
+   * `pending: true` lists the track straight away with a working indicator in
+   * the menus, before there is a cue to show; the first cue clears it, as does
+   * `pending: false` when none are coming.
+   * Returns false when nothing is loaded to attach it to.
+   */
+  appendSubtitleCues(
+    cues: SubtitleCue[],
+    options: { lang: string; label: string; select?: boolean; pending?: boolean },
+  ): boolean {
+    if (!this.player) return false;
+    this.player.appendSubtitleCues(options.lang, options.label, cues, options.pending);
+    this.updateSubtitleTrackMenu();
+    this.refreshOpenContextMenu();
+    if (options.select) {
+      const active = this.player
+        .getSubtitleLangs()
+        .find((l) => l.active)?.lang;
+      if (active !== options.lang) void this.player.selectSubtitleLang(options.lang);
+    }
+    return true;
+  }
+
+  /**
+   * Take a generated subtitle track out of the menus, cues and all — the
+   * captions were switched off before any were made, say. Subtitles go off if
+   * it was showing. False if there is no such track.
+   */
+  removeSubtitleCues(lang: string): boolean {
+    if (!this.player?.removeSubtitleCues(lang)) return false;
+    this.updateSubtitleTrackMenu();
+    this.refreshOpenContextMenu();
+    return true;
+  }
+
+  /**
+   * `smoothwarning`: show a notice when what is loaded is not expected to play
+   * smoothly on this device at the current speed — "This video may not play
+   * smoothly", with the reason. Off by default. Mirrors the attribute.
+   */
+  get smoothWarning(): boolean {
+    return this._smoothWarning;
+  }
+
+  set smoothWarning(value: boolean) {
+    if (value) this.setAttribute("smoothwarning", "");
+    else this.removeAttribute("smoothwarning");
+  }
+
+  /** Present, and not a framework writing it off as "false". */
+  private isSmoothWarningOn(value: string | null): boolean {
+    return value !== null && value !== "false";
+  }
+
+  /**
+   * `nolinkwarning`: suppress only the link-budget notice while smoothwarning
+   * is on. See _noLinkWarning for who needs this. Mirrors the attribute.
+   */
+  get noLinkWarning(): boolean {
+    return this._noLinkWarning;
+  }
+
+  set noLinkWarning(value: boolean) {
+    if (value) this.setAttribute("nolinkwarning", "");
+    else this.removeAttribute("nolinkwarning");
+  }
+
+  /**
+   * Ask canPlaySmoothly about what is loaded, and say so if the answer is no.
+   *
+   * Asked when a source finishes loading and again whenever the speed changes,
+   * because speed is half the question: a 4K file can be fine at 1x and not at
+   * 2x. This is the PREDICTION; the stutter hint ("Play at 1x for smoother
+   * playback") is the MEASUREMENT, raised only after eight bad seconds. They
+   * answer different moments and both stay.
+   *
+   * Only for sources this player demuxes itself. An adaptive stream or the
+   * native fallback has no tracks here to judge, and asking about its URL
+   * instead would open a manifest as if it were a file and report it
+   * unplayable while it plays perfectly well.
+   *
+   * Fires a cancelable `smoothwarning` event first, carrying the assessment
+   * and `media: "video" | "audio"`; preventDefault() keeps the built-in notice
+   * down for a host that shows its own.
+   */
+  private async checkSmoothPlayback(): Promise<void> {
+    if (!this._smoothWarning || !this.player) return;
+    const tracks = this.player.getMediaInfo?.()?.tracks;
+    if (!tracks || tracks.length === 0) return;
+
+    const rate = this._playbackRate;
+    const src =
+      typeof this._src === "string" ? this._src : this._src?.name ?? "";
+    const key = `${src}@${rate}`;
+    if (key === this._smoothWarnKey) return;
+    const seq = ++this._smoothCheckSeq;
+
+    const assessment = await this.canPlaySmoothly({ rate });
+    if (seq !== this._smoothCheckSeq || !this._smoothWarning) return;
+    this._smoothWarnKey = key;
+
+    if (assessment.smooth) {
+      // A speed that fixes it takes the notice down with it.
+      this.hideSmoothWarning();
+      return;
+    }
+    const media: "video" | "audio" = assessment.video ? "video" : "audio";
+    // Is it the SPEED? One more question at normal speed — free once the
+    // tracks are open — decides which of two very different things to say.
+    const fineAtNormalSpeed =
+      rate !== 1 && assessment.playable
+        ? (await this.canPlaySmoothly({ rate: 1 })).smooth
+        : false;
+    if (seq !== this._smoothCheckSeq || !this._smoothWarning) return;
+    const message = MoviElement.plainSmoothMessage(
+      assessment,
+      media,
+      fineAtNormalSpeed,
+    );
+    const allowed = this.dispatchEvent(
+      new CustomEvent("smoothwarning", {
+        detail: { ...assessment, media, message },
+        cancelable: true,
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    if (!allowed) return;
+    this.showSmoothWarning(message);
+  }
+
+  /**
+   * What the notice says, in words for the person watching.
+   *
+   * `reasons` are for developers — codec strings, pixel counts, budgets — and
+   * put in front of a viewer they read as an error log. The viewer needs two
+   * things: will this be a problem, and is there anything they can do. So the
+   * technical reasons stay in the event and the API, and this is written from
+   * the verdict instead. The one piece of advice given is the one that is
+   * always true when it is given: if the file is fine at normal speed, say
+   * so. "Try a lower quality" is not offered — a local file has none.
+   */
+  private static plainSmoothMessage(
+    assessment: PlaybackAssessment,
+    media: "video" | "audio",
+    fineAtNormalSpeed: boolean,
+  ): { title: string; body: string } {
+    if (!assessment.playable) {
+      return {
+        title: `This ${media} can't be played on this device`,
+        body: `Your device or browser doesn't support this ${media}'s format.`,
+      };
+    }
+    if (fineAtNormalSpeed) {
+      return {
+        title: `This ${media} may not play smoothly at ${assessment.rate}× speed`,
+        body: "It plays fine at normal speed — switch back to 1× if it stutters.",
+      };
+    }
+    if (media === "audio") {
+      return {
+        title: "This audio may not play smoothly on this device",
+        body: "Your device may have trouble keeping up, so you might hear gaps or skips.",
+      };
+    }
+    return {
+      title: "This video may not play smoothly on this device",
+      body: "It's very demanding for this device, so it may stutter or lag.",
+    };
+  }
+
+  private showSmoothWarning(message: { title: string; body: string }): void {
+    const el = this.shadowRoot?.querySelector(
+      ".movi-smooth-warning",
+    ) as HTMLElement | null;
+    if (!el) return;
+    const titleEl = el.querySelector(".movi-smooth-warning-title");
+    const reasonEl = el.querySelector(".movi-smooth-warning-reason");
+    if (titleEl) titleEl.textContent = message.title;
+    if (reasonEl) reasonEl.textContent = message.body;
+    el.style.animation = "";
+    el.style.display = "flex";
+    if (this._smoothWarnTimer !== null) clearTimeout(this._smoothWarnTimer);
+    // Long enough to read a sentence, short enough not to sit on the picture.
+    this._smoothWarnTimer = window.setTimeout(() => {
+      this._smoothWarnTimer = null;
+      el.style.animation = "movi-resume-fade-out 0.4s ease forwards";
+      window.setTimeout(() => {
+        if (el.style.animation.startsWith("movi-resume-fade-out")) {
+          el.style.display = "none";
+          el.style.animation = "";
+        }
+      }, 400);
+    }, 12000);
+  }
+
+  private hideSmoothWarning(): void {
+    if (this._smoothWarnTimer !== null) {
+      clearTimeout(this._smoothWarnTimer);
+      this._smoothWarnTimer = null;
+    }
+    const el = this.shadowRoot?.querySelector(
+      ".movi-smooth-warning",
+    ) as HTMLElement | null;
+    if (el) {
+      el.style.display = "none";
+      el.style.animation = "";
+    }
+  }
+
+  canPlaySmoothly(
+    options: PlaybackAssessmentOptions = {},
+  ): Promise<PlaybackAssessment> {
+    const rate = options.rate ?? this.playbackRate;
+    const tracks = this.player?.getMediaInfo?.()?.tracks;
+    if (tracks && tracks.length > 0) {
+      return MoviPlayer.assessPlayback(tracks, { rate });
+    }
+    if (this._src) {
+      return MoviPlayer.assessPlayback(this._src, { rate });
+    }
+    return Promise.resolve({
+      playable: false,
+      smooth: false,
+      powerEfficient: false,
+      rate,
+      video: null,
+      audio: null,
+      reasons: ["No source is loaded."],
+    });
+  }
 
   /** Instance mirror of {@link MoviElement.version}. */
   get version(): string {
@@ -1167,6 +2295,7 @@ export class MoviElement extends HTMLElement {
   static get observedAttributes() {
     return [
       "src",
+      "autopictureinpicture",
       "autoplay",
       "controls",
       "loop",
@@ -1207,11 +2336,15 @@ export class MoviElement extends HTMLElement {
       "doubletap",
       "themecolor",
       "buffersize",
+      "spinnerdelay",
+      "posterdelay",
       "title",
       "showtitle",
       "titlemode",
+      "subtitlepicker",
       "chapters",
       "resume",
+      "resumekey",
       "stablevolume",
       "encrypted",
       "tokenurl",
@@ -1236,6 +2369,12 @@ export class MoviElement extends HTMLElement {
       "controlslist",
       "disablepictureinpicture",
       "disableremoteplayback",
+      "playlist",
+      "playlistindex",
+      "autoadvance",
+      "shuffle",
+      "smoothwarning",
+      "nolinkwarning",
     ];
   }
 
@@ -1294,6 +2433,7 @@ export class MoviElement extends HTMLElement {
     // Create poster image element (overlay on video/canvas)
     this.posterElement = document.createElement("img");
     this.posterElement.className = "movi-poster-overlay";
+    this.posterElement.setAttribute("part", "poster");
     // Pages that ship Cross-Origin-Embedder-Policy: require-corp will block
     // cross-origin images that aren't loaded with CORS. Without this, a host
     // page that opts into COEP gets a silent black overlay instead of the
@@ -1315,9 +2455,25 @@ export class MoviElement extends HTMLElement {
         // otherwise the one poster that arrives after a failure is the one that
         // paints in stripes.
         void this.showPoster(`https://i.ytimg.com/vi/${m[1]}/hqdefault.jpg`);
-      } else {
-        this.hidePoster();
+        return;
       }
+      // CORS is asked for above because a COEP page cannot load a cross-origin
+      // image without it — not because anything here reads these pixels. A
+      // site's own poster is very often on a CDN that sends no CORS header at
+      // all, and then the only thing wrong with the request is the thing we
+      // added to it: measured on a page whose poster host answers with no
+      // Access-Control-Allow-Origin, where every attempt failed and the
+      // overlay went black.
+      //
+      // So ask once more without it. Once per URL, so a poster that is simply
+      // missing still ends at hidePoster rather than looping.
+      if (this.posterElement.crossOrigin && this._posterNoCorsUrl !== url) {
+        this._posterNoCorsUrl = url;
+        this.posterElement.crossOrigin = null;
+        this.posterElement.src = url;
+        return;
+      }
+      this.hidePoster();
     });
     this.posterElement.style.position = "absolute";
     this.posterElement.style.top = "0";
@@ -1364,6 +2520,7 @@ export class MoviElement extends HTMLElement {
     // live region below is their source, so the overlay is aria-hidden.
     this.subtitleOverlay = document.createElement("div");
     this.subtitleOverlay.className = "movi-subtitle-overlay";
+    this.subtitleOverlay.setAttribute("part", "subtitle-area");
     this.subtitleOverlay.setAttribute("aria-hidden", "true");
     shadowRoot.appendChild(this.subtitleOverlay);
 
@@ -1397,66 +2554,69 @@ export class MoviElement extends HTMLElement {
     // Transcript is gated to file sources — streamed sources can't
     // reliably hand back the full cue list.
     this.subtitleOverlay.addEventListener("click", (e) => {
+      // The click that ends a drag is not a click on the caption, it is where
+      // the caption was let go of — and under pointer capture it is aimed at
+      // the overlay rather than at the caption, so this is asked first or the
+      // click falls through to the picture and pauses the video.
+      if (this._subtitleDragSuppressClick) {
+        this._subtitleDragSuppressClick = false;
+        e.stopPropagation();
+        return;
+      }
       const target = e.target as HTMLElement | null;
       if (!target?.closest(".movi-subtitle-block")) return;
       if (!this.player?.isFileSource()) return;
       e.stopPropagation();
-      void this.openCuesPanel();
+      // Held for one double-click interval, because the first click of the
+      // reset gesture lands here: opening the transcript and closing it again
+      // a moment later is worse than a fifth of a second's wait to open it.
+      if (this._captionClickTimer !== null) {
+        window.clearTimeout(this._captionClickTimer);
+      }
+      this._captionClickTimer = window.setTimeout(() => {
+        this._captionClickTimer = null;
+        void this.openCuesPanel();
+      }, 220);
     });
+
+    this.wireSubtitleDrag();
 
     // Create loading indicator (positioned over video area)
     const loadingIndicator = document.createElement("div");
     loadingIndicator.className = "movi-loading-indicator";
     loadingIndicator.style.display = "none";
-    // The play mark, with a segment running round it.
-    //
-    // A ring is the spinner every other page uses and says nothing about what
-    // is being waited for. This is the same idea — a short bright arc chasing
-    // its own track — run around the player's own triangle instead of a
-    // circle: the shape means "video", the lap means "working on it". The
-    // outline stays put, so it stays readable as a play mark while it turns.
-    //
-    // The dash is written in the path's OWN units, not normalised.
-    //
-    // pathLength="100" would let the segment and its offset be plain
-    // percentages of the way round, which is how this was first built — but
-    // WebKit does not honour pathLength when it computes dashes, so in Safari
-    // "28 72" was measured against the real perimeter of 67.27 instead of
-    // against 100. The pattern was then longer than the shape it ran on, and
-    // the chase came out as a static box rather than a segment travelling the
-    // triangle. The awkward numbers below are that same 28%/72% split written
-    // out in user units, which every engine reads the same way.
-    loadingIndicator.innerHTML = `
-      <div class="movi-loader-container">
-        <svg class="movi-loader-mark" viewBox="0 0 48 48" aria-hidden="true">
-          <path class="movi-loader-track" d="M18 12L36 24L18 36Z" />
-          <path class="movi-loader-chase" d="M18 12L36 24L18 36Z" />
-        </svg>
-      </div>
-    `;
+    loadingIndicator.setAttribute("role", "status");
+    loadingIndicator.setAttribute("aria-label", "Loading video");
+    loadingIndicator.setAttribute("part", "spinner");
+    // The ribbon is the SLOT'S FALLBACK, not the slot's content: a host that
+    // supplies <div slot="spinner"> replaces it outright, and one that does not
+    // gets the built-in exactly as before. Replacing it this way keeps the part
+    // the player owns — when the ring is on screen, where it sits, and that it
+    // never shares the middle with the play button — and hands over only the
+    // drawing, which is the half a host actually wants to change.
+    // eslint-disable-next-line no-unsanitized/property -- static template, no user data
+    loadingIndicator.innerHTML = `<slot name="spinner">${loadingIndicatorMarkup}</slot>`;
     shadowRoot.appendChild(loadingIndicator);
 
     // Create centered play/pause button
     const centerPlayPause = document.createElement("button");
     centerPlayPause.className = "movi-center-play-pause";
+    centerPlayPause.setAttribute("part", "center-button");
     centerPlayPause.setAttribute("aria-label", "Play/Pause");
     centerPlayPause.innerHTML = `
-      <!-- Filled AND stroked with a round linejoin: that is what softens the
-           three corners, and it costs nothing next to hand-authoring the arcs.
-           The triangle is drawn inset by half the stroke so the painted shape
-           lands where the sharp one did instead of growing by 1.3px a side. -->
-      <svg class="movi-center-icon-play" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round">
-        <path d="M6.4 5.6L17.6 12L6.4 18.4Z"></path>
-      </svg>
-      <svg class="movi-center-icon-pause" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
-        <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"></path>
-      </svg>
+      ${symbolSvg("play", "movi-center-icon-play", { filled: true })}
+      ${symbolSvg("pause", "movi-center-icon-pause", { filled: true, hidden: true })}
     `;
     shadowRoot.appendChild(centerPlayPause);
 
     // Create broken indicator
     this.brokenIndicator = document.createElement("div");
     this.brokenIndicator.className = "movi-broken-indicator";
+    // error-screen: the backdrop. Documented since the error screen shipped and
+    // missing from the markup until now — the reference named the part, the
+    // "Replace it" section told hosts to override it to drop the backdrop, and
+    // nothing carried it.
+    this.brokenIndicator.setAttribute("part", "error-screen");
     this.brokenIndicator.style.display = "none";
     // part= on every piece a host might want to restyle. ::part() reaches
     // into the shadow root without exposing the markup as an API — the
@@ -1465,37 +2625,35 @@ export class MoviElement extends HTMLElement {
     // to replace the markup outright rather than restyle it.
     this.brokenIndicator.innerHTML = `
       <slot name="error"></slot>
+      <div class="movi-broken-stage">
       <div class="movi-broken-container" part="error-container">
         <div class="movi-broken-icon-wrapper" part="error-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M10.75 3H13.25C17.5 3 21 6.5 21 10.75V13.25C21 17.5 17.5 21 13.25 21H10.75C6.5 21 3 17.5 3 13.25V10.75C3 6.5 6.5 3 10.75 3Z" fill="rgba(255, 68, 68, 0.05)"/>
-            <path d="M12 8V12" stroke="#ff4444"/>
-            <path d="M12 16H12.01" stroke="#ff4444"/>
-            <path d="M3 3L21 21" stroke="white" stroke-opacity="0.2"/>
-          </svg>
+          <!-- The empty state's card stack, so a failure reads as the same
+               place as "nothing loaded", with a warning mark where the play
+               button would be. -->
+          ${symbolSvg("errorCards")}
         </div>
         <div class="movi-broken-text" part="error-text">
           <h3 class="movi-broken-title" part="error-title">Format Unsupported</h3>
           <p class="movi-broken-message" part="error-message">This video codec is not supported by your browser's hardware acceleration.</p>
           <button class="movi-sw-fallback-btn" part="error-button error-software-button" style="display: none;">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-              <path d="M3 3v5h5"/>
-              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
-              <path d="M16 16h5v5"/>
-            </svg>
+            ${symbolSvg("retry")}
             Try Software Decoding
           </button>
           <button class="movi-retry-btn" part="error-button error-retry-button" style="display: none;">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-              <path d="M3 3v5h5"/>
-              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
-              <path d="M16 16h5v5"/>
-            </svg>
+            ${symbolSvg("retry")}
             Retry
           </button>
+          <!-- A failed source in fullscreen leaves the viewer on a black
+               screen with the bar faded; this is the way out that doesn't
+               need a key. Shown only while fullscreen (CSS, off the host's
+               movi-fullscreen-active class). -->
+          <button class="movi-error-exit-fs-btn" part="error-button error-exit-fullscreen-button" type="button">
+            ${symbolSvg("collapse")}
+            Exit full screen
+          </button>
         </div>
+      </div>
       </div>
     `;
     this.brokenIndicator.setAttribute("part", "error-screen");
@@ -1517,6 +2675,13 @@ export class MoviElement extends HTMLElement {
       this.load().catch(() => {});
     });
 
+    this.brokenIndicator
+      .querySelector(".movi-error-exit-fs-btn")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.exitFullscreen();
+      });
+
     // Create empty state indicator (shown when no src is set)
     this.emptyStateIndicator = document.createElement("div");
     this.emptyStateIndicator.className = "movi-empty-state";
@@ -1524,41 +2689,9 @@ export class MoviElement extends HTMLElement {
     this.emptyStateIndicator.innerHTML = `
       <div class="movi-empty-container">
         <div class="movi-empty-icon-wrapper">
-          <!-- An open, empty box.
-               Three marks were tried before this and the first two were
-               pressed: a play triangle inside a frame, then a dashed slot.
-               Anything shaped like the player invites someone to operate it,
-               and there is nothing here to operate — so this one is not a
-               control at all, it is a small picture of nothing being there.
-               An open carton with its flaps up and nothing inside is the one
-               illustration everybody already reads as "empty", and the specks
-               above it are what just left.
-
-               Monochrome, painted in the chrome's own foreground via the
-               classes below: this sits on an otherwise empty stage, where a
-               saturated badge reads as an error rather than a resting state,
-               and a hardcoded white would vanish under the light theme. -->
-          <svg viewBox="0 0 100 100" fill="none" aria-hidden="true">
-            <!-- What left. Smallest and faintest at the top, so the eye starts
-                 at the box and drifts up rather than the other way round. -->
-            <circle class="movi-empty-logo-fill" cx="50" cy="16" r="2.6" opacity="0.22"/>
-            <circle class="movi-empty-logo-fill" cx="37" cy="24" r="2.1" opacity="0.15"/>
-            <circle class="movi-empty-logo-fill" cx="63" cy="24" r="2.1" opacity="0.15"/>
-            <!-- The flaps. Each one hinges along a real stretch of the top
-                 edge — not a corner — and folds outward, which is what makes
-                 them read as flaps rather than as antennae. They stop short of
-                 each other: the gap between them is the way in, and it is why
-                 the box is OPEN rather than a crate with a lid. -->
-            <path class="movi-empty-logo-frame" d="M21 48 L6 34 L33 31 L48 48 Z" stroke-width="3" stroke-linejoin="round" opacity="0.45"/>
-            <path class="movi-empty-logo-frame" d="M79 48 L94 34 L67 31 L52 48 Z" stroke-width="3" stroke-linejoin="round" opacity="0.45"/>
-            <!-- The body, with the inside of its far wall showing just under
-                 the rim. That dark band is the whole point of the drawing: you
-                 can see in, and there is nothing in there. Inset from the
-                 corners so it never fights the body's rounding. -->
-            <rect class="movi-empty-logo-fill" x="21" y="48" width="58" height="32" rx="6" opacity="0.05"/>
-            <rect class="movi-empty-logo-fill" x="25" y="51" width="50" height="6" rx="3" opacity="0.18"/>
-            <rect class="movi-empty-logo-frame" x="21" y="48" width="58" height="32" rx="6" stroke-width="3.5" opacity="0.65"/>
-          </svg>
+          <!-- A soft stack of media cards makes the absence feel intentional
+               without turning the placeholder into a literal box or tray. -->
+          ${symbolSvg("emptyCards")}
         </div>
         <div class="movi-empty-text">
           <!-- Two things this copy must not do. It can't say "video": the
@@ -1586,10 +2719,7 @@ export class MoviElement extends HTMLElement {
     // eslint-disable-next-line no-unsanitized/property -- static template, no user data
     this.pipPlaceholder.innerHTML = `
       <div class="movi-pip-placeholder-inner">
-        <svg class="movi-pip-placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <rect x="2" y="4" width="20" height="16" rx="2"></rect>
-          <rect x="12" y="12" width="8" height="6" rx="1" fill="currentColor" stroke="none"></rect>
-        </svg>
+        ${symbolSvg("pipPlaceholder", "movi-pip-placeholder-icon")}
         <p class="movi-pip-placeholder-text">Playing in picture-in-picture</p>
         <button type="button" class="movi-pip-placeholder-btn">Bring it back</button>
       </div>
@@ -1605,6 +2735,7 @@ export class MoviElement extends HTMLElement {
     // Create OSD (On-Screen Display) container
     const osdContainer = document.createElement("div");
     osdContainer.className = "movi-osd-container";
+    osdContainer.setAttribute("part", "osd");
     osdContainer.style.display = "none";
     osdContainer.innerHTML = `
       <div class="movi-osd-icon"></div>
@@ -1616,7 +2747,7 @@ export class MoviElement extends HTMLElement {
     const holdSpeed = document.createElement("div");
     holdSpeed.className = "movi-hold-speed";
     holdSpeed.style.display = "none";
-    holdSpeed.innerHTML = `<span>2×</span><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4 5l8 7-8 7V5zm9 0l8 7-8 7V5z"/></svg>`;
+    holdSpeed.innerHTML = `<span>2×</span>${symbolSvg("holdSpeed")}`;
     shadowRoot.appendChild(holdSpeed);
 
     // Create context menu FIRST (before setupContextMenu is called)
@@ -1642,30 +2773,20 @@ export class MoviElement extends HTMLElement {
     shadowRoot.appendChild(backdrop);
     contextMenu.innerHTML = `
       <div class="movi-context-menu-item" data-action="play-pause">
-        <svg class="movi-context-menu-icon movi-context-menu-play-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="5 3 19 12 5 21 5 3"></polygon>
-        </svg>
-        <svg class="movi-context-menu-icon movi-context-menu-pause-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-          <rect x="6" y="4" width="4" height="16"></rect>
-          <rect x="14" y="4" width="4" height="16"></rect>
-        </svg>
+        ${symbolSvg("play", "movi-context-menu-icon movi-context-menu-play-icon", { filled: true })}
+        ${symbolSvg("pause", "movi-context-menu-icon movi-context-menu-pause-icon", { filled: true, hidden: true })}
         <span class="movi-context-menu-label">Play</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="playpause">Space</span>
       </div>
       <div class="movi-context-menu-item" data-action="speed">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M5.64 18.36a9 9 0 1 1 12.72 0"></path>
-          <path d="m12 12 4-4"></path>
-        </svg>
+        ${symbolSvg("speed", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Playback Speed</span>
         <span class="movi-context-menu-shortcut" data-shortcut-pair="speedup,speeddown">+/-</span>
         <span class="movi-context-menu-arrow">▶</span>
       </div>
       <div class="movi-context-menu-submenu" data-submenu="speed">
         <div class="movi-context-menu-item movi-context-menu-back" data-action="back">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M15 18l-6-6 6-6"/>
-          </svg>
+          ${symbolSvg("chevronLeft", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Back</span>
         </div>
         <div class="movi-context-menu-item" data-speed="0.25">0.25x</div>
@@ -1678,44 +2799,36 @@ export class MoviElement extends HTMLElement {
         <div class="movi-context-menu-item" data-speed="2">2x</div>
       </div>
       <div class="movi-context-menu-item" data-action="fit">
-        <svg class="movi-context-menu-icon movi-icon-aspect-ratio-ctx" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="18" height="18" rx="2"/><rect x="6" y="8" width="12" height="8" rx="1"/>
-        </svg>
+        ${symbolSvg("aspect", "movi-context-menu-icon movi-icon-aspect-ratio-ctx")}
         <span class="movi-context-menu-label">Aspect Ratio</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="aspect">A</span>
         <span class="movi-context-menu-arrow">▶</span>
       </div>
       <div class="movi-context-menu-submenu" data-submenu="fit">
         <div class="movi-context-menu-item movi-context-menu-back" data-action="back">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M15 18l-6-6 6-6"/>
-          </svg>
+          ${symbolSvg("chevronLeft", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Back</span>
         </div>
         <div class="movi-context-menu-item" data-fit="contain">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><rect x="6" y="8" width="12" height="8" rx="1"/></svg>
+          ${symbolSvg("aspect", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Contain</span>
         </div>
         <div class="movi-context-menu-item" data-fit="cover">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><rect x="1" y="7" width="22" height="10" rx="1"/></svg>
+          ${symbolSvg("aspectCover", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Cover</span>
         </div>
         <div class="movi-context-menu-item" data-fit="fill">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 3h18v18H3z"/></svg>
+          ${symbolSvg("aspectFill", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Stretch</span>
         </div>
         <div class="movi-context-menu-item" data-fit="zoom">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/><path d="M11 8v6M8 11h6"/></svg>
+          ${symbolSvg("zoom", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Zoom</span>
         </div>
       </div>
       <div class="movi-context-menu-divider movi-context-menu-divider-audio" style="display: none;"></div>
       <div class="movi-context-menu-item movi-context-menu-item-audio" data-action="audio-track" style="display: none;">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M9 18V5l12-2v13"></path>
-          <circle cx="6" cy="18" r="3"></circle>
-          <circle cx="18" cy="16" r="3"></circle>
-        </svg>
+        ${symbolSvg("audio", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Audio Track</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="audiotrack">B</span>
         <span class="movi-context-menu-arrow">▶</span>
@@ -1723,24 +2836,15 @@ export class MoviElement extends HTMLElement {
       <div class="movi-context-menu-submenu movi-context-menu-submenu-audio" data-submenu="audio-track" style="display: none;"></div>
       <div class="movi-context-menu-divider movi-context-menu-divider-audiodevice" style="display: none;"></div>
       <div class="movi-context-menu-item movi-context-menu-item-audiodevice" data-action="audio-output" style="display: none;">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="4" y="2" width="16" height="20" rx="2"></rect>
-          <circle cx="12" cy="14" r="4"></circle>
-          <line x1="12" y1="6" x2="12.01" y2="6"></line>
-        </svg>
+        ${symbolSvg("audioOutput", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Audio Output</span>
         <span class="movi-context-menu-arrow">▶</span>
       </div>
       <div class="movi-context-menu-submenu movi-context-menu-submenu-audiodevice" data-submenu="audio-output" style="display: none;"></div>
       <div class="movi-context-menu-divider movi-context-menu-divider-subtitle" style="display: none;"></div>
       <div class="movi-context-menu-item movi-context-menu-item-subtitle" data-action="subtitle-track" style="display: none;">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect width="18" height="14" x="3" y="5" rx="2" ry="2"></rect>
-          <path d="M11 9H9a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2 M17 9h-2a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2"></path>
-        </svg>
-        <svg class="movi-context-menu-icon movi-context-menu-subtitle-filled" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
-           <path fill-rule="evenodd" clip-rule="evenodd" d="M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2z M11 11 H9.5 V10.5 H7.5 V13.5 H9.5 V13 H11 V14 C11 14.55 10.55 15 10 15 H7 C6.45 15 6 14.55 6 14 V10 C6 9.45 6.45 9 7 9 H10 C10.55 9 11 9.45 11 10 V11 Z M18 11 H16.5 V10.5 H14.5 V13.5 H16.5 V13 H18 V14 C18 14.55 17.55 15 17 15 H14 C13.45 15 13 14.55 13 14 V10 C13 9.45 13.45 9 14 9 H17 C17.55 9 18 9.45 18 10 V11 Z"></path>
-        </svg>
+        ${symbolSvg("subtitles", "movi-context-menu-icon")}
+        ${symbolSvg("subtitlesFilled", "movi-context-menu-icon movi-context-menu-subtitle-filled", { hidden: true, filled: true })}
         <span class="movi-context-menu-label">Subtitle Track</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="subtitles">V</span>
         <span class="movi-context-menu-arrow">▶</span>
@@ -1754,127 +2858,76 @@ export class MoviElement extends HTMLElement {
       </div>
       <div class="movi-context-menu-divider movi-hdr-divider" style="display: none;"></div>
       <div class="movi-context-menu-item movi-context-menu-pip" data-action="pip" style="display: none;">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="2" y="3" width="20" height="14" rx="2"/><rect x="12" y="9" width="8" height="6" rx="1"/>
-        </svg>
+        ${symbolSvg("pip", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Picture in Picture</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="pip">P</span>
       </div>
       <div class="movi-context-menu-item" data-action="fullscreen">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
-        </svg>
+        ${symbolSvg("fullscreen", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Fullscreen</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="fullscreen">F</span>
       </div>
       <div class="movi-context-menu-item" data-action="rotate-video">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-          <path d="M21 3v5h-5"></path>
-        </svg>
+        ${symbolSvg("rotate", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Rotate Video</span>
         <span class="movi-context-menu-status movi-rotate-status">0°</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="rotate">R</span>
       </div>
       <div class="movi-context-menu-item" data-action="loop-toggle">
-        <svg class="movi-context-menu-icon movi-context-menu-loop-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-           <path d="M17 2l4 4-4 4"></path>
-           <path d="M3 11v-1a4 4 0 0 1 4-4h14"></path>
-           <path d="M7 22l-4-4 4-4"></path>
-           <path d="M21 13v1a4 4 0 0 1-4 4H3"></path>
-        </svg>
-        <svg class="movi-context-menu-icon movi-context-menu-loop-filled" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-          <path d="M17 2l4 4-4 4"></path><path d="M3 11v-1a4 4 0 0 1 4-4h14"></path><path d="M7 22l-4-4 4-4"></path><path d="M21 13v1a4 4 0 0 1-4 4H3"></path>
-        </svg>
+        ${symbolSvg("loop", "movi-context-menu-icon movi-context-menu-loop-outline")}
+        ${symbolSvg("loop", "movi-context-menu-icon movi-context-menu-loop-filled", { hidden: true })}
         <span class="movi-context-menu-label">Loop</span>
         <span class="movi-context-menu-status movi-loop-status">Off</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="loop">L</span>
       </div>
+      <!-- Shuffle sits under Loop because the two are one question asked about a
+           queue: in what order, and again or not. Shown only when there IS a
+           queue (updateShuffleUI) — the same rule the Next button and the
+           settings row follow. -->
+      <div class="movi-context-menu-item" data-action="shuffle-toggle" style="display: none;">
+        ${symbolSvg("shuffle", "movi-context-menu-icon movi-context-menu-shuffle-outline")}
+        ${symbolSvg("shuffle", "movi-context-menu-icon movi-context-menu-shuffle-filled", { hidden: true })}
+        <span class="movi-context-menu-label">Shuffle</span>
+        <span class="movi-context-menu-status movi-shuffle-status">Off</span>
+      </div>
       <div class="movi-context-menu-item" data-action="stable-audio-toggle">
-        <svg class="movi-context-menu-icon movi-context-menu-stable-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="2" y="4" width="20" height="16" rx="2"></rect>
-          <path d="M6 15v-2"></path>
-          <path d="M9 15v-4"></path>
-          <path d="M12 15v-6"></path>
-          <path d="M15 15v-4"></path>
-          <path d="M18 15v-2"></path>
-        </svg>
-        <svg class="movi-context-menu-icon movi-context-menu-stable-filled" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
-          <path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm1 9v2h2v-2H5zm3-2v4h2v-4H8zm3-2v6h2V9h-2zm3 2v4h2v-4h-2zm3 2v2h2v-2h-2z"></path>
-        </svg>
+        ${symbolSvg("stable", "movi-context-menu-icon movi-context-menu-stable-outline")}
+        ${symbolSvg("stable", "movi-context-menu-icon movi-context-menu-stable-filled", { hidden: true })}
         <span class="movi-context-menu-label">Stable Volume</span>
         <span class="movi-context-menu-status movi-stable-audio-status">Off</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="stableaudio">U</span>
       </div>
       <div class="movi-context-menu-item" data-action="crop-toggle">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M6 2v14a2 2 0 0 0 2 2h14"></path>
-          <path d="M18 22V8a2 2 0 0 0-2-2H2"></path>
-        </svg>
+        ${symbolSvg("crop", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Crop Black Bars</span>
         <span class="movi-context-menu-status movi-crop-status">Off</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="crop">C</span>
       </div>
       <div class="movi-context-menu-item" data-action="ambient-toggle">
-        <svg class="movi-context-menu-icon movi-context-menu-ambient-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="5"></circle>
-          <path d="M12 1v2"></path><path d="M12 21v2"></path>
-          <path d="M4.22 4.22l1.42 1.42"></path><path d="M18.36 18.36l1.42 1.42"></path>
-          <path d="M1 12h2"></path><path d="M21 12h2"></path>
-          <path d="M4.22 19.78l1.42-1.42"></path><path d="M18.36 5.64l1.42-1.42"></path>
-        </svg>
-        <svg class="movi-context-menu-icon movi-context-menu-ambient-filled" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
-          <circle cx="12" cy="12" r="5"></circle>
-          <path d="M12 1v2" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-          <path d="M12 21v2" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-          <path d="M4.22 4.22l1.42 1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-          <path d="M18.36 18.36l1.42 1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-          <path d="M1 12h2" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-          <path d="M21 12h2" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-          <path d="M4.22 19.78l1.42-1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-          <path d="M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
-        </svg>
+        ${symbolSvg("ambient", "movi-context-menu-icon movi-context-menu-ambient-outline")}
+        ${symbolSvg("ambient", "movi-context-menu-icon movi-context-menu-ambient-filled", { hidden: true })}
         <span class="movi-context-menu-label">Ambient Mode</span>
         <span class="movi-context-menu-status movi-ambient-status">Off</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="ambient">G</span>
       </div>
       <div class="movi-context-menu-divider"></div>
       <div class="movi-context-menu-item" data-action="snapshot">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
-          <circle cx="12" cy="13" r="4"></circle>
-        </svg>
+        ${symbolSvg("snapshot", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Snapshot</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="snapshot">S</span>
       </div>
       <div class="movi-context-menu-item" data-action="timeline">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="2" y="3" width="6" height="5" rx="1"></rect>
-          <rect x="9" y="3" width="6" height="5" rx="1"></rect>
-          <rect x="16" y="3" width="6" height="5" rx="1"></rect>
-          <rect x="2" y="10" width="6" height="5" rx="1"></rect>
-          <rect x="9" y="10" width="6" height="5" rx="1"></rect>
-          <rect x="16" y="10" width="6" height="5" rx="1"></rect>
-          <line x1="2" y1="19" x2="22" y2="19"></line>
-          <line x1="2" y1="21" x2="22" y2="21"></line>
-        </svg>
+        ${symbolSvg("timeline", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Timeline</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="timeline">T</span>
       </div>
       <div class="movi-context-menu-item" data-action="nerd-stats">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 20V10"></path>
-          <path d="M18 20V4"></path>
-          <path d="M6 20v-4"></path>
-        </svg>
+        ${symbolSvg("stats", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Stats for nerds</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="stats">I</span>
       </div>
       <div class="movi-context-menu-item" data-action="keyboard-shortcuts">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="2" y="6" width="20" height="12" rx="2"></rect>
-          <path d="M6 10h0M10 10h0M14 10h0M18 10h0M6 14h12"></path>
-        </svg>
+        ${symbolSvg("keyboard", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Keyboard Shortcuts</span>
         <span class="movi-context-menu-shortcut" data-shortcut-action="shortcuts">?</span>
       </div>
@@ -1912,24 +2965,37 @@ export class MoviElement extends HTMLElement {
 
     const container = document.createElement("div");
     container.className = "movi-controls-container";
+    container.setAttribute("part", "controls");
     // eslint-disable-next-line no-unsanitized/property -- static template, no user data
     container.innerHTML = `
-      <div class="movi-controls-bar" style="position: relative;">
+      <div class="movi-controls-bar" part="controls-bar" style="position: relative;">
         <div class="movi-progress-container">
-          <div class="movi-progress-bar" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuenow="0" aria-valuetext="0:00">
+          <div class="movi-progress-bar" part="progress" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuenow="0" aria-valuetext="0:00">
             <!-- Buffer + fill live in a wrapper that spans the whole track.
                  Chapter gaps are cut from THAT: it is the full width, so the
                  cuts can be expressed as percentages of the timeline, and the
                  handle stays outside it so a cut can never clip the knob. -->
             <div class="movi-progress-paint">
-              <div class="movi-progress-buffer"></div>
-              <div class="movi-progress-filled"></div>
+              <div class="movi-progress-buffer" part="progress-buffer"></div>
+              <div class="movi-progress-filled" part="progress-played"></div>
+              <!-- The stretch between the playhead and where the pointer is:
+                   what a click here would skip, or replay. Last inside the
+                   wrapper so it reads over the played bar as well as the
+                   unplayed track — a backwards hover has to show something
+                   too. Inside the wrapper so chapter gaps cut it like the
+                   rest. -->
+              <div class="movi-progress-hover"></div>
             </div>
             <div class="movi-chapter-markers"></div>
-            <div class="movi-progress-handle"></div>
+            <div class="movi-progress-handle" part="progress-handle"></div>
           </div>
           <div class="movi-seek-thumbnail" style="display: none;">
              <div class="movi-thumbnail-placeholder" style="display: none;"></div>
+             <!-- A storyboard tile, painted where it lies: the mosaic as a
+                  background, scaled so one tile fills the card, offset to the
+                  tile the pointer is on. No crop, no encode, no image decode —
+                  a background-position change, in the frame the pointer moved. -->
+             <div class="movi-thumbnail-tile" style="display: none;"></div>
              <img class="movi-thumbnail-img" style="display: none;">
              <div class="movi-seek-caption">
                <span class="movi-seek-time">0:00</span>
@@ -1940,58 +3006,61 @@ export class MoviElement extends HTMLElement {
         
         <div class="movi-buttons-row">
           <div class="movi-controls-left">
-            <button class="movi-btn movi-play-pause" aria-label="Play/Pause">
-              <!-- Rounded the same way as the centre one — see there. -->
-              <svg class="movi-icon-play" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round">
-                <path d="M6.4 5.6L17.6 12L6.4 18.4Z"></path>
-              </svg>
-              <svg class="movi-icon-pause" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
-                <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"></path>
-              </svg>
+            <!-- Previous, Play and Next are one control, not three: they are
+                 one decision about what is on screen, and the bar says that the
+                 way it already says it for the seek pair — a single capsule.
+                 The ends are absent from it until there IS a queue, and a
+                 capsule of one is no capsule at all, so with them gone the
+                 wrapper stands down and Play wears its own again (see
+                 .movi-play-group-solo in the styles).
+
+                 data-group="play" on purpose: a host's addControl({ group:
+                 "play" }) looks for exactly this, so its button joins THIS
+                 capsule rather than wrapping Play in a second one. -->
+            <div class="movi-control-group movi-play-group" data-group="play">
+            <!-- The queue's two ends. Absent from the bar until there IS a
+                 queue: a Previous button on a single video is a control that
+                 can never do anything, and the commonest case by far is a
+                 single video. Filled glyphs, like Play beside them. -->
+            <button class="movi-btn movi-prev-btn" part="button prev-button" aria-label="Previous in queue">
+              ${symbolSvg("previous", "", { filled: true })}
             </button>
+
+            <button class="movi-btn movi-play-pause" part="button play-button" aria-label="Play/Pause">
+              ${symbolSvg("play", "movi-icon-play", { filled: true })}
+              ${symbolSvg("pause", "movi-icon-pause", { filled: true, hidden: true })}
+            </button>
+
+            <button class="movi-btn movi-next-btn" part="button next-button" aria-label="Next in queue">
+              ${symbolSvg("next", "", { filled: true })}
+            </button>
+            </div>
 
             <!-- The two seek buttons are one control, not two: they do the same
                  thing in opposite directions, and the bar groups them as one. -->
             <div class="movi-seek-group">
-              <button class="movi-btn movi-seek-backward" aria-label="Skip Backward 10s">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                  <path d="M3 3v5h5" />
-                  <text x="50%" y="54%" font-size="7" font-family="sans-serif" font-weight="bold" fill="currentColor" text-anchor="middle" dominant-baseline="middle" stroke="none">10</text>
-                </svg>
+              <button class="movi-btn movi-seek-backward" part="button seek-backward-button" aria-label="Skip Backward 10s">
+                ${symbolSvg("seekBackward")}
               </button>
 
-              <button class="movi-btn movi-seek-forward" aria-label="Skip Forward 10s">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
-                  <path d="M21 3v5h-5" />
-                  <text x="50%" y="54%" font-size="7" font-family="sans-serif" font-weight="bold" fill="currentColor" text-anchor="middle" dominant-baseline="middle" stroke="none">10</text>
-                </svg>
+              <button class="movi-btn movi-seek-forward" part="button seek-forward-button" aria-label="Skip Forward 10s">
+                ${symbolSvg("seekForward")}
               </button>
             </div>
 
             <div class="movi-volume-container">
-              <button class="movi-btn movi-volume-btn" aria-label="Mute/Unmute">
-                <svg class="movi-icon-volume-high" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M11 5L6 9H2v6h4l5 4V5z"></path>
-                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                </svg>
-                <svg class="movi-icon-volume-low" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                  <path d="M11 5L6 9H2v6h4l5 4V5z"></path>
-                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                </svg>
-                <svg class="movi-icon-volume-mute" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                  <path d="M11 5L6 9H2v6h4l5 4V5z"></path>
-                  <line x1="23" y1="9" x2="17" y2="15"></line>
-                  <line x1="17" y1="9" x2="23" y2="15"></line>
-                </svg>
+              <button class="movi-btn movi-volume-btn" part="button volume-button" aria-label="Mute/Unmute">
+                ${symbolSvg("volumeFull", "movi-icon-volume-high")}
+                ${symbolSvg("volumeOne", "movi-icon-volume-mid", { hidden: true })}
+                ${symbolSvg("volume", "movi-icon-volume-low", { hidden: true })}
+                ${symbolSvg("volumeMuted", "movi-icon-volume-mute", { hidden: true })}
               </button>
               <div class="movi-volume-slider-container">
                 <input type="range" class="movi-volume-slider" min="0" max="2" step="0.01" value="1" aria-label="Volume" aria-valuemin="0" aria-valuemax="200" aria-valuenow="100" aria-valuetext="Volume 100%">
               </div>
             </div>
 
-            <div class="movi-time">
+            <div class="movi-time" part="time">
               <span class="movi-current-time">0:00</span>
               <span class="movi-time-separator"> / </span>
               <span class="movi-duration">0:00</span>
@@ -2004,21 +3073,24 @@ export class MoviElement extends HTMLElement {
                  have chapters, which most do not. -->
             <button class="movi-chapter-pill" type="button" aria-label="Chapters" style="display: none;">
               <span class="movi-chapter-pill-text"></span>
-              <svg class="movi-chapter-pill-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M9 18l6-6-6-6"/>
-              </svg>
+              ${symbolSvg("chevronRight", "movi-chapter-pill-chevron")}
             </button>
           </div>
+
+          <!-- The middle of the bar. Empty, and empty is the ordinary case:
+               the player puts nothing here — its own bar is a left run and a
+               settings run, and everything between them is free width. A host
+               control asking for placement "center" is what lands in it, and
+               with nothing in it the cluster draws nothing and measures
+               nothing. See .movi-controls-center in the styles for why it is
+               out of flow rather than a third child of the row. -->
+          <div class="movi-controls-center"></div>
 
           <div class="movi-controls-right">
             <div class="movi-mobile-expandable">
               <div class="movi-audio-track-container">
-                <button class="movi-btn movi-audio-track-btn" aria-label="Audio Track">
-                  <svg class="movi-icon-audio-track" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M9 18V5l12-2v13"></path>
-                    <circle cx="6" cy="18" r="3"></circle>
-                    <circle cx="18" cy="16" r="3"></circle>
-                  </svg>
+                <button class="movi-btn movi-audio-track-btn" part="button audio-button" aria-label="Audio Track">
+                  ${symbolSvg("audio", "movi-icon-audio-track")}
                 </button>
                 <div class="movi-audio-track-menu" style="display: none;">
                   <div class="movi-track-menu-header">
@@ -2029,23 +3101,16 @@ export class MoviElement extends HTMLElement {
                 </div>
               </div>
               <div class="movi-hdr-container">
-                <button class="movi-btn movi-hdr-btn" aria-label="Toggle HDR">
-                  <svg class="movi-icon-hdr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M5 7v10M5 12h5M10 7v10M14 7h6a3 3 0 0 1 0 6h-6M17 13l3 4"></path>
-                  </svg>
+                <button class="movi-btn movi-hdr-btn" part="button hdr-button" aria-label="Toggle HDR">
+                  ${symbolSvg("hdr", "movi-icon-hdr")}
                   <span class="movi-hdr-label">HDR</span>
                 </button>
               </div>
 
               <div class="movi-subtitle-track-container">
-                <button class="movi-btn movi-subtitle-track-btn" aria-label="Subtitles/Captions">
-                  <svg class="movi-icon-subtitle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <rect width="20" height="16" x="2" y="4" rx="2" ry="2"></rect>
-                    <path d="M10 8.5H8a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2 M18 8.5h-2a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2"></path>
-                  </svg>
-                  <svg class="movi-icon-subtitle-filled" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
-                    <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zM10 15H7c-.83 0-1.5-.67-1.5-1.5v-3c0-.83.67-1.5 1.5-1.5h3V11H7.5v2.5h2V13H10v2zm8 0h-3c-.83 0-1.5-.67-1.5-1.5v-3c0-.83.67-1.5 1.5-1.5h3V11h-2.5v2.5h2V13H18v2z"></path>
-                  </svg>
+                <button class="movi-btn movi-subtitle-track-btn" part="button subtitles-button" aria-label="Subtitles/Captions">
+                  ${symbolSvg("subtitles", "movi-icon-subtitle")}
+                  ${symbolSvg("subtitlesFilled", "movi-icon-subtitle-filled", { hidden: true, filled: true })}
                 </button>
                 <div class="movi-subtitle-track-menu" style="display: none;">
                   <div class="movi-track-menu-header movi-subtitle-track-header">
@@ -2054,23 +3119,13 @@ export class MoviElement extends HTMLElement {
                             class="movi-subtitle-browse-btn"
                             aria-label="Open transcript"
                             title="Transcript">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-                        <line x1="8" y1="6" x2="21" y2="6"/>
-                        <line x1="8" y1="12" x2="21" y2="12"/>
-                        <line x1="8" y1="18" x2="21" y2="18"/>
-                        <circle cx="3.5" cy="6" r="1"/>
-                        <circle cx="3.5" cy="12" r="1"/>
-                        <circle cx="3.5" cy="18" r="1"/>
-                      </svg>
+                      ${symbolSvg("transcript")}
                     </button>
                     <button type="button"
                             class="movi-subtitle-customize-btn"
                             aria-label="Customize captions"
                             title="Customize captions">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-                        <circle cx="12" cy="12" r="3"></circle>
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                      </svg>
+                      ${symbolSvg("settings")}
                     </button>
                   </div>
                   <div class="movi-subtitle-track-list"></div>
@@ -2079,11 +3134,8 @@ export class MoviElement extends HTMLElement {
               </div>
 
               <div class="movi-quality-container" style="display: none;">
-                <button class="movi-btn movi-quality-btn" aria-label="Quality">
-                  <svg class="movi-icon-quality" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.1a2 2 0 0 1-1-1.72v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
-                    <circle cx="12" cy="12" r="3"></circle>
-                  </svg>
+                <button class="movi-btn movi-quality-btn" part="button quality-button" aria-label="Quality">
+                  ${symbolSvg("quality", "movi-icon-quality")}
                   <span class="movi-quality-btn-badge" style="display: none;"></span>
                 </button>
                 <div class="movi-quality-menu" style="display: none;">
@@ -2092,11 +3144,8 @@ export class MoviElement extends HTMLElement {
               </div>
 
               <div class="movi-speed-container">
-                <button class="movi-btn movi-speed-btn" aria-label="Playback Speed">
-                  <svg class="movi-icon-speed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M5.64 18.36a9 9 0 1 1 12.72 0"></path>
-                    <path d="m12 12 4-4"></path>
-                  </svg>
+                <button class="movi-btn movi-speed-btn" part="button speed-button" aria-label="Playback Speed">
+                  ${symbolSvg("speed", "movi-icon-speed")}
                 </button>
                 <div class="movi-speed-menu" style="display: none;">
                   <div class="movi-speed-list">
@@ -2113,57 +3162,47 @@ export class MoviElement extends HTMLElement {
               </div>
 
               <div class="movi-stable-audio-container">
-                <button class="movi-btn movi-stable-audio-btn" aria-label="Toggle Stable Audio">
-                  <svg class="movi-icon-stable-audio-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="2" y="4" width="20" height="16" rx="2"></rect>
-                    <path d="M6 15v-2"></path>
-                    <path d="M9 15v-4"></path>
-                    <path d="M12 15v-6"></path>
-                    <path d="M15 15v-4"></path>
-                    <path d="M18 15v-2"></path>
-                  </svg>
-                  <svg class="movi-icon-stable-audio-filled" viewBox="0 0 24 24" fill="currentColor" style="display: none;">
-                    <path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm1 9v2h2v-2H5zm3-2v4h2v-4H8zm3-2v6h2V9h-2zm3 2v4h2v-4h-2zm3 2v2h2v-2h-2z"></path>
-                  </svg>
+                <button class="movi-btn movi-stable-audio-btn" part="button stableaudio-button" aria-label="Toggle Stable Audio">
+                  ${symbolSvg("stable", "movi-icon-stable-audio-outline")}
+                  ${symbolSvg("stable", "movi-icon-stable-audio-filled", { hidden: true })}
                 </button>
               </div>
 
-              <button class="movi-btn movi-loop-btn" aria-label="Toggle Loop">
-                <svg class="movi-icon-loop-outline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M17 2l4 4-4 4"></path>
-                  <path d="M3 11v-1a4 4 0 0 1 4-4h14"></path>
-                  <path d="M7 22l-4-4 4-4"></path>
-                  <path d="M21 13v1a4 4 0 0 1-4 4H3"></path>
-                </svg>
-                <svg class="movi-icon-loop-filled" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                  <path d="M17 2l4 4-4 4"></path><path d="M3 11v-1a4 4 0 0 1 4-4h14"></path><path d="M7 22l-4-4 4-4"></path><path d="M21 13v1a4 4 0 0 1-4 4H3"></path>
-                </svg>
+              <button class="movi-btn movi-loop-btn" part="button loop-button" aria-label="Toggle Loop">
+                ${symbolSvg("loop", "movi-icon-loop-outline")}
+                ${symbolSvg("loop", "movi-icon-loop-filled", { hidden: true })}
               </button>
 
             </div>
+
+            <!-- Track controls and viewing controls share the right capsule,
+                 but they are different tasks. A quiet divider preserves the
+                 compact footprint while making the sequence scannable. -->
+            <span class="movi-controls-divider movi-controls-right-divider" part="controls-divider" aria-hidden="true"></span>
 
             <!-- Settings: the gear owns every playback setting now. The
                  per-setting buttons below still exist and still do all the
                  work — their menus are borrowed into this panel a page at a
                  time — but only this one is on the bar. -->
             <div class="movi-settings-container">
-              <button class="movi-btn movi-settings-btn" aria-label="Settings">
-                <svg class="movi-icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.1a2 2 0 0 1-1-1.72v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
-                  <circle cx="12" cy="12" r="3"></circle>
-                </svg>
+              <button class="movi-btn movi-settings-btn" part="button settings-button" aria-label="Settings">
+                ${symbolSvg("settings", "movi-icon-settings")}
                 <span class="movi-settings-btn-badge" style="display: none;"></span>
               </button>
               <div class="movi-settings-menu" style="display: none;">
+                <div class="movi-settings-grabber" aria-hidden="true"></div>
                 <div class="movi-settings-root"></div>
                 <div class="movi-settings-page" style="display: none;">
                   <button class="movi-settings-back" type="button">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+                    ${symbolSvg("chevronLeft")}
                     <span class="movi-settings-page-title"></span>
                   </button>
                   <div class="movi-settings-page-body"></div>
                 </div>
               </div>
+              <button class="movi-settings-close" type="button" aria-label="Close settings">
+                ${symbolSvg("close", "movi-settings-close-icon")}
+              </button>
             </div>
 
             <!-- Aspect ratio sits on the far side of the gear at every width —
@@ -2173,41 +3212,28 @@ export class MoviElement extends HTMLElement {
                  phone too (the tray comes BEFORE the gear, so a member of it
                  can only ever appear on the left); the narrow-width rules fold
                  it away with the tray instead. -->
-            <button class="movi-btn movi-aspect-ratio-btn" aria-label="Aspect Ratio">
-              <svg class="movi-icon-aspect-ratio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="3" y="3" width="18" height="18" rx="2"/>
-                <rect class="movi-aspect-inner" x="6" y="8" width="12" height="8" rx="1"/>
-              </svg>
+            <button class="movi-btn movi-aspect-ratio-btn" part="button aspect-button" aria-label="Aspect Ratio">
+              ${symbolSvg("aspect", "movi-icon-aspect-ratio")}
             </button>
 
             <!-- PiP sits beside the gear, outside the mobile "more" tray: the
                  two are the controls a viewer reaches for while watching, not
                  settings to go hunting for. -->
-            <button class="movi-btn movi-pip-btn" aria-label="Picture in Picture" style="display:none">
+            <button class="movi-btn movi-pip-btn" part="button pip-button" aria-label="Picture in Picture" style="display:none">
               <!-- Drawn to fill the 24x24 box like its neighbours. The old
                    20x14 frame sat inside the box with room to spare, so at the
                    same nominal size it read as a smaller button. -->
-              <svg class="movi-icon-pip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="11" width="8" height="6" rx="1" fill="currentColor" opacity="0.35"/>
-              </svg>
+              ${symbolSvg("pip", "movi-icon-pip")}
             </button>
 
-            <button class="movi-btn movi-more-btn" aria-label="More Settings">
-              <svg class="movi-icon-more" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="15 18 9 12 15 6"></polyline>
-              </svg>
-              <svg class="movi-icon-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                <polyline points="9 18 15 12 9 6"></polyline>
-              </svg>
+            <button class="movi-btn movi-more-btn" part="button more-button" aria-label="More Settings">
+              ${symbolSvg("more", "movi-icon-more")}
+              ${symbolSvg("close", "movi-icon-close", { hidden: true })}
             </button>
 
-            <button class="movi-btn movi-fullscreen-btn" aria-label="Fullscreen">
-              <svg class="movi-icon-fullscreen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
-              </svg>
-              <svg class="movi-icon-fullscreen-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                <path d="M4 14h6v6m10-6h-6v6M4 10h6V4m10 6h-6V4"></path>
-              </svg>
+            <button class="movi-btn movi-fullscreen-btn" part="button fullscreen-button" aria-label="Fullscreen">
+              ${symbolSvg("fullscreen", "movi-icon-fullscreen")}
+              ${symbolSvg("fullscreenExit", "movi-icon-fullscreen-exit", { hidden: true })}
             </button>
           </div>
         </div>
@@ -2253,20 +3279,15 @@ export class MoviElement extends HTMLElement {
     unmuteOverlay.type = "button";
     unmuteOverlay.setAttribute("aria-label", "Unmute");
     unmuteOverlay.style.display = "none";
-    // textContent + appendChild — no innerHTML to keep the security
-    // hook happy and avoid an XSS surface even with a static template.
-    const unmuteSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    unmuteSvg.setAttribute("viewBox", "0 0 24 24");
-    unmuteSvg.setAttribute("fill", "none");
-    unmuteSvg.setAttribute("stroke", "currentColor");
-    unmuteSvg.setAttribute("stroke-width", "2");
-    unmuteSvg.setAttribute("stroke-linecap", "round");
-    unmuteSvg.setAttribute("stroke-linejoin", "round");
-    unmuteSvg.innerHTML =
-      '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>' +
-      '<line x1="23" y1="9" x2="17" y2="15"/>' +
-      '<line x1="17" y1="9" x2="23" y2="15"/>';
-    unmuteOverlay.appendChild(unmuteSvg);
+    // Built from the symbol table like every other mark, so setIcon reaches it.
+    // Through a holder rather than assigning to the pill's own innerHTML: the
+    // security hook objects to innerHTML on a node that is going into the tree,
+    // and this one never does.
+    const unmuteHolder = document.createElement("div");
+    // eslint-disable-next-line no-unsanitized/property -- player's own symbol table
+    unmuteHolder.innerHTML = symbolSvg("unmute");
+    if (unmuteHolder.firstElementChild)
+      unmuteOverlay.appendChild(unmuteHolder.firstElementChild);
     const unmuteText = document.createElement("span");
     unmuteText.textContent = "Tap to unmute";
     unmuteOverlay.appendChild(unmuteText);
@@ -2280,13 +3301,19 @@ export class MoviElement extends HTMLElement {
       // Defensive — updateMuted() should hide it via updateUnmuteOverlay,
       // but if state is mid-flight this guarantees the click feels instant.
       unmuteOverlay.style.display = "none";
-      // The tap is a user gesture — if playback isn't running, start it too.
+      // The tap is a user gesture — if playback never got going, start it too.
       // An auto-advanced audio-only track that couldn't autoplay with sound
       // lands paused behind this pill; without this the user has to unmute AND
       // then hit play. Skipped when already playing (a muted-autoplay video is
       // rolling), so we only ever resume a genuinely stopped player.
+      //
+      // …and never against a pause the viewer asked for: unmuting a video you
+      // had deliberately stopped started it playing again, and the pill's job
+      // is the sound, not the picture. _pauseWasAskedFor says exactly that —
+      // someone called pause() and has not called play() since — and a new
+      // source clears it, so the auto-advanced track above still starts.
       const state = this.player?.getState();
-      if (state && state !== "playing" && state !== "buffering") {
+      if (state && state !== "playing" && state !== "buffering" && !this._pauseWasAskedFor) {
         this.play();
       }
     });
@@ -2296,11 +3323,12 @@ export class MoviElement extends HTMLElement {
     // Create title bar as a separate element outside controls container
     const titleBar = document.createElement("div");
     titleBar.className = "movi-title-bar";
+    titleBar.setAttribute("part", "title-bar");
     titleBar.style.display = "none";
     // The back arrow is always in the DOM and hidden by default — the bar is
     // rebuilt on nothing, so toggling a class beats re-writing markup whenever
     // `titlemode` changes.
-    titleBar.innerHTML = `<button class="movi-title-back" type="button" aria-label="Back" title="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12H3"/><path d="M10 19l-7-7 7-7"/></svg></button><span class="movi-title-text"></span>`;
+    titleBar.innerHTML = `<button class="movi-title-back" type="button" aria-label="Back" title="Back">${symbolSvg("chevronLeft")}</button><span class="movi-title-text"></span>`;
     (
       titleBar.querySelector(".movi-title-back") as HTMLButtonElement
     ).addEventListener("click", (e) => {
@@ -2308,6 +3336,17 @@ export class MoviElement extends HTMLElement {
       this.handleBackClick();
     });
     shadowRoot.appendChild(titleBar);
+
+    // The top-right corner's own row, for controls a host places there
+    // (placement: "top"). Its own element rather than a wrapper around the
+    // three-dots below: that button carries a breakpoint's worth of corner
+    // positioning, a strip-mode override and a transform composed into its
+    // hover and press states, and none of that survives being made a flex
+    // child. Two siblings anchored to the same corner cost one margin (see the
+    // coarse-pointer rule) and leave the three-dots exactly as it was.
+    const topControls = document.createElement("div");
+    topControls.className = "movi-top-controls";
+    shadowRoot.appendChild(topControls);
 
     // Gear button (top-right) → opens the context menu. This is how touch users
     // reach it now that long-press drives hold-to-2x; on desktop it's a
@@ -2323,7 +3362,7 @@ export class MoviElement extends HTMLElement {
     gearBtn.setAttribute("title", "More options");
     // Dots at r=2 in a 24 box read as a lighter mark than the stroked icons
     // around it; 2.3 with a slightly tighter run evens out the weight.
-    gearBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="12" cy="5.5" r="2.3"/><circle cx="12" cy="12" r="2.3"/><circle cx="12" cy="18.5" r="2.3"/></svg>`;
+    gearBtn.innerHTML = `${symbolSvg("dots")}`;
     gearBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       // Open the context menu via a synthetic contextmenu event; the flag lets
@@ -2340,7 +3379,14 @@ export class MoviElement extends HTMLElement {
         }),
       );
     });
-    shadowRoot.appendChild(gearBtn);
+    // Into the corner ROW, not the shadow root. It used to be pinned to the
+    // corner on its own, which made "beside the three-dots" a thing only the
+    // player could do: a host control could be laid out to its left (by a
+    // margin) and nowhere else. As one member of the row it has a POSITION,
+    // and a position is something anything else in the row can be placed
+    // against — see the "dots" anchor. Last by default, so the corner still
+    // ends with it unless a host says otherwise.
+    topControls.appendChild(gearBtn);
 
     // Create Nerd Stats overlay
     const nerdStats = document.createElement("div");
@@ -2372,11 +3418,11 @@ export class MoviElement extends HTMLElement {
       </div>
       <div class="movi-timeline-scroller">
         <button class="movi-timeline-arrow movi-timeline-arrow-left" type="button" tabindex="-1" aria-label="Scroll timeline left">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+          ${symbolSvg("chevronLeftBold")}
         </button>
         <div class="movi-timeline-strip"></div>
         <button class="movi-timeline-arrow movi-timeline-arrow-right" type="button" tabindex="-1" aria-label="Scroll timeline right">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+          ${symbolSvg("chevronRightBold")}
         </button>
       </div>
       <div class="movi-timeline-status"></div>
@@ -2469,6 +3515,40 @@ export class MoviElement extends HTMLElement {
     `;
     shadowRoot.appendChild(resumeDialog);
 
+    // "May not play smoothly" — see checkSmoothPlayback. Bottom-LEFT, mirroring
+    // the resume prompt on the right, so the two never land on each other.
+    const smoothWarning = document.createElement("div");
+    smoothWarning.className = "movi-smooth-warning";
+    smoothWarning.setAttribute("role", "status");
+    smoothWarning.style.display = "none";
+    smoothWarning.innerHTML = `
+      ${symbolSvg("warning", "movi-smooth-warning-icon")}
+      <div class="movi-smooth-warning-body">
+        <div class="movi-smooth-warning-title"></div>
+        <div class="movi-smooth-warning-reason"></div>
+      </div>
+      <button class="movi-smooth-warning-close" type="button" aria-label="Dismiss">
+        ${symbolSvg("closeThin")}
+      </button>
+    `;
+    // A click on the notice is not a click on the video under it.
+    smoothWarning.addEventListener("click", (e) => e.stopPropagation());
+    smoothWarning
+      .querySelector(".movi-smooth-warning-close")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.hideSmoothWarning();
+      });
+    shadowRoot.appendChild(smoothWarning);
+
+    // Said once, while the caption is in the viewer's hand and the answer is
+    // of any use to them — and then not again. See showCaptionHint().
+    this._captionHint = document.createElement("div");
+    this._captionHint.className = "movi-caption-hint";
+    this._captionHint.setAttribute("role", "status");
+    this._captionHint.style.display = "none";
+    shadowRoot.appendChild(this._captionHint);
+
     resumeDialog.querySelector(".movi-resume-yes")?.addEventListener("click", (e) => {
       e.stopPropagation();
       const time = parseFloat(resumeDialog.dataset.time || "0");
@@ -2527,7 +3607,7 @@ export class MoviElement extends HTMLElement {
       <div class="movi-shortcuts-body">
         <div class="movi-shortcuts-col">
           <div class="movi-shortcut-row"><kbd data-shortcut-action="playpause">Space</kbd><span>Play / Pause</span></div>
-          <div class="movi-shortcut-row" data-video-only><kbd data-shortcut-action="fullscreen">F</kbd><span>Fullscreen</span></div>
+          <div class="movi-shortcut-row"><kbd data-shortcut-action="fullscreen">F</kbd><span>Fullscreen</span></div>
           <div class="movi-shortcut-row" data-video-only><kbd data-shortcut-action="pip">P</kbd><span>Picture-in-Picture</span></div>
           <div class="movi-shortcut-row"><kbd data-shortcut-action="mute">M</kbd><span>Mute / Unmute</span></div>
           <div class="movi-shortcut-row"><kbd data-shortcut-pair="volumeup,volumedown">&uarr;/&darr;</kbd><span>Volume</span></div>
@@ -2549,6 +3629,8 @@ export class MoviElement extends HTMLElement {
           <div class="movi-shortcut-row" data-video-only><kbd data-shortcut-action="snapshot">S</kbd><span>Snapshot</span></div>
           <div class="movi-shortcut-row"><kbd data-shortcut-action="stats">I</kbd><span>Stats for Nerds</span></div>
           <div class="movi-shortcut-row" data-video-only><kbd data-shortcut-action="timeline">T</kbd><span>Timeline</span></div>
+          <div class="movi-shortcut-row" data-playlist-only><kbd data-shortcut-action="nexttrack">Shift+N</kbd><span>Next in Queue</span></div>
+          <div class="movi-shortcut-row" data-playlist-only><kbd data-shortcut-action="prevtrack">Shift+P</kbd><span>Previous in Queue</span></div>
           <div class="movi-shortcut-row"><kbd data-shortcut-action="shortcuts">?</kbd><span>This Panel</span></div>
         </div>
       </div>
@@ -2571,10 +3653,7 @@ export class MoviElement extends HTMLElement {
       <div class="movi-cues-header">
         <span class="movi-cues-title">Transcript</span>
         <div class="movi-cues-search-wrap">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-            <circle cx="11" cy="11" r="7"/>
-            <path d="m21 21-4.3-4.3"/>
-          </svg>
+          ${symbolSvg("search")}
           <input type="search" class="movi-cues-search" placeholder="Search transcript…" aria-label="Search transcript">
         </div>
         <button class="movi-cues-close" aria-label="Close">&times;</button>
@@ -2834,6 +3913,16 @@ export class MoviElement extends HTMLElement {
     const k = (action: string) => this.shortcutLabel(action);
     if (is("movi-play-pause"))
       return { text: this.paused ? "Play" : "Pause", key: k("playpause") };
+    // The title of what the click leads to, when the queue knows it — the
+    // point of a Next button is what is next, and "Next" alone is the one
+    // thing the arrow already said.
+    if (is("movi-prev-btn"))
+      return {
+        text: this.neighbourItemTitle(-1) || "Previous",
+        key: k("prevtrack"),
+      };
+    if (is("movi-next-btn"))
+      return { text: this.neighbourItemTitle(1) || "Next", key: k("nexttrack") };
     if (is("movi-seek-backward"))
       return { text: "Back 10 seconds", key: k("seekback") };
     if (is("movi-seek-forward"))
@@ -2920,6 +4009,20 @@ export class MoviElement extends HTMLElement {
     const seekForwardBtn = shadowRoot.querySelector(
       ".movi-seek-forward",
     ) as HTMLElement;
+    const prevBtn = shadowRoot.querySelector(".movi-prev-btn") as HTMLElement;
+    const nextBtn = shadowRoot.querySelector(".movi-next-btn") as HTMLElement;
+
+    // The queue's two ends. Both are display:none until there is a queue, and
+    // disabled at the end they point past, so neither can be clicked into a
+    // no-op — the guards inside previous()/next() are the second half of that.
+    prevBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.previous();
+    });
+    nextBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.next();
+    });
 
     let ignoreHover = false; // Prevent hover immediately after click from re-showing thumb
 
@@ -3078,7 +4181,11 @@ export class MoviElement extends HTMLElement {
       ".movi-thumbnail-img",
     ) as HTMLImageElement;
 
-    let previewDebounce: number | null = null;
+    let previewFrameRaf: number | null = null;
+    // The hover card's measured width, and the shape it was measured at. See
+    // the read in updateScrubbingUI — this is what keeps a pointer move off
+    // the forced-layout path.
+    const previewCardWidth = { sig: "", w: 0 };
     let lastPreviewUrl: string | null = null;
     let hoverIntentTimer: number | null = null;
     let lastHoverEvent: MouseEvent | null = null;
@@ -3089,6 +4196,141 @@ export class MoviElement extends HTMLElement {
     const previewLoopState = {
       isFetching: false,
       nextTime: null as number | null,
+    };
+
+    // How long the picture already on the card is allowed to stand in for the
+    // one being made. Under it, nothing on screen changes; over it, the card
+    // admits it is working.
+    const STALE_PREVIEW_GRACE_MS = 220;
+
+    /**
+     * Above this, the last preview was not made from bytes already in hand.
+     *
+     * A frame decoded out of memory lands in ~16ms, and one cropped from a
+     * storyboard in ~0. A frame whose keyframe had to be fetched takes as long
+     * as the link takes — hundreds of ms upwards. The gap between the two is
+     * wide enough that one number tells them apart without knowing anything
+     * about the source.
+     */
+    const PREVIEW_SLOW_MS = 120;
+    /**
+     * How still the pointer must be before a fetching source is asked again.
+     *
+     * Long enough that a pointer travelling across the bar asks for nothing on
+     * the way — every one of those would be a 2MB window the viewer never sees,
+     * ahead in the queue of the one they stop on — and short enough to read as
+     * a response to stopping rather than a wait.
+     */
+    const PREVIEW_SETTLE_MS = 180;
+    /**
+     * …but never leave a moving pointer with no new picture for longer than
+     * this. A slow drag right across a long film would otherwise show nothing
+     * at all until it ended, which is worse than a picture every so often.
+     *
+     * Measured from the last picture SHOWN, and never shorter than half again
+     * what a preview is costing. Measured from the last request instead, it
+     * cancelled the settle rule outright on exactly the links the rule is for:
+     * a fetch taking about this long means the guard has already expired by the
+     * time that fetch lands, so the next one goes out immediately and the
+     * pointer's stopping place queues behind it — the very thing being fixed.
+     */
+    const PREVIEW_SLOW_MAX_WAIT_MS = 1500;
+    /**
+     * What the last preview cost, when the pointer last moved, and when one
+     * last reached the card. Together these decide whether the next request
+     * goes on the next frame or waits for the pointer to settle.
+     */
+    const previewPace = { lastMs: 0, lastMoveAt: 0, lastShownAt: 0 };
+
+    /**
+     * How long the pointer has to have been still, with its picture made and
+     * nothing waiting, before the rest of the preview's 2MB window stops
+     * downloading.
+     *
+     * The window streams on after the frame so that the next positions of a
+     * drag are already in hand; for a pointer at rest they are bytes for
+     * nobody. Measured at 12 Mbit: the preview was up 0.17s into its request
+     * and 1.9MB kept arriving for 1.3s more, and on a 4 Mbit link for four.
+     * The player cannot judge this itself — mid-drag the pacer above holds its
+     * requests back for up to PREVIEW_SLOW_MAX_WAIT_MS.
+     */
+    const PREVIEW_FILL_IDLE_MS = 500;
+    let previewFillTimer: number | null = null;
+    const armPreviewFillStop = (cardHidden = false) => {
+      if (previewFillTimer !== null) clearTimeout(previewFillTimer);
+      previewFillTimer = window.setTimeout(
+        () => {
+          previewFillTimer = null;
+          // A frame being made needs the window, and re-arms this when done.
+          if (previewLoopState.isFetching) return;
+          if (!cardHidden) {
+            // A position still waiting its turn will be fetched, and re-arm
+            // this when it is.
+            if (previewLoopState.nextTime !== null) return;
+            const stillFor = performance.now() - previewPace.lastMoveAt;
+            if (stillFor < PREVIEW_FILL_IDLE_MS) {
+              armPreviewFillStop();
+              return;
+            }
+          }
+          (this.player as any)?.stopPreviewFill?.();
+        },
+        cardHidden ? 0 : PREVIEW_FILL_IDLE_MS,
+      );
+    };
+    let previewSettleTimer: number | null = null;
+    const cancelSettleTimer = () => {
+      if (previewSettleTimer !== null) {
+        clearTimeout(previewSettleTimer);
+        previewSettleTimer = null;
+      }
+    };
+    let stalePreviewTimer: number | null = null;
+    const cancelStaleTimer = () => {
+      if (stalePreviewTimer !== null) {
+        clearTimeout(stalePreviewTimer);
+        stalePreviewTimer = null;
+      }
+    };
+
+    const tileLayerEl = () =>
+      shadowRoot.querySelector(".movi-thumbnail-tile") as HTMLElement | null;
+    /**
+     * Is a storyboard tile on the card right now?
+     *
+     * The card holds its three surfaces — placeholder, tile, decoded frame —
+     * as SIBLINGS in a column, so any two of them showing at once is two boxes
+     * stacked, not one replacing another. Everything that puts the loading
+     * placeholder up therefore has to know whether the tile is already
+     * answering: it counts as a picture, and it has to come down before the
+     * placeholder goes up.
+     */
+    const tileShowing = () => {
+      const tile = tileLayerEl();
+      return (
+        !!tile && tile.style.display !== "none" && !!tile.style.backgroundImage
+      );
+    };
+    /** Put the loading placeholder up — never over a tile. */
+    const showPreviewPlaceholder = (placeholder: HTMLElement | null) => {
+      const tile = tileLayerEl();
+      if (tile) tile.style.display = "none";
+      if (thumbnailImg) thumbnailImg.style.display = "none";
+      if (placeholder) placeholder.style.display = "block";
+    };
+
+    /** Drop the card back to time-only: no frame, and no spinner promising one. */
+    const hidePreviewLoading = () => {
+      cancelStaleTimer();
+      if (thumbnailImg) thumbnailImg.style.display = "none";
+      const tileLayer = shadowRoot.querySelector(
+        ".movi-thumbnail-tile",
+      ) as HTMLElement | null;
+      if (tileLayer) tileLayer.style.display = "none";
+      const placeholder = shadowRoot.querySelector(
+        ".movi-thumbnail-placeholder",
+      ) as HTMLElement | null;
+      if (placeholder) placeholder.style.display = "none";
     };
 
     const processPreviewQueue = async () => {
@@ -3106,13 +4348,23 @@ export class MoviElement extends HTMLElement {
         const vrView = this._vr360
           ? (this.player as any).getVR360View?.()
           : undefined;
+        // Timed, because how long the last one took is what decides how hard
+        // the next one may be pushed for — see PREVIEW_SLOW_MS.
+        const startedAt = performance.now();
         const blob = await (this.player as any).getPreviewFrame?.(
           timeToFetch,
           vrView,
         );
+        previewPace.lastMs = performance.now() - startedAt;
+        if (blob) previewPace.lastShownAt = performance.now();
 
         // Update UI if we got a blob
         if (blob && thumbnailImg) {
+          cancelStaleTimer();
+          const tileLayer = shadowRoot.querySelector(
+            ".movi-thumbnail-tile",
+          ) as HTMLElement | null;
+          if (tileLayer) tileLayer.style.display = "none";
           if (lastPreviewUrl) URL.revokeObjectURL(lastPreviewUrl);
           lastPreviewUrl = URL.createObjectURL(blob);
           thumbnailImg.src = lastPreviewUrl;
@@ -3129,16 +4381,92 @@ export class MoviElement extends HTMLElement {
           // so a CSS rotate would double-transform them.
           if (!this._vr360) this.applyThumbnailRotation(thumbnailImg);
           else thumbnailImg.style.transform = "";
+        } else if (previewLoopState.nextTime === null) {
+          // No frame for THIS position, and nothing newer queued behind it.
+          // canPreviewFrames() rules out the sources that can never produce
+          // one, but a source that usually can still says no for a particular
+          // time: a live stream hovered at the edge, where the thumbnail
+          // segment isn't published yet, is the reproducible case. Without an
+          // exit here the card keeps the loading state it entered on hover and
+          // never leaves it — a spinner over a frame that was already decided
+          // not to exist. Fall back to the time-only card, same as a stream
+          // that carries no thumbnail track at all.
+          //
+          // Skipped when another time is already pending: that fetch owns the
+          // card and is about to repaint it, and blanking in between is a
+          // flicker on every drag across the bar.
+          hidePreviewLoading();
         }
       } catch (e) {
         // Ignore aborts
       } finally {
         previewLoopState.isFetching = false;
-        // If another time was requested while we were busy, loop again immediately
+        armPreviewFillStop();
+        // A time was requested while we were busy. Go through the pacer rather
+        // than straight back into the fetch: on a source that has to fetch,
+        // looping immediately is the whole problem — the moment one 2MB window
+        // lands, the next one starts for wherever the pointer happens to be
+        // mid-travel, and the position the viewer actually stops on waits
+        // behind it.
         if (previewLoopState.nextTime !== null) {
-          processPreviewQueue();
+          schedulePreviewDispatch();
         }
       }
+    };
+
+    /**
+     * Ask for the pending position — on the next frame, or once the pointer
+     * has held still, depending on what the last preview cost.
+     *
+     * Everything the pipeline can answer out of memory goes on the next frame:
+     * that is the scrub the seek bar is meant to have, and the single-flight
+     * queue below it is throttle enough. A source that is still fetching gets
+     * the opposite treatment, because there the cost is not ours to pace — each
+     * position is a 2MB window off the link, and asking for the ones the
+     * pointer merely crossed delays the one it lands on by a whole fetch each.
+     */
+    const schedulePreviewDispatch = () => {
+      if (previewLoopState.nextTime === null) return;
+      const fetching =
+        previewPace.lastMs > PREVIEW_SLOW_MS &&
+        ((this.player as any)?.previewsMayFetch?.() ?? false);
+
+      if (!fetching) {
+        cancelSettleTimer();
+        // The screen cannot show two pictures in one frame, so rAF caps the
+        // rate at the refresh rate and never starves.
+        if (previewFrameRaf === null) {
+          previewFrameRaf = requestAnimationFrame(() => {
+            previewFrameRaf = null;
+            processPreviewQueue();
+          });
+        }
+        return;
+      }
+
+      // Wait out whichever comes first: the pointer settling, or the longest
+      // the card may go without showing anything new.
+      const now = performance.now();
+      const settleLeft = Math.max(
+        0,
+        PREVIEW_SETTLE_MS - (now - previewPace.lastMoveAt),
+      );
+      const maxWait = Math.max(
+        PREVIEW_SLOW_MAX_WAIT_MS,
+        previewPace.lastMs * 1.5,
+      );
+      const maxLeft = Math.max(
+        0,
+        maxWait - (now - previewPace.lastShownAt),
+      );
+      cancelSettleTimer();
+      previewSettleTimer = window.setTimeout(
+        () => {
+          previewSettleTimer = null;
+          processPreviewQueue();
+        },
+        Math.min(settleLeft, maxLeft),
+      );
     };
 
     const requestPreview = (time: number) => {
@@ -3148,25 +4476,53 @@ export class MoviElement extends HTMLElement {
         ".movi-thumbnail-placeholder",
       ) as HTMLElement;
 
-      // Cancel pending timer
-      if (previewDebounce) clearTimeout(previewDebounce);
-
-      // Always switch to static noise when invalidating/debouncing
-      thumbnailImg.style.display = "none";
-      if (thumbnailPlaceholder) thumbnailPlaceholder.style.display = "block";
+      // Keep the picture that is up while the next one is made.
+      //
+      // Blanking to the placeholder on every pointer move meant a scrub was a
+      // strobe: frame, static, frame, static, at one flash per few pixels of
+      // travel — and the frames themselves now arrive in single-digit
+      // milliseconds off a storyboard, so the "loading" state was on screen
+      // longer than the loading was. A frame a fraction of a second stale is a
+      // better answer than no frame at all; only when the next one really is
+      // taking a while does the card admit it.
+      cancelStaleTimer();
+      // A storyboard tile is a picture too. Read only from the decoded frame,
+      // this saw an empty card whenever the tile was the thing on it — which
+      // is every hover on a source with a board — and put the placeholder up
+      // straight away, ON TOP of the tile, for the fraction of a second until
+      // the next paint. That flash is the empty box that appeared above the
+      // thumbnail mid-scrub.
+      const showingPicture =
+        (!!thumbnailImg.getAttribute("src") &&
+          thumbnailImg.style.display !== "none") ||
+        tileShowing();
+      if (!showingPicture) {
+        showPreviewPlaceholder(thumbnailPlaceholder);
+      } else {
+        stalePreviewTimer = window.setTimeout(() => {
+          stalePreviewTimer = null;
+          showPreviewPlaceholder(thumbnailPlaceholder);
+        }, STALE_PREVIEW_GRACE_MS);
+      }
 
       // Schedule this time
       previewLoopState.nextTime = time;
+      previewPace.lastMoveAt = performance.now();
+      armPreviewFillStop();
 
-      // Short debounce: hover previews far from the playhead need a fresh
-      // network fetch, so the debounce is pure added latency. 150ms made a
-      // far-position hover feel ~4s vs <2s for a real seek. The serialized
-      // single-flight queue (processPreviewQueue) already coalesces rapid
-      // moves — it drops to the latest pending time when a fetch finishes —
-      // so a tight debounce won't flood the network.
-      previewDebounce = window.setTimeout(() => {
-        processPreviewQueue();
-      }, 40);
+      // Paced by what the source costs, NOT by a fixed quiet period.
+      //
+      // This was once a flat 40ms trailing debounce, re-armed by every call —
+      // and a scrub calls this on every pointer move, which the browser
+      // delivers about every 8-16ms. The timer was therefore cleared before it
+      // could ever fire, so for the whole length of a drag NOTHING was
+      // requested: measured at ONE decoded frame across 60 moves spanning
+      // 2.2s, and that one only after the pointer came to rest.
+      //
+      // The mistake was not the waiting; it was waiting the same amount
+      // whatever the wait bought. schedulePreviewDispatch splits the two cases
+      // that a single number could never serve at once — see there.
+      schedulePreviewDispatch();
     };
 
     // Helper to show/update thumbnail AND progress visuals during dragging/hovering
@@ -3177,6 +4533,13 @@ export class MoviElement extends HTMLElement {
       if (!progressBar || !thumbnail || !thumbnailTime) return;
 
       const rect = progressBar.getBoundingClientRect();
+      // Read beside the track's rect, before anything below writes a style.
+      // Its use is at the bottom, clamping the card against the player — but
+      // taken there it came after the progress fill, the chapter paint and the
+      // card's own display flip, so every pointer move forced a second layout
+      // to answer a box that had not moved. Two reads back to back settle in
+      // the one layout the first was going to cost anyway.
+      const hostRect = this.getBoundingClientRect();
       const offsetX = clientX - rect.left;
       const percent = Math.max(0, Math.min(1, offsetX / rect.width));
       const duration = this.duration;
@@ -3202,6 +4565,10 @@ export class MoviElement extends HTMLElement {
 
       const time = this.barFractionToTime(percent);
       thumbnailTime.textContent = this.formatTime(time);
+      // Mark what seeking here would cost: the stretch between the playhead
+      // and the pointer. First, because it records where the pointer is and
+      // the chapter paint below reads that.
+      this.paintSeekRangeHover(time);
       // Raise the section the pointer is over (no-op without chapters).
       this.paintChapterHover(time);
 
@@ -3232,14 +4599,21 @@ export class MoviElement extends HTMLElement {
         (time >= (this.player.getBufferStartTime?.() ?? 0) &&
           time <= (this.player.getBufferEndTime?.() ?? duration));
 
-      if (this._thumb && previewInWindow) {
-        requestPreview(time);
+      if (this.canPreviewFrames() && (previewInWindow || this.hasInstantPreviews())) {
+        // A storyboard can answer in this very frame — the mosaic is an image
+        // the browser already has, and the tile is a background offset into
+        // it. Going through requestPreview instead would spend 40ms of
+        // debounce and then a crop, an encode and an image decode to arrive at
+        // the same pixels: measured 45-66ms from pointer move to picture,
+        // against ~0 here.
+        // Skip the DECODE, not the card. `return` here left the tile painted
+        // into a container that the code below had not shown yet — so a source
+        // with a storyboard scrubbed against a picture nobody could see, while
+        // one without a board (falling through to requestPreview) worked. The
+        // only thing a painted tile makes unnecessary is the request.
+        if (!this.paintStoryboardTile(time)) requestPreview(time);
       } else {
-        if (thumbnailImg) thumbnailImg.style.display = "none";
-        const thumbnailPlaceholder = shadowRoot.querySelector(
-          ".movi-thumbnail-placeholder",
-        ) as HTMLElement;
-        if (thumbnailPlaceholder) thumbnailPlaceholder.style.display = "none";
+        hidePreviewLoading();
       }
 
       // The frame's box, from the source's proportions. Before the measurement
@@ -3253,8 +4627,36 @@ export class MoviElement extends HTMLElement {
       // bar the card hung past the frame and was cut off by exactly the amount
       // the guess was wrong.
       thumbnail.style.display = "flex";
+      // The pre-measurement guess has to match what will actually be in the
+      // card: a stream with no thumbnail track shows the time alone, so guessing
+      // the 180px frame width would clamp it as if it were four times wider.
+      //
+      // Measured only when the card's shape can have changed. Reading
+      // offsetWidth right after the style writes above forces a synchronous
+      // layout of the player subtree, and this runs on EVERY pointer move: 5.7
+      // ms a move on a 960px desktop player, which is most of a frame's budget
+      // spent re-learning a number that only moves when the frame box, the
+      // chapter title or the length of the time text changes. Those three are
+      // the signature; anything else leaves the card exactly as wide as it was.
+      const widthSig =
+        `${this._previewBoxKey}|` +
+        `${chapterTitleEl?.style.display !== "none" ? chapterTitleEl?.textContent ?? "" : ""}|` +
+        `${thumbnailTime.textContent?.length ?? 0}|` +
+        `${this.canPreviewFrames() ? 1 : 0}`;
+      if (widthSig !== previewCardWidth.sig) {
+        const measured = thumbnail.offsetWidth;
+        // A card that has not been laid out yet measures 0; keep guessing
+        // until it has a real width rather than caching the guess forever.
+        if (measured > 0) {
+          previewCardWidth.sig = widthSig;
+          previewCardWidth.w = measured;
+        } else {
+          previewCardWidth.sig = "";
+          previewCardWidth.w = 0;
+        }
+      }
       const tooltipWidth =
-        thumbnail.offsetWidth || (this._thumb ? 180 : 60);
+        previewCardWidth.w || (this.canPreviewFrames() ? 180 : 60);
       const half = tooltipWidth / 2;
       // Clamped against the PLAYER, not against the track. The track is inset
       // from the frame by the chrome padding, so clamping to the track pinned
@@ -3262,7 +4664,6 @@ export class MoviElement extends HTMLElement {
       // FRAME that clips, so a card kept inside the track can still be cut by
       // the frame if the two disagree. Measured in viewport coordinates and
       // converted back, which is the only way to compare them.
-      const hostRect = this.getBoundingClientRect();
       const EDGE = 6; // never let it touch the frame
       const minCentre = hostRect.left + half + EDGE;
       const maxCentre = hostRect.right - half - EDGE;
@@ -3309,7 +4710,13 @@ export class MoviElement extends HTMLElement {
 
       const doHide = () => {
         thumbnail.classList.remove("visible");
-        if (previewDebounce) clearTimeout(previewDebounce);
+        // The card is going: nothing will ask for the rest of that window.
+        armPreviewFillStop(true);
+        if (previewFrameRaf !== null) {
+          cancelAnimationFrame(previewFrameRaf);
+          previewFrameRaf = null;
+        }
+        cancelSettleTimer();
 
         // If immediate (delay 0), hide immediately. Otherwise wait for transition.
         const transitionDelay = delay === 0 ? 0 : 150;
@@ -3321,8 +4728,21 @@ export class MoviElement extends HTMLElement {
             const thumbnailPlaceholder = shadowRoot.querySelector(
               ".movi-thumbnail-placeholder",
             ) as HTMLElement;
-            if (thumbnailPlaceholder)
-              thumbnailPlaceholder.style.display = "block";
+            // Arming the placeholder here is how a card that has to decode its
+            // next frame opens in the loading state. A board has nothing to
+            // wait for — its next tile is painted in the same frame the
+            // pointer moves — so arming one left the empty box showing above
+            // the tile for the first moment of the NEXT hover. Leave the card
+            // as the tile left it.
+            if (this.hasInstantPreviews()) {
+              if (thumbnailPlaceholder)
+                thumbnailPlaceholder.style.display = "none";
+            } else {
+              const tile = tileLayerEl();
+              if (tile) tile.style.display = "none";
+              if (thumbnailPlaceholder)
+                thumbnailPlaceholder.style.display = "block";
+            }
           }
         }, transitionDelay);
       };
@@ -3527,6 +4947,35 @@ export class MoviElement extends HTMLElement {
 
     // Mouse Hover Logic for Thumbnail (Desktop)
     if (progressBar && thumbnail) {
+      /**
+       * Is this position's picture already in memory?
+       *
+       * The same question the storyboard carve-out below asks, for the other
+       * way of already having a frame. Leaving the bar hides the card, so the
+       * next hover took the intent delay again — 150ms before it even looked
+       * — for a picture that was in hand and answered in 0ms once asked.
+       * Measured: 54ms while staying on the bar against 162ms after stepping
+       * off and back onto the same spot, with no fetch in either case.
+       *
+       * The rect read is a layout, so it is deliberately on the branch where
+       * the card is NOT already up: during a walk the first branch takes over
+       * and this never runs.
+       */
+      const previewAlreadyHeld = (clientX: number): boolean => {
+        if (this._vr360) return false;
+        const duration = this.duration;
+        if (!(duration > 0)) return false;
+        const rect = progressBar.getBoundingClientRect();
+        if (!(rect.width > 0)) return false;
+        const percent = Math.max(
+          0,
+          Math.min(1, (clientX - rect.left) / rect.width),
+        );
+        return (
+          (this.player as any)?.hasPreviewFor?.(percent * duration) ?? false
+        );
+      };
+
       progressBar.addEventListener("mousemove", (e) => {
         // Ignore if dragging OR recent click
         if (this.isDragging || ignoreHover) return;
@@ -3540,6 +4989,17 @@ export class MoviElement extends HTMLElement {
 
         // Hover Logic
         if (thumbnail.classList.contains("visible")) {
+          updateScrubbingUI(e.clientX);
+        } else if (this.hasInstantPreviews() || previewAlreadyHeld(e.clientX)) {
+          // Nothing to wait and see about. The intent delay is there so a
+          // pointer merely crossing the bar doesn't start work — and with a
+          // storyboard there is no work to start: the tile is a rectangle in
+          // an image already in hand. Waiting 150ms to show a picture that is
+          // ready now is the whole of what makes the first hover feel slow.
+          //
+          // A remembered frame is ready in exactly the same sense, and that is
+          // the case this carve-out was missing: it is why coming back to a
+          // spot you have already looked at loaded all over again.
           updateScrubbingUI(e.clientX);
         } else {
           if (!hoverIntentTimer) {
@@ -3563,8 +5023,11 @@ export class MoviElement extends HTMLElement {
         }
         // The raised section drops with the cursor, not with the preview's
         // 300ms grace — it is part of the bar, and a chapter left standing
-        // proud of a bar nobody is pointing at reads as a stuck control.
+        // proud of a bar nobody is pointing at reads as a stuck control. The
+        // hover range goes with it: it describes a seek the pointer is no
+        // longer offering.
         this.paintChapterHover();
+        this.paintSeekRangeHover();
         hideThumbnail(300); // 300ms delay for mouse leave
       });
     }
@@ -3681,6 +5144,7 @@ export class MoviElement extends HTMLElement {
       this.setFit(next);
       this.updateFitMode();
       this.showAspectOsd(next);
+      this.announceAspect(next);
     });
 
     // Playback Speed
@@ -3976,6 +5440,17 @@ export class MoviElement extends HTMLElement {
         // If we've passed all the control checks above, toggle play/pause
         // This means the click is on the video area (canvas/overlay), not on controls
         this.focus(); // Make sure it gets focus for keyboard shortcuts
+        // Someone already answered this click. The toggle waits 300ms for a
+        // double-click, and a page's own click handler on the video or the
+        // box around it (an upgraded <video>, whose listeners now land here)
+        // does not wait: it paused, and this would have played it straight
+        // back. One click, one toggle — and still the receipt for it, since
+        // the page's call went through play()/pause(), which draw none.
+        if (this.toggledThisGesture()) {
+          this.flashCenterIcon(this.paused ? "pause" : "play");
+          this.clickTimer = null;
+          return;
+        }
         if (this.shouldPauseOnToggle()) {
           this.flashCenterIcon("pause");
           this.pause();
@@ -3990,6 +5465,24 @@ export class MoviElement extends HTMLElement {
     overlay?.addEventListener("click", handleVideoClick);
     this.canvas.addEventListener("click", handleVideoClick);
     this.video.addEventListener("click", handleVideoClick);
+    // Where playback stood when this press began — see toggledThisGesture.
+    // A key is a press too: Space or K toggles here, and a page's own keydown
+    // handler on the video (now on this element) answers the same key.
+    if (!this._gestureWatch) {
+      this._gestureWatch = true;
+      const markGesture = () => {
+        this._gestureAt = performance.now();
+        this._gesturePausedAtStart = this.paused;
+      };
+      this.addEventListener("pointerdown", markGesture, { capture: true });
+      this.addEventListener(
+        "keydown",
+        (e) => {
+          if (!e.repeat) markGesture();
+        },
+        { capture: true },
+      );
+    }
 
     // Keyboard shortcuts
     this.setupKeyboardShortcuts();
@@ -4026,9 +5519,9 @@ export class MoviElement extends HTMLElement {
     ) as HTMLElement;
 
     // Keep controls visible when hovering over controls area
-    controlsContainer?.addEventListener("mouseenter", () => {
+    controlsContainer?.addEventListener("mouseenter", (e) => {
       this.isOverControls = true;
-      this.showControls();
+      if (pointerReallyMoved(e)) this.showControls();
     });
 
     controlsContainer?.addEventListener(
@@ -4044,7 +5537,12 @@ export class MoviElement extends HTMLElement {
     controlsContainer?.addEventListener(
       "touchend",
       () => {
-        setTimeout(() => {
+        // Kept, so a tap that lands somewhere else in the meantime can call it
+        // off — see the outside-tap handler. A finger leaving the bar is not
+        // the same statement as a finger arriving somewhere else, and this
+        // timer was written only to hear the first one.
+        clearTimeout(this._barTouchReshowTimer);
+        this._barTouchReshowTimer = window.setTimeout(() => {
           this.isOverControls = false;
           // Re-arm the auto-hide timer after a touch interaction with the
           // bar or a popup menu. Always call showControls() — it re-checks
@@ -4059,6 +5557,53 @@ export class MoviElement extends HTMLElement {
       },
       { passive: true },
     );
+
+    // A tap that lands outside the player is touch's version of the pointer
+    // leaving — and touch has no other version. The bar hides on mouseleave
+    // and, failing that, on three seconds of inactivity; a finger produces
+    // neither. Tapping the bar and then tapping something else on the page
+    // left the chrome sitting over the picture, because as far as the player
+    // could tell nothing had happened since the tap.
+    //
+    // pointerdown rather than click: it is the first thing a tap does, and a
+    // page whose own handler swallows the click still gets the down. Capture,
+    // for the same reason. composedPath rather than the target, or every tap
+    // on something inside the shadow root would read as a tap on the document.
+    this._outsideTapHandler = (e: Event) => {
+      if (!this._controls) return;
+      if ((e.composedPath?.() ?? []).includes(this)) return;
+      this.isOverControls = false;
+      // The bar's own touchend arms a re-show a second later, to re-arm the
+      // auto-hide after a finger has finished with it. That second may not be
+      // up yet — and if it is not, it would put the bar straight back after
+      // this hide. With a source loaded the inactivity timer then took it away
+      // again three seconds later and the bounce passed for a slow hide; with
+      // nothing loaded that timer never arms, so the bar came back and stayed.
+      clearTimeout(this._barTouchReshowTimer);
+      // The inactivity timer's gates, minus two. The one this event has just
+      // settled, obviously — and the source check, which is not this event's
+      // business: the timer skips an empty player because auto-hiding chrome
+      // nobody asked to hide would look broken with nothing loaded, but a tap
+      // somewhere else IS the asking. Gating on it left the "Nothing to Play"
+      // state as the one place a touch could raise the bar (a tap on it) and
+      // never put it down again. It comes back the same way it went up.
+      //
+      // A menu still open is left alone: the handlers that close it run on the
+      // click that follows this, and taking the bar out from under an open
+      // menu mid-tap leaves the menu believing it is still up. Its own timer
+      // catches that case a moment later.
+      if (
+        !this._isUnsupported &&
+        !this.isDragging &&
+        !this.isTouchDragging &&
+        !this._vrPadDragging &&
+        !this.isAnyMenuOpen() &&
+        !this.isTimelineOpen()
+      ) {
+        this.hideControls();
+      }
+    };
+    document.addEventListener("pointerdown", this._outsideTapHandler, true);
 
     controlsContainer?.addEventListener("mouseleave", (e) => {
       // Check if mouse is moving to another part of controls
@@ -4255,12 +5800,21 @@ export class MoviElement extends HTMLElement {
     this._holdSpeedTimer = null;
     if (this._holdSpeedActive || !this.player) return;
     if (this.player.getState() !== "playing") return;
+    // Hold-to-2x is a speed control without a button — `nospeed` takes it too.
+    if (this.isControlDisabled("speed")) return;
     this._holdSpeedActive = true;
     this.gesturePerformed = true; // suppress the touchend tap (show/hide chrome)
     this._rateBeforeHold = this._playbackRate || 1;
+    Logger.info(TAG, `Hold speed on: 2x (was ${this._rateBeforeHold}x)`);
     this.player.setPlaybackRate(2);
     this._playbackRate = 2;
     this.updateMediaSessionPosition();
+    this._smoothWarnedByMeasurement = false;
+    this._warnedLinkBudget = false;
+    this._linkProbeAbort?.abort();
+    this._linkProbeAbort = null;
+    this._linkStalls = 0;
+    this._deliveryStalls = 0;
     this.resetStutterHint();
     const pill = this.shadowRoot?.querySelector(
       ".movi-hold-speed",
@@ -4276,6 +5830,7 @@ export class MoviElement extends HTMLElement {
     }
     if (!this._holdSpeedActive) return;
     this._holdSpeedActive = false;
+    Logger.info(TAG, `Hold speed off: back to ${this._rateBeforeHold}x`);
     this.player?.setPlaybackRate(this._rateBeforeHold);
     this._playbackRate = this._rateBeforeHold;
     this.updateMediaSessionPosition();
@@ -4509,18 +6064,19 @@ export class MoviElement extends HTMLElement {
               let next: "contain" | "cover" | null = null;
               if (ratio > 1.2 && current !== "cover") next = "cover";
               else if (ratio < 0.83 && current !== "contain") next = "contain";
-              if (next) {
+              // The pinch is the A key by hand, so `noaspect` takes it too. The
+              // two fingers are still consumed here — let through, they would
+              // reach the one-finger swipes below as a stray drag.
+              if (next && !this.isControlDisabled("aspect")) {
                 this.setFit(next);
                 this.updateFitMode();
+                this.announceAspect(next);
                 const labels: Record<string, string> = {
                   contain: "Fit",
                   cover: "Fill",
                 };
-                const osdSvg =
-                  MoviElement.ASPECT_ICONS[next] ||
-                  MoviElement.ASPECT_ICONS.contain;
                 this.showOSD(
-                  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${osdSvg}</svg>`,
+                  symbolSvg(MoviElement.aspectSymbol(next)),
                   labels[next],
                 );
                 // Re-baseline so the opposite pinch can toggle straight back.
@@ -4641,8 +6197,8 @@ export class MoviElement extends HTMLElement {
               // Show OSD with seek information
               const icon =
                 deltaX >= 0
-                  ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 17l5-5-5-5M6 17l5-5-5-5"/></svg>`
-                  : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/></svg>`;
+                  ? `${symbolSvg("chevronsRight")}`
+                  : `${symbolSvg("chevronsLeft")}`;
 
               const timeStr = this.formatTime(newTime);
               const durationStr = this.formatTime(this.duration);
@@ -4686,13 +6242,12 @@ export class MoviElement extends HTMLElement {
               startXPercent <= 0.5
             ) {
               if (deltaY < -60) {
-                // Swipe UP -> Enter Fullscreen (skip for any audio source).
-                // Route through toggleFullscreen so the iOS pseudo-fullscreen
-                // fallback and the host-fullscreen event apply here too.
-                if (
-                  !this.isFullscreenActive() &&
-                  !this.classList.contains("movi-audio-mode")
-                ) {
+                // Swipe UP -> Enter Fullscreen. Route through toggleFullscreen
+                // so the iOS pseudo-fullscreen fallback and the host-fullscreen
+                // event apply here too. Audio included: the cover view is a
+                // surface to swipe on, and the strip has none (its overlay is
+                // display:none, so no gesture ever starts there).
+                if (!this.isFullscreenActive()) {
                   this.toggleFullscreen();
                 }
               } else if (deltaY > 60) {
@@ -5161,12 +6716,22 @@ export class MoviElement extends HTMLElement {
       // is the symptom that surfaced this gap.
       if (this.classList.contains("movi-audio-mode")) {
         // a:fit  p:pip  r:rotate  g:ambient  s:snapshot  t:timeline
-        // v:subtitle-track. f (fullscreen) and h (hdr) are intentionally
-        // omitted — they already self-guard: toggleFullscreen() is the
-        // single audio-mode chokepoint, and the h case no-ops because the
-        // hdr-toggle item is display:none for non-HDR (audio) content.
+        // v:subtitle-track. f (fullscreen) is not on the list: audio has a
+        // full-screen view of its own. h (hdr) is omitted because it already
+        // no-ops — the hdr-toggle item is display:none for non-HDR (audio)
+        // content.
         const VIDEO_ONLY_KEYS = "aprgstv";
-        if (e.key.length === 1 && VIDEO_ONLY_KEYS.includes(e.key.toLowerCase())) {
+        // Bare presses only. These letters are the keys of video-only controls
+        // when nothing is held with them; Shift+P is a different shortcut that
+        // happens to be spelled with one of them, and an audio queue is the
+        // most ordinary queue there is.
+        const bareKey =
+          !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
+        if (
+          bareKey &&
+          e.key.length === 1 &&
+          VIDEO_ONLY_KEYS.includes(e.key.toLowerCase())
+        ) {
           return;
         }
       }
@@ -5214,6 +6779,22 @@ export class MoviElement extends HTMLElement {
           }
           break;
         }
+        // The queue, by key. Both no-op when there is nothing that way — the
+        // guard lives in next()/previous(), so the key and the button can never
+        // disagree about where the ends are.
+        case "shift+n":
+          // controlslist="noplaylist" takes the keys with the buttons — a
+          // control the host switched off is off everywhere, not just where it
+          // could be seen.
+          if (this.isControlDisabled("playlist")) break;
+          e.preventDefault();
+          if (this.next()) this.showControls();
+          break;
+        case "shift+p":
+          if (this.isControlDisabled("playlist")) break;
+          e.preventDefault();
+          if (this.previous()) this.showControls();
+          break;
         case "ArrowLeft":
           // Left Arrow: Seek backward 5 seconds or single frame (if Ctrl)
           // Only when fastseek names the key channel. In linear mode the seek
@@ -5231,7 +6812,7 @@ export class MoviElement extends HTMLElement {
             const frameTime = 1 / fps;
             this.currentTime = Math.max(0, this.currentTime - frameTime);
             this.showOSD(
-              `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/></svg>`,
+              `${symbolSvg("chevronsLeft")}`,
               `-1 Frame`,
             );
           } else {
@@ -5259,7 +6840,7 @@ export class MoviElement extends HTMLElement {
                 this.currentTime + frameTime,
               );
               this.showOSD(
-                `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 17l5-5-5-5M6 17l5-5-5-5"/></svg>`,
+                `${symbolSvg("chevronsRight")}`,
                 `+1 Frame`,
               );
             } else {
@@ -5270,14 +6851,14 @@ export class MoviElement extends HTMLElement {
         case "ArrowUp":
           // Up Arrow: Increase volume
           e.preventDefault();
-          if (this.player && this.player.hasAudibleSource()) {
+          if (this.player && this.player.hasAudibleSource() && !this._noAudibleAudio) {
             this.volume = Math.min(this.getMaxVolume(), this.volume + 0.1);
           }
           break;
         case "ArrowDown":
           // Down Arrow: Decrease volume
           e.preventDefault();
-          if (this.player && this.player.hasAudibleSource()) {
+          if (this.player && this.player.hasAudibleSource() && !this._noAudibleAudio) {
             this.volume = Math.max(0, this.volume - 0.1);
           }
           break;
@@ -5285,6 +6866,11 @@ export class MoviElement extends HTMLElement {
         case "M":
           // M: Mute/Unmute
           e.preventDefault();
+          // Nothing to mute when the browser could not decode the audio at all
+          // — the key would just toggle an icon over a silence it can't lift.
+          // The arrow keys already refuse on the same grounds
+          // (hasAudibleSource); this is the same refusal for the same reason.
+          if (this._noAudibleAudio) break;
           this.muted = !this.muted;
           this.showOSD(
             this.muted
@@ -5336,7 +6922,7 @@ export class MoviElement extends HTMLElement {
           if (this.player && !this._pipWindow && this.isControlAvailable("rotate")) {
             const deg = this.player.rotateVideo();
             this.showOSD(
-              `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>`,
+              `${symbolSvg("replay")}`,
               `${deg}°`,
             );
             const statusEl = this.contextMenuRoot().querySelector(".movi-rotate-status");
@@ -5358,10 +6944,10 @@ export class MoviElement extends HTMLElement {
             this.setFit(next);
             this.updateFitMode();
             this.updateAspectRatioIcon();
+            this.announceAspect(next);
             const labels: Record<string, string> = { contain: "Fit", cover: "Fill", fill: "Stretch", zoom: "Zoom" };
-            const osdSvg = MoviElement.ASPECT_ICONS[next] || MoviElement.ASPECT_ICONS.contain;
             this.showOSD(
-              `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${osdSvg}</svg>`,
+              symbolSvg(MoviElement.aspectSymbol(next)),
               labels[next],
             );
           }
@@ -5369,6 +6955,10 @@ export class MoviElement extends HTMLElement {
         case "l":
         case "L":
           // L: Toggle loop
+          // Every key below that belongs to a control a token can switch off
+          // checks for it before claiming the press, as the queue keys above
+          // do: a switched-off control's key is not the player's to take.
+          if (this.isControlDisabled("loop")) break;
           e.preventDefault();
           this.loop = !this.loop;
           this.showOSD(
@@ -5379,6 +6969,10 @@ export class MoviElement extends HTMLElement {
         case "v":
         case "V":
           // V: Cycle subtitle track (VLC standard) — external then muxed
+          // `nocc` freezes the captions where the host left them, both ways: a
+          // caption on screen is not a place the viewer is stuck in, and one
+          // the host turned on may be the reason the page set the token.
+          if (this.isControlDisabled("cc")) break;
           e.preventDefault();
           if (this.player) {
             const extSubs = this.player.getSubtitleLangs();
@@ -5433,7 +7027,9 @@ export class MoviElement extends HTMLElement {
           // File-source only — streamed sources don't expose the timing
           // controls this nudge depends on. Also require an active subtitle
           // track: nudging a delay value that applies to nothing on screen
-          // would just surface a misleading OSD readout.
+          // would just surface a misleading OSD readout. The delay lives in the
+          // captions menu, so it goes with `nocc`.
+          if (this.isControlDisabled("cc")) break;
           e.preventDefault();
           if (!this.player || !this.player.isFileSource()) break;
           const hasActiveMuxed = !!this.player.trackManager.getActiveSubtitleTrack();
@@ -5453,6 +7049,7 @@ export class MoviElement extends HTMLElement {
         case "b":
         case "B":
           // B: Cycle audio track — muxed + external combined
+          if (this.isControlDisabled("audio")) break;
           e.preventDefault();
           if (this.player) {
             const bMuxed = this.player.getAudioTracks();
@@ -5521,6 +7118,7 @@ export class MoviElement extends HTMLElement {
         case "c":
         case "C":
           // C: Crop the black bars baked into the picture
+          if (this.isControlDisabled("crop")) break;
           e.preventDefault();
           this.cropbars = !this._cropBars;
           this.updateCropUI();
@@ -5544,6 +7142,7 @@ export class MoviElement extends HTMLElement {
         case "=":
         case "+":
           // +: Speed up (VLC standard)
+          if (this.isControlDisabled("speed")) break;
           e.preventDefault();
           {
             const maxRate = this.getMaxAllowedRate();
@@ -5559,6 +7158,7 @@ export class MoviElement extends HTMLElement {
           break;
         case "-":
           // -: Speed down (VLC standard)
+          if (this.isControlDisabled("speed")) break;
           e.preventDefault();
           {
             const maxRate = this.getMaxAllowedRate();
@@ -5575,13 +7175,7 @@ export class MoviElement extends HTMLElement {
         case "?":
           // ?: Show keyboard shortcuts
           e.preventDefault();
-          {
-            const panel = this.shadowRoot?.querySelector(".movi-shortcuts-panel") as HTMLElement;
-            if (panel) {
-              this.syncShortcutsPanel();
-              panel.style.display = panel.style.display === "none" ? "flex" : "none";
-            }
-          }
+          this.toggleShortcutsPanel();
           break;
         case "0":
           // 0: Seek to start
@@ -5663,10 +7257,13 @@ export class MoviElement extends HTMLElement {
     );
 
     // Surface controls the moment the cursor enters the player.
-    this.addEventListener("mouseenter", () => {
+    this.addEventListener("mouseenter", (e) => {
       // Skip when this is a touch-induced synthetic mouse event (a real
       // hover never follows a recent touchstart).
       if (Date.now() - this.lastTouchTime < 800) return;
+      // …or the page moving under a pointer that did not — see
+      // pointerReallyMoved.
+      if (!pointerReallyMoved(e)) return;
       // Surface the controls the moment the cursor enters the player,
       // regardless of which child element is under it. The canvas/video/
       // overlay mousemove handlers miss the case where the cursor is
@@ -5676,8 +7273,9 @@ export class MoviElement extends HTMLElement {
       if (this._controls) this.showControls();
     });
 
-    this.addEventListener("mousemove", () => {
+    this.addEventListener("mousemove", (e) => {
       if (Date.now() - this.lastTouchTime < 800) return;
+      if (!pointerReallyMoved(e)) return;
       if (this._controls) this.showControls();
     });
 
@@ -5880,7 +7478,7 @@ export class MoviElement extends HTMLElement {
         if (isStripMode || inFullscreen) {
           if (inFullscreen) this.classList.add("movi-menu-overflow");
           contextMenu.style.position = "fixed";
-          contextMenu.style.maxHeight = `${Math.max(180, window.innerHeight - 40)}px`;
+          contextMenu.style.maxHeight = `${MoviElement.contextMenuMaxHeight()}px`;
           contextMenu.style.display = "block";
           contextMenu.style.visibility = "hidden";
           const menuWidth = contextMenu.offsetWidth;
@@ -5914,8 +7512,9 @@ export class MoviElement extends HTMLElement {
         let y = e.clientY;
 
         // Cap height to the VIEWPORT so a tall menu extends downward instead of
-        // scrolling inside a tiny box.
-        contextMenu.style.maxHeight = `${Math.max(180, window.innerHeight - 40)}px`;
+        // scrolling inside a tiny box — and to a menu's height, not a window's:
+        // see contextMenuMaxHeight.
+        contextMenu.style.maxHeight = `${MoviElement.contextMenuMaxHeight()}px`;
 
         // Temporarily show menu to get its dimensions
         contextMenu.style.display = "block";
@@ -5962,7 +7561,7 @@ export class MoviElement extends HTMLElement {
     };
 
     // Helper to hide context menu
-    const hideContextMenu = () => {
+    const hideContextMenu: () => void = () => {
       contextMenu.classList.remove("visible");
       // Restore the host's paint/overflow clip (lifted while the desktop menu
       // was open so it could spill outside the player).
@@ -6012,7 +7611,18 @@ export class MoviElement extends HTMLElement {
         // appear pinned to the player's top-left. The panels are hidden now and
         // every desktop open re-runs showSubmenu to set fresh coords, so leaving
         // the last values is harmless — and avoids the top-left pin.
-        const closedSubs = this._portaledSubs;
+        // Snapshot PLUS a live sweep of the portal — the same belt-and-braces
+        // unportalContextMenu uses for the move itself. A panel missing from
+        // this list keeps its visible class through the reparent, which is the
+        // one way a panel can end up painting at its old coordinates against a
+        // new containing block.
+        const closedSet = new Set<Element>(this._portaledSubs);
+        for (const sm of Array.from(
+          this._menuPortalRoot?.querySelectorAll(MoviElement.SUBMENU_SELECTOR) || [],
+        )) {
+          closedSet.add(sm);
+        }
+        const closedSubs = Array.from(closedSet);
         for (const sm of closedSubs) {
           const el = sm as HTMLElement;
           el.style.transition = "none";
@@ -6324,6 +7934,21 @@ export class MoviElement extends HTMLElement {
         return;
       }
 
+      // A row the host switched off does nothing, whichever way it was reached.
+      // The stylesheet hides these rows, but a hidden row is still a row: a
+      // stale open menu, a tap already in flight, a script's .click() — and the
+      // values inside a submenu (a speed, a fit, a track) answer to the
+      // submenu's control, the same join worksBeforePlayback makes.
+      const submenuKey = (
+        item.closest(".movi-context-menu-submenu") as HTMLElement | null
+      )?.dataset.submenu;
+      const menuControl =
+        MoviElement.MENU_ACTION_CONTROL[submenuKey || action || ""];
+      if (menuControl && this.isControlDisabled(menuControl)) {
+        hideContextMenu();
+        return;
+      }
+
       const speed = item.dataset.speed;
       const audioTrackId = item.dataset.audioTrackId;
       const audioLang = item.dataset.audioLang;
@@ -6344,11 +7969,24 @@ export class MoviElement extends HTMLElement {
         }
         hideContextMenu();
       } else if (action === "speed") {
-        // Show speed submenu (changed from toggle to add)
-        const submenu = shadowRoot.querySelector(
+        // contextMenuRoot(), not shadowRoot: on desktop the menu and its
+        // panels are MOVED into a body-level portal so they escape the
+        // player's containing block, and from there shadowRoot finds none of
+        // them. This looked exactly like "playback speed does nothing" — the
+        // row was clickable, the panel it was meant to reveal was simply never
+        // found, so nothing opened and no speed could be picked. Same trap the
+        // fit branch below already documents.
+        const submenu = this.contextMenuRoot().querySelector(
           '.movi-context-menu-submenu[data-submenu="speed"]',
         ) as HTMLElement;
         if (submenu) {
+          // Give it coordinates before showing it. The mobile menu lays its
+          // panels out itself (full-width slide-in), so only the desktop one
+          // is placed here.
+          if (!contextMenu.classList.contains("movi-context-menu-mobile")) {
+            this.positionSubmenu(item, submenu);
+          }
+          this.syncSpeedSubmenuActive(submenu);
           contextMenu.scrollTop = 0;
           submenu.classList.add("movi-context-menu-submenu-visible");
         }
@@ -6356,15 +7994,24 @@ export class MoviElement extends HTMLElement {
         const submenu = this.contextMenuRoot().querySelector('.movi-context-menu-submenu[data-submenu="fit"]') as HTMLElement;
         if (submenu) {
           this.syncFitSubmenuActive(submenu); // touch: reflect current fit
+          if (!contextMenu.classList.contains("movi-context-menu-mobile")) {
+            this.positionSubmenu(item, submenu);
+          }
           contextMenu.scrollTop = 0;
           submenu.classList.add("movi-context-menu-submenu-visible");
         }
       } else if (action === "audio-track") {
-        // Show audio track submenu (changed from toggle to add)
-        const submenu = shadowRoot.querySelector(
+        // Portal-aware lookup — see the speed branch above.
+        const submenu = this.contextMenuRoot().querySelector(
           ".movi-context-menu-submenu-audio",
         ) as HTMLElement;
         if (submenu) {
+          // Give it coordinates before showing it. The mobile menu lays its
+          // panels out itself (full-width slide-in), so only the desktop one
+          // is placed here.
+          if (!contextMenu.classList.contains("movi-context-menu-mobile")) {
+            this.positionSubmenu(item, submenu);
+          }
           contextMenu.scrollTop = 0;
           submenu.classList.add("movi-context-menu-submenu-visible");
         }
@@ -6397,11 +8044,17 @@ export class MoviElement extends HTMLElement {
         }
         hideContextMenu();
       } else if (action === "audio-output") {
-        // Show the audio output device submenu
-        const submenu = shadowRoot.querySelector(
+        // Portal-aware lookup — see the speed branch above.
+        const submenu = this.contextMenuRoot().querySelector(
           ".movi-context-menu-submenu-audiodevice",
         ) as HTMLElement;
         if (submenu) {
+          // Give it coordinates before showing it. The mobile menu lays its
+          // panels out itself (full-width slide-in), so only the desktop one
+          // is placed here.
+          if (!contextMenu.classList.contains("movi-context-menu-mobile")) {
+            this.positionSubmenu(item, submenu);
+          }
           contextMenu.scrollTop = 0;
           submenu.classList.add("movi-context-menu-submenu-visible");
         }
@@ -6420,11 +8073,17 @@ export class MoviElement extends HTMLElement {
         this.showOSD(OSD.audio, label);
         hideContextMenu();
       } else if (action === "subtitle-track") {
-        // Show subtitle track submenu (changed from toggle to add)
-        const submenu = shadowRoot.querySelector(
+        // Portal-aware lookup — see the speed branch above.
+        const submenu = this.contextMenuRoot().querySelector(
           ".movi-context-menu-submenu-subtitle",
         ) as HTMLElement;
         if (submenu) {
+          // Give it coordinates before showing it. The mobile menu lays its
+          // panels out itself (full-width slide-in), so only the desktop one
+          // is placed here.
+          if (!contextMenu.classList.contains("movi-context-menu-mobile")) {
+            this.positionSubmenu(item, submenu);
+          }
           contextMenu.scrollTop = 0;
           submenu.classList.add("movi-context-menu-submenu-visible");
         }
@@ -6464,13 +8123,28 @@ export class MoviElement extends HTMLElement {
         }
         hideContextMenu();
       } else if (speed) {
-        // Set playback speed
-        const playbackSpeed = parseFloat(speed);
-        if (this.player) {
-          this.player.setPlaybackRate(playbackSpeed);
-          this._playbackRate = playbackSpeed;
-          this.setAttribute("playbackrate", playbackSpeed.toString());
-        }
+        // Through the public setter, exactly as the gear panel's speed list
+        // does — NOT by writing the field and reflecting the attribute by
+        // hand.
+        //
+        // That hand-rolled pair is a trap. Writing `playbackrate` without
+        // first recording it as the viewer's choice looks, to the persistence
+        // layer, precisely like a HOST re-asserting its markup over a
+        // remembered setting — so hostOverridingStoredChoice put the stored
+        // value straight back, one tick later, from inside the same click.
+        // The result was a menu that announced "Speed 0.25x" over a video
+        // still playing at 1x, and only once the viewer had used the gear
+        // panel earlier in the session (before that there was no stored
+        // choice to override, and the same code worked).
+        //
+        // The setter also brings the ceiling with it: 8K+ sources cannot
+        // sustain over 1.5x in any browser today, and this path was handing
+        // the decoder 2x regardless.
+        const playbackSpeed = Math.min(
+          parseFloat(speed),
+          this.getMaxAllowedRate(),
+        );
+        this.playbackRate = playbackSpeed;
 
         // Update active state (query the item's own submenu — the speed submenu
         // is a moved-out sibling of contextMenu, so contextMenu wouldn't find
@@ -6488,11 +8162,10 @@ export class MoviElement extends HTMLElement {
       } else if (item.dataset.fit) {
         const fitMode = item.dataset.fit as "contain" | "cover" | "fill" | "zoom";
         const viaControl = this._objectFit === "control";
-        if (viaControl) {
-          this._currentFit = fitMode;
-        } else {
-          this._objectFit = fitMode;
-        }
+        // setFit, not the raw fields: it picks the right one of the two AND
+        // records the choice. Written by hand here, an aspect chosen from this
+        // menu applied to the picture and was forgotten by the next load.
+        this.setFit(fitMode);
         this.updateFitMode();
         this.updateAspectRatioIcon();
         // The context menu applies the fit itself rather than going through
@@ -6521,7 +8194,7 @@ export class MoviElement extends HTMLElement {
         // Surface the same Fit/Fill/… OSD the aspect button and keyboard show —
         // changing the fit from the menu was silently skipping it.
         this.showOSD(
-          `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${MoviElement.ASPECT_ICONS[fitMode] || MoviElement.ASPECT_ICONS.contain}</svg>`,
+          `${symbolSvg(MoviElement.aspectSymbol(fitMode))}`,
           fitLabels[fitMode] || fitMode,
         );
         hideContextMenu();
@@ -6554,6 +8227,13 @@ export class MoviElement extends HTMLElement {
           this.loop ? "Loop On" : "Loop Off",
         );
         hideContextMenu();
+      } else if (action === "shuffle-toggle") {
+        this.shuffle = !this._shuffle;
+        this.showOSD(
+          OSD.shuffle,
+          this._shuffle ? "Shuffle On" : "Shuffle Off",
+        );
+        hideContextMenu();
       } else if (action === "stable-audio-toggle") {
         if (this.player) {
           this.stableVolume = !this._stableVolume;
@@ -6583,13 +8263,7 @@ export class MoviElement extends HTMLElement {
         this.toggleNerdStats(shadowRoot);
         hideContextMenu();
       } else if (action === "keyboard-shortcuts") {
-        const panel = shadowRoot.querySelector(
-          ".movi-shortcuts-panel",
-        ) as HTMLElement;
-        if (panel) {
-          this.syncShortcutsPanel();
-          panel.style.display = panel.style.display === "none" ? "flex" : "none";
-        }
+        this.toggleShortcutsPanel();
         hideContextMenu();
       } else if (action === "timeline") {
         this.toggleTimeline();
@@ -6621,6 +8295,7 @@ export class MoviElement extends HTMLElement {
     // reached nothing at all, which looked like the deepest rows simply not
     // working.
     this._menuItemClickHandler = itemClickHandler;
+    this._hideContextMenu = hideContextMenu;
 
     // Handle hover for submenu
     const speedItem = contextMenu.querySelector(
@@ -6693,9 +8368,7 @@ export class MoviElement extends HTMLElement {
         window.matchMedia("(pointer: coarse)").matches
       ) {
         html += `<div class="movi-context-menu-item movi-context-menu-back" data-action="back">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M15 18l-6-6 6-6"/>
-          </svg>
+          ${symbolSvg("chevronBack", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Back</span>
         </div>`;
       }
@@ -6795,9 +8468,7 @@ export class MoviElement extends HTMLElement {
         window.matchMedia("(pointer: coarse)").matches
       ) {
         html += `<div class="movi-context-menu-item movi-context-menu-back" data-action="back">
-          <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M15 18l-6-6 6-6"/>
-          </svg>
+          ${symbolSvg("chevronBack", "movi-context-menu-icon")}
           <span class="movi-context-menu-label">Back</span>
         </div>`;
       }
@@ -6830,7 +8501,8 @@ export class MoviElement extends HTMLElement {
       html += ctxExternalSubs
         .map((t) => {
           const activeClass = t.active ? " movi-context-menu-active" : "";
-          return `<div class="movi-context-menu-item${activeClass}" data-subtitle-lang="${t.lang}">${t.label} (${t.lang.toUpperCase()})</div>`;
+          const tail = t.pending ? MoviElement.SUBTITLE_PENDING : ` (${t.lang.toUpperCase()})`;
+          return `<div class="movi-context-menu-item${activeClass}" data-subtitle-lang="${t.lang}">${t.label}${tail}</div>`;
         })
         .join("");
 
@@ -6908,6 +8580,99 @@ export class MoviElement extends HTMLElement {
       );
   }
 
+  /**
+   * Place a submenu panel beside its row.
+   *
+   * Lived inside the hover closure, which is why a submenu opened by CLICK
+   * came up with no coordinates at all: portaled, an unpositioned panel
+   * resolves to its containing block's origin, so it appeared pinned to the
+   * top-left — and moved again on close, when the panel went home and the same
+   * empty coords started resolving against the player. Both paths now measure
+   * through here, so a click opens the panel exactly where a hover does.
+   */
+  private positionSubmenu(item: HTMLElement, submenu: HTMLElement): void {
+    // The menu (and its submenu panels) may be in the body portal (desktop)
+    // rather than the shadow root — find it wherever it lives.
+    const contextMenu = (this._menuPortalRoot?.querySelector(
+      ".movi-context-menu",
+    ) ||
+      this.shadowRoot?.querySelector(
+        ".movi-context-menu",
+      )) as HTMLElement | null;
+    if (contextMenu) {
+      // Use VIEWPORT coordinates when the menu itself is viewport-positioned:
+      // the desktop menu is portaled (absolute inside the fixed portal host at
+      // 0,0), and the audio-strip menu is fixed (strip mode drops the host's
+      // container-type, so a fixed submenu is viewport-relative too and lines
+      // up with it — the tiny 56px strip's bounds must NOT confine it).
+      // Otherwise the submenu is :host-relative and confined to the player.
+      const portaled = contextMenu.getRootNode() === this._menuPortalRoot;
+      const strip = this.classList.contains("movi-audio-strip");
+      const useViewport = portaled || strip;
+      // Strip: pin the submenu to the viewport like the strip menu.
+      submenu.style.position = strip ? "fixed" : "";
+      const itemRect = item.getBoundingClientRect();
+      const menuRect = contextMenu.getBoundingClientRect();
+      const playerRect = this.getBoundingClientRect();
+      const submenuWidth = submenu.offsetWidth || 160;
+      const gap = 4;
+      const padding = 10;
+
+      const originLeft = useViewport ? 0 : playerRect.left;
+      const originTop = useViewport ? 0 : playerRect.top;
+      const boundsLeft = useViewport ? 0 : playerRect.left;
+      const boundsRight = useViewport ? window.innerWidth : playerRect.right;
+      const boundsBottom = useViewport ? window.innerHeight : playerRect.bottom;
+
+      const spaceOnRight = boundsRight - menuRect.right;
+      const spaceOnLeft = menuRect.left - boundsLeft;
+
+      submenu.style.right = "auto";
+      submenu.style.marginLeft = "0";
+      submenu.style.marginRight = "0";
+
+      // Positions are relative to the submenu's containing block (viewport
+      // origin when portaled, else :host), so subtract the origin.
+      if (spaceOnRight >= submenuWidth + padding) {
+        // 1. RIGHT (Preferred)
+        submenu.style.left = `${menuRect.right + gap - originLeft}px`;
+        submenu.style.transform = "translateX(-8px)";
+      } else if (spaceOnLeft >= submenuWidth + padding) {
+        // 2. LEFT
+        submenu.style.left = `${menuRect.left - submenuWidth - gap - originLeft}px`;
+        submenu.style.transform = "translateX(8px)";
+      } else {
+        // 3. OVERLAP (tight space)
+        submenu.style.left = `${menuRect.left + 20 - originLeft}px`;
+        submenu.style.transform = "translateY(10px)";
+      }
+
+      let topPx = itemRect.top - originTop;
+      submenu.style.top = `${topPx}px`;
+
+      // Measure submenu height (force layout if hidden)
+      const wasClassVisible = submenu.classList.contains(
+        "movi-context-menu-submenu-visible",
+      );
+      if (!wasClassVisible) {
+        submenu.style.visibility = "hidden";
+        submenu.style.display = "block";
+      }
+      const submenuHeight = submenu.getBoundingClientRect().height;
+      if (!wasClassVisible) {
+        submenu.style.display = "";
+        submenu.style.visibility = "";
+      }
+
+      // Clamp to the bounds (viewport when portaled, else player).
+      const maxTop = boundsBottom - originTop - padding - submenuHeight;
+      if (topPx > maxTop) {
+        topPx = Math.max(padding, maxTop);
+        submenu.style.top = `${topPx}px`;
+      }
+    }
+  }
+
   private setupSubmenuHover(item: HTMLElement, submenu: HTMLElement): void {
     // Check if listeners are already attached (using a data attribute)
     if (item.dataset.hoverSetup === "true") {
@@ -6920,91 +8685,22 @@ export class MoviElement extends HTMLElement {
     let hideTimeout: number | null = null;
 
     const showSubmenu = () => {
+      // A closed menu has no submenus.
+      //
+      // Closing the menu moves it and its panels out of the body portal, and
+      // that changes what sits under the pointer — so the browser fires
+      // mouseenter at whatever is there now, including the very row the
+      // pointer was on. Unguarded, that re-opened the panel for a menu that
+      // had already gone: back home its coordinates are player-relative, so it
+      // appeared in the player's top-left corner and sat there until the 150ms
+      // hide timer took it away again. That is the flash after picking an item.
+      if (!this._contextMenuVisible) return;
       // Clear any pending hide timeout
       if (hideTimeout !== null) {
         clearTimeout(hideTimeout);
         hideTimeout = null;
       }
-      // The menu (and its submenu panels) may be in the body portal (desktop)
-      // rather than the shadow root — find it wherever it lives.
-      const contextMenu = (this._menuPortalRoot?.querySelector(
-        ".movi-context-menu",
-      ) ||
-        this.shadowRoot?.querySelector(
-          ".movi-context-menu",
-        )) as HTMLElement | null;
-      if (contextMenu) {
-        // Use VIEWPORT coordinates when the menu itself is viewport-positioned:
-        // the desktop menu is portaled (absolute inside the fixed portal host at
-        // 0,0), and the audio-strip menu is fixed (strip mode drops the host's
-        // container-type, so a fixed submenu is viewport-relative too and lines
-        // up with it — the tiny 56px strip's bounds must NOT confine it).
-        // Otherwise the submenu is :host-relative and confined to the player.
-        const portaled = contextMenu.getRootNode() === this._menuPortalRoot;
-        const strip = this.classList.contains("movi-audio-strip");
-        const useViewport = portaled || strip;
-        // Strip: pin the submenu to the viewport like the strip menu.
-        submenu.style.position = strip ? "fixed" : "";
-        const itemRect = item.getBoundingClientRect();
-        const menuRect = contextMenu.getBoundingClientRect();
-        const playerRect = this.getBoundingClientRect();
-        const submenuWidth = submenu.offsetWidth || 160;
-        const gap = 4;
-        const padding = 10;
-
-        const originLeft = useViewport ? 0 : playerRect.left;
-        const originTop = useViewport ? 0 : playerRect.top;
-        const boundsLeft = useViewport ? 0 : playerRect.left;
-        const boundsRight = useViewport ? window.innerWidth : playerRect.right;
-        const boundsBottom = useViewport ? window.innerHeight : playerRect.bottom;
-
-        const spaceOnRight = boundsRight - menuRect.right;
-        const spaceOnLeft = menuRect.left - boundsLeft;
-
-        submenu.style.right = "auto";
-        submenu.style.marginLeft = "0";
-        submenu.style.marginRight = "0";
-
-        // Positions are relative to the submenu's containing block (viewport
-        // origin when portaled, else :host), so subtract the origin.
-        if (spaceOnRight >= submenuWidth + padding) {
-          // 1. RIGHT (Preferred)
-          submenu.style.left = `${menuRect.right + gap - originLeft}px`;
-          submenu.style.transform = "translateX(-8px)";
-        } else if (spaceOnLeft >= submenuWidth + padding) {
-          // 2. LEFT
-          submenu.style.left = `${menuRect.left - submenuWidth - gap - originLeft}px`;
-          submenu.style.transform = "translateX(8px)";
-        } else {
-          // 3. OVERLAP (tight space)
-          submenu.style.left = `${menuRect.left + 20 - originLeft}px`;
-          submenu.style.transform = "translateY(10px)";
-        }
-
-        let topPx = itemRect.top - originTop;
-        submenu.style.top = `${topPx}px`;
-
-        // Measure submenu height (force layout if hidden)
-        const wasClassVisible = submenu.classList.contains(
-          "movi-context-menu-submenu-visible",
-        );
-        if (!wasClassVisible) {
-          submenu.style.visibility = "hidden";
-          submenu.style.display = "block";
-        }
-        const submenuHeight = submenu.getBoundingClientRect().height;
-        if (!wasClassVisible) {
-          submenu.style.display = "";
-          submenu.style.visibility = "";
-        }
-
-        // Clamp to the bounds (viewport when portaled, else player).
-        const maxTop = boundsBottom - originTop - padding - submenuHeight;
-        if (topPx > maxTop) {
-          topPx = Math.max(padding, maxTop);
-          submenu.style.top = `${topPx}px`;
-        }
-      }
+      this.positionSubmenu(item, submenu);
 
       // Hover-open: reflect live state. Both of these submenus are static
       // markup whose active row is otherwise only set by clicking in them.
@@ -7063,7 +8759,7 @@ export class MoviElement extends HTMLElement {
     }
   }
 
-  private async toggleFullscreen(): Promise<void> {
+  private async toggleFullscreen(byPage = false): Promise<void> {
     // LEAVING fullscreen is always allowed. Every guard below is about whether
     // there is anything worth going fullscreen FOR — none of them is a reason
     // to hold someone in it. Gating the whole toggle meant an error arriving
@@ -7083,12 +8779,18 @@ export class MoviElement extends HTMLElement {
     ) {
       return;
     }
-    // Audio-only sources (bare strip OR cover-art view) have nothing to show
-    // fullscreen. Block it at this single chokepoint so double-click, the F
-    // key, and the button are all covered, in both audio layouts. (Entering
-    // only — a source that turns out to be audio while already fullscreen must
-    // still be escapable.)
-    if (!currentlyActive && this.classList.contains("movi-audio-mode")) {
+    // Audio is NOT a reason to refuse either. The cover-art view is a picture
+    // in its own right, and a source with no art gets the same full-screen
+    // surface with a drawn sleeve instead of its 56px strip (see
+    // updateCoverArtOverlay) — a record playing across the room is a thing
+    // people put on a big screen.
+    // Switched off by the host (controlslist="nofullscreen"). The same
+    // chokepoint, for the same reason: F, the menu row, double-click,
+    // double-tap and the swipe all end here, and only the button and the row
+    // were hidden. Entering only — see the top of this method. A page asking
+    // through its own code (_enterFullscreenForPage) is not the viewer
+    // reaching for a control the page removed, so it passes.
+    if (!currentlyActive && !byPage && this.isControlDisabled("fullscreen")) {
       return;
     }
 
@@ -7228,6 +8930,14 @@ export class MoviElement extends HTMLElement {
   `;
 
   private async togglePiP(): Promise<void> {
+    // Switched off by the host (controlslist="nopip" or disablepictureinpicture).
+    // The P key and the context-menu action both land here, and only the
+    // button and the menu row were hidden — so P still opened a window on a
+    // page that had turned PiP off. Leaving a window that is already open
+    // stays allowed.
+    const pipOpen =
+      !!this._pipWindow || (!!this.video && document.pictureInPictureElement === this.video);
+    if (!pipOpen && (this.isControlDisabled("pip") || this.disablePictureInPicture)) return;
     // Native fallback: the visible surface is a real <video>, not the canvas, so
     // use the standard video PiP API. It works even for opaque cross-origin video
     // (PiP never exposes pixels to JS) and inside iframes granted the
@@ -7368,13 +9078,8 @@ export class MoviElement extends HTMLElement {
           background: rgba(0,0,0,0.35); pointer-events: none;
         }
         body.is-loading .pip-spinner { display: flex; }
-        .pip-spinner > i {
-          width: 34px; height: 34px; border-radius: 50%;
-          border: 3px solid rgba(255,255,255,0.25);
-          border-top-color: #fff;
-          animation: pip-spin 0.9s linear infinite;
-        }
-        @keyframes pip-spin { to { transform: rotate(360deg); } }
+        ${loadingIndicatorStyles}
+        .pip-spinner .movi-loader-container { width: 52px; height: 52px; }
         .pip-time { font: 500 10px/1 -apple-system, sans-serif; color: rgba(255,255,255,0.7); white-space: nowrap; }
         .pip-time-row { display: flex; justify-content: space-between; padding: 0 2px; }
         .pip-btn-row { display: flex; align-items: center; justify-content: center; gap: 16px; position: relative; }
@@ -7471,16 +9176,16 @@ export class MoviElement extends HTMLElement {
         return btn;
       };
 
-      const seekBackBtn = makeBtn("seek-back", `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.5 3C7.81 3 4.01 6.54 3.58 11H1l3.5 4L8 11H5.59c.42-3.35 3.33-6 6.91-6 3.87 0 7 3.13 7 7s-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.96 8.96 0 0012.5 21c4.97 0 9-4.03 9-9s-4.03-9-9-9z"/><text x="12.5" y="15.5" text-anchor="middle" font-size="7.5" font-weight="700" font-family="-apple-system,sans-serif">10</text></svg>`);
+      const seekBackBtn = makeBtn("seek-back", symbolSvg("seekBackward"));
       const playPauseBtn = makeBtn("play-pause", this.player.getState() === "playing"
-        ? `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>`
-        : `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"><path d="M9.3 6.6L17.7 12L9.3 17.4Z"/></svg>`);
-      const seekFwdBtn = makeBtn("seek-fwd", `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M11.5 3c4.69 0 8.49 3.54 8.92 8H23l-3.5 4L16 11h2.41c-.42-3.35-3.33-6-6.91-6-3.87 0-7 3.13-7 7s3.13 7 7 7c1.93 0 3.68-.79 4.94-2.06l1.42 1.42A8.96 8.96 0 0111.5 21c-4.97 0-9-4.03-9-9s4.03-9 9-9z"/><text x="11.5" y="15.5" text-anchor="middle" font-size="7.5" font-weight="700" font-family="-apple-system,sans-serif">10</text></svg>`);
-      const backToTabBtn = makeBtn("back-to-tab", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`);
+        ? symbolSvg("pause", "", { filled: true })
+        : symbolSvg("play", "", { filled: true }));
+      const seekFwdBtn = makeBtn("seek-fwd", symbolSvg("seekForward"));
+      const backToTabBtn = makeBtn("back-to-tab", symbolSvg("backToTab"));
       const isMuted = this._muted;
       const muteBtn = makeBtn("mute-toggle", isMuted
-        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`
-        : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`);
+        ? symbolSvg("volumeMuted")
+        : symbolSvg("volumeFull"));
 
       btnRow.appendChild(muteBtn);
       btnRow.appendChild(seekBackBtn);
@@ -7497,8 +9202,8 @@ export class MoviElement extends HTMLElement {
         if (!this.player) return;
         const isPlaying = this.player.getState() === "playing";
         playPauseBtn.innerHTML = isPlaying
-          ? `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>`
-          : `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"><path d="M9.3 6.6L17.7 12L9.3 17.4Z"/></svg>`;
+          ? symbolSvg("pause", "", { filled: true })
+          : symbolSvg("play", "", { filled: true });
       };
 
       playPauseBtn.addEventListener("click", () => {
@@ -7525,9 +9230,7 @@ export class MoviElement extends HTMLElement {
       muteBtn.addEventListener("click", () => {
         this.muted = !this.muted;
         this.showOSD(
-          this.muted
-            ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`
-            : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`,
+          this.muted ? OSD.muted : OSD.unmuted,
           this.muted ? "Muted" : "Unmuted",
         );
       });
@@ -7557,27 +9260,32 @@ export class MoviElement extends HTMLElement {
         const buffered = this.player.getBufferEndTime?.() ?? 0;
         progressBuffer.style.width =
           dur > 0 ? `${Math.min(100, (buffered / dur) * 100)}%` : "0%";
-        // Loading is anything that is not playable picture: opening a source,
-        // and re-buffering mid-play.
-        const st = this.player.getState?.();
+        // The PiP window's spinner is the same spinner, on another surface —
+        // so it reads the same answer rather than making its own out of the
+        // player state. That answer has been through every suppression the
+        // main one has (internal seeks, a picture that is still moving) and
+        // through spinnerdelay, which is what keeps a flicker here from being
+        // the one place the page's setting does not reach.
         pipWindow.document.body.classList.toggle(
           "is-loading",
-          st === "loading" || st === "buffering" || st === "seeking",
+          this.classList.contains("is-buffering"),
         );
         timeCurrent.textContent = this.formatTime(cur);
         timeDuration.textContent = this.formatTime(dur);
         updatePlayPauseIcon();
         const muted = this._muted;
         muteBtn.innerHTML = muted
-          ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`
-          : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`;
+          ? symbolSvg("volumeMuted")
+          : symbolSvg("volumeFull");
       }, 250);
 
       // The spinner lives outside the controls, which fade out — a load that
       // outlasts them must not take the only sign of life with it.
       const pipSpinner = pipWindow.document.createElement("div");
       pipSpinner.className = "pip-spinner";
-      pipSpinner.appendChild(pipWindow.document.createElement("i"));
+      pipSpinner.setAttribute("role", "status");
+      pipSpinner.setAttribute("aria-label", "Loading video");
+      pipSpinner.innerHTML = loadingIndicatorMarkup;
       pipWindow.document.body.appendChild(pipSpinner);
 
       // Show controls briefly on open
@@ -7737,7 +9445,9 @@ export class MoviElement extends HTMLElement {
    * (window wider than tall) the rotation is dropped.
    */
   private updatePseudoFsRotation(): void {
-    if (!this._pseudoFullscreen) {
+    // Audio has no frame to turn — and an audio-only VIDEO source still
+    // reports its video track, which would rotate the sleeve on its side.
+    if (!this._pseudoFullscreen || this.classList.contains("movi-audio-mode")) {
       this.classList.remove("movi-pseudo-fs-rotate");
       return;
     }
@@ -7808,8 +9518,12 @@ export class MoviElement extends HTMLElement {
    * On phones/tablets, rotate to match the video when entering fullscreen and
    * release the lock on exit. Wide clips lock landscape, tall clips portrait;
    * defaults to landscape (the common case) if dimensions aren't known. No-op on
-   * desktop, audio-only, or where the Screen Orientation lock API is missing
-   * (e.g. iOS Safari, which rejects programmatic lock — caught and ignored).
+   * desktop, or where the Screen Orientation lock API is missing (e.g. iOS
+   * Safari, which rejects programmatic lock — caught and ignored).
+   * Audio never locks: a sleeve has no orientation of its own, so the phone is
+   * left free to be held however the viewer holds it — and entering with
+   * audio RELEASES a lock, which is what updateCoverArtOverlay relies on when
+   * a film turns into sound while fullscreen.
    */
   private applyFullscreenOrientation(isFullscreen: boolean): void {
     const so = (
@@ -7822,9 +9536,8 @@ export class MoviElement extends HTMLElement {
     ).orientation;
     if (!so || typeof so.lock !== "function") return;
     if (!window.matchMedia("(pointer: coarse)").matches) return;
-    if (this.classList.contains("movi-audio-mode")) return;
 
-    if (isFullscreen) {
+    if (isFullscreen && !this.classList.contains("movi-audio-mode")) {
       const track = this.player?.trackManager?.getActiveVideoTrack?.();
       const rawW = track?.width ?? 0;
       const rawH = track?.height ?? 0;
@@ -7850,6 +9563,12 @@ export class MoviElement extends HTMLElement {
   }
 
   private applyFullscreenUiState(isFullscreen: boolean): void {
+    // The one class every fullscreen-scoped rule reads. Off isFullscreenActive
+    // rather than off the argument: three routes lead here (native, host-driven
+    // and the iOS fallback) and each sets its own flag before calling, so a
+    // player leaving pseudo-fullscreen while a host still holds its own must
+    // not be told it left fullscreen altogether.
+    this.classList.toggle("movi-fullscreen-active", this.isFullscreenActive());
     this.updateFullscreenIcon(isFullscreen);
     this.updateFullscreenContextMenu(isFullscreen);
     // Every fullscreen route lands here — native, host-driven and the iOS
@@ -7859,6 +9578,19 @@ export class MoviElement extends HTMLElement {
     // And the one place the fullscreen button's exemption from the disabled
     // chrome flips: it stays live only while there is a fullscreen to leave.
     this.updateControlsState();
+    // A screen-scoped host control just appeared or left (see markCustomScopes),
+    // and the row is a different width besides. Re-decide what fits in it —
+    // waiting for the resize is enough for native fullscreen and is not for a
+    // host-driven one, where the element may already be the size it will be.
+    this.fitControlsRow();
+    this.syncEmptyCapsules();
+    // An audio source's layout depends on fullscreen: a strip with no art is
+    // a full-screen sleeve while it lasts (see updateCoverArtOverlay). Decided
+    // here, not left to the resize, because a strip's 56px height is
+    // !important — a host-driven fullscreen could never grow it, so no resize
+    // would ever arrive to drop the strip. Leaving puts the strip back the
+    // same way; the resize that follows repaints at the final size.
+    if (this.classList.contains("movi-audio-mode")) this.updateCoverArtOverlay();
   }
 
   /**
@@ -7882,16 +9614,43 @@ export class MoviElement extends HTMLElement {
     if (this.isFullscreenActive()) void this.toggleFullscreen();
   }
 
-  private static readonly ASPECT_ICONS: Record<string, string> = {
-    contain: `<rect x="3" y="3" width="18" height="18" rx="2"/><rect x="6" y="8" width="12" height="8" rx="1"/>`,
-    cover: `<rect x="3" y="3" width="18" height="18" rx="2"/><rect x="1" y="7" width="22" height="10" rx="1"/>`,
-    fill: `<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 3h18v18H3z"/>`,
-    zoom: `<circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/><path d="M11 8v6M8 11h6"/>`,
+  /**
+   * @internal For upgrade.ts. A page asking its old <video> to go fullscreen —
+   * requestFullscreen, or iOS's webkitEnterFullscreen — gets the route the
+   * player's own button takes, not the bare element API, which iOS does not
+   * have and which skips the host and pseudo fallbacks.
+   */
+  _enterFullscreenForPage(): Promise<void> {
+    return this.isFullscreenActive() ? Promise.resolve() : this.toggleFullscreen(true);
+  }
+
+  /** @internal For upgrade.ts — see _enterFullscreenForPage. */
+  _isFullscreenForPage(): boolean {
+    return this.isFullscreenActive();
+  }
+
+  /**
+   * Which symbol each crop is drawn with.
+   *
+   * The name, not the body. Pouring one symbol's paths into another's <svg>
+   * shell was how this worked, and it left the shell saying data-icon="aspect"
+   * over a Zoom drawing — so setIcon("zoom", …) changed nothing on the bar and
+   * setIcon("aspect", …) was undone the next time the crop changed.
+   */
+  private static readonly ASPECT_SYMBOLS: Record<string, SymbolName> = {
+    contain: "aspect",
+    cover: "aspectCover",
+    fill: "aspectFill",
+    zoom: "zoom",
   };
+
+  private static aspectSymbol(fit: string | undefined): SymbolName {
+    return MoviElement.ASPECT_SYMBOLS[fit ?? ""] ?? "aspect";
+  }
 
   private updateAspectRatioIcon(): void {
     const fit = this._objectFit === "control" ? this._currentFit : (this._objectFit as any);
-    const svg = MoviElement.ASPECT_ICONS[fit] || MoviElement.ASPECT_ICONS.contain;
+    const name = MoviElement.aspectSymbol(fit);
     // Every place the crop is drawn shows the CURRENT one: the bar button, and
     // the context menu's row. A generic frame there while the setting says
     // "Zoom" is the menu contradicting itself.
@@ -7903,19 +9662,46 @@ export class MoviElement extends HTMLElement {
     const bar = this.shadowRoot?.querySelector(
       ".movi-icon-aspect-ratio",
     ) as SVGElement | null;
-    if (bar) bar.innerHTML = svg;
+    if (bar) bar.outerHTML = symbolSvg(name, "movi-icon-aspect-ratio");
     const ctx = this.contextMenuRoot().querySelector(
       ".movi-icon-aspect-ratio-ctx",
     ) as SVGElement | null;
-    if (ctx) ctx.innerHTML = svg;
+    if (ctx)
+      ctx.outerHTML = symbolSvg(
+        name,
+        "movi-context-menu-icon movi-icon-aspect-ratio-ctx",
+      );
       // Keep an open panel / context menu in step - see the method's note.
     this.refreshOpenSettingsSurfaces();
   }
 
-  private static readonly TRACK_ICON_AUDIO = `<svg class="movi-track-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>`;
-  private static readonly TRACK_ICON_SUBTITLE = `<svg class="movi-track-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2" ry="2"/><path d="M10 8.5H8a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2 M18 8.5h-2a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2"/></svg>`;
-  private static readonly TRACK_ICON_OFF = `<svg class="movi-track-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="6" y1="12" x2="18" y2="12"/></svg>`;
-  private static readonly TRACK_ICON_CHECK = `<svg class="movi-track-item-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+  private static readonly TRACK_ICON_AUDIO = symbolSvg(
+    "volumeFull",
+    "movi-track-item-icon",
+  );
+  private static readonly TRACK_ICON_SUBTITLE = symbolSvg(
+    "subtitles",
+    "movi-track-item-icon",
+  );
+  /** Stands in for a generated subtitle track's language badge until its
+   *  first cue arrives: a small turning ring, in the bar's list and the
+   *  context menu alike. */
+  private static readonly SUBTITLE_PENDING = '<span class="movi-subtitle-pending" role="img" aria-label="Making captions" title="Making captions…"></span>';
+
+  /** An open context menu is built when it opens; a generated subtitle track
+   *  that changes under it (listed, or its first cue landed) redraws it. */
+  private refreshOpenContextMenu(): void {
+    if (!this._contextMenuVisible) return;
+    const ctx = this.contextMenuRoot().querySelector(".movi-context-menu") as HTMLElement | null;
+    if (ctx) this.updateContextMenuContent(ctx);
+  }
+
+  /** Below this height the settings panel packs its rows closer — see
+   *  publishPlayerWidth. */
+  private static readonly SHORT_PLAYER_PX = 400;
+
+  private static readonly TRACK_ICON_OFF = `${symbolSvg("trackItem", "movi-track-item-icon")}`;
+  private static readonly TRACK_ICON_CHECK = `${symbolSvg("check", "movi-track-item-check")}`;
 
   private formatAudioBadge(track: AudioTrack): string {
     const codec = (track.codec || "").toUpperCase();
@@ -8304,9 +10090,7 @@ export class MoviElement extends HTMLElement {
             ${
               isActive
                 ? `
-            <svg class="movi-quality-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="20 6 9 17 4 12"></polyline>
-            </svg>`
+            ${symbolSvg("check", "movi-quality-check")}`
                 : ""
             }
          </div>
@@ -8335,7 +10119,26 @@ export class MoviElement extends HTMLElement {
           this.setBottomMenuOpen(menu, false);
           this.updateQualityMenu();
           this.showControls();
-          this.dispatchEvent(new CustomEvent("qualitychange", { detail: { trackId } }));
+          // `height` and `auto` ride along with the id — the fields every
+          // other quality pick reports, and the only ones a host remembering
+          // the viewer's rung can use. Without them this pick was invisible to
+          // such a host, and so was a later one of the rung Auto was already
+          // on: that selects nothing new, so no rung change followed it.
+          const picked =
+            trackId === -1
+              ? 0
+              : (this.player as any).getVideoTracks?.()?.find(
+                  (t: VideoTrack) => t.id === trackId,
+                )?.height || 0;
+          if (trackId !== -1) {
+            this._involuntaryQualityUntil = 0;
+            if (picked > 0) this._lastNotifiedQualityHeight = picked;
+          }
+          this.dispatchEvent(
+            new CustomEvent("qualitychange", {
+              detail: { trackId, height: picked, auto: trackId === -1 },
+            }),
+          );
         }
       });
     });
@@ -8345,6 +10148,33 @@ export class MoviElement extends HTMLElement {
    * Map a video height to its YouTube-style quality badge (HD/4K/8K) or
    * empty string when the resolution doesn't qualify.
    */
+  /**
+   * Tell the host about a rung the viewer picked by hand, when nothing else
+   * will.
+   *
+   * A pick is normally reported when the switch it starts lands — the rung
+   * changes, tracksChange sees a new height, `qualitychange` goes out with
+   * `auto: false`. Two picks never got that far: the rung Auto was already
+   * sitting on (nothing to switch to), and a rung of the height last reported
+   * (the switch lands on a height that is "not news"). Both are the viewer
+   * saying "this one, always" — and a host that remembers the rung (movi-tube
+   * keeps the height and marks it as the next video's default source) kept the
+   * one before, while the player's own Auto preference had already been turned
+   * off. The next video then opened on the old, fixed rung.
+   *
+   * Also ends any rescue window: a pick made inside the 30s after a rescue is
+   * still the viewer's, and was being reported as `auto: true`.
+   */
+  private announceQualityPick(height: number, switching: boolean): void {
+    this._involuntaryQualityUntil = 0;
+    if (height <= 0) return;
+    if (switching && height !== this._lastNotifiedQualityHeight) return;
+    this._lastNotifiedQualityHeight = height;
+    this.dispatchEvent(
+      new CustomEvent("qualitychange", { detail: { height, auto: false } }),
+    );
+  }
+
   /** Persisted "Auto quality" preference. Survives movi-tube's per-video element
    *  rebuild (localStorage), so once the user picks Auto it stays Auto on the
    *  next video instead of falling back to a fixed height. */
@@ -8480,6 +10310,19 @@ export class MoviElement extends HTMLElement {
   // keep the error from being raised again on every subsequent tick. Cleared
   // the moment playback actually recovers, alongside _stuckRecoveries.
   private _stuckGaveUp = false;
+  // Rung rescues spent from the STUCK path, separately from the nudge budget.
+  //
+  // A nudge moves the playhead, which is the right move for a byte range that
+  // will not come. It is the wrong move — and can never be the right one — when
+  // the bytes are arriving and it is the DECODE that has stopped: seen on an
+  // 8K AV1 HDR file where ABR climbed 1440p → 2160p, the new decoder configured
+  // (`av01.0.13M.10 3840x2160`, hardware) and then never produced a single
+  // frame, while audio kept decoding and the source kept reading at 4-6 MB/s.
+  // Three nudges later the watchdog declared the video dead of a network fault
+  // it had no evidence for. Dropping a rung is what addresses that, so the
+  // stuck path gets its own small budget for it before it is allowed to give up.
+  private _stuckRungRescues = 0;
+  private static readonly MAX_STUCK_RUNG_RESCUES = 2;
   // Set only by the decode-downshift recreate so its own load() keeps the ceiling
   // (every other load clears it, so the next source re-attempts its top rung).
   private _preserveDecodeCapOnce = false;
@@ -8487,6 +10330,39 @@ export class MoviElement extends HTMLElement {
   // it, the video is clearly fine again and the budgets reset (loop-safe: a
   // failing recreate never progresses, so it can't reset itself).
   private _recoveryResumeTime = -1;
+
+  /**
+   * What `_startAt` was before a recovery rebuild borrowed it.
+   *
+   * The rebuild resumes by writing the position into `_startAt`, the value
+   * every load seeks to — and nothing ever put it back. It outlived the
+   * rebuild and the video: a watch page whose split-audio link expired
+   * rebuilt at 27.6s, and every video played after that, in the same element,
+   * opened at 27.6s. A quality switch has always saved and restored it
+   * (_startAtBeforeSwitch); the rebuild now does the same.
+   */
+  private _startAtBeforeRecovery: number | null = null;
+
+  /** The rebuild's resume has landed: `_startAt` is the host's again. */
+  private endRecoveryResume(): void {
+    if (this._startAtBeforeRecovery !== null) {
+      this._startAt = this._startAtBeforeRecovery;
+      this._startAtBeforeRecovery = null;
+    }
+  }
+
+  /**
+   * A new source: whatever a rebuild of the last one meant to resume at
+   * belongs to that one — its `_startAt`, and a held seek it had not placed
+   * yet.
+   */
+  private forgetRecoveryResume(): void {
+    if (this._pendingSeek !== null && this._pendingSeek === this._recoveryResumeTime) {
+      this._pendingSeek = null;
+    }
+    this.endRecoveryResume();
+    this._recoveryResumeTime = -1;
+  }
   // One failed load fires TWO error paths in the same tick — MoviPlayer's
   // "error" event AND initializePlayer's init-catch. This same-tick latch makes
   // them consume ONE recovery attempt between them, so a single failure can't
@@ -8549,6 +10425,36 @@ export class MoviElement extends HTMLElement {
 
   private _reloadFromSourceChildren(): void {
     Logger.info(TAG, "Source children changed — reloading in place");
+    // The same media with fresh links, or a different one?
+    //
+    // A host with expiring URLs — YouTube's, a signed CDN link, Drive's — has
+    // to swap the children to renew them, and from here that looks exactly
+    // like the next video in a queue. Reloading it as a new source put the
+    // viewer back at 0:00 and started a paused video, measured on a watch page
+    // that renewed its links after a long pause: paused at 47.5s, restarted
+    // from the top. `resumekey` is the host's own id for the media, so it
+    // decides. It is NOT read here: a framework wrapper sets attributes in an
+    // effect, after this microtask, so the key on the element right now is
+    // still the outgoing media's — which is exactly what gets recorded. The
+    // next load compares it with the key it finds by then (takeDiscardState).
+    this._refreshCarry = null;
+    if (this._resumeKey && this.player) {
+      const t = this.currentTime;
+      if (t > 0) {
+        this._refreshCarry = {
+          key: this._resumeKey,
+          t,
+          playing: !this.paused && !this.ended,
+          rate: this.playbackRate,
+        };
+      }
+    }
+    // Swapping the children IS writing a new source — it is the only way to
+    // change video without losing fullscreen, and the host that does it is
+    // making the same statement as one that writes `src`. Without this, the
+    // one thing the src path invalidates and this one did not was the
+    // storyboard: the new video scrubbed through the old video's pictures.
+    this.noteSourceAssigned();
     // A bare `src` attribute hides the children, so it has to go first; the
     // same clearing the source-error rebuild does before re-parsing.
     if (this.hasAttribute("src")) this.removeAttribute("src");
@@ -8573,12 +10479,15 @@ export class MoviElement extends HTMLElement {
     // forced rung.
     this._streamDemuxTried = false;
     this._streamEngineTried = false;
+    this._forcedStreamTried = false;
     this._engineTried.clear();
     this._startProbeDone = false;
+    this._startPickConfirmed = false;
     this._measuredStartBps = 0;
     this._forcedDashRendition = null;
     this._hasEverPlayed = false;
     this._restoreRungSrc = "";
+    this.forgetRecoveryResume();
     // A new file gets its own go at the remembered languages: the tracks that
     // matched last time are gone, and the preference has to be matched afresh.
     this._persistedTracksApplied = false;
@@ -8601,9 +10510,8 @@ export class MoviElement extends HTMLElement {
     // new source starts from the same clean slate a fresh element gets.
     this._startCancelled = false;
     this._pendingPlay = false;
-    this.dispatchEvent(
-      new CustomEvent("loadstart", { detail: { src: this._src } }),
-    );
+    this._playUnprompted = false;
+    this.announceLoadStart(typeof this._src === "string" ? this._src : null);
     this.load();
   }
 
@@ -8632,6 +10540,21 @@ export class MoviElement extends HTMLElement {
       }))
       .filter((t) => t.src);
     if (replace || parsed.length > 0) this._subtitleTracks = parsed;
+
+    // `default` on a track means "show this one" — it is how every player that
+    // takes <track> children says it, and markup written for one of those
+    // arrives here expecting the same. Carried rather than applied: the tracks
+    // do not exist until the source has loaded, and _restoreTrackSelection is
+    // already the place that waits for that. A selection the viewer (or the
+    // host) has already made outranks it.
+    const marked = Array.from(trackEls).find(
+      (el) => el.hasAttribute("default") && el.getAttribute("src"),
+    );
+    if (marked && !this._carrySubtitleLang && this._carrySubtitleTrackId === null) {
+      const lang =
+        marked.getAttribute("srclang") || marked.getAttribute("lang") || "";
+      if (lang) this._carrySubtitleLang = lang;
+    }
   }
 
   /**
@@ -8694,6 +10617,11 @@ export class MoviElement extends HTMLElement {
   private static readonly AUDIO_LINK_SHARE = 0.15;
 
   private _parseChildSources(): void {
+    // The <track> children come with them. This is the FIRST-load path (the
+    // source-swap path re-reads them itself), and without it markup that
+    // declares its captions as children — which is how video.js, and HTML
+    // itself, says it — arrived with an empty subtitle menu.
+    this._parseChildSubtitleTracks();
     if (!this._src && !this._encrypted) {
       const sourceEls = this.querySelectorAll("source");
       if (sourceEls.length > 0) {
@@ -8721,6 +10649,13 @@ export class MoviElement extends HTMLElement {
         let audioSources = allSources.filter((s) => s.kind === "audio");
         const videoSources = allSources.filter((s) => s.kind !== "audio");
 
+        // The candidates, in the order they were written. A <source> list is a
+        // list of things to TRY: an element that can't open the first one moves
+        // to the next and only reports failure once they are all gone. See
+        // _trySiblingSource, which walks this.
+        this._childSourceUrls = videoSources.map((s) => s.src);
+        this._childSourceIndex = -1;
+
         if (videoSources.length > 0) {
           // Capture quality metadata for non-HLS quality menu
           this._videoQualities = videoSources
@@ -8747,6 +10682,7 @@ export class MoviElement extends HTMLElement {
             const picked = this.pickSource(videoSources);
             this._src = picked ? picked.src : videoSources[0].src;
           }
+          this._childSourceIndex = this._childSourceUrls.indexOf(this._src);
 
           // Under Auto, ALWAYS open on the SMALLEST rung, not the consumer's
           // default (movi-tube marks the HIGHEST as default — right for a manual
@@ -8951,6 +10887,10 @@ export class MoviElement extends HTMLElement {
     this.isLoading = false; // don't let initializePlayer's guard bail early
     this._recoveryResumeTime = resumeTime;
     if (resumeTime > 1) {
+      // Borrowed for this rebuild only — see forgetRecoveryResume.
+      if (this._startAtBeforeRecovery === null) {
+        this._startAtBeforeRecovery = this._startAt;
+      }
       this._startAt = resumeTime;
       this._pendingSeek = resumeTime;
     }
@@ -9084,6 +11024,51 @@ export class MoviElement extends HTMLElement {
     this.updateAudioTrackMenu();
   }
 
+  /**
+   * The next `<source>` along, when the current one wouldn't open.
+   *
+   * This is what the list is for. A page that writes
+   *
+   *   <source src="movie.mp4" type="video/mp4">
+   *   <source src="movie.webm" type="video/webm">
+   *
+   * is naming alternatives, and an element that fails on the first one is
+   * expected to try the second — the error belongs to the LIST, and is only
+   * reported once every candidate is spent. We picked by type up front (see
+   * pickSource) but a type hint says nothing about whether the file is
+   * actually there: a moved or mistyped first URL used to end the load with
+   * "Not Found" while a perfectly good second source sat unread underneath it.
+   *
+   * Only during resource selection: once media has loaded, the list has done
+   * its job and a later failure is this source's failure, not a reason to
+   * start another one. Returns true when the next candidate is loading, and
+   * the caller then leaves the overlay alone.
+   */
+  private _trySiblingSource(): boolean {
+    if (this._loadedDataFired) return false;
+    const next = this._childSourceIndex + 1;
+    if (next <= 0 || next >= this._childSourceUrls.length) return false;
+    const url = this._childSourceUrls[next];
+    if (!url) return false;
+    this._childSourceIndex = next;
+    Logger.warn(
+      TAG,
+      `Source ${next} of ${this._childSourceUrls.length} wouldn't open — trying the next <source>: ${url}`,
+    );
+    try {
+      this.player?.destroy();
+    } catch {
+      /* a player that failed to open may not tear down cleanly */
+    }
+    this.player = null;
+    // The guards a failed load leaves behind, cleared so load() runs at all.
+    this._isUnsupported = false;
+    this.isLoading = false;
+    this._src = url;
+    this.load();
+    return true;
+  }
+
   private _recreateAtLowerQuality(): boolean {
     if (this._decodeDownshifts >= MoviElement.MAX_DECODE_DOWNSHIFTS) return false;
     const sorted = [...this._videoQualities].sort((a, b) => b.height - a.height);
@@ -9212,6 +11197,12 @@ export class MoviElement extends HTMLElement {
   private _measuredStartBps = 0;
   // One pre-play probe per source (reset when src changes).
   private _startProbeDone = false;
+  // Whether the confirm pass has actually measured the rung we intend to open.
+  // Separate from `_startProbeDone`, which only says a probe was STARTED: an
+  // init that gets superseded mid-confirm sets the latch and leaves the pick
+  // riding on an unconfirmed seed, and the next init then re-applied that seed
+  // and opened on it. Reset with `_startProbeDone` when the src changes.
+  private _startPickConfirmed = false;
 
   /**
    * Pre-play speed test: measure the link, then set the opening rung from it.
@@ -9260,15 +11251,11 @@ export class MoviElement extends HTMLElement {
       } catch {
         /* the prober logs its own failure */
       }
-      if (this._measuredStartBps > 0) {
-        await this._applyProbePick(this._measuredStartBps, true);
-      }
+      await this._reapplyStartPick();
       return;
     }
     if (this._startProbeDone) {
-      if (this._measuredStartBps > 0) {
-        await this._applyProbePick(this._measuredStartBps, true);
-      }
+      await this._reapplyStartPick();
       return;
     }
     this._startProbeDone = true;
@@ -9279,6 +11266,23 @@ export class MoviElement extends HTMLElement {
     } finally {
       this._startProbeInFlight = null;
     }
+  }
+
+  /**
+   * Put an earlier init's decision back into `_src` — and finish the job if
+   * that init never got to.
+   *
+   * Re-applying alone is what the two latch branches used to do, and it is
+   * only half of the pass: the opening pick is a SEED until the confirm pass
+   * has read the rung's own stream and re-picked from that. An init that is
+   * superseded mid-confirm sets the latch, leaves the seed pick standing, and
+   * the init that replaces it then re-applied the seed and opened on it — the
+   * confirmation silently skipped because a probe had technically "run".
+   */
+  private async _reapplyStartPick(): Promise<void> {
+    if (!(this._measuredStartBps > 0)) return;
+    await this._applyProbePick(this._measuredStartBps, true);
+    if (!this._startPickConfirmed) await this._confirmStartPick();
   }
 
   /**
@@ -9301,11 +11305,14 @@ export class MoviElement extends HTMLElement {
     // actually intend to open, keeps its bytes as the opening buffer, and
     // steps down if the rate has fallen since. The measurement that used to
     // cost its own request now comes from bytes we needed anyway.
-    const seed = loadPersistedLinkBps();
+    // Measured if we have it, otherwise the browser's own estimate — see
+    // linkSeedBps(). Either way the confirm pass below is what makes it safe.
+    const seed = linkSeedBps();
     if (seed > 0) {
+      const measured = loadPersistedLinkBps() > 0;
       Logger.info(
         TAG,
-        `Pre-play: seeding from the last measured link (${(seed / 1e6).toFixed(1)}Mbps) — no separate probe`,
+        `Pre-play: seeding from ${measured ? "the last measured link" : "the browser's link estimate"} (${(seed / 1e6).toFixed(1)}Mbps) — no separate probe`,
       );
       this._measuredStartBps = seed;
       await this._applyProbePick(seed, false);
@@ -9341,16 +11348,32 @@ export class MoviElement extends HTMLElement {
       signal: this._sourceAbort.signal,
     });
     if (bits <= 0) {
-      // Unmeasurable — keep the smallest rung. Logged with the elapsed time
-      // because the two causes look identical from the outside and need
-      // opposite fixes: a full 6s means the fetch timed out (slow link, or the
-      // proxy was still opening upstream), while a near-instant give-up means
-      // the response was unusable — too small, an error status, or a shape the
-      // probe couldn't time.
+      // Unmeasurable — but giving up here is what "opening on the smallest
+      // rung" meant in practice: 144p, with nothing left to lift it. One
+      // failed reading is not proof of a slow link. The probe returns nothing
+      // for a 502 from the proxy, for a body that was truncated when the
+      // upstream dropped mid-pipe, and for anything under 500KB inside the 6s
+      // cap — none of which is a measurement of the link.
+      //
+      // So try once more, deliberately on a DIFFERENT rung and a different
+      // request shape: the confirm pass reads the head of the rung we would
+      // actually open. That is a different URL (this probe uses a mid rung),
+      // a different reader with its own fallbacks — a single-chunk body that
+      // reads as "nothing" here still times cleanly there — and it is the
+      // cheaper of the two attempts, because its bytes are handed to
+      // HttpSource as the opening buffer instead of being discarded. A
+      // genuinely slow link pays latency it was going to pay anyway rather
+      // than a second wasted 3MB.
+      //
+      // Logged with the elapsed time because the causes look identical from
+      // the outside and need opposite fixes: a full 6s means the fetch timed
+      // out (slow link, or the proxy was still opening upstream), while a
+      // near-instant give-up means the response was unusable.
       Logger.info(
         TAG,
-        `Pre-play speed test: unmeasured after ${Math.round(performance.now() - startedAt)}ms — opening on the smallest rung`,
+        `Pre-play speed test: unmeasured after ${Math.round(performance.now() - startedAt)}ms — retrying on the opening rung`,
       );
+      await this._confirmStartPick();
       return;
     }
     this._measuredStartBps = bits;
@@ -9381,9 +11404,17 @@ export class MoviElement extends HTMLElement {
         (b.bandwidth || this._estimateBitrate(b.height)),
     );
     let idx = byBitrate.findIndex((q) => q.src === this._src);
-    // Already on the cheapest rung (or the pick isn't in the ladder) — there is
-    // nothing a confirmation could change.
-    if (idx <= 0) return;
+    // Only a pick that isn't in the ladder at all is beyond confirming. The
+    // CHEAPEST rung used to bail out here too, back when this pass could only
+    // step down — but it goes both ways now, and the bottom rung is precisely
+    // where an upward correction matters most: a seed that reads low opens on
+    // 144p, and this guard then skipped the one thing that would have caught
+    // it. Nothing lifted the pick and the viewer watched the ABR climb the
+    // ladder instead.
+    if (idx < 0) {
+      this._startPickConfirmed = true;
+      return;
+    }
 
     // `idx > 0` was the down-only guard; the loop can move up now, so the
     // only bound left is the attempt count — at most two head reads.
@@ -9401,6 +11432,7 @@ export class MoviElement extends HTMLElement {
         return;
       }
       this._measuredStartBps = bits;
+      this._startPickConfirmed = true;
       persistLinkBps(bits);
 
       // Re-pick from what was just measured. This goes BOTH ways on purpose.
@@ -9606,6 +11638,24 @@ export class MoviElement extends HTMLElement {
         timedBytes = total;
       }
 
+      const head = new Uint8Array(total);
+      let at = 0;
+      for (const c of chunks) {
+        head.set(c, at);
+        at += c.byteLength;
+      }
+      // Even a probe that couldn't be timed leaves its bytes behind — the
+      // download already happened, and the source would only repeat it.
+      //
+      // BEFORE the cache check below, which is where this used to sit behind.
+      // A head served from the browser's cache is the one case where the bytes
+      // are already on the machine and free to hand over, and it was the one
+      // case that returned without handing them over — so the source went and
+      // fetched the same range again. Measured on a prefetched click: the probe
+      // read the head in 23ms, dropped it, and the open then sat in
+      // `Read: waiting for data...` for 129ms of a 345ms start.
+      HttpSource.offerWarmHead(url, head);
+
       // A body that arrived faster than any link could deliver it didn't come
       // over the link — it came from the browser's cache, and it says nothing
       // about the network. Reported as a measurement it produced "24000.0Mbps"
@@ -9615,20 +11665,10 @@ export class MoviElement extends HTMLElement {
       if (totalSecs < 0.03) {
         Logger.info(
           TAG,
-          `Head probe served from cache in ${(totalSecs * 1000).toFixed(0)}ms — link not measured`,
+          `Head probe served from cache in ${(totalSecs * 1000).toFixed(0)}ms — link not measured, head kept`,
         );
         return 0;
       }
-
-      const head = new Uint8Array(total);
-      let at = 0;
-      for (const c of chunks) {
-        head.set(c, at);
-        at += c.byteLength;
-      }
-      // Even a probe that couldn't be timed leaves its bytes behind — the
-      // download already happened, and the source would only repeat it.
-      HttpSource.offerWarmHead(url, head);
 
       const secs = timingStart > 0 ? (performance.now() - timingStart) / 1000 : 0;
       if (secs <= 0 || timedBytes <= 0) return 0;
@@ -9922,7 +11962,7 @@ export class MoviElement extends HTMLElement {
       activeQuality?.badge || this._rungBadge(activeQuality?.height || 0),
     );
 
-    const check = `<svg class="movi-quality-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+    const check = `${symbolSvg("check", "movi-quality-check")}`;
     const rows: string[] = [];
     if (abrCapable) {
       // "Auto (1080p)" — show the rung Auto is currently serving (Shaka/YouTube).
@@ -9973,7 +12013,8 @@ export class MoviElement extends HTMLElement {
         e.stopPropagation();
         const newSrc = (item as HTMLElement).dataset.src;
         if (newSrc === "__auto__") {
-          player?.setAutoQuality?.(true);
+          // Snap: straight to the rung the link carries, as a fresh load would.
+          player?.setAutoQuality?.(true, { snap: true });
           this._writeQualityAutoPref(true);
           this.updateQualityMenu();
           closeMenu();
@@ -9988,9 +12029,11 @@ export class MoviElement extends HTMLElement {
         // A screen, not a speedometer: this is the picture changing, and the
         // speed icon here read as though the playback rate had moved.
         if (picked) this.showOSD(OSD.quality, picked.label || "Quality");
-        if (newSrc && newSrc !== activeSrc) {
-          this.markQualityPending(newSrc);
-          this.switchPremuxedQuality(newSrc);
+        const switching = !!newSrc && newSrc !== activeSrc;
+        this.announceQualityPick(picked?.height || 0, switching);
+        if (switching) {
+          this.markQualityPending(newSrc!);
+          this.switchPremuxedQuality(newSrc!);
         } else this.updateQualityMenu();
         closeMenu();
       });
@@ -10033,14 +12076,12 @@ export class MoviElement extends HTMLElement {
 
     const BADGE_CSS =
       "margin-left:8px;font-size:9px;font-weight:700;letter-spacing:0.5px;padding:1px 5px;border-radius:var(--movi-radius-badge,4px);background:rgba(255,255,255,0.16);color:#fff;vertical-align:middle;";
-    const checkSvg = () =>
-      document.importNode(
-        new DOMParser().parseFromString(
-          '<svg xmlns="http://www.w3.org/2000/svg" class="movi-quality-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>',
-          "image/svg+xml",
-        ).documentElement,
-        true,
-      );
+    const checkSvg = () => {
+      const holder = document.createElement("div");
+      // eslint-disable-next-line no-unsanitized/property -- player's own symbol table
+      holder.innerHTML = symbolSvg("check", "movi-quality-check");
+      return holder.firstElementChild as Element;
+    };
     const closeMenu = () => {
       const menu = this.shadowRoot?.querySelector(
         ".movi-quality-menu",
@@ -10070,7 +12111,7 @@ export class MoviElement extends HTMLElement {
       if (isAuto) item.appendChild(checkSvg());
       item.addEventListener("click", (e) => {
         e.stopPropagation();
-        player?.setAutoQuality?.(true);
+        player?.setAutoQuality?.(true, { snap: true });
         this._writeQualityAutoPref(true);
         this.updateQualityMenu();
         closeMenu();
@@ -10105,6 +12146,7 @@ export class MoviElement extends HTMLElement {
         // Picking a specific quality leaves Auto.
         player?.setAutoQuality?.(false);
         this._writeQualityAutoPref(false);
+        this.announceQualityPick(parseInt(r.label, 10) || 0, r.url !== activeUrl);
         if (r.url !== activeUrl) {
           this.markQualityPending(r.url);
           this.switchDashRendition(r.url);
@@ -10532,8 +12574,11 @@ export class MoviElement extends HTMLElement {
     if (this._stutterInterval !== null) return;
     const h = this.player?.getRenderHealth?.();
     this._stutterLastPresented = h ? h.framesPresented : 0;
-    this._stutterSeconds = 0;
-    this._stutterInterval = window.setInterval(() => this.sampleStutter(), 1000);
+    this._stutterHistory.length = 0;
+    this._stutterInterval = window.setInterval(() => {
+      this.sampleStutter();
+      this.sampleLinkBudget();
+    }, 1000);
   }
 
   private stopStutterMonitor(): void {
@@ -10541,7 +12586,7 @@ export class MoviElement extends HTMLElement {
       clearInterval(this._stutterInterval);
       this._stutterInterval = null;
     }
-    this._stutterSeconds = 0;
+    this._stutterHistory.length = 0;
   }
 
   /**
@@ -10557,11 +12602,34 @@ export class MoviElement extends HTMLElement {
    */
   private static readonly JUDDER_RATIO = 0.6; // < 60% of the expected frames
   private static readonly JUDDER_SECONDS = 2; // consecutive bad seconds
+  /**
+   * The "Play at 1x for smoother playback" hint is a claim about the DEVICE —
+   * that it cannot hold this speed — so it needs more than a passing dip.
+   *
+   * It used to fire after three bad seconds, and a speed change on its own
+   * costs about that much: the corrective seek re-primes the pipeline, the
+   * read-ahead unwinds, and the picture is thin for a second or two before it
+   * settles. So the hint was going up over a disturbance the player had just
+   * caused itself and then recovered from, telling the viewer their machine was
+   * at fault. Sustained incapacity outlasts that easily; a self-inflicted hitch
+   * does not.
+   */
+  //
+  // …and "sustained" is judged over a window, not as an unbroken run. Software
+  // 4K60 H.264 at 2x on an M4 stutters in bursts: 44, 40, 32, 42, 56, 38, 32
+  // of 60 frames a second, with holds of up to 384ms. One passable second in
+  // there reset a consecutive count every time, so the hint never came — nor
+  // did anything else, since the judder and decode-bound checks are built the
+  // same way. Most of a window going bad is the device, whichever seconds they
+  // are; a speed change's own hitch is a second or two, and has its grace.
+  private static readonly STUTTER_RATIO = 0.75; // < 75% of the expected frames
+  private static readonly STUTTER_SECONDS = 5; // bad seconds…
+  private static readonly STUTTER_WINDOW = 8; // …out of the last this many
   private _judderSeconds = 0;
   private _juddering = false;
 
   private resetStutterHint(): void {
-    this._stutterSeconds = 0;
+    this._stutterHistory.length = 0;
     this._judderSeconds = 0;
     if (this._juddering) {
       this._juddering = false;
@@ -10576,6 +12644,197 @@ export class MoviElement extends HTMLElement {
   }
 
   /** One stutter sample: compare presented FPS to the smooth-playback baseline. */
+  /**
+   * Say so when the connection cannot carry this media at all.
+   *
+   * Separate from canPlaySmoothly, which asks whether the DEVICE can decode it.
+   * A 40GB remux can be perfectly decodable and still unwatchable because the
+   * bytes cannot arrive in time, and nothing here said that.
+   *
+   * The link rate comes from a PROBE, and nothing else will do. Two earlier
+   * versions of this read the ABR's throughput instead and both cried wolf:
+   * once the buffer is ahead the source parks at the prefetch gate, so the
+   * window sees a stream being paced rather than a link being slow. Measured on
+   * a healthy link, 0.41 Mbps against a 2.84 Mbps file; reported from the wild,
+   * "2 Mbps" on a 40 Mbps line. That number is a FLOOR, not a capacity, and no
+   * amount of corroborating evidence turns it into one — the stalls it was
+   * paired with can come from decode, from a seek, from startup.
+   *
+   * So the stalls only decide WHEN to ask, and probeLinkBandwidth answers: it
+   * skips the proxy burst and times the sustained tail, a few MB, bounded, and
+   * only ever once per source. No answer, or an answer that clears the bar, and
+   * nothing is said.
+   */
+  private sampleLinkBudget(): void {
+    if (!this._smoothWarning || this._noLinkWarning || this._warnedLinkBudget)
+      return;
+    const p = this.player;
+    if (!p || p.getState?.() !== "playing") return;
+    const needed = p.requiredLinkBps?.() ?? 0;
+    if (!(needed > 0)) return; // a local file, or a size we never learned
+    // …and not while the device is the one falling behind. The decode-bound
+    // notice owns that case, and a probe competing with the player's own
+    // streaming can read low enough to look like agreement. Unless the
+    // stalls themselves showed the delivery running dry: then the question
+    // is the link's whatever the picture is doing, and the probe answers it.
+    if (
+      p.deviceIsBottleneck?.() &&
+      this._deliveryStalls < MoviElement.LINK_BUDGET_STALLS
+    ) {
+      return;
+    }
+    // Playback stopping is what makes the question worth the probe's bytes —
+    // one stall is a hiccup, so wait for the second.
+    if (this._linkStalls < MoviElement.LINK_BUDGET_STALLS) return;
+    const url = typeof this._src === "string" ? this._src : "";
+    if (!url) return;
+    // One attempt per source whatever it finds, so a link that stays slow does
+    // not buy a fresh probe every second.
+    this._warnedLinkBudget = true;
+    this._linkProbeAbort?.abort();
+    const ac = new AbortController();
+    this._linkProbeAbort = ac;
+    void this.bestLinkBps(url, needed, ac)
+      .then((bps) => {
+        if (ac.signal.aborted || !this._smoothWarning || this._noLinkWarning)
+          return;
+        // The verdict leaves no other trace — a probe that clears the bar
+        // says nothing on screen, and the browser does not log a successful
+        // fetch — so a session that stalled without a notice could not tell
+        // "never asked" from "asked, and the link was fast enough".
+        const arriving = p.deliveryRateBps?.() ?? -1;
+        Logger.info(
+          TAG,
+          `Link probe: best ${bps > 0 ? (bps / 1e6).toFixed(1) + "Mbps" : "no reading"} ` +
+            `for ${(needed / 1e6).toFixed(1)}Mbps needed; arriving ` +
+            `${arriving > 0 ? (arriving / 1e6).toFixed(1) + "Mbps" : "unknown"} at best, ` +
+            `${(() => { const v = p.sustainedDeliveryBps?.() ?? -1; return v > 0 ? (v / 1e6).toFixed(1) + "Mbps" : "unknown"; })()} sustained ` +
+            `(stalls ${this._linkStalls}, from delivery ${this._deliveryStalls})`,
+        );
+        // What has ACTUALLY been arriving decides. The probe is a second
+        // opinion, and only where the stalls did not already prove the
+        // delivery short: when reads sat waiting on the network through the
+        // stalls, a separate probe connection reading fast does not make the
+        // media arrive any faster. The best-window figure is not a verdict
+        // either — it is the most flattering five seconds of the last minute,
+        // and a link that bursts to 28 while averaging 6 never fell short of
+        // it. Measured on a 4K R2 source: seven stalls, 1-13 Mbps sustained
+        // against 20.4 needed, and no notice, because the probe (read from
+        // cache) said 3404 and the best window said 28.6.
+        const sustained = p.sustainedDeliveryBps?.() ?? -1;
+        const deliveryProven =
+          this._deliveryStalls >= MoviElement.LINK_BUDGET_STALLS;
+        if (sustained > 0) {
+          if (sustained >= needed) return; // it is being delivered
+        } else {
+          if (!(bps > 0)) return; // no answer either way — say nothing
+          if (bps >= needed && !deliveryProven) return;
+          if (arriving > 0 && arriving >= needed) return;
+        }
+        if (bps >= needed && !deliveryProven) return; // the stalls were not this
+        // The figure to quote is the recent best window when it is still
+        // short of the need — it cannot read above the line, and it does not
+        // sink with whatever the last few seconds held — and otherwise the
+        // sustained average, which is what fell short.
+        const quote =
+          arriving > 0 && arriving < needed
+            ? arriving
+            : sustained > 0
+              ? sustained
+              : bps;
+        this.announceLinkShortfall(needed, quote);
+      })
+      .catch(() => {
+        /* a probe that cannot run is not evidence of anything */
+      });
+  }
+
+  /**
+   * The best reading a few probes can find, which is the only one worth having.
+   *
+   * A single probe is not a measurement here. It runs WHILE the player is
+   * streaming the same media from the same origin, so the two share the link
+   * and the probe gets whatever is left at that moment — reported from the
+   * wild, the same media reading 10, then 40, then 50 Mbps on one connection.
+   * Contention, a busy edge and a momentary dip all push a reading DOWN and
+   * none of them push it up, so the largest of several is the closest thing to
+   * what the path can actually do, and the average would just be a record of
+   * how busy the player was while asking.
+   *
+   * It stops the moment a reading clears the requirement, which is the whole
+   * point: the case this gets wrong is the false alarm, and that one now costs
+   * a single probe. Only a path that keeps falling short pays for the rest —
+   * and there the bytes are already not arriving in time anyway.
+   */
+  private async bestLinkBps(
+    url: string,
+    needed: number,
+    ac: AbortController,
+  ): Promise<number> {
+    let best = -1;
+    for (let i = 0; i < MoviElement.LINK_PROBE_TRIES; i++) {
+      if (ac.signal.aborted) break;
+      // With the source's own headers, as the pre-play probe sends them: a
+      // source behind a token (Google Drive's alt=media) answered this bare
+      // probe 403 every time, the probe came back empty, and a link that
+      // really was too slow for the file never got its notice.
+      const bps = await probeLinkBandwidth(url, {
+        signal: ac.signal,
+        headers: this._headers || undefined,
+      });
+      if (bps > best) best = bps;
+      if (best >= needed) break;
+      if (i < MoviElement.LINK_PROBE_TRIES - 1) {
+        await new Promise((r) =>
+          setTimeout(r, MoviElement.LINK_PROBE_GAP_MS),
+        );
+      }
+    }
+    return best;
+  }
+
+  /** The notice itself, once the probes have confirmed the shortfall. */
+  private announceLinkShortfall(needed: number, measured: number): void {
+    // "About 69 Mbps" is a measurement read out loud, not advice. Nobody buys a
+    // 69 Mbps line, and a figure that precise invites the reader to check it
+    // against a number that moves anyway. Round to something a person
+    // recognises as a connection speed and let "about" carry the rest.
+    let need = MoviElement.niceMbps(needed);
+    const got = MoviElement.niceMbps(measured);
+    // …but never to the SAME number. 52 against 48 rounds to fifty and fifty,
+    // and a notice that says the media needs exactly what the line is giving
+    // it, while warning that it will stop, reads as a bug. The requirement is
+    // the one to move: it is the advice, and erring high is the safe direction.
+    if (need <= got) need = got + MoviElement.mbpsStep(got);
+    // Say what was measured, not whose fault it is. The probe times the path to
+    // THIS origin, so a throttling server, a busy CDN edge and a slow line all
+    // read the same from here, and there is no second reference point to tell
+    // them apart. "This connection is measuring about N Mbps" claimed the one
+    // thing the reading cannot support — it blamed the viewer's internet for
+    // what may be the host's. What IS true either way is the rate the media is
+    // arriving at, so that is what it says, and it names both possibilities
+    // rather than picking one.
+    const message = {
+      title: `This media needs about ${need} Mbps to play`,
+      body: `It's only arriving at about ${got} Mbps — this connection or the server can't deliver it fast enough.`,
+    };
+    const allowed = this.dispatchEvent(
+      new CustomEvent("smoothwarning", {
+        detail: {
+          link: true,
+          neededBps: needed,
+          measuredBps: measured,
+          media: "video",
+          message,
+        },
+        cancelable: true,
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    if (allowed) this.showSmoothWarning(message);
+  }
+
   private sampleStutter(): void {
     // No video to smooth → the frame-drop heuristic is meaningless and would
     // falsely nag "Play at 1x for smoother playback" (framesPresented never
@@ -10584,14 +12843,22 @@ export class MoviElement extends HTMLElement {
     // audio-only mode (video track dropped). Skip entirely.
     const hasVideoTrack =
       !!this.player?.trackManager?.getActiveVideoTrack?.();
-    if (!hasVideoTrack || this.player?.isAudioOnly?.()) {
-      this._stutterSeconds = 0;
+    if (
+      !hasVideoTrack ||
+      this.player?.isAudioOnly?.()
+    ) {
+      this._stutterHistory.length = 0;
+      this._judderSeconds = 0;
+      if (this._juddering) {
+        this._juddering = false;
+        this.updateLoadingIndicator();
+      }
       return;
     }
     // Only judge during genuine playback — buffering/seeking legitimately
     // present few/no frames and would false-positive.
     if (this.player?.getState?.() !== "playing") {
-      this._stutterSeconds = 0;
+      this._stutterHistory.length = 0;
       return;
     }
     const h = this.player?.getRenderHealth?.();
@@ -10612,7 +12879,7 @@ export class MoviElement extends HTMLElement {
       performance.now() - this._becameVisibleAt < MoviElement.VISIBILITY_SETTLE_MS
     ) {
       this._stutterLastPresented = h.framesPresented;
-      this._stutterSeconds = 0;
+      this._stutterHistory.length = 0;
       this._judderSeconds = 0;
       if (this._juddering) {
         this._juddering = false;
@@ -10625,14 +12892,14 @@ export class MoviElement extends HTMLElement {
     // before the "Play at 1x" heuristic can judge it.
     if (performance.now() < this._stutterGraceUntil) {
       this._stutterLastPresented = h.framesPresented;
-      this._stutterSeconds = 0;
+      this._stutterHistory.length = 0;
       return;
     }
     const presented = h.framesPresented - this._stutterLastPresented;
     this._stutterLastPresented = h.framesPresented;
     // framesPresented resets to 0 on seek → negative delta; skip that sample.
     if (presented < 0) {
-      this._stutterSeconds = 0;
+      this._stutterHistory.length = 0;
       return;
     }
     // Only meaningful above 1x — at ≤1x there's nothing slower to suggest.
@@ -10668,13 +12935,48 @@ export class MoviElement extends HTMLElement {
       this.updateLoadingIndicator();
     }
 
-    if (this._playbackRate > 1 && presented < expected * 0.6) {
-      this._stutterSeconds++;
-    } else {
-      this._stutterSeconds = 0;
+    // What the load-time assessment could not know.
+    //
+    // canPlaySmoothly answers from the file and the device's advertised
+    // capability, and 8K60 sits exactly AT the hardware ceiling rather than
+    // past it — so a browser that claims the format gets a "smooth" verdict and
+    // no notice. On a machine where that claim does not hold, nothing then said
+    // anything: the "Play at 1x" hint below is gated to rates above 1x, which
+    // is right (there is nothing slower to suggest), and the judder signal only
+    // raises the spinner. So the viewer watched an 8K60 AV1 file present ~22 of
+    // its 60 frames with no word about why.
+    //
+    // The renderer's decode-bound verdict IS the measurement the ceiling
+    // comment promises — "if the headroom turns out not to be there, the
+    // stutter hint says so from what actually happened" — so say it, once per
+    // source, at any rate, through the same notice and the same cancelable
+    // event a host can already intercept.
+    if (this.player?.isDecodeBound?.()) this.warnSmoothFromMeasurement();
+
+    // A second the host page starved rAF is not the device falling short —
+    // the renderer holds its own detectors off for exactly the same reason.
+    this._stutterHistory.push(
+      !h.hostContended && presented < expected * MoviElement.STUTTER_RATIO,
+    );
+    if (this._stutterHistory.length > MoviElement.STUTTER_WINDOW) {
+      this._stutterHistory.shift();
     }
-    if (this._stutterSeconds >= 3 && !this._stutterCooldown) {
-      this._stutterSeconds = 0;
+    const badSeconds = this._stutterHistory.filter(Boolean).length;
+    // At 1x the decode-bound verdict above was the only thing that could say
+    // anything, and it wants four bad seconds in an unbroken run — bursty
+    // stutter never gives it that. Most of the window going bad says the same
+    // thing, so it raises the same once-per-source notice. Above 1x the speed
+    // hint below speaks for it, and the load-time check already priced the
+    // speed in.
+    if (badSeconds >= MoviElement.STUTTER_SECONDS && this._playbackRate <= 1) {
+      this.warnSmoothFromMeasurement();
+    }
+    if (
+      this._playbackRate > 1 &&
+      badSeconds >= MoviElement.STUTTER_SECONDS &&
+      !this._stutterCooldown
+    ) {
+      this._stutterHistory.length = 0;
       this._stutterCooldown = true;
       // Cooldown so it doesn't nag while stuttering at the SAME rate; a rate
       // change (resetStutterHint) lifts it early so each new speed can warn.
@@ -10690,9 +12992,139 @@ export class MoviElement extends HTMLElement {
   }
 
   /**
+   * "May not play smoothly", from what playback actually did — once per source,
+   * through the same cancelable event as the load-time notice.
+   */
+  private warnSmoothFromMeasurement(): void {
+    if (!this._smoothWarning || this._smoothWarnedByMeasurement) return;
+    this._smoothWarnedByMeasurement = true;
+    // When the stutter is the software decoder's, say so. The generic "your
+    // device can't decode it fast enough" reads as a verdict on the device —
+    // wrong and unactionable when the hardware decoder was carrying this video
+    // fine until it refused the stream mid-playback and the WASM decoder took
+    // over. Name the actual situation so the viewer (and a host listening on
+    // the event) can tell "weak device" from "this video turned hardware away".
+    const software = this.player?.isSoftwareDecoding() ?? false;
+    const softwareReason = software
+      ? (this.player?.softwareDecodeReason() ?? null)
+      : null;
+    const message =
+      software && softwareReason === "hardware-refused"
+        ? {
+            title: "This video switched to software decoding",
+            body: "Hardware decoding didn't work for this video, so a slower software decoder took over. The picture may stutter or fall behind the sound.",
+          }
+        : software
+          ? {
+              title: "This video may not play smoothly on this device",
+              body: "This format can't be hardware-decoded here, so the processor is doing the work and may not keep up. The picture may stutter or fall behind the sound.",
+            }
+          : {
+              title: "This video may not play smoothly on this device",
+              body: "Your device can't decode it fast enough, so the picture may stutter or fall behind the sound.",
+            };
+    const allowed = this.dispatchEvent(
+      new CustomEvent("smoothwarning", {
+        detail: { measured: true, media: "video", software, softwareReason, message },
+        cancelable: true,
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    if (allowed) this.showSmoothWarning(message);
+  }
+
+  /**
    * Show On-Screen Display (OSD) notification
    */
   private osdTimeout: number | null = null;
+
+  /** Once per source: the native element is decoding a picture and no sound. */
+  private _nativeAudioSilentReported = false;
+  /** True while the volume control is switched off for want of any audio. */
+  private _noAudibleAudio = false;
+  private _nativeAudioCheckTimer: number | null = null;
+
+  /**
+   * Say so when the browser is playing the video and dropping the audio.
+   *
+   * The native handoff plays a file the WASM path could not read, and the
+   * browser decodes only what it has decoders for. A Hindi WEB-DL is typically
+   * H.264 with E-AC-3 (DDP5.1): Chrome plays the picture out of the MKV and has
+   * no E-AC-3 decoder at all, so the sound is dropped without a word. From the
+   * viewer's side that is a silent video and a player that looks broken.
+   *
+   * Chromium counts what it decoded, and the two counters answer it exactly —
+   * video bytes climbing while audio bytes sit at zero is the browser saying it
+   * never decoded a sample. There is nothing to do about it here (the fixes are
+   * CORS on the host, so the WASM path can decode it, or a file the browser
+   * knows) but saying it is better than silence.
+   *
+   * Chromium-only, because the counters are: elsewhere we don't claim.
+   */
+  private watchNativeAudio(video: HTMLVideoElement): void {
+    const el = video as HTMLVideoElement & {
+      webkitAudioDecodedByteCount?: number;
+      webkitVideoDecodedByteCount?: number;
+    };
+    if (typeof el.webkitAudioDecodedByteCount !== "number") return;
+    if (this._nativeAudioCheckTimer !== null) {
+      clearTimeout(this._nativeAudioCheckTimer);
+    }
+    this._nativeAudioCheckTimer = window.setTimeout(() => {
+      this._nativeAudioCheckTimer = null;
+      if (!this._nativeFallbackActive || this._nativeAudioSilentReported) return;
+      // Only once the picture is genuinely running: before that both counters
+      // are zero for the ordinary reason.
+      if ((el.webkitVideoDecodedByteCount ?? 0) <= 0) {
+        this.watchNativeAudio(video);
+        return;
+      }
+      if ((el.webkitAudioDecodedByteCount ?? 0) > 0) return; // sound is fine
+      this._nativeAudioSilentReported = true;
+      Logger.warn(
+        TAG,
+        "The browser decoded this file's video but not its audio — no decoder here for its audio codec (E-AC-3/AC-3/DTS in Chrome, typically). Playing without sound.",
+      );
+      this.dispatchEvent(
+        new CustomEvent("nativeaudiounsupported", {
+          detail: { src: typeof this._src === "string" ? this._src : null },
+        }),
+      );
+      this.showOSD(
+        symbolSvg("volumeOff"),
+        "This audio format isn't supported by your browser",
+      );
+      this.setNoAudibleAudio(true);
+    }, 3000) as unknown as number;
+  }
+
+  /**
+   * Switch the volume control off (or back on): the button, the slider and the
+   * keys that drive them. See the CSS note on .movi-no-audible-audio.
+   */
+  private setNoAudibleAudio(on: boolean): void {
+    this._noAudibleAudio = on;
+    this.classList.toggle("movi-no-audible-audio", on);
+    const sr = this.shadowRoot;
+    if (!sr) return;
+    const btn = sr.querySelector(".movi-volume-btn") as HTMLButtonElement | null;
+    const slider = sr.querySelector(".movi-volume-slider") as HTMLInputElement | null;
+    // aria and the disabled property as well as the class: a control that is
+    // only dimmed is still reachable by keyboard and still announced as usable.
+    if (btn) {
+      btn.disabled = on;
+      btn.setAttribute("aria-disabled", on ? "true" : "false");
+      if (on) btn.title = "This media's audio can't be decoded by your browser";
+      else btn.removeAttribute("title");
+    }
+    if (slider) {
+      slider.disabled = on;
+      slider.setAttribute("aria-disabled", on ? "true" : "false");
+    }
+    // The pill is an offer of sound; withdraw it along with the control.
+    this.updateUnmuteOverlay();
+  }
 
   private showOSD(icon: string, text: string): void {
     const osdContainer = this.shadowRoot?.querySelector(
@@ -10835,6 +13267,15 @@ export class MoviElement extends HTMLElement {
         ) {
           this._subtitleSettings.edge = parsed.edge;
         }
+        // Clamped on the way in as well as on the way out: a stored position
+        // is only ever as trustworthy as the localStorage it came from, and a
+        // caption parked off the edge of the picture cannot be dragged back.
+        if (Number.isFinite(parsed.posX)) {
+          this._subtitleSettings.posX = MoviElement.clampSubtitlePos(parsed.posX);
+        }
+        if (Number.isFinite(parsed.posY)) {
+          this._subtitleSettings.posY = MoviElement.clampSubtitlePos(parsed.posY);
+        }
       }
     } catch {
       /* ignore — fall back to defaults */
@@ -10864,6 +13305,385 @@ export class MoviElement extends HTMLElement {
     this.style.setProperty(
       "--movi-sub-edge",
       MoviElement.SUBTITLE_EDGE_STYLES[s.edge],
+    );
+    this.applySubtitlePosition();
+  }
+
+  /**
+   * Let the viewer put the caption where it suits them, and leave it there.
+   *
+   * On the caption itself, which is the only part of the overlay that takes a
+   * pointer at all (the rest stays transparent so a click lands on the picture
+   * behind it). The move is tracked on the window rather than on the caption:
+   * the overlay's contents are rewritten on every karaoke tick, so the element
+   * the drag started on is routinely gone before the drag ends.
+   *
+   * A double click puts it back. Hosts that don't want any of this write
+   * `controlslist="nosubtitledrag"`.
+   */
+  private wireSubtitleDrag(): void {
+    const overlay = this.subtitleOverlay;
+    if (!overlay) return;
+    const GRABBABLE = ".movi-subtitle-block, .movi-subtitle-image";
+
+    const onMove = (e: PointerEvent) => {
+      const drag = this._subtitleDrag;
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      const dx = e.clientX - drag.startX;
+      const dy = e.clientY - drag.startY;
+      // A caption is also a button (it opens the transcript), so the first few
+      // pixels belong to the click, not to the drag.
+      if (!drag.moved && Math.hypot(dx, dy) < 3) return;
+      if (!drag.moved) {
+        drag.moved = true;
+        overlay.classList.add("movi-subtitle-dragging");
+        // Whatever of the caption's present height is the controls reserve
+        // becomes part of the drag, and the reserve is then suspended for the
+        // duration. Read before the hold, which is what suspends it: from here
+        // the caption answers the pointer alone, and it neither lurches as it
+        // is picked up nor stalls for the first stretch of the way up.
+        const reserve = this.player?.getSubtitleReserve?.() ?? 0;
+        if (reserve) drag.baseY -= (reserve / drag.boxH) * 100;
+        // Capture on the overlay, which outlives the cue. Without it the
+        // pointer is implicitly captured by the caption the drag started on,
+        // and on touch the browser answers that caption's removal with
+        // pointercancel — the subtitles drop the drag themselves. Taken here
+        // and not on the press, because a captured pointer aims its click at
+        // the capture element: from the press it would take the plain click
+        // and the double click off the caption they were meant for.
+        try {
+          overlay.setPointerCapture(e.pointerId);
+        } catch {
+          /* an exotic pointer, or one already gone: the drag still tracks */
+        }
+        this.showCaptionHint(
+          e.pointerType === "touch",
+          (
+            this.subtitleOverlay?.querySelector(
+              ".movi-subtitle-block, .movi-subtitle-image",
+            ) as HTMLElement | null
+          )?.getBoundingClientRect() ?? null,
+        );
+        // Only now, not on the pointerdown: a plain click on the caption
+        // opens the transcript and has no business stopping the subtitles.
+        this.player?.setSubtitleHeld(true);
+      }
+      const settings = this._subtitleSettings;
+      settings.posX = MoviElement.clampSubtitlePos(
+        drag.baseX + (dx / drag.boxW) * 100,
+      );
+      settings.posY = MoviElement.clampSubtitlePos(
+        drag.baseY + (dy / drag.boxH) * 100,
+      );
+      this.applySubtitlePosition();
+      const box = this.keepCaptionInPicture(drag.boxW, drag.boxH);
+      if (box) this.syncCaptionHintClearance(box);
+      e.preventDefault();
+    };
+
+    const onEnd = (e: PointerEvent) => {
+      const drag = this._subtitleDrag;
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      this._subtitleDrag = null;
+      overlay.classList.remove("movi-subtitle-dragging");
+      try {
+        overlay.releasePointerCapture(e.pointerId);
+      } catch {
+        /* released with the pointer itself */
+      }
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      if (!drag.moved) return;
+      this.player?.setSubtitleHeld(false);
+      this._subtitleDragSuppressClick = true;
+      this.saveSubtitleSettings();
+      this.dismissCaptionHint();
+    };
+
+    overlay.addEventListener("pointerdown", (e) => {
+      if (this.isControlDisabled("subtitledrag")) return;
+      if (e.button > 0) return;
+      const grabbed = (e.target as HTMLElement | null)?.closest(
+        GRABBABLE,
+      ) as HTMLElement | null;
+      if (!grabbed) return;
+      const host = this.getBoundingClientRect();
+      this._subtitleDrag = {
+        pointerId: e.pointerId,
+        startX: e.clientX,
+        startY: e.clientY,
+        baseX: this._subtitleSettings.posX,
+        baseY: this._subtitleSettings.posY,
+        boxW: overlay.offsetWidth || host.width || 1,
+        boxH: overlay.offsetHeight || host.height || 1,
+        moved: false,
+      };
+      // Not the picture's pointerdown: this one is for the caption, and the
+      // play/pause toggle behind it must not also take it.
+      e.stopPropagation();
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onEnd);
+      window.addEventListener("pointercancel", onEnd);
+    });
+
+    overlay.addEventListener("dblclick", (e) => {
+      if (!(e.target as HTMLElement | null)?.closest(GRABBABLE)) return;
+      // Double click on the picture is fullscreen, and double tap is a seek.
+      // On the caption it is neither.
+      e.stopPropagation();
+      e.preventDefault();
+      if (this._captionClickTimer !== null) {
+        window.clearTimeout(this._captionClickTimer);
+        this._captionClickTimer = null;
+      }
+      const s = this._subtitleSettings;
+      if (!s.posX && !s.posY) return;
+      s.posX = 0;
+      s.posY = 0;
+      this.saveSubtitleSettings();
+      this.applySubtitlePosition();
+      // They know — they just did it. Nothing more to say, now or ever.
+      this.markCaptionHintLearned();
+      this.dismissCaptionHint(true);
+    });
+  }
+
+  /**
+   * Pull a caption that has left the picture back to its edge.
+   *
+   * Measured after the move rather than bounded before it, because the ground
+   * shifts under a drag: the bar hides and the caption's home moves the height
+   * of the bar, the cue changes and the block changes width. Bounds worked out
+   * when the caption was picked up are wrong by then, and the caption stopped
+   * short of the top of the picture by exactly the height of the bar that
+   * hid while it was being carried there.
+   */
+  private keepCaptionInPicture(boxW: number, boxH: number): DOMRect | null {
+    const held = this.subtitleOverlay?.querySelector(
+      ".movi-subtitle-block, .movi-subtitle-image",
+    ) as HTMLElement | null;
+    if (!held) return null;
+    const box = held.getBoundingClientRect();
+    const host = this.getBoundingClientRect();
+    const edge = 4;
+    // A caption wider (or taller) than the picture cannot satisfy both edges,
+    // and pulling it at one of them just fights the viewer. Leave that axis.
+    const fix = (low: number, high: number, near: number, far: number) =>
+      far - near > high - low ? 0 : near < low ? low - near : far > high ? high - far : 0;
+    const fixX = fix(host.left + edge, host.right - edge, box.left, box.right);
+    const fixY = fix(host.top + edge, host.bottom - edge, box.top, box.bottom);
+    if (!fixX && !fixY) return box;
+    const settings = this._subtitleSettings;
+    settings.posX = MoviElement.clampSubtitlePos(settings.posX + (fixX / boxW) * 100);
+    settings.posY = MoviElement.clampSubtitlePos(settings.posY + (fixY / boxH) * 100);
+    this.applySubtitlePosition();
+    return box;
+  }
+
+  private _captionHint: HTMLDivElement | null = null;
+  private _captionHintTimer: number | null = null;
+  private static readonly CAPTION_HINT_STORAGE_KEY = "movi.captionDragHintDone";
+
+  /**
+   * Has the viewer ever put a caption back?
+   *
+   * The one thing that proves the hint has been read. Counting drags would
+   * only prove the hint has been SHOWN, which is not the same and stops
+   * telling people who have not looked at it yet.
+   */
+  private captionHintLearned(): boolean {
+    try {
+      return !!localStorage.getItem(MoviElement.CAPTION_HINT_STORAGE_KEY);
+    } catch {
+      // No store: offer it every time rather than never. A hint nobody can
+      // reach is worse than one offered again.
+      return false;
+    }
+  }
+
+  private markCaptionHintLearned(): void {
+    try {
+      localStorage.setItem(MoviElement.CAPTION_HINT_STORAGE_KEY, "1");
+    } catch {
+      /* private window, blocked storage — the hint just keeps being offered */
+    }
+  }
+
+  /**
+   * Tell the viewer, while they are dragging, how to put the caption back.
+   *
+   * A drag has no undo the eye can find: the caption is somewhere new and
+   * nothing on screen says the way back. So it is said at the one moment it
+   * is wanted, in the smallest thing that can carry a sentence — on every
+   * drag, until the viewer puts a caption back for the first time. That, and
+   * not a number of showings, is what says the sentence has been read; after
+   * it, the hint is a label on a door they know how to open.
+   */
+  private showCaptionHint(touch: boolean, captionBox: DOMRect | null): void {
+    const hint = this._captionHint;
+    if (!hint) return;
+    if (this.captionHintLearned()) return;
+    if (this._captionHintTimer !== null) {
+      window.clearTimeout(this._captionHintTimer);
+      this._captionHintTimer = null;
+    }
+    hint.textContent = touch
+      ? "Double-tap to put it back"
+      : "Double-click to put it back";
+    hint.style.display = "block";
+    // Out of the fade it may be in the middle of, on a second drag.
+    hint.classList.remove("movi-caption-hint-leaving");
+    this._captionHintCrowdedOut = false;
+    this.placeCaptionHint(captionBox);
+  }
+
+  /** Let it go, a beat after the caption is let go of. */
+  private dismissCaptionHint(immediately = false): void {
+    const hint = this._captionHint;
+    if (!hint) return;
+    if (hint.style.display === "none") {
+      this._captionHintCrowdedOut = false;
+      return;
+    }
+    if (this._captionHintTimer !== null) {
+      window.clearTimeout(this._captionHintTimer);
+      this._captionHintTimer = null;
+    }
+    const hide = () => {
+      this._captionHintTimer = null;
+      hint.classList.remove("movi-caption-hint-leaving");
+      hint.style.display = "none";
+    };
+    if (!this._subtitleDrag) this._captionHintCrowdedOut = false;
+    if (immediately) {
+      hide();
+      return;
+    }
+    hint.classList.add("movi-caption-hint-leaving");
+    this._captionHintTimer = window.setTimeout(hide, 900);
+  }
+
+  /**
+   * Put the hint at the end of the picture the caption is not at — and then
+   * leave it there for the whole drag.
+   *
+   * It used to be worked out on every movement, so carrying a caption past
+   * the middle of the frame sent the hint sailing the other way across it,
+   * animated, in the middle of the gesture it was there to explain. Where it
+   * goes is decided once, when it is raised.
+   */
+  private placeCaptionHint(captionBox: DOMRect | null): void {
+    const hint = this._captionHint;
+    if (!hint) return;
+    const host = this.getBoundingClientRect();
+    const captionIsHigh =
+      !!captionBox &&
+      captionBox.top + captionBox.height / 2 < host.top + host.height / 2;
+    if (!captionIsHigh) {
+      hint.style.top = "18px";
+      return;
+    }
+    // Below, it has to clear the bar — measured, because the bar is 48px tall
+    // on a phone and twice that on a desktop, and it is down at this moment
+    // anyway on the drag that puts the caption up here.
+    const bar = this.shadowRoot?.querySelector(
+      ".movi-controls-bar",
+    ) as HTMLElement | null;
+    const floor = (bar?.offsetHeight ?? 80) + 12;
+    hint.style.top =
+      Math.max(18, host.height - (hint.offsetHeight || 28) - floor) + "px";
+  }
+
+  /**
+   * The caption has been carried to where the hint is standing.
+   *
+   * The one case a fixed note cannot answer by staying put. It does not dodge
+   * — a note that jumps out of the way is the thing that distracts — it steps
+   * out while the caption is on top of it and comes back the moment the
+   * caption moves off, so carrying one to the top of the picture does not
+   * cost the sentence for the rest of the drag.
+   */
+  private syncCaptionHintClearance(captionBox: DOMRect): void {
+    const hint = this._captionHint;
+    if (!hint) return;
+    if (hint.style.display === "none" && !this._captionHintCrowdedOut) return;
+    const box = hint.getBoundingClientRect();
+    const gap = 10;
+    const crowded =
+      captionBox.right > box.left - gap &&
+      captionBox.left < box.right + gap &&
+      captionBox.bottom > box.top - gap &&
+      captionBox.top < box.bottom + gap;
+    if (crowded === this._captionHintCrowdedOut) return;
+    this._captionHintCrowdedOut = crowded;
+    if (crowded) {
+      this.dismissCaptionHint();
+      return;
+    }
+    // Back where it was standing — not re-placed, because where it stands was
+    // settled when the drag began and the caption has not stopped moving.
+    if (this._captionHintTimer !== null) {
+      window.clearTimeout(this._captionHintTimer);
+      this._captionHintTimer = null;
+    }
+    hint.classList.remove("movi-caption-hint-leaving");
+    hint.style.display = "block";
+  }
+
+  /** Standing aside for a caption that is on top of it, as opposed to done. */
+  private _captionHintCrowdedOut: boolean = false;
+
+  private _subtitleDrag: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    baseX: number;
+    baseY: number;
+    boxW: number;
+    boxH: number;
+    moved: boolean;
+  } | null = null;
+  /** A drag ends in a click event the transcript must not answer. */
+  private _subtitleDragSuppressClick: boolean = false;
+  private _captionClickTimer: number | null = null;
+
+  /**
+   * A sanity bound on a STORED position, not a leash on the drag.
+   *
+   * How far the caption may actually travel is decided by the picture: the
+   * drag is clamped to the player's own box, so the caption stops at the edge
+   * it reached and nowhere sooner. This only catches a number that came back
+   * from localStorage as something no drag could have produced, which would
+   * park the caption off-screen where it cannot be dragged back.
+   */
+  private static readonly SUBTITLE_POS_LIMIT = 100;
+
+  private static clampSubtitlePos(value: number): number {
+    const limit = MoviElement.SUBTITLE_POS_LIMIT;
+    return Math.min(limit, Math.max(-limit, value));
+  }
+
+  /**
+   * Put the caption where it was dragged to.
+   *
+   * The independent `translate` property, not `transform`: the renderer owns
+   * `transform` on this overlay (it carries the video's rotation, rewritten on
+   * every cue), and the two compose without either having to know about the
+   * other. `translate` also applies OUTSIDE the rotation, so a caption on a
+   * rotated video still follows the pointer rather than the picture's idea of
+   * which way is right.
+   *
+   * Written on the overlay rather than the host so it travels with the element
+   * into the document-PiP window, where the host's own custom properties do
+   * not reach.
+   */
+  private applySubtitlePosition(): void {
+    if (!this.subtitleOverlay) return;
+    const { posX, posY } = this._subtitleSettings;
+    this.subtitleOverlay.style.setProperty(
+      "translate",
+      posX || posY ? `${posX}% ${posY}%` : "",
     );
   }
 
@@ -11097,9 +13917,7 @@ export class MoviElement extends HTMLElement {
       return `
         <div class="movi-sub-cust-panel">
           <button type="button" class="movi-sub-cust-back" data-action="back" aria-label="Back to subtitles">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-              <path d="M15 18l-6-6 6-6"/>
-            </svg>
+            ${symbolSvg("chevronBack")}
             <span>Back</span>
           </button>
           <div class="movi-sub-cust-empty">Select a subtitle track to customize.</div>
@@ -11110,9 +13928,7 @@ export class MoviElement extends HTMLElement {
     return `
       <div class="movi-sub-cust-panel">
         <button type="button" class="movi-sub-cust-back" data-action="back" aria-label="Back to subtitles">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-            <path d="M15 18l-6-6 6-6"/>
-          </svg>
+          ${symbolSvg("chevronBack")}
           <span>Back</span>
         </button>
 
@@ -11361,6 +14177,8 @@ export class MoviElement extends HTMLElement {
         color: "#FFFFFF",
         bgAlpha: 0.75,
         edge: "shadow",
+        posX: 0,
+        posY: 0,
       };
       this.saveSubtitleSettings();
       this.applySubtitleSettings();
@@ -11720,8 +14538,10 @@ export class MoviElement extends HTMLElement {
     const externalSubs = this.player.getSubtitleLangs();
     const hasExternalSubs = externalSubs.length > 0;
 
-    // Hide container if no subtitle tracks (muxed or external)
-    if (subtitleTracks.length === 0 && !hasExternalSubs) {
+    // Hide container if no subtitle tracks (muxed or external). Not when the
+    // picker is on: a file the viewer is about to add is exactly the case
+    // where the menu is empty, and hiding the button hides the way to add it.
+    if (subtitleTracks.length === 0 && !hasExternalSubs && !this._subtitlePicker) {
       subtitleTrackContainer.style.display = "none";
       return;
     }
@@ -11837,11 +14657,21 @@ export class MoviElement extends HTMLElement {
              data-subtitle-lang="${t.lang}">
           ${ICON}
           <span class="movi-subtitle-track-label">${t.label}</span>
-          <span class="movi-subtitle-track-info">${t.lang.toUpperCase()}</span>
+          ${t.pending ? MoviElement.SUBTITLE_PENDING : `<span class="movi-subtitle-track-info">${t.lang.toUpperCase()}</span>`}
           ${CHECK}
         </div>
       `)
       .join("");
+
+    // "Add subtitle…" — last, under the tracks it will join.
+    if (this._subtitlePicker) {
+      menuHTML += `
+        <div class="movi-subtitle-track-item movi-subtitle-pick-item" data-subtitle-pick="1">
+          ${symbolSvg("plus")}
+          <span class="movi-subtitle-track-label">Add subtitle…</span>
+        </div>
+      `;
+    }
 
     subtitleTrackList.innerHTML = menuHTML;
     this.flashSubtitleListFade(subtitleTrackList);
@@ -11853,9 +14683,11 @@ export class MoviElement extends HTMLElement {
     if (subtitleFooter) {
       const count = subtitleTracks.length + externalSubs.length;
       subtitleFooter.textContent =
-        count === 1
-          ? "1 subtitle track available"
-          : `${count} subtitle tracks available`;
+        count === 0
+          ? "SRT, VTT or TTML"
+          : count === 1
+            ? "1 subtitle track available"
+            : `${count} subtitle tracks available`;
     }
 
     // Add click handlers
@@ -11864,6 +14696,12 @@ export class MoviElement extends HTMLElement {
       .forEach((item) => {
         item.addEventListener("click", (e) => {
           e.stopPropagation();
+          // The picker row shares the item class for its styling but is not a
+          // track — it opens the file dialog and nothing else.
+          if ((item as HTMLElement).dataset.subtitlePick) {
+            this.openSubtitleFilePicker();
+            return;
+          }
           const trackIdStr = (item as HTMLElement).dataset.trackId;
           const subtitleLang = (item as HTMLElement).dataset.subtitleLang;
 
@@ -11926,6 +14764,31 @@ export class MoviElement extends HTMLElement {
    * and the video rolled the moment data arrived. Intent is what the icon
    * shows, so intent is what the press has to act on.
    */
+  /** When the current press on the player began, and whether playback was
+   *  paused then. Read by toggledThisGesture and _revertsThisGesture. */
+  private _gestureAt = 0;
+  private _gesturePausedAtStart = true;
+  private _gestureWatch = false;
+  private static readonly GESTURE_WINDOW_MS = 1500;
+
+  /** Has playback already flipped since this press on the player began? */
+  private toggledThisGesture(): boolean {
+    return (
+      performance.now() - this._gestureAt < MoviElement.GESTURE_WINDOW_MS &&
+      this.paused !== this._gesturePausedAtStart
+    );
+  }
+
+  /**
+   * Would going to `wantPaused` undo a toggle already made for the press in
+   * progress? For the upgrade proxy (see forwardTo in upgrade.ts), whose
+   * page may answer the same click the player already answered.
+   * @internal
+   */
+  _revertsThisGesture(wantPaused: boolean): boolean {
+    return this.toggledThisGesture() && wantPaused === this._gesturePausedAtStart;
+  }
+
   private shouldPauseOnToggle(): boolean {
     if (this.isStartPending()) return true;
     const state = this.player?.getState?.();
@@ -11958,6 +14821,68 @@ export class MoviElement extends HTMLElement {
   }
 
   /**
+   * Take the play/pause glyph out of the seek's hands — see _iconHeldForSeek.
+   *
+   * Armed only from a seek the viewer is meant to come out of still playing,
+   * so a seek made while paused leaves the glyph alone and it keeps saying
+   * "play". The backstop is long enough to cover a scrub that has to fetch
+   * across the network and short enough that a resume which never arrives is
+   * admitted rather than hidden.
+   */
+  private holdIconThroughSeek(): void {
+    this._iconHeldForSeek = true;
+    if (this._iconHoldTimer) clearTimeout(this._iconHoldTimer);
+    this._iconHoldTimer = window.setTimeout(() => {
+      this._iconHoldTimer = null;
+      if (!this._iconHeldForSeek) return;
+      this._iconHeldForSeek = false;
+      this.updatePlayPauseIcon();
+    }, MoviElement.SEEK_ICON_HOLD_MS);
+  }
+
+  /**
+   * Is the centre button standing in for the ring right now?
+   *
+   * On touch, with the chrome up, that button IS the play control — and during
+   * a seek it is showing the pause glyph, held there by _iconHeldForSeek. The
+   * ring wants the same spot, and the stylesheet's "never the button and the
+   * spinner together" rule resolves that by taking the button away: measured on
+   * a phone scrub, is-spinner-pending came on at 583ms and faded the button out
+   * over ~190ms, the ring took over at 1.6s, and the button faded back in at
+   * 1.8s. A live control blinking out and back for a seek the viewer asked for.
+   *
+   * Here the rule is resolved the other way. The button is the one that stays:
+   * it is a control the viewer may want to press, the seek already has feedback
+   * of its own in the scrubber and the clock, and the glyph it shows is a pause
+   * — not the play triangle inside a loading ring that the rule was written
+   * against. Bounded by the hold's own backstop, so a seek that really is
+   * taking a long time still gets a ring once the hold expires.
+   *
+   * Only where all of that holds: a seek in flight, touch, and the chrome up.
+   * With the chrome down there is no button to protect, on a mouse it is not a
+   * control, and a seek made while paused never arms the hold — which is the
+   * case the original rule is still exactly right about.
+   */
+  private centrePinnedForSeek(): boolean {
+    return (
+      this._iconHeldForSeek &&
+      this._controls &&
+      !this._isUnsupported &&
+      this.isTouchLike() &&
+      this.areControlsVisible()
+    );
+  }
+
+  /** The seek is over, one way or another. Safe to call when nothing is held. */
+  private releaseIconHold(): void {
+    if (this._iconHoldTimer) {
+      clearTimeout(this._iconHoldTimer);
+      this._iconHoldTimer = null;
+    }
+    this._iconHeldForSeek = false;
+  }
+
+  /**
    * Put the chrome back the way a freshly-created, source-less player looks.
    *
    * Clearing the source ran dispose(), and dispose() does refresh the controls
@@ -11971,6 +14896,59 @@ export class MoviElement extends HTMLElement {
    * Called from every route that lands on "no source": the property setter's
    * two null branches and the attribute callback's removal.
    */
+  /**
+   * Everything a fresh load has to forget, whichever route it arrived by.
+   *
+   * Any src (re)set — even to the same URL — is a fresh load, so the
+   * DASH-fallback guards clear: the fallback must be able to run again, and a
+   * stale forced-quality pick must not carry over. Same for the `engine`
+   * priority walk (the new source starts at the top of the author's list, not
+   * wherever the last one gave up) and the pre-play speed test.
+   *
+   * `_hasEverPlayed` goes with them, EXCEPT during a rebuild. A quality switch
+   * on a premuxed ladder comes through the attribute too — each rung is its own
+   * URL — but the CONTENT is the one already playing, and clearing the flag
+   * there makes the poster eligible again, so the switch paints a static
+   * thumbnail over a video that never stopped. That is what the last-frame
+   * snapshot is meant to cover, and the snapshot is best-effort, which is why
+   * the cover appeared only sometimes.
+   *
+   * Both callers matter. The attribute callback returns early when the value
+   * has not changed — a deliberate guard against hosts that re-write props on
+   * every render — so a page re-sending the URL it is already on reaches this
+   * only through the setter's same-value branch. Until that branch called this,
+   * a re-set reloaded the media, landed it paused at zero, and left the element
+   * believing the source had already played: no centre play button, which is
+   * only offered before the first play, at the end, or on touch. A paused video
+   * with nothing to press, from pressing the web app's URL bar twice.
+   */
+  private resetForFreshSource(): void {
+    this._streamDemuxTried = false;
+    this._streamEngineTried = false;
+    this._forcedStreamTried = false;
+    this._engineTried.clear();
+    this._startProbeDone = false;
+    this._startPickConfirmed = false;
+    this._measuredStartBps = 0;
+    this._forcedDashRendition = null;
+    const isRebuild =
+      this._qualitySwitchInProgress || this._fullRecreateInFlight;
+    if (!isRebuild) {
+      this.forgetRecoveryResume();
+      this._hasEverPlayed = false;
+      // …and with it the lift that flag grants. `movi-bar-visible` raises the
+      // centre button and the spinner clear of the bar on a short player, and
+      // it is only ever meant to be on once playback has started — but nothing
+      // re-read the flag at the moment it changed, so the class sat there until
+      // the next showControls/hideControls happened along. Measured on a phone
+      // swapping sources with the chrome up: the button stayed 18px high for
+      // two seconds after the new src landed and then dropped on its own, which
+      // is the "upar hota hai, then neeche" — and reads as the bar being there
+      // invisibly, because the lift is the only thing the bar was still doing.
+      this.classList.remove("movi-bar-visible");
+    }
+  }
+
   private resetToEmptyState(): void {
     // A load that was in flight is over — leaving this set keeps the spinner
     // eligible on a player with nothing to spin for.
@@ -12164,6 +15142,14 @@ export class MoviElement extends HTMLElement {
       this.announceControls(true);
       this.syncBarCollapsedClass();
 
+      // The bar is on screen again, so its capsules can finally be measured
+      // for what they hold. syncEmptyCapsules refuses to judge a row it cannot
+      // see — otherwise a hidden bar would report every capsule as empty — so
+      // without this the only thing that ever re-measured them was a RESIZE.
+      // A capsule that had been called empty by mistake therefore stayed
+      // hidden for the rest of the session, however many controls were in it.
+      if (wasHidden) this.syncEmptyCapsules();
+
       // Restore cursor — clear the inline `none` on the host so the
       // CSS-driven cursor (default on the visible-controls path)
       // takes back over. Mirrors what hideControls does in reverse.
@@ -12223,6 +15209,7 @@ export class MoviElement extends HTMLElement {
       this.classList.remove("movi-bar-visible");
     }
 
+
     // Shift timeline panel up above controls
     const bar = this.shadowRoot?.querySelector(".movi-controls-bar") as HTMLElement;
     const barHeight = bar?.offsetHeight ?? 80;
@@ -12258,10 +15245,11 @@ export class MoviElement extends HTMLElement {
 
     // Reveal the settings gear with the rest of the chrome — but only once a
     // source is set (nothing to configure in the empty "No Video" state).
-    const gearEl = this.shadowRoot?.querySelector(".movi-gear-btn");
-    if (gearEl) {
-      gearEl.classList.toggle("movi-gear-visible", this.hasMediaSource());
-    }
+    // The whole corner at once — the three-dots is inside this row, along with
+    // whatever the host has put beside it.
+    this.shadowRoot
+      ?.querySelector(".movi-top-controls")
+      ?.classList.toggle("movi-gear-visible", this.hasMediaSource());
 
     // Clear existing timeout
     if (this.controlsTimeout) {
@@ -12299,6 +15287,17 @@ export class MoviElement extends HTMLElement {
       !this.isTimelineOpen()
     ) {
       this.controlsTimeout = window.setTimeout(() => {
+        this.controlsTimeout = null;
+        // Still spinning through the opening load: the bar is the only
+        // play/pause control on screen (see openingLoadHoldsControls), so
+        // hold it and ask again rather than leaving a spinner at 00:00 with
+        // nothing to press. Re-arming through showControls rather than
+        // skipping the timer means the auto-hide starts for real the moment
+        // the ring clears, without every isLoading exit having to say so.
+        if (this.openingLoadHoldsControls()) {
+          this.showControls();
+          return;
+        }
         // Re-check gating conditions before hiding — a menu may have
         // been opened, the cursor may have moved over the bar, the 360°
         // joystick may now be in use, etc.
@@ -12312,7 +15311,6 @@ export class MoviElement extends HTMLElement {
         ) {
           this.hideControls();
         }
-        this.controlsTimeout = null;
       }, 3000); // 3 seconds of inactivity
     }
   }
@@ -12324,7 +15322,7 @@ export class MoviElement extends HTMLElement {
    * Pass a `keep` selector to skip closing the menu currently being
    * opened, otherwise everything goes away.
    */
-  private closeAllBottomMenus(keep?: string): void {
+  private closeAllBottomMenus(keep?: string, rearm = true): void {
     if (!this.shadowRoot) return;
     const animatedSelectors = [
       ".movi-speed-menu",
@@ -12339,10 +15337,15 @@ export class MoviElement extends HTMLElement {
       this.setBottomMenuOpen(el, false);
     }
     if (keep !== ".movi-context-menu") {
-      const ctx = this.shadowRoot.querySelector(
+      // Through the menu's own close, not a display poke. The desktop menu is
+      // in the body portal while it is open, and hiding it where it stands
+      // leaves it there with _portaledSubs stale — the next open then skips
+      // the snapshot, and the close after that has no list of panels to
+      // silence before moving them home.
+      const ctx = this.contextMenuRoot().querySelector(
         ".movi-context-menu",
       ) as HTMLElement | null;
-      if (ctx && ctx.style.display !== "none") ctx.style.display = "none";
+      if (ctx && ctx.style.display !== "none") this._hideContextMenu?.();
     }
 
     // Full close (not the open-one/close-others case): re-arm the auto-hide
@@ -12350,7 +15353,7 @@ export class MoviElement extends HTMLElement {
     // menu open and nothing scheduled to hide it — on touch devices, where
     // there's no mouseleave to re-trigger showControls(), the bar would stay
     // up. With `keep` set a different menu is opening, so leave it alone.
-    if (!keep) {
+    if (!keep && rearm) {
       this.showControls();
     }
   }
@@ -12389,7 +15392,15 @@ export class MoviElement extends HTMLElement {
       // scrollTop 0 keeps the first row (0.25x / Audio 1 / first subtitle)
       // visible; the rest is reachable by scrolling. The mobile menu CSS sets
       // max-height with !important, so the inline override must also carry it.
-      if (!this.classList.contains("movi-audio-strip")) {
+      // Not for a menu the stylesheet has made a centred popup (the settings
+      // panel on a small player, position: fixed): it does not open upward
+      // from the bar, so the room above the bar is not its room. Capped here
+      // anyway it came out 168px tall in a 263px player — two and a half rows
+      // — against the 247px its own rule allows.
+      if (
+        !this.classList.contains("movi-audio-strip") &&
+        getComputedStyle(el).position !== "fixed"
+      ) {
         // Cap the upward-opening menu to the room between the player's top and
         // the controls bar, measured from STABLE elements — the bar and the
         // host — NOT the menu's own rect, which on a very short player is
@@ -12461,11 +15472,25 @@ export class MoviElement extends HTMLElement {
   }
 
   /**
-   * Strip-mode menu positioning: place the menu just below the anchor
-   * button using viewport-relative position:fixed. The strip CSS drops
-   * the host's `contain: paint` + `container-type` so fixed coords are
-   * actually viewport-relative again (default behaviour) and paint
-   * extends outside the 56px strip box.
+   * Strip-mode menu positioning: place the menu against the anchor button
+   * using viewport-relative position:fixed. The strip CSS drops the host's
+   * `contain: paint` + `container-type` so fixed coords reach the viewport
+   * again and paint extends outside the 56px strip box.
+   *
+   * Two things the first version of this got wrong, both of which left the
+   * subtitle menu looking like it had not opened at all:
+   *
+   *  - Its height. The stylesheet caps these menus against the PLAYER's own
+   *    height, which in strip mode IS the bar: min(56px - 100px, 460px)
+   *    floors at zero, so the menu opened 2px tall. A strip's room is the
+   *    viewport's, so measure that instead.
+   *  - Its position. `fixed` is viewport-relative only while nothing up the
+   *    tree carries a transform, and the controls' right-hand cluster
+   *    animates with one — which makes IT the containing block. The menu
+   *    landed a cluster's width and a bar's height away from where it was
+   *    put (measured: asked for 771,476 and arrived at 1772,918, off-screen).
+   *    Rather than hunt for the transformed ancestor, put the menu down, see
+   *    where it actually went, and take the difference out.
    */
   private applyStripFixedMenuPosition(menu: HTMLElement): void {
     if (!this.classList.contains("movi-audio-strip")) return;
@@ -12473,23 +15498,70 @@ export class MoviElement extends HTMLElement {
       ".movi-btn",
     ) as HTMLElement | null;
     if (!anchor) return;
+    const GAP = 8;
+    const EDGE = 8;
     const btnRect = anchor.getBoundingClientRect();
-    // Measure intrinsic size by briefly placing the menu offscreen.
     menu.style.position = "fixed";
     menu.style.bottom = "auto";
     menu.style.right = "auto";
+    // The phone stylesheet centres these menus with a translate on their own
+    // --movi-menu-tx axis. Placed by hand it is not a centring any more, just
+    // an offset — on a 420px screen it carried the menu to x=614, off it.
+    menu.style.setProperty("--movi-menu-tx", "0px");
     menu.style.visibility = "hidden";
     menu.style.left = "0";
     menu.style.top = "0";
+
+    // Vertically the menu clears the whole BAR, not just the button inside
+    // it — anchored to the button it opened over the strip's own title row.
+    const barRect = this.getBoundingClientRect();
+    const below = window.innerHeight - barRect.bottom - GAP - EDGE;
+    const above = barRect.top - GAP - EDGE;
+    // Room is the VIEWPORT's, not the gap between the bar and the window edge.
+    // Measured against that gap the menu came out 120px tall with its own
+    // scrollbar whenever the strip sat high on the page — a list of subtitle
+    // tracks behind a scroll thumb, with the rest of the window empty. A menu
+    // may cover the bar it came from; that is what a pop-up does.
+    menu.style.setProperty(
+      "max-height",
+      `${Math.min(460, window.innerHeight - 2 * EDGE)}px`,
+      "important",
+    );
+
     const menuW = menu.offsetWidth || 200;
-    // Right-align with the button; clamp into viewport on both edges.
+    const menuH = menu.offsetHeight || 0;
+    // Below the bar when the page has room under it, above it when it does
+    // not — a strip sitting near the bottom of a page has neither by much,
+    // so take whichever side is roomier.
+    // Keep the bar clear when the menu fits beside it; otherwise let it
+    // overlap, clamped into the viewport below.
+    const openBelow = below >= menuH ? true : above >= menuH ? false : below >= above;
     let left = btnRect.right - menuW;
-    if (left < 8) left = 8;
-    if (left + menuW > window.innerWidth - 8) {
-      left = window.innerWidth - menuW - 8;
-    }
+    left = Math.min(
+      Math.max(left, EDGE),
+      Math.max(EDGE, window.innerWidth - menuW - EDGE),
+    );
+    let top = openBelow ? barRect.bottom + GAP : barRect.top - GAP - menuH;
+    top = Math.min(
+      Math.max(top, EDGE),
+      Math.max(EDGE, window.innerHeight - menuH - EDGE),
+    );
     menu.style.left = `${left}px`;
-    menu.style.top = `${btnRect.bottom + 8}px`;
+    menu.style.top = `${top}px`;
+
+    // Where did it actually land? Measured with the menu's own entrance
+    // transform off: that transform moves the rect too, and correcting for it
+    // would fight the animation rather than the containing block.
+    const inlineTransform = menu.style.transform;
+    menu.style.transform = "none";
+    const got = menu.getBoundingClientRect();
+    menu.style.transform = inlineTransform;
+    const dx = left - got.left;
+    const dy = top - got.top;
+    if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+      menu.style.left = `${left + dx}px`;
+      menu.style.top = `${top + dy}px`;
+    }
     menu.style.visibility = "";
   }
 
@@ -12870,7 +15942,7 @@ export class MoviElement extends HTMLElement {
       window.matchMedia("(pointer: coarse)").matches
     ) {
       html += `<div class="movi-context-menu-item movi-context-menu-back" data-action="back">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+        ${symbolSvg("chevronBack", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Back</span>
       </div>`;
     }
@@ -12896,7 +15968,7 @@ export class MoviElement extends HTMLElement {
     // opening the submenu does not).
     if (real.length < 1 && canUnlock) {
       html += `<div class="movi-context-menu-item movi-context-menu-audiodevice-unlock" data-audio-output-unlock="1">
-        <svg class="movi-context-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        ${symbolSvg("info", "movi-context-menu-icon")}
         <span class="movi-context-menu-label">Show output devices…</span>
       </div>`;
     }
@@ -12952,19 +16024,20 @@ export class MoviElement extends HTMLElement {
    *  of bare words is slower to scan than a list with marks against it — and
    *  these are the same marks the context menu already trained people on. */
   private static readonly SETTINGS_ICONS: Record<string, string> = {
-    quality: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg>`,
-    speed: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5.64 18.36a9 9 0 1 1 12.72 0"/><path d="m12 12 4-4"/></svg>`,
-    audio: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`,
-    subtitles: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="14" x="3" y="5" rx="2"/><path d="M7 15h4M13 15h4"/></svg>`,
+    quality: symbolSvg("quality", "movi-settings-icon"),
+    speed: symbolSvg("speed", "movi-settings-icon"),
+    audio: symbolSvg("audio", "movi-settings-icon"),
+    subtitles: symbolSvg("subtitles", "movi-settings-icon"),
     hdr: `<span class="movi-settings-icon movi-settings-icon-text">HDR</span>`,
-    stable: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 15v-2M9 15v-4M12 15v-6M15 15v-4M18 15v-2"/></svg>`,
-    loop: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>`,
-    aspect: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><rect x="6" y="8" width="12" height="8" rx="1"/></svg>`,
-    ambient: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>`,
+    stable: symbolSvg("stable", "movi-settings-icon"),
+    loop: symbolSvg("loop", "movi-settings-icon"),
+    shuffle: symbolSvg("shuffle", "movi-settings-icon"),
+    aspect: symbolSvg("aspect", "movi-settings-icon"),
+    ambient: symbolSvg("ambient", "movi-settings-icon"),
     // Crop marks — the two overhanging L's of the crop tool. A framed
     // rectangle was tried and it was indistinguishable from Aspect's, which is
     // half of why that row moved away from this one.
-    crop: `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>`,
+    crop: symbolSvg("crop", "movi-settings-icon"),
   };
 
   private static readonly ASPECT_CHOICES: ReadonlyArray<
@@ -13135,9 +16208,10 @@ export class MoviElement extends HTMLElement {
    *  answers "what is it set to" without opening anything. */
   private aspectRowIcon(): string {
     const fit = this._objectFit === "control" ? this._currentFit : this._objectFit;
-    const icon =
-      MoviElement.ASPECT_ICONS[fit as string] || MoviElement.ASPECT_ICONS.contain;
-    return `<svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon}</svg>`;
+    return symbolSvg(
+      MoviElement.aspectSymbol(fit as string),
+      "movi-settings-icon",
+    );
   }
 
   /**
@@ -13176,14 +16250,20 @@ export class MoviElement extends HTMLElement {
     const videoPresentation =
       !this.classList.contains("movi-audio-mode") &&
       !this.classList.contains("movi-native-video");
-    const aspectFoldable = videoPresentation;
+    // Nor from a token that took it off the bar: a switched-off button is not
+    // an extra, and counting it kept a "more" button for a one-item tray.
+    const aspectFoldable =
+      videoPresentation && !this.isControlDisabled("aspect");
     // PiP hides itself outright where the browser has no Picture-in-Picture, so
     // its own display is the honest signal here, unlike aspect's.
     const pipEl = this.shadowRoot?.querySelector(
       ".movi-pip-btn",
     ) as HTMLElement | null;
     const pipFoldable =
-      videoPresentation && !!pipEl && pipEl.style.display !== "none";
+      videoPresentation &&
+      !!pipEl &&
+      pipEl.style.display !== "none" &&
+      !this.isControlDisabled("pip");
     this.classList.toggle(
       "movi-single-extra",
       shown + (aspectFoldable ? 1 : 0) + (pipFoldable ? 1 : 0) <= 1,
@@ -13195,7 +16275,7 @@ export class MoviElement extends HTMLElement {
       ".movi-settings-root",
     ) as HTMLElement | null;
     if (!root) return;
-    const chevron = `<svg class="movi-settings-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>`;
+    const chevron = `${symbolSvg("chevronForward", "movi-settings-chevron")}`;
     const rows: string[] = [];
     const page = (
       pageKey: string,
@@ -13250,15 +16330,27 @@ export class MoviElement extends HTMLElement {
     // the thing this panel was getting wrong in the first place.
     const deadIf = (actionKey: string) =>
       liveNow(actionKey) ? "" : ' disabled aria-disabled="true"';
+    rows.push(
+      `<div class="movi-settings-section-label">Playback</div>`,
+    );
     // Every row here is a remembered preference, and all of them can be set
     // before there is anything to apply them to — the same list
     // worksBeforePlayback keeps live in the context menu.
+    //
+    // A row whose control the host switched off is not built. settingsRowAvailable
+    // reads the owning menu's INLINE display, and `controlslist` hides those
+    // menus from the stylesheet — so without the token check here, the gear
+    // was one more way in to a speed, a track or a quality the page had taken
+    // off the bar. The static quality row goes with its control: it is the
+    // same row, only without a list to open.
+    const off = (name: string) => this.isControlDisabled(name);
     if (
       !audioOnly &&
+      !off("quality") &&
       this.settingsRowAvailable(".movi-quality-container", ".movi-quality-item")
     ) {
       page("quality", "Quality", ".movi-quality-container", ".movi-quality-item");
-    } else if (!audioOnly) {
+    } else if (!audioOnly && !off("quality")) {
       // One rung only (a plain file, a single <source>). The row still belongs:
       // "what am I watching" is the question people open this panel with, and
       // an absent row reads as "the player doesn't know". It just doesn't
@@ -13266,25 +16358,31 @@ export class MoviElement extends HTMLElement {
       const label = this.singleQualityLabel();
       if (label) {
         rows.push(
-          `<div class="movi-settings-row is-static" aria-disabled="true">${MoviElement.SETTINGS_ICONS.quality}<span class="movi-settings-row-label">Quality</span><span class="movi-settings-row-value">${MoviElement.escapeSettingsText(label)}</span></div>`,
+          `<div class="movi-settings-row is-static" data-page="quality" aria-disabled="true">${MoviElement.SETTINGS_ICONS.quality}<span class="movi-settings-row-label">Quality</span><span class="movi-settings-row-value">${MoviElement.escapeSettingsText(label)}</span></div>`,
         );
       }
     }
-    rows.push(
-      `<button type="button"${deadIf("speed")} class="movi-settings-row" data-page="speed">${MoviElement.SETTINGS_ICONS.speed}<span class="movi-settings-row-label">Playback speed</span><span class="movi-settings-row-value">${MoviElement.escapeSettingsText(this.settingsRowValue("speed"))}</span>${chevron}</button>`,
-    );
-    page(
-      "audio",
-      "Audio track",
-      ".movi-audio-track-container",
-      ".movi-audio-track-item",
-    );
-    page(
-      "subtitles",
-      "Subtitles",
-      ".movi-subtitle-track-container",
-      ".movi-subtitle-track-item",
-    );
+    if (!off("speed")) {
+      rows.push(
+        `<button type="button"${deadIf("speed")} class="movi-settings-row" data-page="speed">${MoviElement.SETTINGS_ICONS.speed}<span class="movi-settings-row-label">Playback speed</span><span class="movi-settings-row-value">${MoviElement.escapeSettingsText(this.settingsRowValue("speed"))}</span>${chevron}</button>`,
+      );
+    }
+    if (!off("audio")) {
+      page(
+        "audio",
+        "Audio track",
+        ".movi-audio-track-container",
+        ".movi-audio-track-item",
+      );
+    }
+    if (!off("cc")) {
+      page(
+        "subtitles",
+        "Subtitles",
+        ".movi-subtitle-track-container",
+        ".movi-subtitle-track-item",
+      );
+    }
 
     // Aspect is the canvas renderer's fit mode. The native fallback has no
     // canvas — its setFitMode() is an empty method — so the page would let the
@@ -13305,12 +16403,12 @@ export class MoviElement extends HTMLElement {
     };
     const toggle = (toggleKey: string, label: string, on: boolean) =>
       `<button type="button"${deadIf(TOGGLE_ACTION[toggleKey] ?? toggleKey)} class="movi-settings-row" data-toggle="${toggleKey}" aria-pressed="${on}">${MoviElement.SETTINGS_ICONS[toggleKey] || ""}<span class="movi-settings-row-label">${label}</span><span class="movi-settings-switch ${on ? "is-on" : ""}"><span class="movi-settings-knob"></span></span></button>`;
-    // The divider earns its keep by separating the two KINDS of row: above it
-    // everything opens a list and shows what is currently chosen, below it
-    // everything is a switch. Aspect used to sit alone at the bottom, a
-    // chevron stranded after four toggles — which read as an afterthought and
-    // left the divider separating nothing in particular.
-    rows.push(`<div class="movi-settings-divider"></div>`);
+    // A quiet label separates navigation rows from switches without drawing a
+    // rule across the glass surface. The words aid scanning; spacing carries
+    // the hierarchy.
+    rows.push(
+      `<div class="movi-settings-section-label movi-settings-section-label-secondary">Enhancements</div>`,
+    );
     // HDR: defer to the decision the bar's own logic already made.
     // updateHdrVisibility writes "flex" on the container only when HDR is
     // genuinely on offer (Chromium + canvas + an HDR source), so requiring that
@@ -13362,7 +16460,14 @@ export class MoviElement extends HTMLElement {
     if (!audioOnly && offered("aspect") && !this.isControlDisabled("crop")) {
       rows.push(toggle("crop", "Crop black bars", this._cropBars));
     }
-    rows.push(toggle("loop", "Loop", this._loop));
+    if (!off("loop")) rows.push(toggle("loop", "Loop", this._loop));
+    // One item is not a queue, and a Shuffle that can only draw the same card
+    // is a control that takes up room — the same reasoning the Next button is
+    // hidden by (see refreshPlaylistUi). `noplaylist` switches the queue off as
+    // a feature, and the order it plays in is part of that.
+    if (this._playlist.length > 1 && !off("playlist")) {
+      rows.push(toggle("shuffle", "Shuffle", this._shuffle));
+    }
     root.innerHTML = rows.join("");
   }
 
@@ -13394,7 +16499,24 @@ export class MoviElement extends HTMLElement {
     if (title) title.textContent = def.title;
     root.style.display = "none";
     page.style.display = "block";
+    this.animateSettingsView(page, "forward");
     this._settingsPage = key;
+  }
+
+  private animateSettingsView(
+    view: HTMLElement,
+    direction: "forward" | "back",
+  ): void {
+    const cls = direction === "forward"
+      ? "movi-settings-view-forward"
+      : "movi-settings-view-back";
+    view.classList.remove(
+      "movi-settings-view-forward",
+      "movi-settings-view-back",
+    );
+    void view.offsetWidth;
+    view.classList.add(cls);
+    window.setTimeout(() => view.classList.remove(cls), 280);
   }
 
   /** Put a borrowed list back where its own menu expects it. */
@@ -13405,10 +16527,10 @@ export class MoviElement extends HTMLElement {
     ) as HTMLElement | null;
     if (!menu || !this.isBottomMenuOpen(menu)) return;
     this.setBottomMenuOpen(menu, false);
-    this.closeSettingsPage();
+    this.closeSettingsPage(false);
   }
 
-  private closeSettingsPage(): void {
+  private closeSettingsPage(animate = true): void {
     const sr = this.shadowRoot;
     if (!sr || !this._settingsPage) return;
     const def = MoviElement.SETTINGS_PAGES[this._settingsPage];
@@ -13434,7 +16556,16 @@ export class MoviElement extends HTMLElement {
     const page = sr.querySelector(".movi-settings-page") as HTMLElement | null;
     const root = sr.querySelector(".movi-settings-root") as HTMLElement | null;
     if (page) page.style.display = "none";
-    if (root) root.style.display = "block";
+    if (root) {
+      root.style.display = "block";
+      if (animate) this.animateSettingsView(root, "back");
+      else {
+        root.classList.remove(
+          "movi-settings-view-forward",
+          "movi-settings-view-back",
+        );
+      }
+    }
     this._settingsPage = null;
   }
 
@@ -13443,13 +16574,13 @@ export class MoviElement extends HTMLElement {
     if (key !== "aspect") return "";
     const current =
       this._objectFit === "control" ? this._currentFit : this._objectFit;
-    const check = `<svg class="movi-settings-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+    const check = `${symbolSvg("check", "movi-settings-check")}`;
     return MoviElement.ASPECT_CHOICES.map(([fit, label]) => {
       // Each fit already HAS a drawing — the bar button cycled through exactly
       // these to show which was active. Reuse them here: for a spatial setting,
       // the picture of the crop says more than the word for it.
-      const icon = MoviElement.ASPECT_ICONS[fit] || MoviElement.ASPECT_ICONS.contain;
-      return `<button type="button" class="movi-settings-choice ${fit === current ? "is-active" : ""}" data-fit="${fit}"><span class="movi-settings-choice-main"><svg class="movi-settings-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon}</svg><span>${label}</span></span>${fit === current ? check : ""}</button>`;
+      const icon = symbolSvg(MoviElement.aspectSymbol(fit), "movi-settings-icon");
+      return `<button type="button" class="movi-settings-choice ${fit === current ? "is-active" : ""}" data-fit="${fit}"><span class="movi-settings-choice-main">${icon}<span>${label}</span></span>${fit === current ? check : ""}</button>`;
     }).join("");
   }
 
@@ -13462,9 +16593,8 @@ export class MoviElement extends HTMLElement {
 
   /** The toast a fit change puts up — same one the old aspect button showed. */
   private showAspectOsd(fit: string): void {
-    const svg = MoviElement.ASPECT_ICONS[fit] || MoviElement.ASPECT_ICONS.contain;
     this.showOSD(
-      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${svg}</svg>`,
+      symbolSvg(MoviElement.aspectSymbol(fit)),
       MoviElement.ASPECT_OSD_LABELS[fit] || "Fit",
     );
   }
@@ -13484,6 +16614,20 @@ export class MoviElement extends HTMLElement {
     this.dispatchEvent(
       new CustomEvent(name, { detail, bubbles: true, composed: true }),
     );
+  }
+
+  /**
+   * Tell the host the viewer picked a fit. The gear panel and the context
+   * menu did; the bar's aspect button, the A key and the pinch only saved it
+   * in the player's own store — so a host that remembers the fit itself (and
+   * hands it back as `objectfit` on the next page) kept the old value, and the
+   * two stores drifted: a change made from the bar or the key did not stick.
+   */
+  private announceAspect(fit: string): void {
+    this.emitSettingChange("aspectchange", {
+      fit,
+      mode: this._objectFit === "control" ? "control" : "objectfit",
+    });
   }
 
   /**
@@ -13634,12 +16778,165 @@ export class MoviElement extends HTMLElement {
       true,
     );
 
+    // …and a press that lands outside the player closes it as well.
+    //
+    // The rule above covers the rest of the control row and a click on the
+    // picture closes it from the surface handler, which between them is the
+    // whole player — when the player is a picture. In strip mode it is the
+    // row and nothing else: the panel opens over the page, every place the
+    // viewer might press next is outside the host, and the only thing that
+    // put the panel away was the gear a second time.
+    //
+    // pointerdown in capture, the same reasoning as the outside-tap that
+    // hides the bar: it is the first thing a press does, and a page with its
+    // own click handler still lets the down through. composedPath rather than
+    // the target, or every press inside the shadow root reads as a press on
+    // the document. The gear is excluded or its own click would find the
+    // panel already closed and open it straight back.
+    this._settingsOutsideHandler = (e: Event) => {
+      if (!this.isBottomMenuOpen(menu)) return;
+      const path = e.composedPath?.() ?? [];
+      if (path.includes(menu) || path.includes(btn)) return;
+      if (container && path.includes(container)) return;
+      // Outside the PLAYER, not merely outside the panel. Inside it the click
+      // that follows already closes the panel — the bar's own rule for the
+      // row, the surface handler for the picture — and that handler closes it
+      // and then swallows the click, which is how the track and speed popups
+      // have always behaved: the press that dismisses one does nothing else.
+      // Closing here instead left that click with no menu to find, so a tap on
+      // the picture dismissed the panel AND toggled playback.
+      if (path.includes(this)) return;
+      this.closeSettingsMenu();
+    };
+    document.addEventListener("pointerdown", this._settingsOutsideHandler, true);
+
+    // Swipe down to dismiss, on a touch popup (the panel on a small player).
+    //
+    // The panel follows the finger down and fades as it goes; let go past
+    // SWIPE_CLOSE_PX, or flick, and it carries on out and closes, otherwise it
+    // settles back. From the handle it always drags; from the list only when the
+    // list is at its top and the finger moves down, so scrolling the rows is
+    // still scrolling. Moved with the `translate` property, which composes with
+    // the centring the stylesheet keeps in `transform`.
+    const SWIPE_CLOSE_PX = 90;
+    const SWIPE_FLICK_PX_PER_MS = 0.4;
+    let swipe: {
+      y0: number;
+      dy: number;
+      fromHandle: boolean;
+      dragging: boolean;
+      // Recent positions, for the speed at release: a flick is fast at the
+      // end, and averaged over the whole drag it read as slow.
+      trail: Array<[number, number]>;
+    } | null = null;
+    let swallowClickUntil = 0;
+    const isTouchPopup = () =>
+      this.isBottomMenuOpen(menu) &&
+      !this.classList.contains("movi-audio-strip") &&
+      getComputedStyle(menu).position === "fixed";
+    const settle = (close: boolean) => {
+      menu.style.transition = "translate 180ms ease, opacity 180ms ease";
+      if (close) {
+        menu.style.translate = `0 ${Math.max(swipe?.dy ?? 0, 0) + menu.offsetHeight * 0.5}px`;
+        menu.style.opacity = "0";
+      } else {
+        menu.style.translate = "0 0";
+        menu.style.opacity = "";
+      }
+      window.setTimeout(() => {
+        if (close) this.closeSettingsMenu();
+        // Once the close has taken the panel away (or the snap-back has
+        // landed), leave nothing inline for the next open to inherit.
+        window.setTimeout(
+          () => {
+            menu.style.transition = "";
+            menu.style.translate = "";
+            menu.style.opacity = "";
+          },
+          close ? 260 : 0,
+        );
+      }, 180);
+    };
+    menu.addEventListener(
+      "touchstart",
+      (e) => {
+        if (e.touches.length !== 1 || !isTouchPopup()) {
+          swipe = null;
+          return;
+        }
+        const fromHandle = !!(e.target as HTMLElement).closest(
+          ".movi-settings-grabber",
+        );
+        swipe = {
+          y0: e.touches[0].clientY,
+          dy: 0,
+          fromHandle,
+          dragging: false,
+          trail: [[performance.now(), e.touches[0].clientY]],
+        };
+      },
+      { passive: true },
+    );
+    menu.addEventListener(
+      "touchmove",
+      (e) => {
+        if (!swipe) return;
+        const y = e.touches[0].clientY;
+        const dy = y - swipe.y0;
+        const now = performance.now();
+        swipe.trail.push([now, y]);
+        while (swipe.trail.length > 2 && now - swipe.trail[0][0] > 100) {
+          swipe.trail.shift();
+        }
+        if (!swipe.dragging) {
+          if (dy > 6 && (swipe.fromHandle || menu.scrollTop <= 0)) {
+            swipe.dragging = true;
+            menu.style.transition = "none";
+          } else if (dy < -6 || (dy > 6 && menu.scrollTop > 0)) {
+            swipe = null; // the list is being scrolled
+          }
+          return;
+        }
+        e.preventDefault();
+        // Upward past the resting place gives a little, then stops.
+        swipe.dy = dy >= 0 ? dy : -Math.min(12, Math.sqrt(-dy) * 2);
+        menu.style.translate = `0 ${swipe.dy}px`;
+        menu.style.opacity = `${Math.max(0.35, 1 - Math.max(0, swipe.dy) / 320)}`;
+      },
+      { passive: false },
+    );
+    const endSwipe = () => {
+      if (!swipe) return;
+      if (swipe.dragging) {
+        const [t1, y1] = swipe.trail[0];
+        const [t2, y2] = swipe.trail[swipe.trail.length - 1];
+        const speed = (y2 - y1) / Math.max(1, t2 - t1);
+        const flick = swipe.dy > 24 && speed > SWIPE_FLICK_PX_PER_MS;
+        // A drag is not a tap: the row it ended on must not toggle.
+        swallowClickUntil = performance.now() + 400;
+        settle(swipe.dy > SWIPE_CLOSE_PX || flick);
+      }
+      swipe = null;
+    };
+    menu.addEventListener("touchend", endSwipe);
+    menu.addEventListener("touchcancel", endSwipe);
+    menu.addEventListener(
+      "click",
+      (e) => {
+        if (performance.now() < swallowClickUntil) {
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      },
+      true,
+    );
+
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       const open = this.isBottomMenuOpen(menu);
       if (open) {
         this.setBottomMenuOpen(menu, false);
-        this.closeSettingsPage();
+        this.closeSettingsPage(false);
         // The clamp's inline right/max-width are deliberately NOT cleared here.
         // Clearing them starts the close by snapping the panel back to right:0
         // — a visible jump to the right while it is still fading out. The next
@@ -13647,10 +16944,16 @@ export class MoviElement extends HTMLElement {
         return;
       }
       this.closeAllBottomMenus(".movi-settings-menu");
-      this.closeSettingsPage();
+      this.closeSettingsPage(false);
       this.buildSettingsRoot();
       this.setBottomMenuOpen(menu, true);
       this.clampSettingsPanel(menu);
+    });
+
+    container?.querySelector(".movi-settings-close")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.closeSettingsMenu();
+      this.focus();
     });
 
     menu.addEventListener("click", (e) => {
@@ -13675,35 +16978,55 @@ export class MoviElement extends HTMLElement {
         // Each toggle puts up the same toast its old bar button did. A
         // setting changed from a list still deserves the confirmation — the
         // panel covers the picture, so the switch alone is easy to miss.
-        if (row.dataset.toggle === "hdr") {
+        const toggleKey = row.dataset.toggle;
+        if (toggleKey === "hdr") {
           this.hdr = !this.hdr;
           this.showOSD(OSD.hdr, this.hdr ? "HDR On" : "HDR Off");
-        } else if (row.dataset.toggle === "stable") {
+        } else if (toggleKey === "stable") {
           this.stableVolume = !this._stableVolume;
           this.showOSD(
             OSD.stableAudio,
             this._stableVolume ? "Stable Volume On" : "Stable Volume Off",
           );
-        } else if (row.dataset.toggle === "loop") {
+        } else if (toggleKey === "loop") {
           this.loop = !this._loop;
           this.showOSD(OSD.loop, this._loop ? "Loop On" : "Loop Off");
-        } else if (row.dataset.toggle === "ambient") {
+        } else if (toggleKey === "shuffle") {
+          this.shuffle = !this._shuffle;
+          this.showOSD(
+            OSD.shuffle,
+            this._shuffle ? "Shuffle On" : "Shuffle Off",
+          );
+        } else if (toggleKey === "ambient") {
           this.ambientMode = !this._ambientMode;
           this.updateAmbientUI();
           this.showOSD(
             OSD.ambient,
             this._ambientMode ? "Ambient Mode On" : "Ambient Mode Off",
           );
-        } else if (row.dataset.toggle === "crop") {
+        } else if (toggleKey === "crop") {
           this.cropbars = !this._cropBars;
           this.showOSD(
             OSD.crop,
             this._cropBars ? "Black Bars Cropped" : "Black Bars Kept",
           );
         }
-        // Toggles stay on the panel — the point of a settings list is flipping
-        // a couple of things without it closing under you.
-        this.buildSettingsRoot();
+        // Toggles stay on the panel, and the rows themselves stay mounted.
+        // Their setters normally sync this already; the direct call also
+        // covers a future toggle whose updater does not refresh surfaces yet.
+        this.syncSettingsRootState(shadowRoot);
+        if (toggleKey) {
+          const toggle = row.querySelector(
+            ".movi-settings-switch",
+          ) as HTMLElement | null;
+          toggle?.classList.remove("movi-settings-switch-confirmed");
+          if (toggle) void toggle.offsetWidth;
+          toggle?.classList.add("movi-settings-switch-confirmed");
+          window.setTimeout(
+            () => toggle?.classList.remove("movi-settings-switch-confirmed"),
+            420,
+          );
+        }
         return;
       }
       const choice = target.closest(
@@ -13719,7 +17042,7 @@ export class MoviElement extends HTMLElement {
           Logger.warn(TAG, "aspect choice failed", err);
         }
         this.setBottomMenuOpen(menu, false);
-        this.closeSettingsPage();
+        this.closeSettingsPage(false);
         this.showControls();
         return;
       }
@@ -13744,7 +17067,7 @@ export class MoviElement extends HTMLElement {
         // After the list's own handler has run, not before it.
         setTimeout(() => {
           this.setBottomMenuOpen(menu, false);
-          this.closeSettingsPage();
+          this.closeSettingsPage(false);
           this.showControls();
         }, 0);
       },
@@ -13791,6 +17114,13 @@ export class MoviElement extends HTMLElement {
     // hidden (nobody can see them), so hiding it here left a frozen 0:00 and an
     // empty progress bar sitting in plain sight for as long as PiP was open.
     if (this._pipWindow) return;
+    // Nor in strip mode, for the same reason read the other way round: there
+    // is no picture here for the bar to be in the way of. Hiding it took the
+    // controls away and left a clock and a line, and everything the hidden
+    // class drags along with it — the cursor going, the resume dialog and the
+    // smoothness notice standing down — applied to a player that was still
+    // sitting there in full view.
+    if (this.classList.contains("movi-audio-strip")) return;
     const container = this.controlsContainer;
     if (container) {
       container.classList.remove("movi-controls-visible");
@@ -13890,7 +17220,7 @@ export class MoviElement extends HTMLElement {
     // gear must stay put rather than auto-hiding with the transient controls.
     if (!this.classList.contains("movi-audio-strip")) {
       this.shadowRoot
-        ?.querySelector(".movi-gear-btn")
+        ?.querySelector(".movi-top-controls")
         ?.classList.remove("movi-gear-visible");
     }
   }
@@ -13904,13 +17234,38 @@ export class MoviElement extends HTMLElement {
    *  Must track the 0.68 offset in the keyframes below — everything before it
    *  sits at full opacity. */
   private static readonly CENTER_FLASH_FADE_AT = 0.68;
-  /** The other shape: a press on a button that is ALREADY on screen. There is
-   *  nothing to pop in, so it is all exit — a short hold, then the same fade.
-   *  Shorter than the full flash because the hold is only there to let the
-   *  glyph register, not to bring an icon into view. */
-  private static readonly CENTER_FLASH_EXIT_MS = 520;
-  private static readonly CENTER_FLASH_EXIT_FADE_AT = 0.34;
+  /** The other shape: a press on a button that is ALREADY on screen. Nothing to
+   *  pop in, so the receipt is the press itself — in, past the resting size on
+   *  the way up, and settled back ON it. The fade after that is for the one
+   *  case where such a button does leave (the poster's play button, pressed);
+   *  where it stays, settleCenterFlashSolid drops that tail and the press has
+   *  already played out in full by then. */
+  private static readonly CENTER_FLASH_PRESS_MS = 640;
+  /** Where the press has finished moving and the fade would start. The motion
+   *  must be complete by here, because this is the boundary the settle logic
+   *  cancels on. */
+  private static readonly CENTER_FLASH_PRESS_FADE_AT = 0.66;
+  /** How long the glyph may be held across a seek before an unresolved resume
+   *  is reported honestly — see _iconHeldForSeek. */
+  private static readonly SEEK_ICON_HOLD_MS = 5000;
   private _centerFlashAnim: Animation | null = null;
+  /**
+   * Does the flash in flight own the centre GLYPH?
+   *
+   * Only the pop does. That shape is a receipt over the picture — it shows the
+   * ACTION taken, the pause bars when you paused, and it has to keep them for
+   * its whole run or the 250ms tick would reconcile them to the resulting state
+   * halfway through.
+   *
+   * The press does not. There the button is a persistent CONTROL, and a control
+   * says what pressing it will do NEXT — which is what the bar's icon does, at
+   * once. Pinning the action glyph there made the centre button lag the bar by
+   * the whole animation and then snap: measured on a phone, the bar read "play"
+   * 24ms after the tap while the centre button was still showing pause bars
+   * until 664ms, when the press ended. So the press leaves the glyph to
+   * updatePlayPauseIcon and animates the button around it.
+   */
+  private _centerFlashOwnsGlyph = false;
   private _centerFlashTimer: number | null = null;
   /** When the flash in flight starts fading, in ms from its own start. Stored
    *  per flash because the two shapes hold for different lengths. */
@@ -13944,6 +17299,7 @@ export class MoviElement extends HTMLElement {
     this._centerFlashAnim?.cancel();
     this._centerFlashAnim = null;
     this._centerFlashFadeAtMs = 0;
+    this._centerFlashOwnsGlyph = false;
     if (this._centerFlashTimer) {
       clearTimeout(this._centerFlashTimer);
       this._centerFlashTimer = null;
@@ -13986,7 +17342,17 @@ export class MoviElement extends HTMLElement {
     if (this._centerFlashSettleTimer) return;
     this._centerFlashSettleTimer = window.setTimeout(() => {
       this._centerFlashSettleTimer = null;
-      if (this._centerFlashAnim === anim) this.cancelCenterFlash();
+      if (this._centerFlashAnim !== anim) return;
+      // Still settling solid? The button can stop being a persistent control
+      // between arming this and it firing — pressing the poster's play button
+      // is exactly that: the class comes off a couple of hundred milliseconds
+      // in, and cancelling anyway took the fade with it and snapped the button
+      // out on one frame instead.
+      const btn = this.shadowRoot?.querySelector(
+        ".movi-center-play-pause",
+      ) as HTMLElement | null;
+      if (!btn?.classList.contains("movi-center-visible")) return;
+      this.cancelCenterFlash();
     }, fadeAt - at);
   }
 
@@ -14013,7 +17379,19 @@ export class MoviElement extends HTMLElement {
     //
     // So: always flash, and let the button's resting state decide only whether
     // the flash FADES at the end. See `persistent` below.
-    const persistent = btn.classList.contains("movi-center-visible");
+    //
+    // "On screen" is the class AND no ring overriding it. A ring up, or one
+    // still inside its wait, hides this button with !important whatever the
+    // class says — so during a load the class alone read a button the viewer
+    // could not see as already there, and the receipt used the exit shape:
+    // no pop, a shorter hold, and an icon that appeared and left without ever
+    // arriving. Coming from nowhere is exactly what it is doing there.
+    const spinnerWasUp = this.centerHiddenBySpinner();
+    const spinnerWasPending = this.classList.contains("is-spinner-pending");
+    const persistent =
+      btn.classList.contains("movi-center-visible") &&
+      !spinnerWasUp &&
+      !spinnerWasPending;
 
     const playIcon = btn.querySelector(
       ".movi-center-icon-play",
@@ -14021,8 +17399,12 @@ export class MoviElement extends HTMLElement {
     const pauseIcon = btn.querySelector(
       ".movi-center-icon-pause",
     ) as HTMLElement | null;
-    playIcon?.style.setProperty("display", kind === "play" ? "block" : "none");
-    pauseIcon?.style.setProperty("display", kind === "play" ? "none" : "block");
+    // The action glyph belongs to the pop alone — see _centerFlashOwnsGlyph.
+    this._centerFlashOwnsGlyph = !persistent;
+    if (!persistent) {
+      playIcon?.style.setProperty("display", kind === "play" ? "block" : "none");
+      pauseIcon?.style.setProperty("display", kind === "play" ? "none" : "block");
+    }
 
     // A repeated toggle restarts cleanly — cancel() drops the old one outright
     // rather than leaving two animations compositing against each other.
@@ -14034,8 +17416,19 @@ export class MoviElement extends HTMLElement {
     // class hides this button with !important, so the flash would run entirely
     // invisibly. Take it down for the length of the receipt; done() re-asks
     // whether it is still wanted and puts it straight back if so.
-    const spinnerWasUp = this.centerHiddenBySpinner();
-    if (spinnerWasUp) this.setSpinnerVisible(false);
+    // The RAW hide, not the gated one: this spinner has already served its
+    // spinnerdelay, and the receipt is covering it for well under a second,
+    // not ending the load. Routing it through setSpinnerVisible would end the
+    // run, and done() below would then make the viewer wait the whole delay
+    // over again to get back a spinner that never actually left.
+    // A ring still inside its `spinnerdelay` wait hides this button just as
+    // hard — :host(.is-spinner-pending) carries the same !important rule, for
+    // the reason the stylesheet gives — and nothing here used to take that one
+    // off, so on a page with a delay the whole receipt ran invisibly. Only the
+    // CLASS goes; the wait keeps running, and the show it eventually asks for
+    // is deferred behind the flash like any other.
+    if (spinnerWasUp) this.applySpinnerVisible(false);
+    else if (spinnerWasPending) this.applySpinnerPending(false);
 
     // Feedback must never swallow a click meant for the video underneath.
     //
@@ -14065,13 +17458,50 @@ export class MoviElement extends HTMLElement {
     // under it, settles ON it, and both shapes drift a touch over as they go.
     // Ending well past that (the old 1.22) read as a second, oversized button;
     // staying entirely under it read as a shrunken one.
+    //
+    // The exit shape assumed the button was on its way OUT — it holds where the
+    // button already is, then fades. On touch it never goes out: the centre
+    // button IS the play control while the chrome is up, so the class holds it
+    // solid, settleCenterFlashSolid drops the fade exactly as it is meant to,
+    // and what is left is a hold at the resting size followed by nothing.
+    // Measured on a phone press: 176ms of opacity 1 at scale 1, the flash
+    // cancelled at the fade boundary, then a 0.9% wobble off the stylesheet's
+    // own transition. That is the same "it reads as nothing at all" this method
+    // was already rewritten once to cure, arrived at from the other side.
+    //
+    // A button that stays needs motion it comes BACK from, so this is a press:
+    // in, past the resting size on the way up, and settled exactly on it. It
+    // ends where the button lives, so there is no fade for the settle logic to
+    // drop and nothing for the CSS transition to snap back from.
     const held = "translate(-50%, -50%) scale(1)";
     const gone = "translate(-50%, -50%) scale(1.08)";
+    const pressed = "translate(-50%, -50%) scale(0.86)";
+    const sprung = "translate(-50%, -50%) scale(1.045)";
     const frames = persistent
       ? [
-          { offset: 0, visibility: "visible", opacity: 1, transform: held },
           {
-            offset: MoviElement.CENTER_FLASH_EXIT_FADE_AT,
+            offset: 0,
+            visibility: "visible",
+            opacity: 1,
+            transform: held,
+            easing: "cubic-bezier(.4, 0, .6, 1)",
+          },
+          {
+            offset: 0.17,
+            visibility: "visible",
+            opacity: 1,
+            transform: pressed,
+            easing: "cubic-bezier(.2, .8, .2, 1)",
+          },
+          {
+            offset: 0.41,
+            visibility: "visible",
+            opacity: 1,
+            transform: sprung,
+            easing: "ease-out",
+          },
+          {
+            offset: MoviElement.CENTER_FLASH_PRESS_FADE_AT,
             visibility: "visible",
             opacity: 1,
             transform: held,
@@ -14101,7 +17531,7 @@ export class MoviElement extends HTMLElement {
           { offset: 1, visibility: "visible", opacity: 0, transform: gone },
         ];
     const duration = persistent
-      ? MoviElement.CENTER_FLASH_EXIT_MS
+      ? MoviElement.CENTER_FLASH_PRESS_MS
       : MoviElement.CENTER_FLASH_MS;
     const anim = btn.animate(frames, {
       duration,
@@ -14111,23 +17541,27 @@ export class MoviElement extends HTMLElement {
       fill: "none",
     });
     this._centerFlashAnim = anim;
-    // Both shapes fade out now. A button that is STILL a persistent control
-    // when the fade is due has that tail dropped instead — see
-    // settleCenterFlashSolid — which is what keeps a fade from fighting the
-    // class holding it solid.
+    // Only the pop fades, and a button that turns into a persistent control
+    // while it is mid-air has that tail dropped — see settleCenterFlashSolid,
+    // which is what keeps a fade from fighting the class holding it solid. The
+    // press has no tail to drop: it ends ON the resting style, so it is marked
+    // as fading only at its very last frame and the settle logic leaves it to
+    // finish. Cancelling it at a boundary earlier than that is precisely what
+    // erased the receipt on touch.
     this._centerFlashFadeAtMs =
       duration *
       (persistent
-        ? MoviElement.CENTER_FLASH_EXIT_FADE_AT
+        ? MoviElement.CENTER_FLASH_PRESS_FADE_AT
         : MoviElement.CENTER_FLASH_FADE_AT);
     // Set after the animation exists, because setSpinnerVisible(false) above
     // clears this flag — and it is what tells done() to ask for the spinner
     // back. (A spinner that wants to appear DURING the flash sets it too.)
-    if (spinnerWasUp) this._spinnerDeferredByFlash = true;
+    if (spinnerWasUp || spinnerWasPending) this._spinnerDeferredByFlash = true;
     const done = () => {
       if (this._centerFlashAnim === anim) {
         this._centerFlashAnim = null;
         this._centerFlashFadeAtMs = 0;
+        this._centerFlashOwnsGlyph = false;
       }
       // Retire this flash's settle timer. It already checks that the animation
       // it fires for is still the current one, so it cannot cancel a later
@@ -14181,6 +17615,53 @@ export class MoviElement extends HTMLElement {
    * setting goes through it without each one having to remember.
    */
   private _refreshingSurfaces = false;
+
+  /** Update the open root panel without replacing its rows.
+   *
+   * A toggle changes state, not structure. Rebuilding root.innerHTML for it
+   * discarded hover/focus and restarted every entrance animation, making the
+   * whole panel look as though it had reopened. */
+  private syncSettingsRootState(sr: ShadowRoot): void {
+    const root = sr.querySelector(".movi-settings-root") as HTMLElement | null;
+    if (!root) return;
+
+    root.querySelectorAll<HTMLElement>(".movi-settings-row[data-page]").forEach(
+      (row) => {
+        const key = row.dataset.page;
+        if (!key) return;
+        const value = row.querySelector(".movi-settings-row-value");
+        if (value) {
+          value.textContent =
+            key === "quality" && row.classList.contains("is-static")
+              ? this.singleQualityLabel() || this.settingsRowValue(key)
+              : this.settingsRowValue(key);
+        }
+        if (key === "aspect") {
+          const icon = row.querySelector(".movi-settings-icon") as HTMLElement | null;
+          if (icon) icon.outerHTML = this.aspectRowIcon();
+        }
+      },
+    );
+
+    const toggleState: Record<string, boolean> = {
+      hdr: this._hdr,
+      ambient: this._ambientMode,
+      stable: this._stableVolume,
+      crop: this._cropBars,
+      loop: this._loop,
+      shuffle: this._shuffle,
+    };
+    root.querySelectorAll<HTMLElement>(".movi-settings-row[data-toggle]").forEach(
+      (row) => {
+        const key = row.dataset.toggle;
+        if (!key || !(key in toggleState)) return;
+        const on = toggleState[key];
+        row.setAttribute("aria-pressed", String(on));
+        row.querySelector(".movi-settings-switch")?.classList.toggle("is-on", on);
+      },
+    );
+  }
+
   private refreshOpenSettingsSurfaces(): void {
     const sr = this.shadowRoot;
     if (!sr) return;
@@ -14212,7 +17693,7 @@ export class MoviElement extends HTMLElement {
           if (body) body.innerHTML = this.renderSettingsChoices("aspect");
         }
       } else {
-        this.buildSettingsRoot();
+        this.syncSettingsRootState(sr);
       }
     }
     if (this._contextMenuVisible) {
@@ -14250,6 +17731,7 @@ export class MoviElement extends HTMLElement {
     for (const name of [
       "--movi-primary",
       "--movi-secondary",
+      "--movi-accent",
       "--movi-chrome-fg",
       "--movi-controls-color",
     ]) {
@@ -14261,6 +17743,8 @@ export class MoviElement extends HTMLElement {
   private applyThemeColor(raw: string | null): void {
     this.style.removeProperty("--movi-primary");
     this.style.removeProperty("--movi-secondary");
+    this.style.removeProperty("--movi-accent");
+    this.style.removeProperty("--movi-brand-fill");
     const trimmed = raw?.trim();
     if (!trimmed) return;
 
@@ -14268,10 +17752,89 @@ export class MoviElement extends HTMLElement {
     const primary = parts.length === 2 ? parts[0] : trimmed;
     const secondary = parts.length === 2 ? parts[1] : null;
 
-    this.style.setProperty("--movi-primary", primary);
-    if (secondary) this.style.setProperty("--movi-secondary", secondary);
+    // A gradient is allowed, and it is a background — nothing else takes one.
+    // So it goes to the surfaces that PAINT the brand (the scrubber's fill, a
+    // switch that is on, the resume button), while everything that colours
+    // text, a border or a focus ring — and the color-mix() shades derived off
+    // it — gets the gradient's first colour instead. Handing those a gradient
+    // makes the whole declaration invalid and the accent silently disappears.
+    const gradient = /(^|\s)(repeating-)?(linear|radial|conic)-gradient\(/i.test(
+      primary,
+    );
+    if (gradient) {
+      this.style.setProperty("--movi-brand-fill", primary);
+      const solid = MoviElement.firstColorOf(primary);
+      if (solid) this.style.setProperty("--movi-primary", solid);
+    } else {
+      this.style.setProperty("--movi-primary", primary);
+      // The default fill is the brand's gradient, so a plain colour has to say
+      // so — otherwise a host that asked for one solid accent would keep the
+      // gradient on every surface that paints. Written as a gradient of one
+      // colour because this value is also layered UNDER a scrim as a
+      // background-image (the centre button, an active menu row), and a bare
+      // colour there is not an image: the whole declaration would be dropped.
+      this.style.setProperty(
+        "--movi-brand-fill",
+        `linear-gradient(${primary}, ${primary})`,
+      );
+    }
+    if (secondary) {
+      this.style.setProperty("--movi-secondary", secondary);
+      // The second colour IS the accent: it is what the centre play button
+      // wears, and primary is only that button's fallback for a themecolor
+      // that names one colour.
+      this.style.setProperty("--movi-accent", secondary);
+    }
     // A theme change while PiP is open has to reach that document too.
     this.syncPipTheme();
+  }
+
+  /**
+   * The first colour in a gradient, for everything that cannot take one.
+   *
+   * Reads the stops rather than the whole value: the first argument of a
+   * gradient is often a direction or an angle ("to right", "110deg", "in oklch
+   * longer hue"), and a stop itself may carry a position ("#674cff 20%"). What
+   * comes back is the colour alone, or null if nothing in there looks like one.
+   */
+  private static firstColorOf(value: string): string | null {
+    const open = value.indexOf("(");
+    const close = value.lastIndexOf(")");
+    if (open < 0 || close <= open) return null;
+    const args = MoviElement.splitTopLevelBy(value.slice(open + 1, close), ",");
+    for (const arg of args) {
+      const part = arg.trim();
+      if (!part) continue;
+      if (/^(to\b|[-\d.]+(deg|grad|rad|turn)\b|in\b|from\b|at\b)/i.test(part)) {
+        continue;
+      }
+      // A stop is "<colour> [position]" — take the colour, which is either a
+      // function call or the first bare token.
+      const fn = part.match(/^[a-z-]+\([^)]*\)/i);
+      if (fn) return fn[0];
+      const token = part.split(/\s+/)[0];
+      if (/^(#|[a-z])/i.test(token) && !/^\d/.test(token)) return token;
+    }
+    return null;
+  }
+
+  /** Split on a separator that sits outside parentheses. */
+  private static splitTopLevelBy(value: string, sep: string): string[] {
+    const out: string[] = [];
+    let depth = 0;
+    let current = "";
+    for (const ch of value) {
+      if (ch === "(") depth++;
+      else if (ch === ")") depth = Math.max(0, depth - 1);
+      if (ch === sep && depth === 0) {
+        out.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) out.push(current);
+    return out;
   }
 
   /** Split on whitespace that sits outside parentheses, so `rgb(255 0 51)` and
@@ -14343,9 +17906,23 @@ export class MoviElement extends HTMLElement {
       // mouseenter / mousemove handlers surface the bar on the first
       // real interaction, and stateChange → "paused" / "ended" still
       // re-shows it after playback has started.
+      // …except in strip mode, where there is no picture to keep clear and
+      // the row IS the player: it comes up with the first paint and stays.
+      // Without this the hidden class landed here after the strip layout had
+      // already taken it off, and while the row still showed (its own rules
+      // see to that) everything keyed off "the bar is away" believed it.
+      const strip = this.classList.contains("movi-audio-strip");
       container.style.display = "block";
-      container.classList.remove("movi-controls-visible");
-      container.classList.add("movi-controls-hidden");
+      container.classList.toggle("movi-controls-visible", strip);
+      container.classList.toggle("movi-controls-hidden", !strip);
+      // The corner row goes with the bar. This is the one place that puts the
+      // bar into the hidden state directly rather than through hideControls(),
+      // and it used to leave the three-dots behind: a source change on touch
+      // showed the chrome, this hid the bar, and the corner stayed lit on its
+      // own until the inactivity timer got round to it two seconds later.
+      this.shadowRoot
+        ?.querySelector(".movi-top-controls")
+        ?.classList.toggle("movi-gear-visible", strip && this.hasMediaSource());
     } else {
       container.style.display = "none";
       if (centerPlayPause) centerPlayPause.classList.remove("movi-center-visible");
@@ -14446,7 +18023,14 @@ export class MoviElement extends HTMLElement {
             !this._stalledFired
           ) {
             this._stalledFired = true;
-            this.dispatchEvent(new Event("stalled"));
+            // Bytes stopped arriving — but if there are none left to ask for,
+            // that is the download FINISHING, which a media element reports as
+            // `suspend`. Calling it `stalled` told a page its network had died
+            // every time a short file finished buffering.
+            const buffered = this.player?.getBufferedTime?.() ?? 0;
+            const whole = this.duration || 0;
+            const complete = whole > 0 && buffered >= whole - 0.5;
+            this.dispatchEvent(new Event(complete ? "suspend" : "stalled"));
           } else if (!this._stalledSince) {
             this._stalledSince = timestamp;
           }
@@ -14601,7 +18185,18 @@ export class MoviElement extends HTMLElement {
     const bufferedAhead = (p.getBufferedTime?.() ?? 0) - t;
     if (bufferedAhead < 0.5) {
       this._frozenSince = 0;
-      const starving = t > this._starvedLastTime + 0.05;
+      // …and the picture has to actually be running out. The buffered figure
+      // counts bytes fetched but not yet demuxed, and on a link that keeps up
+      // the demuxer takes each range the moment it lands — so it reads ~0s
+      // ahead over playback that is perfectly fine, with seconds of frames
+      // already decoded and queued. That read as starvation six seconds after
+      // every climb and bounced 240p straight back to 144p, four times, on a
+      // link measuring 14–150 Mbps, with not one stall in between. Nothing
+      // queued to show is what starving looks like from the screen.
+      const pictureShort =
+        ((p as { pictureRunwaySeconds?: () => number }).pictureRunwaySeconds?.() ??
+          0) < 0.05;
+      const starving = pictureShort && t > this._starvedLastTime + 0.05;
       this._starvedLastTime = t;
       if (!starving) {
         this._starvedSince = 0;
@@ -14748,6 +18343,7 @@ export class MoviElement extends HTMLElement {
       // budget now ends playback) primed to give up on its first stall.
       if (st === "playing" || st === "idle" || st === "loading") {
         this._stuckRecoveries = 0;
+        this._stuckRungRescues = 0;
         this._stuckGaveUp = false;
       }
       return;
@@ -14772,7 +18368,17 @@ export class MoviElement extends HTMLElement {
     // back to where they seeked FROM. The bar then showed the old spot until the
     // real target finally landed. The seek has its own (adaptive) timeout in
     // MoviPlayer; this watchdog only owns the rebuffer case.
-    if (this.isSeeking || this._uiSeekTarget >= 0) {
+    // …nor a quality switch preparing its rung. The bytes that count are
+    // landing on the incoming source, the outgoing one is held on purpose, and
+    // a nudge here is a seek the prep reads as the viewer's and abandons for.
+    // Measured at 0.2 MB/s: a 2160p to 480p downshift was nudged out of its
+    // prep four times, each nudge resetting the next attempt, until this gave
+    // up on the video with 0 frames and blamed the decoder.
+    if (
+      this.isSeeking ||
+      this._uiSeekTarget >= 0 ||
+      p.isPreparingRendition?.()
+    ) {
       this._stuckRecoverySince = 0;
       this._stuckRecoveryLastTime = -1;
       this._stuckLastBuffered = -1;
@@ -14819,20 +18425,74 @@ export class MoviElement extends HTMLElement {
     // the `error` event a host could act on — to say why. Ending here is the
     // honest outcome, and the same overlay a fatal load error already shows.
     if (this._stuckRecoveries >= MoviElement.MAX_STUCK_RECOVERIES) {
-      if (this._stuckGaveUp) return;
-      this._stuckGaveUp = true;
       // Prefer the source's own reason — an expired link, a revoked token —
       // over the generic stall, so the overlay can say something true.
-      const failure = p.getSourceFailure?.() ?? null;
+      // Either source: a split stream's audio is fetched separately, and when
+      // it is the half that has died the video source has nothing to report —
+      // so the stall read as "the bytes are fine" and went on spending rungs
+      // on a rendition whose sound was never coming.
+      const failure =
+        p.getSourceFailure?.() ?? p.getSplitAudioFailure?.() ?? null;
+
+      // The source has NO complaint. That is evidence, not an absence of it:
+      // the bytes are fine and something downstream is failing to turn them
+      // into a picture. Nudging cannot reach that, and three nudges have just
+      // proved it — so spend a rung before spending the viewer's session.
+      // Bounded, because a file that decodes at no rung has to end somewhere.
+      if (
+        !failure &&
+        this._stuckRungRescues < MoviElement.MAX_STUCK_RUNG_RESCUES &&
+        this._rescueRung(`stuck in "${st}" with the source reporting no fault`)
+      ) {
+        this._stuckRungRescues++;
+        // A fresh budget for the rung we are dropping to. It is a different
+        // rendition with a different decoder path; it deserves the same
+        // chances the last one got, not the last one's exhausted tally.
+        this._stuckRecoveries = 0;
+        this._stuckRecoverySince = 0;
+        Logger.warn(
+          TAG,
+          `Playback stuck in "${st}" and the source reports no fault — dropping a rung ` +
+            `(rescue ${this._stuckRungRescues}/${MoviElement.MAX_STUCK_RUNG_RESCUES}) before giving up`,
+        );
+        return;
+      }
+
+      if (this._stuckGaveUp) return;
+      this._stuckGaveUp = true;
+      // What to blame, when the source has not named anything.
+      //
+      // "no data arrived" was the only answer here, and on the decode-stall
+      // above it is simply false — it sent a viewer to check a connection that
+      // was delivering several MB/s, and it routes the overlay away from the
+      // one button that could have helped (see the `Playback stalled` branch in
+      // the error handler, which reads it as a byte-starved pipeline). If the
+      // renderer has never presented a frame, the pipeline is not starving; it
+      // is not decoding, and the message has to say so for the overlay to offer
+      // software decoding.
+      // `null` means there is no frame counter to read — the picture is going
+      // through the browser's MSE (HLS/DASH), where movi decodes nothing and
+      // "try software decoding" is not an answer to anything. Only OUR pipeline
+      // can be accused of not decoding, so a null reading keeps the old message.
+      const health = (
+        p as unknown as {
+          getRenderHealth?: () => { framesPresented: number } | null;
+        }
+      ).getRenderHealth?.();
+      const neverDecoded = !!health && health.framesPresented === 0;
+      const stall = neverDecoded
+        ? new Error(
+            "Playback stalled: the decoder produced no frames for this rendition",
+          )
+        : new Error("Playback stalled: no data arrived after repeated retries");
       Logger.error(
         TAG,
-        `Playback stuck in "${st}" after ${MoviElement.MAX_STUCK_RECOVERIES} recovery attempts — giving up`,
+        `Playback stuck in "${st}" after ${MoviElement.MAX_STUCK_RECOVERIES} recovery attempts ` +
+          `and ${this._stuckRungRescues} rung rescue(s) — giving up ` +
+          `(framesPresented=${health ? health.framesPresented : "n/a"})`,
         failure,
       );
-      p.failFatally?.(
-        failure ??
-          new Error("Playback stalled: no data arrived after repeated retries"),
-      );
+      p.failFatally?.(failure ?? stall);
       return;
     }
     this._stuckRecoveries++;
@@ -14933,6 +18593,34 @@ export class MoviElement extends HTMLElement {
         appearance: none;
       }
 
+      /* One rendering contract for every 24px control glyph, including the
+         older secondary menus that still author their SVG inline. This keeps
+         cap shape, joins and weight identical without changing their meaning
+         or any of the selectors integrations use to find them. */
+      svg[viewBox="0 0 24 24"][stroke="currentColor"] {
+        stroke-width: 1.65;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        shape-rendering: geometricPrecision;
+      }
+      .movi-symbol {
+        overflow: visible;
+        shape-rendering: geometricPrecision;
+      }
+      .movi-quality-check,
+      .movi-settings-check,
+      .movi-track-item-check {
+        stroke-width: 2.1;
+      }
+      .movi-icon-stable-audio-filled,
+      .movi-icon-loop-filled,
+      .movi-context-menu-stable-filled,
+      .movi-context-menu-loop-filled,
+      .movi-context-menu-shuffle-filled,
+      .movi-context-menu-ambient-filled {
+        stroke-width: 2.05;
+      }
+
       :host {
         /* Treat the host as a query container so the responsive
            breakpoints below trigger off the PLAYER's own width
@@ -14973,13 +18661,32 @@ export class MoviElement extends HTMLElement {
         --movi-title-line: calc(var(--movi-title-font) * 1.4);
         --movi-title-pad-top: 16px;
 
-        /* Premium Color Palette */
-        --movi-primary: #8B5CF6;
+        /* The mark's own colours.
+           The player used a generic violet and a cyan partner while the logo,
+           the site and the extensions had settled on a blue-violet with a blue
+           second — so the one surface carrying the brand was the one not
+           wearing it. These are the site's accent tokens. */
+        --movi-primary: #7c75ff;
+        /* What the brand PAINTS with — the mark's own gradient, the same one
+           the site and the extensions use. --movi-primary stays a solid
+           because text, borders, focus rings and the color-mix() shades below
+           cannot take a gradient; only the surfaces that fill an area read
+           this (the scrubber's fill, a switch that is on, the resume button).
+           A themecolor attribute replaces it, gradient or colour — see
+           applyThemeColor. */
+        --movi-brand-fill: linear-gradient(110deg, #674cff, #3c6df5);
         /* Derived so themecolor attribute cascades to light/dark variants */
         --movi-primary-light: color-mix(in srgb, var(--movi-primary) 70%, white);
         --movi-primary-dark: color-mix(in srgb, var(--movi-primary) 70%, black);
-        --movi-accent: #06B6D4;
-        --movi-accent-light: #22D3EE;
+        /* The accent is its own colour, not a shade of the brand: the centre
+           play button and the context menu's selected rows wear it, and
+           --movi-primary is only what they fall back to when no accent was
+           given. A themecolor's second value sets it — see applyThemeColor. */
+        --movi-accent: #4f86ff;
+        /* Derived, for the same reason the primary's variants are: an accent
+           handed in through themecolor has to carry its lighter shade with it,
+           or the row's text stays the default blue while its fill turns. */
+        --movi-accent-light: color-mix(in srgb, var(--movi-accent) 70%, white);
         /* Use solid color instead of gradient */
         --movi-gradient: var(--movi-primary);
         
@@ -14999,6 +18706,10 @@ export class MoviElement extends HTMLElement {
            on is allowed to. (Not --movi-overlay-bg: that name is taken by the
            controls overlay's gradient, further down.) */
         --movi-osd-bg: rgba(0, 0, 0, 0.55);
+        /* The same capsule with the pointer on it. It deepens rather than
+           lightening: these sit over the picture, so they stay dark in both
+           themes — the panel surface (--movi-glass-bg) is the one that flips. */
+        --movi-osd-bg-strong: rgba(0, 0, 0, 0.78);
         --movi-glass-blur: 20px;
 
         /* Corners. Two values for the whole chrome: the SURFACE a menu is
@@ -15059,8 +18770,18 @@ export class MoviElement extends HTMLElement {
            not follow --movi-glass-bg when that flips to a light surface — white
            text on white is what that costs. Public hook all the same. */
         /* The capsule behind the right-hand icon cluster. Public hook: a host
-           that wants the old loose row sets it to transparent. */
-        --movi-controls-group-bg: rgba(255, 255, 255, 0.065);
+           that wants the old loose row sets it to transparent.
+
+           Faint on purpose. Its whole job is to say which controls belong
+           together — it is a grouping, not a surface — and the icons inside it
+           are what the eye should land on. At 0.065 the capsule was reading as
+           a raised panel of its own and competing with them for attention; the
+           grouping survives being barely there, because shape does that work
+           and the fill only has to hint at the edges. Kept above zero on
+           purpose: at nothing at all the bar goes back to a loose row of icons
+           with no telling which belong together, which is the thing the capsule
+           was added for. */
+        --movi-controls-group-bg: rgba(255, 255, 255, 0.025);
         --movi-chrome-bg: rgba(0, 0, 0, 0.92);
         --movi-chrome-border: rgba(255, 255, 255, 0.1);
         --movi-text-secondary: rgba(255, 255, 255, 0.7);
@@ -15108,11 +18829,23 @@ export class MoviElement extends HTMLElement {
         --movi-transition-normal: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
         --movi-transition-slow: 0.4s cubic-bezier(0.4, 0, 0.2, 1);
         --movi-transition-bounce: 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+        --movi-motion-out: cubic-bezier(0.16, 1, 0.3, 1);
+        --movi-motion-spring: cubic-bezier(0.2, 0.9, 0.25, 1.18);
+
+        /* Dividers on the bar — the built-in one and any a host adds. */
+        --movi-divider-color: rgba(255, 255, 255, 0.14);
+        --movi-divider-width: 1px;
+        --movi-divider-height: 20px;
+        --movi-divider-gap: 4px;
         
         /* Legacy variables for compatibility */
         --movi-controls-bg: var(--movi-glass-bg);
         --movi-progress-color: var(--movi-primary);
         --movi-progress-buffer-color: rgba(255, 255, 255, 0.2);
+        /* The hover range. White at low alpha on purpose: it has to read over
+           the played bar (the accent colour) and over bare track alike, and a
+           solid colour that works on one washes out on the other. */
+        --movi-progress-hover-color: rgba(255, 255, 255, 0.45);
         --movi-btn-hover-bg: rgba(255, 255, 255, 0.1);
         
         display: block;
@@ -15192,7 +18925,10 @@ export class MoviElement extends HTMLElement {
 
       /* Light Theme Override */
       :host([theme="light"]) {
-        --movi-primary: #7c3aed; /* Vibrancy boost for light theme */
+        /* The site's light-theme accent — a touch deeper than the dark one,
+           for the same reason it is there: contrast against a pale surface. */
+        --movi-primary: #7c6cf0;
+        --movi-brand-fill: linear-gradient(110deg, #5f4ae8, #3560e0);
         --movi-glass-bg: rgba(255, 255, 255, 0.7);
         --movi-glass-border: rgba(0, 0, 0, 0.1);
         --movi-controls-color: #11142d;
@@ -15207,6 +18943,7 @@ export class MoviElement extends HTMLElement {
         --movi-btn-hover-bg: rgba(0, 0, 0, 0.05);
         --movi-btn-hover-bg: rgba(0, 0, 0, 0.05);
         --movi-progress-buffer-color: rgba(0, 0, 0, 0.15);
+        --movi-progress-hover-color: rgba(255, 255, 255, 0.55);
 
         /* Light Theme Backgrounds. Bottom bar uses the same dark
            gradient as the dark theme + as the title bar — the white
@@ -15337,23 +19074,32 @@ export class MoviElement extends HTMLElement {
 
       /* Light Theme Center Play Button */
       :host([theme="light"]) .movi-center-play-pause {
-        background: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 15%, transparent) !important;
-        border-color: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 30%, transparent) !important;
-        box-shadow: 0 8px 32px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 20%, transparent), inset 0 0 0 1px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 10%, transparent) !important;
-      }
-
-      :host([theme="light"]) .movi-center-play-pause:hover {
-        background: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 25%, transparent) !important;
-        border-color: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 50%, transparent) !important;
-        box-shadow: 0 8px 40px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 30%, transparent), inset 0 0 0 1px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 15%, transparent) !important;
+        background: transparent !important;
+        border-color: color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 30%, transparent) !important;
+        box-shadow: 0 8px 32px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 20%, transparent), inset 0 0 0 1px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 10%, transparent) !important;
       }
 
       :host([theme="light"]) .movi-center-play-pause svg {
-        filter: drop-shadow(0 0 4px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 30%, transparent)) !important;
+        filter: drop-shadow(0 0 4px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 30%, transparent)) !important;
       }
 
-      :host([theme="light"]) .movi-center-play-pause:hover svg {
-        filter: drop-shadow(0 0 8px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 50%, transparent)) !important;
+      /* Both hovers behind a real hovering pointer, the way the dark theme's
+         are. A tap leaves :hover stuck on the element until the next tap lands
+         elsewhere, and these two are !important AND more specific than the
+         touch block's reset — so they won inside it. Measured on a phone: the
+         disc went from a transparent fill to a 25% accent one on the tap and
+         stayed there, which is the "hover pe zyada dark" report. The reset is
+         left where it is; this simply stops there being anything to reset. */
+      @media (hover: hover) {
+        :host([theme="light"]) .movi-center-play-pause:hover {
+          background: color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 25%, transparent) !important;
+          border-color: color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 50%, transparent) !important;
+          box-shadow: 0 8px 40px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 30%, transparent), inset 0 0 0 1px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 15%, transparent) !important;
+        }
+
+        :host([theme="light"]) .movi-center-play-pause:hover svg {
+          filter: drop-shadow(0 0 8px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 50%, transparent)) !important;
+        }
       }
 
       /* Light Theme Context Menu */
@@ -15431,6 +19177,9 @@ export class MoviElement extends HTMLElement {
       :host([theme="light"]) .movi-settings-row-value {
         color: rgba(17, 20, 45, 0.6) !important;
       }
+      :host([theme="light"]) .movi-settings-section-label {
+        color: rgba(17, 20, 45, 0.46) !important;
+      }
       :host([theme="light"]) .movi-settings-divider,
       :host([theme="light"]) .movi-settings-back {
         border-color: rgba(0, 0, 0, 0.12) !important;
@@ -15445,7 +19194,7 @@ export class MoviElement extends HTMLElement {
         background: rgba(0, 0, 0, 0.22) !important;
       }
       :host([theme="light"]) .movi-settings-switch.is-on {
-        background: var(--movi-primary) !important;
+        background: var(--movi-brand-fill, var(--movi-primary)) !important;
       }
 
       :host([theme="light"]) .movi-quality-item.movi-quality-active {
@@ -15504,8 +19253,10 @@ export class MoviElement extends HTMLElement {
         -ms-user-select: none;
       }
 
-      /* Ensure canvas fills fullscreen */
-      :host(:fullscreen) canvas:not(.movi-nerd-stats-graph),
+      /* Ensure canvas fills fullscreen. The cover-art meter is a canvas too,
+         but it lives inside the scrubber: at 100vw its right end — the total
+         it draws there — ran off the screen once audio could go fullscreen. */
+      :host(:fullscreen) canvas:not(.movi-nerd-stats-graph):not(.movi-cover-eq),
       :host(:fullscreen) video {
         width: 100vw !important;
         max-width: 100vw !important;
@@ -15525,7 +19276,9 @@ export class MoviElement extends HTMLElement {
         right: 0;
         z-index: 10;
         pointer-events: none;
-        transition: opacity var(--movi-transition-normal), transform var(--movi-transition-normal);
+        transition:
+          opacity 180ms ease,
+          transform 280ms var(--movi-motion-out);
         transform: translateY(0);
       }
 
@@ -15541,8 +19294,10 @@ export class MoviElement extends HTMLElement {
          wasn't enough. Wildcard inside the host catches the overlay,
          controls-container, title bar, and any other layered child
          without having to enumerate them. */
-      :host:has(.movi-controls-container.movi-controls-hidden),
-      :host:has(.movi-controls-container.movi-controls-hidden) * {
+      /* …except in strip mode, where the bar never goes away: the pointer
+         would vanish over a row that is still fully live. */
+      :host(:not(.movi-audio-strip)):has(.movi-controls-container.movi-controls-hidden),
+      :host(:not(.movi-audio-strip)):has(.movi-controls-container.movi-controls-hidden) * {
         cursor: none !important;
       }
 
@@ -15656,7 +19411,12 @@ export class MoviElement extends HTMLElement {
         font-family: inherit;
       }
       .movi-unmute-overlay:hover {
-        background: var(--movi-glass-bg);
+        /* Not --movi-glass-bg. That token is the floating-PANEL surface, and
+           the light theme flips it to white — while this pill keeps its white
+           text, because it sits over the picture rather than over the page.
+           Pointing at it turned the label invisible. Hover deepens the pill's
+           own OSD shade instead, which is the same in both themes. */
+        background: var(--movi-osd-bg-strong, rgba(0, 0, 0, 0.78));
         transform: scale(1.03);
       }
       .movi-unmute-overlay svg {
@@ -15679,8 +19439,13 @@ export class MoviElement extends HTMLElement {
         left: 0;
         right: 0;
         /* Extra right padding keeps the title text from running under the
-           settings gear pinned in the top-right corner. */
-        padding: var(--movi-title-pad-top) 62px var(--movi-title-pad-top) 20px;
+           settings gear pinned in the top-right corner — and under whatever
+           the host has put beside it, which is counted rather than measured:
+           a count survives a resize, a measured width goes stale at the next
+           breakpoint (see syncTopControlCount). */
+        padding: var(--movi-title-pad-top)
+          calc(62px + var(--movi-top-controls-n, 0) * (var(--movi-btn-size) + 4px))
+          var(--movi-title-pad-top) 20px;
         background: linear-gradient(to bottom, rgba(0, 0, 0, 0.7) 0%, transparent 100%);
         z-index: 5;
         opacity: 0;
@@ -15788,26 +19553,33 @@ export class MoviElement extends HTMLElement {
         }
       }
 
-      /* Settings gear (top-right) — opens the context menu. Vertically centred
-         on the title text (title padding-top 16px + ~half the ~20px line) and
-         inset to match; the title bar reserves right padding so the title
-         doesn't run under it. */
-      .movi-gear-btn {
+      /* The host's top-right row. Anchored to the same point the three-dots
+         is, and carried along by the same rules — every breakpoint's corner
+         inset below names both, so the corner stays one corner. */
+      .movi-top-controls {
         position: absolute;
-        /* Centred on the title's first line rather than a fixed inset — see
-           the --movi-title-* vars on :host. Anchored by its own midpoint via
-           translateY(-50%) rather than by subtracting its height: this element
-           also matches .movi-btn and picks up its box from the responsive
-           layout rules, so any height arithmetic here goes stale the moment
-           those change. The slide-in offset rides on the same transform. */
         top: calc(var(--movi-title-pad-top) + var(--movi-title-line) / 2);
-        /* Tucked closer to the edge than the bar's inset. Matching the bar
-           exactly is the correct-on-paper answer and the wrong-looking one: the
-           bar is a full-width band whose row reads as a group, while this button
-           floats alone against the picture, so the same inset leaves it looking
-           adrift rather than pinned to the corner. */
         right: max(4px, calc(var(--movi-chrome-inset) - 8px));
         z-index: 30;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        opacity: 0;
+        visibility: hidden;
+        transform: translateY(calc(-50% - 4px));
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        pointer-events: none;
+      }
+      .movi-top-controls.movi-gear-visible {
+        opacity: 1;
+        visibility: visible;
+        transform: translateY(-50%);
+        pointer-events: auto;
+      }
+      /* The corner's buttons are round and dark like the three-dots, not the
+         bar's flat glyphs: they float against the picture with nothing behind
+         them, and a bare icon there is unreadable over a bright frame. */
+      .movi-top-controls .movi-btn {
         width: var(--movi-btn-size);
         height: var(--movi-btn-size);
         padding: 8px;
@@ -15819,17 +19591,39 @@ export class MoviElement extends HTMLElement {
         color: var(--movi-chrome-fg, #fff);
         background: rgba(0, 0, 0, 0.35);
         border-radius: 50%;
-        opacity: 0;
-        visibility: hidden;
-        transform: translateY(calc(-50% - 4px));
-        transition: opacity 0.2s ease, transform 0.2s ease, background 0.2s ease;
-        pointer-events: none;
+        transition: background 0.2s ease, transform 0.2s ease;
       }
-      .movi-gear-btn.movi-gear-visible {
-        opacity: 1;
-        visibility: visible;
-        transform: translateY(-50%);
-        pointer-events: auto;
+      .movi-top-controls .movi-btn:hover {
+        background: rgba(0, 0, 0, 0.55);
+      }
+      .movi-top-controls .movi-btn svg {
+        width: 22px;
+        height: 22px;
+      }
+      .movi-top-controls .movi-btn.movi-custom-active {
+        background: color-mix(in srgb, var(--movi-primary) 55%, rgba(0, 0, 0, 0.35));
+      }
+
+      /* Settings gear — opens the context menu. One member of the corner row
+         above, which owns where the corner IS and when it is shown; this rule
+         is only what the button looks like. (It was pinned to the corner
+         itself until the row existed, and the corner's inset, its centring on
+         the title line and its fade all moved up there together — leaving them
+         here would have anchored the button twice, in two places that then
+         disagree.) */
+      .movi-gear-btn {
+        width: var(--movi-btn-size);
+        height: var(--movi-btn-size);
+        padding: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: none;
+        cursor: pointer;
+        color: var(--movi-chrome-fg, #fff);
+        background: rgba(0, 0, 0, 0.35);
+        border-radius: 50%;
+        transition: background 0.2s ease, transform 0.2s ease;
       }
       /* Hide the gear while a bottom dropdown OR the storyboard timeline is
          open — it lives in a higher stacking context than either and would
@@ -15837,9 +19631,9 @@ export class MoviElement extends HTMLElement {
       /* Stats-for-nerds has its own close button in the same corner, and on a
          small phone the two overlap — the tap lands on this one and the panel
          won't close. The panel is the thing being read, so it wins. */
-      :host:has(.movi-nerd-stats[style*="flex"]) .movi-gear-btn,
-      :host(.movi-bottom-menu-open) .movi-gear-btn,
-      :host:has(.movi-timeline-panel[style*="flex"]) .movi-gear-btn {
+      :host:has(.movi-nerd-stats[style*="flex"]) .movi-top-controls,
+      :host(.movi-bottom-menu-open) .movi-top-controls,
+      :host:has(.movi-timeline-panel[style*="flex"]) .movi-top-controls {
         opacity: 0 !important;
         visibility: hidden !important;
         pointer-events: none !important;
@@ -16083,8 +19877,8 @@ export class MoviElement extends HTMLElement {
          and over any frame — the bar's own gradient is what it sits on. */
       .movi-controls-right,
       .movi-control-group,
-      .movi-controls-left > .movi-play-pause,
       .movi-controls-left > .movi-custom-btn,
+      .movi-controls-center > .movi-custom-btn,
       .movi-controls-left > .movi-seek-group,
       .movi-controls-left > .movi-volume-container,
       .movi-controls-left > .movi-chapter-pill,
@@ -16134,10 +19928,14 @@ export class MoviElement extends HTMLElement {
       /* An empty capsule is a dot. Groups come and go with the controls in
          them — a host removing its last one, or controlslist switching a
          built-in pair off — and a capsule with nothing left inside it stayed in
-         the row as a 4px mark with no meaning. */
+         the row as a 4px mark with no meaning. The :empty half catches a
+         group with no children at all; the class is set by syncEmptyCapsules
+         for the commoner case, where the children are still there and every one
+         of them is hidden. */
       .movi-control-group:empty,
+      .movi-capsule-empty,
       :host([controlslist~="noseekbuttons"]) .movi-seek-group {
-        display: none;
+        display: none !important;
       }
 
       .movi-seek-group {
@@ -16155,13 +19953,81 @@ export class MoviElement extends HTMLElement {
         gap: 6px;
       }
 
+      /* The middle of the bar — a place a host can put a control, and nothing
+         of the player's own.
+
+         Out of flow on purpose. The row is space-between with two children of
+         very different widths, so a third flex child would land in the middle
+         of the FREE SPACE between them and not in the middle of the bar —
+         which is the one thing "center" has to mean. Absolutely centred, it is
+         the middle of the bar at every width, and while it is empty it costs
+         the two clusters nothing at all.
+
+         Same 6px as the left cluster: each control here wears its own capsule
+         (see the capsule rule above), and 2px between two capsules reads as
+         one shape with a seam in it. */
+      .movi-controls-center {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        /* It floats OVER the row, and the row is still a row: the gap between
+           two of the host's buttons must not swallow a click meant for the bar
+           underneath. Only the controls themselves take the pointer. */
+        pointer-events: none;
+      }
+      .movi-controls-center > * {
+        pointer-events: auto;
+      }
+      /* Nothing in it — no mark in the middle of the bar. (A cluster whose
+         children are all HIDDEN is caught by .movi-capsule-empty instead; see
+         syncEmptyCapsules.) */
+      .movi-controls-center:empty {
+        display: none !important;
+      }
+      /* No ROOM for it. The middle is the first thing to go when the two
+         clusters grow towards each other — a control drawn across the clock is
+         worse than a control that stepped aside. Set by fitControlsRow. */
+      .movi-controls-center.movi-center-crowded {
+        display: none !important;
+      }
+
       /* Play is a capsule made of one button, so the button has to carry the
          ring the container groups get from their padding — without it, it sits
          2px shorter than everything beside it and the row's baseline breaks.
          A host's button on this side is the same shape of thing: its own
          capsule, so its own ring. */
-      :host .movi-controls-left > .movi-play-pause,
-      :host .movi-controls-left > .movi-custom-btn {
+      :host .movi-controls-left > .movi-custom-btn,
+      :host .movi-controls-center > .movi-custom-btn {
+        --movi-btn-size: 42px;
+        width: var(--movi-btn-size);
+        height: var(--movi-btn-size);
+      }
+
+      /* A capsule of one is no capsule. With no queue — the ordinary case for
+         almost every player on almost every page — the group holds nothing but
+         Play, and Play has always been its own capsule: the wrapper draws
+         nothing and hands the ring back, so a player with one video looks
+         exactly as it did before queues existed.
+
+         The three ways that happens: no queue at all, the queue switched off
+         wholesale, or both of its ends switched off one at a time. A host
+         control that joined group:"play" makes it a real group again whichever
+         of those is true, which is what the :has() is for. */
+      :host(:not(.movi-has-playlist)) .movi-play-group:not(:has(> .movi-custom-btn)),
+      :host([controlslist~="noplaylist"]) .movi-play-group:not(:has(> .movi-custom-btn)),
+      :host([controlslist~="noprev"][controlslist~="nonext"]) .movi-play-group:not(:has(> .movi-custom-btn)) {
+        background: none;
+        padding: 0;
+      }
+      :host(:not(.movi-has-playlist)) .movi-play-group:not(:has(> .movi-custom-btn)) > .movi-play-pause,
+      :host([controlslist~="noplaylist"]) .movi-play-group:not(:has(> .movi-custom-btn)) > .movi-play-pause,
+      :host([controlslist~="noprev"][controlslist~="nonext"]) .movi-play-group:not(:has(> .movi-custom-btn)) > .movi-play-pause {
+        background: var(--movi-controls-group-bg);
+        border-radius: 999px;
         --movi-btn-size: 42px;
         width: var(--movi-btn-size);
         height: var(--movi-btn-size);
@@ -16181,6 +20047,57 @@ export class MoviElement extends HTMLElement {
         flex-shrink: 0;
       }
 
+      .movi-controls-divider {
+        flex: 0 0 auto;
+        align-self: center;
+        width: var(--movi-divider-width);
+        height: var(--movi-divider-height);
+        margin: 0 var(--movi-divider-gap);
+        border-radius: 999px;
+        background: var(--movi-divider-color);
+        pointer-events: none;
+      }
+
+      /* The player's own shows only when there is a track control to divide
+         off — see the container rule below. */
+      .movi-controls-right-divider {
+        display: none;
+      }
+
+      /* A host's shows unless it has been left with nothing to divide: see
+         syncEmptyCapsules. */
+      .movi-custom-divider {
+        display: block;
+      }
+      .movi-custom-divider.movi-divider-stranded {
+        display: none;
+      }
+      /* The built-in one answers to the same measurement, and that
+         measurement wins — hence !important, against the container rule
+         below which is more specific.
+         That rule asks whether a track container's INLINE style says
+         "display: flex", which is a string test standing in for "is there a
+         button here". In native fallback the subtitle button is gone while
+         its container keeps that inline style, so the test still passed and
+         the divider stood at the edge of the pill with nothing on its left.
+         syncStrandedDividers asks the question properly: it measures what is
+         actually laid out beside it. */
+      .movi-controls-right-divider.movi-divider-stranded {
+        display: none !important;
+      }
+
+      @container movi-host (min-width: 721px) {
+        .movi-controls-right:has(.movi-audio-track-container[style*="display: flex"]) .movi-controls-right-divider,
+        .movi-controls-right:has(.movi-subtitle-track-container[style*="display: flex"]) .movi-controls-right-divider {
+          display: block;
+        }
+      }
+
+      :host([controlslist~="noaudio"][controlslist~="nocc"]) .movi-controls-right-divider,
+      :host([controlslist~="nodivider"]) .movi-controls-right-divider {
+        display: none !important;
+      }
+
       /* The right group reads wider than the left at the same spacing, because
          the left is broken up by the volume slider and the clock while these
          sit in an unbroken run — 26px between glyphs across five icons is a row
@@ -16190,6 +20107,7 @@ export class MoviElement extends HTMLElement {
          the smaller box instead of turning into an ellipse around it. */
       .movi-controls-left .movi-btn,
       .movi-controls-right .movi-btn,
+      .movi-controls-center .movi-btn,
       /* A group that stepped OUT of the clusters — see group: "none" — is
          still a control in this row and has to be the size the rest are. Named
          here rather than left to the base .movi-btn, which is the 44px box the
@@ -16215,13 +20133,36 @@ export class MoviElement extends HTMLElement {
         padding: 7px;
       }
 
+      /* A host's control is not always an icon. addControl takes any element
+         — a switch, a pill, a badge — and the box it lands in is the square the
+         player's own icons use, with overflow visible: a 78px pill inside a
+         38px button, spilling 40px over whatever sits beside it. Measured on
+         movi-tube's autoplay pill, that was the clock: the pill drew straight
+         across "00:01 / 04:12".
+         So let the box follow the content, with the icon square as its floor —
+         an SVG-only control keeps exactly the size it had (the glyph is smaller
+         than the floor), and a wider one takes the width it actually needs, so
+         the row lays out around the thing the host drew instead of around a
+         square it was never drawn for. */
+      :host .movi-controls-left > .movi-custom-btn,
+      :host .movi-controls-right .movi-custom-btn,
+      :host .movi-controls-center > .movi-custom-btn,
+      :host .movi-buttons-row > .movi-control-group .movi-custom-btn {
+        width: auto;
+        min-width: var(--movi-btn-size);
+      }
+
       /* Where the host's controls end and the player's begin. Six marks at one
          spacing read as six unrelated things — measured on a host that adds two
          of its own, the row was a switch, an icon, a badged gear and three more
          icons, all equally far apart. A little more air at the seam lets the
          eye take it as two small groups instead, and costs no width anywhere
-         else: no custom controls, no seam, no gap. */
-      .movi-controls-right .movi-custom-btn + .movi-btn:not(.movi-custom-btn),
+         else: no custom controls, no seam, no gap.
+         Not before fullscreen, though. It always ends the row, and a host
+         control placed right against it (a wide/theater toggle, say) was put
+         there to join it — the seam split the pair and read as a missing
+         button between them. */
+      .movi-controls-right .movi-custom-btn + .movi-btn:not(.movi-custom-btn):not(.movi-fullscreen-btn),
       .movi-controls-right .movi-custom-btn + .movi-settings-container {
         margin-left: 10px;
       }
@@ -16234,6 +20175,7 @@ export class MoviElement extends HTMLElement {
          the gap between them is unchanged: the box grew with the glyph. */
       .movi-controls-left .movi-btn svg,
       .movi-controls-right .movi-btn svg,
+      .movi-controls-center .movi-btn svg,
       .movi-buttons-row > .movi-control-group .movi-btn svg {
         width: 24px;
         height: 24px;
@@ -16244,7 +20186,8 @@ export class MoviElement extends HTMLElement {
          place is that they are targets before they are icons. */
       @media (pointer: coarse) {
         .movi-controls-left .movi-btn,
-        .movi-controls-right .movi-btn {
+        .movi-controls-right .movi-btn,
+        .movi-controls-center .movi-btn {
           --movi-btn-size: 40px;
           width: var(--movi-btn-size);
           height: var(--movi-btn-size);
@@ -16270,7 +20213,11 @@ export class MoviElement extends HTMLElement {
         width: var(--movi-btn-size);
         height: var(--movi-btn-size);
         border-radius: 50%;
-        transition: all var(--movi-transition-fast);
+        transition:
+          background-color 160ms ease,
+          color 160ms ease,
+          transform 220ms var(--movi-motion-spring),
+          opacity 160ms ease;
         pointer-events: auto !important;
         outline: none !important;
       }
@@ -16305,17 +20252,14 @@ export class MoviElement extends HTMLElement {
         transition-duration: 0.08s;
       }
 
-      /* The gear is centred on the title line with translateY(-50%), and the
-         two rules above REPLACE transform outright rather than adding to it —
-         so pressing the gear dropped it half its own height. That is not just
-         cosmetic: the button moved out from under the finger between touchstart
-         and touchend, so no click was ever dispatched and the menu never
-         opened. Compose the press/hover scale with the centering instead. */
+      /* Plain scales now: the centring that these once had to compose with
+         belongs to the corner row, so replacing transform here no longer drops
+         the button out from under a finger mid-tap. */
       .movi-gear-btn:hover {
-        transform: translateY(-50%) scale(1.06);
+        transform: scale(1.06);
       }
       .movi-gear-btn:active {
-        transform: translateY(-50%) scale(0.94);
+        transform: scale(0.94);
       }
 
       .movi-btn:focus,
@@ -16520,6 +20464,11 @@ export class MoviElement extends HTMLElement {
       :host(.movi-live) .movi-time-separator,
       :host(.movi-live) .movi-duration { display: none; }
       :host(.movi-live) .movi-live-badge { display: inline-flex; }
+      /* A container that never stored a duration. There is no total, so don't
+         print one: a 0:00 sitting where the length belongs reads as a broken
+         file. The elapsed time stays — it is the one number still true. */
+      :host(.movi-unknown-duration) .movi-time-separator,
+      :host(.movi-unknown-duration) .movi-duration { display: none; }
 
       .movi-progress-container {
         width: 100%;
@@ -16549,6 +20498,32 @@ export class MoviElement extends HTMLElement {
            so it should breathe rather than snap. */
         transition: height 0.18s cubic-bezier(0.4, 0, 0.2, 1), background 0.18s ease;
         overflow: visible;
+      }
+
+      /* The hit area, not the drawing. Every seek listener - click, drag,
+         hover preview - is on this element, and this element is the 4px
+         track: the padding around it that looks like part of the control
+         caught nothing, so a seek was a matter of landing on a hairline, and
+         in fullscreen the hairline is the same 4px across a much bigger
+         picture. An invisible band over and under it belongs to the track, so
+         a press there is a press on the track and hovering it thickens the
+         track the way landing on it does. Up into the space over the bar,
+         down only as far as the gap above the button row - the buttons stay
+         where they were. */
+      .movi-progress-bar::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: -18px;
+        bottom: -10px;
+      }
+      /* Only while the bar is up. The track keeps pointer-events through a
+         hidden bar (the auto !important above), and a band this size, unseen
+         along the bottom of the picture, would turn a click meant for the
+         picture into a seek. Hidden, it is the hairline it always was. */
+      .movi-controls-container.movi-controls-hidden .movi-progress-bar::before {
+        pointer-events: none;
       }
 
       .movi-progress-bar:hover {
@@ -16595,7 +20570,11 @@ export class MoviElement extends HTMLElement {
         top: 0;
         left: 0;
         height: 100%;
-        background: var(--movi-primary);
+        /* --movi-brand-fill is set only when the theme colour is a gradient
+           (see applyThemeColor): a gradient is a background and nothing else,
+           so the places that PAINT the brand read it, and the places that
+           colour text or a border keep reading --movi-primary. */
+        background: var(--movi-brand-fill, var(--movi-primary));
         /* Pill on the leading end only. The trailing end is where the buffered
            segment picks up, and a rounded edge there curves away from the
            buffer's own edge, leaving a visible pinch of bare track between the
@@ -16604,6 +20583,35 @@ export class MoviElement extends HTMLElement {
         border-radius: 100px 0 0 100px;
         width: 0%;
         transition: width 0.1s linear;
+      }
+
+      /* Set by fitControlsRow when the row's two ends would otherwise collide. */
+      :host(.movi-clock-compact) .movi-controls-left > .movi-time .movi-time-separator,
+      :host(.movi-clock-compact) .movi-controls-left > .movi-time .movi-duration {
+        display: none;
+      }
+      :host(.movi-clock-hidden) .movi-controls-left > .movi-time {
+        display: none;
+      }
+
+      .movi-progress-hover {
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 100%;
+        width: 0%;
+        background: var(--movi-progress-hover-color, rgba(255, 255, 255, 0.45));
+        border-radius: 100px;
+        pointer-events: none;
+        opacity: 0;
+        /* Fade, don't slide: the band's ends are the playhead and the pointer,
+           and animating those would have it lag the cursor it is describing.
+           Only its appearance is worth easing. */
+        transition: opacity 0.12s linear;
+      }
+
+      .movi-progress-hover.visible {
+        opacity: 1;
       }
 
       .movi-chapter-markers {
@@ -16656,12 +20664,49 @@ export class MoviElement extends HTMLElement {
         height: var(--movi-progress-height-hover);
         transform: translateY(-50%);
         border-radius: 2px;
-        background-image: linear-gradient(
-          to right,
-          var(--movi-primary) 0 var(--movi-seg-played, 0%),
-          rgba(255, 255, 255, 0.25) var(--movi-seg-played, 0%) var(--movi-seg-buffered, 0%),
-          var(--movi-progress-bg) var(--movi-seg-buffered, 0%) 100%
-        );
+        /* The groove is a background COLOUR under the gradients, not the last
+           stop inside one of them — because the buffer is translucent white and
+           the groove it sits on is ALSO white, at the same alpha once the bar is
+           hovered (0.25). Painted as a stop the buffer REPLACED the groove
+           instead of stacking on it, so the two came out the same colour and the
+           buffered stretch of the raised chapter vanished — the one section you
+           were pointing at was the one that stopped saying how far it had
+           loaded. As a layer over the colour it composites exactly the way the
+           thin bar's buffer element does over the track.
+
+           Then two gradient layers, in the same order the thin bar stacks them:
+           the hover range on top of the played/buffered one, so a raised section
+           shows the same band as the rest of the bar. The band is its own layer
+           rather than more stops in one gradient because it can sit either side
+           of the playhead, and a single gradient needs its stops in order —
+           which "either side" cannot promise. Collapsed to nothing (from == to)
+           when the pointer is elsewhere. */
+        background-color: var(--movi-progress-bg);
+        background-image:
+          linear-gradient(
+            to right,
+            transparent 0 var(--movi-seg-hover-from, 0%),
+            var(--movi-progress-hover-color) var(--movi-seg-hover-from, 0%)
+              var(--movi-seg-hover-to, 0%),
+            transparent var(--movi-seg-hover-to, 0%) 100%
+          ),
+          var(--movi-brand-fill, linear-gradient(var(--movi-primary), var(--movi-primary))),
+          linear-gradient(
+            to right,
+            transparent 0 var(--movi-seg-played, 0%),
+            rgba(255, 255, 255, 0.25) var(--movi-seg-played, 0%) var(--movi-seg-buffered, 0%),
+            transparent var(--movi-seg-buffered, 0%) 100%
+          );
+        /* The played slice is a LAYER, not a stop: the brand fill is a
+           gradient, and a gradient cannot be a colour stop inside another one —
+           which is why the raised chapter used to fill with flat
+           --movi-primary while the rest of the bar wore the gradient. Sized to
+           the played percentage, exactly as the thin bar's fill element is
+           sized by its width, so the brand runs across the played part of this
+           chapter the same way it runs across the bar. */
+        background-size: 100% 100%, var(--movi-seg-played, 0%) 100%, 100% 100%;
+        background-position: left center;
+        background-repeat: no-repeat;
         transition: height 0.18s cubic-bezier(0.4, 0, 0.2, 1);
       }
 
@@ -16694,7 +20739,10 @@ export class MoviElement extends HTMLElement {
         background: var(--movi-controls-color);
         border-radius: 50%;
         opacity: 0;
-        transition: all var(--movi-transition-fast);
+        transition:
+          opacity 140ms ease,
+          transform 220ms var(--movi-motion-spring),
+          box-shadow 180ms ease;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 3px color-mix(in srgb, var(--movi-primary) 30%, transparent);
         z-index: 5;
       }
@@ -16723,6 +20771,37 @@ export class MoviElement extends HTMLElement {
         align-items: center;
         gap: 4px;
         height: 100%;
+      }
+
+      /* No sound to control.
+         When the native handoff is playing a file whose audio the browser has
+         no decoder for (see watchNativeAudio), the volume control does nothing
+         — dragging it is the viewer trying to fix a silence that isn't theirs
+         to fix. Switched off rather than removed: an absent control reads as
+         "this player can't do volume", where a dead one reads as "there is no
+         audio here", which is the truth. The MARK fades, the capsule doesn't —
+         same rule the disabled play button follows. */
+      /* The button and the slider, not the container: the container carries an
+         inline pointer-events from the controls-visibility code, and inline
+         beats a rule. Both are also disabled in the DOM — this is what stops
+         the cursor and the hover states from still offering them. */
+      :host(.movi-no-audible-audio) .movi-volume-btn,
+      :host(.movi-no-audible-audio) .movi-volume-slider,
+      :host(.movi-no-audible-audio) .movi-volume-slider-container {
+        /* Important because the controls-visibility code writes both of these
+           inline on every control it reveals, and inline outranks a rule.
+           Nothing else in the cascade wants them on a dead control. */
+        pointer-events: none !important;
+        cursor: default !important;
+      }
+      :host(.movi-no-audible-audio) .movi-volume-btn svg,
+      :host(.movi-no-audible-audio) .movi-volume-slider {
+        /* The slider IS the mark on this control, so it fades with the glyph —
+           a full-strength track beside a dimmed speaker reads as half-broken
+           rather than switched off. Important for the slider's sake: the
+           controls-visibility code writes opacity on it inline, the same way it
+           writes pointer-events, and inline outranks a rule. */
+        opacity: 0.4 !important;
       }
 
       .movi-volume-slider-container {
@@ -16988,6 +21067,27 @@ export class MoviElement extends HTMLElement {
         flex: 1;
       }
 
+      /* "Add subtitle…" — an action sitting under the tracks, so it takes
+         the accent and a rule above it rather than reading as one more track
+         you could select. */
+      .movi-subtitle-pick-item {
+        /* --movi-primary, not --movi-accent: the accent belongs to the
+           SELECTED state — the active row, the centre button. This is an
+           action, not a selection, so it wears the brand instead. */
+        color: var(--movi-primary);
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        margin-top: 4px;
+        padding-top: 10px;
+      }
+      .movi-subtitle-pick-item .movi-subtitle-track-label {
+        color: inherit;
+        font-weight: 600;
+      }
+      .movi-subtitle-pick-item svg {
+        flex: 0 0 auto;
+        opacity: 0.9;
+      }
+
       .movi-subtitle-customize-btn,
       .movi-subtitle-browse-btn {
         all: unset;
@@ -17047,6 +21147,12 @@ export class MoviElement extends HTMLElement {
       .movi-subtitle-track-list {
         padding: 6px;
         overflow-y: auto;
+        /* Never sideways. These are vertical lists, and once the content is
+           tall enough for a vertical scrollbar that bar eats into the width —
+           which on a menu with a fixed min-width is enough to put a HORIZONTAL
+           scrollbar under it for a second. overflow-y alone computes overflow-x
+           to auto, so it has to be said. */
+        overflow-x: hidden;
         overscroll-behavior: contain;
         /* Bound the list directly off the player's own height (minus
            ~180px of chrome: header + footer + the controls-bar reserve
@@ -17163,6 +21269,35 @@ export class MoviElement extends HTMLElement {
         border: 1px solid color-mix(in srgb, var(--movi-controls-color) 0.08, transparent);
       }
 
+      /* A generated subtitle track still waiting for its first cue. */
+      .movi-subtitle-pending {
+        display: inline-block;
+        flex-shrink: 0;
+        box-sizing: border-box;
+        width: 14px;
+        height: 14px;
+        margin: 0 4px 0 8px;
+        vertical-align: -2px;
+        border-radius: 50%;
+        border: 2px solid color-mix(in srgb, currentColor 22%, transparent);
+        border-top-color: var(--movi-primary, currentColor);
+        animation: movi-subtitle-pending-turn 0.8s linear infinite;
+      }
+
+      @keyframes movi-subtitle-pending-turn {
+        to { transform: rotate(360deg); }
+      }
+
+      @keyframes movi-subtitle-pending-breathe {
+        50% { opacity: 0.35; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .movi-subtitle-pending {
+          animation: movi-subtitle-pending-breathe 1.6s ease-in-out infinite;
+        }
+      }
+
       .movi-audio-track-item.movi-audio-track-active .movi-audio-track-info,
       .movi-subtitle-track-item.movi-subtitle-track-active .movi-subtitle-track-info {
         background: color-mix(in srgb, var(--movi-primary) 0.18, transparent);
@@ -17222,8 +21357,13 @@ export class MoviElement extends HTMLElement {
         background: color-mix(in srgb, var(--movi-primary) 0.16, transparent);
       }
 
+      /* Sized here because the glyph is not: symbolSvg writes a viewBox and no
+         width, so an svg nothing sizes fills whatever box it is in — this one
+         grew to the height of the panel. */
       .movi-sub-cust-back svg {
         flex-shrink: 0;
+        width: 16px;
+        height: 16px;
       }
 
       /* Live preview — sample text rendered using the EXACT same look
@@ -17753,6 +21893,12 @@ export class MoviElement extends HTMLElement {
            longer clip because opening lifts the host clip (movi-menu-overflow). */
         max-height: min(70vh, 380px);
         overflow-y: auto;
+        /* Never sideways. These are vertical lists, and once the content is
+           tall enough for a vertical scrollbar that bar eats into the width —
+           which on a menu with a fixed min-width is enough to put a HORIZONTAL
+           scrollbar under it for a second. overflow-y alone computes overflow-x
+           to auto, so it has to be said. */
+        overflow-x: hidden;
         box-shadow: var(--movi-shadow-lg);
         z-index: 1000;
         pointer-events: auto !important;
@@ -18849,6 +22995,152 @@ export class MoviElement extends HTMLElement {
         to { opacity: 0; transform: translateY(10px); }
       }
 
+      /* "May not play smoothly" (smoothwarning). The resume prompt's surface
+         and motion, on the opposite side so both can be up at once, and taller
+         because it carries a sentence of reason rather than a question. */
+      .movi-smooth-warning {
+        position: absolute;
+        bottom: 90px;
+        left: 16px;
+        z-index: 50;
+        max-width: min(380px, calc(100% - 32px));
+        background: var(--movi-chrome-bg);
+        border: 1px solid var(--movi-chrome-border);
+        border-radius: var(--movi-radius-panel);
+        padding: 12px 10px 12px 14px;
+        align-items: flex-start;
+        gap: 10px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        font-family: 'Inter', -apple-system, sans-serif;
+        pointer-events: auto;
+        animation: movi-resume-slide-up 0.3s ease;
+        transition: bottom 0.2s ease;
+      }
+
+      :host:has(.movi-controls-container.movi-controls-hidden) .movi-smooth-warning,
+      :host(:not([controls])) .movi-smooth-warning {
+        bottom: 16px;
+      }
+
+      .movi-smooth-warning-icon {
+        width: 18px;
+        height: 18px;
+        flex-shrink: 0;
+        margin-top: 1px;
+        color: #f5b83d;
+      }
+
+      .movi-smooth-warning-body {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .movi-smooth-warning-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.95);
+      }
+
+      .movi-smooth-warning-reason {
+        font-size: 12px;
+        line-height: 1.4;
+        color: rgba(255, 255, 255, 0.65);
+      }
+
+      .movi-smooth-warning-reason:empty {
+        display: none;
+      }
+
+      .movi-smooth-warning-close {
+        flex-shrink: 0;
+        width: 24px;
+        height: 24px;
+        margin: -3px 0 0 2px;
+        padding: 5px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: rgba(255, 255, 255, 0.6);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .movi-smooth-warning-close:hover {
+        background: rgba(255, 255, 255, 0.1);
+        color: #fff;
+      }
+
+      .movi-smooth-warning-close svg {
+        width: 14px;
+        height: 14px;
+      }
+
+      @container movi-host (max-width: 720px) {
+        .movi-smooth-warning {
+          bottom: 80px;
+          padding: 10px 8px 10px 12px;
+        }
+        .movi-smooth-warning-title {
+          font-size: 12px;
+        }
+        .movi-smooth-warning-reason {
+          font-size: 11px;
+        }
+      }
+
+      /* A phone held upright. The notice keeps to the bottom — the top is where
+         the speed OSD appears, and a speed change is exactly when this notice
+         goes up, so up there the two landed on each other. It spans the width
+         and gets compact, and the line under the title stops at two.
+
+         Moving it to the top with top AND leaving bottom to the rules above was
+         tried first, and the controls-hidden rule (more specific) kept its
+         bottom: the notice was pinned at both ends and stretched over the whole
+         picture. */
+      @container movi-host (max-width: 400px) {
+        .movi-smooth-warning {
+          left: 10px;
+          right: 10px;
+          max-width: none;
+          padding: 8px 6px 8px 10px;
+          gap: 8px;
+        }
+        .movi-smooth-warning-icon {
+          width: 16px;
+          height: 16px;
+        }
+        .movi-smooth-warning-title {
+          font-size: 12px;
+          line-height: 1.3;
+        }
+        .movi-smooth-warning-reason {
+          font-size: 11px;
+          line-height: 1.35;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+        }
+        /* Unless the resume prompt holds the bottom: at this width it spans it
+           too. Then go up — the OSD passes in a second, the prompt does not.
+           bottom has to be forced: the controls-hidden rule outranks this. */
+        :host:has(.movi-resume-dialog[style*="flex"]) .movi-smooth-warning {
+          top: 10px;
+          bottom: auto !important;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .movi-smooth-warning {
+          animation: none;
+          transition: none;
+        }
+      }
+
       .movi-resume-text {
         font-size: 13px;
         font-weight: 500;
@@ -18905,8 +23197,9 @@ export class MoviElement extends HTMLElement {
         }
       }
 
+      /* Same reading as the scrubber's fill — see --movi-brand-fill. */
       .movi-resume-yes {
-        background: var(--movi-primary);
+        background: var(--movi-brand-fill, var(--movi-primary));
         color: var(--movi-chrome-fg, #fff);
       }
 
@@ -18940,7 +23233,7 @@ export class MoviElement extends HTMLElement {
       @container movi-host (max-width: 400px) {
         /* Top-right button: tucked closer to the edge than the bar - see the
            --movi-chrome-inset note on :host. */
-        .movi-gear-btn {
+        .movi-top-controls {
           right: 4px;
         }
         .movi-resume-dialog {
@@ -18962,6 +23255,42 @@ export class MoviElement extends HTMLElement {
         }
       }
 
+      /* Players narrower than a phone: a thumbnail in a feed, a preview tile,
+         a comparison grid. The bottom row is a fixed left cluster and a fixed
+         right cluster with nothing between them that can give way, so below
+         about 300px the clock ran straight under the settings run — "00:00 /
+         02:41" overlapping the gear, which is what a viewer sees as a broken
+         control rather than a small one.
+
+         Take the readout apart in the order the information is worth keeping.
+         The duration is the half a viewer can infer (and the seek bar shows
+         it); the position is the half they can't, so it goes last. */
+      @container movi-host (max-width: 340px) {
+        :host .movi-controls-left > .movi-time {
+          padding: 0 8px;
+        }
+        :host .movi-controls-left {
+          gap: 4px;
+          /* The cluster is what overflows, and everything to its right is a
+             fixed run of icons — so it, not they, is what has to give. */
+          min-width: 0;
+          flex-shrink: 1;
+          overflow: hidden;
+        }
+      }
+
+      /* Smaller still: the transport and nothing else. A clock nobody can read
+         at this size is worth less than the room it takes from the buttons. */
+      @container movi-host (max-width: 240px) {
+        :host .movi-controls-bar {
+          padding-left: 4px;
+          padding-right: 4px;
+        }
+        :host .movi-controls-right {
+          gap: 0;
+        }
+      }
+
       /* ========================================
          RESPONSIVE STYLES - Mobile First
       ======================================== */
@@ -18973,11 +23302,6 @@ export class MoviElement extends HTMLElement {
           --movi-btn-size: var(--movi-btn-size-mobile);
         }
         
-        .movi-loader-container {
-          width: 64px !important;
-          height: 64px !important;
-        }
-
         /* Keyframe animations off on small/compact layouts for perf, but keep
            CSS transitions so the controls still move smoothly here too (the
            PiP / mini player is a small container).
@@ -19015,6 +23339,24 @@ export class MoviElement extends HTMLElement {
            opacity: 1 !important;
            transform: none !important;
         }
+
+        /* …and the slide back, which is what made the phone's bar read as
+           dropping away rather than blinking out. It was dropped wholesale
+           because a transformed container is the containing block for the
+           fixed-position sheets inside it — the settings panel was laid out
+           against the control group and went off-screen. That is only true
+           while a sheet is OPEN, and the bar does not auto-hide then, so the
+           transform is scoped to the rest of the time. The resting state stays
+           none (a transform of zero is still a containing block); a
+           transition from none animates all the same. */
+        :host(:not(.movi-bottom-menu-open)) .movi-controls-container {
+          transition:
+            opacity 0.2s ease,
+            transform 0.26s var(--movi-motion-out) !important;
+        }
+        :host(:not(.movi-bottom-menu-open)) .movi-controls-container.movi-controls-hidden {
+           transform: translateY(10px) !important;
+        }
         
         /* Sized to a finger-friendly tap target on phones (was 68×68 +
            32×32 svg, which read as undersized next to the bottom bar);
@@ -19047,7 +23389,10 @@ export class MoviElement extends HTMLElement {
         }
         .movi-center-icon-play {
            margin-left: 0 !important;
-           transform: translateX(4px) scale(1.15) !important;
+           /* The same proportion as the base rule — see the note there for why
+              it cannot be a constant. This override exists for the margin; it
+              has to restate the transform because it is !important. */
+           transform: translateX(4.58%) scale(1.15) !important;
         }
         .movi-progress-handle {
             /* Handle needs transform for centering and positioning */
@@ -19060,7 +23405,7 @@ export class MoviElement extends HTMLElement {
 
         /* Top-right button: closer to the edge than the bar's inset - see the
            --movi-chrome-inset note on :host for why this is per-breakpoint. */
-        .movi-gear-btn {
+        .movi-top-controls {
           right: 4px;
         }
 
@@ -19148,6 +23493,7 @@ export class MoviElement extends HTMLElement {
         .movi-controls-right,
         .movi-controls-left > .movi-play-pause,
         .movi-controls-left > .movi-custom-btn,
+        .movi-controls-center > .movi-custom-btn,
         .movi-controls-left > .movi-volume-container,
         .movi-controls-left > .movi-chapter-pill,
         .movi-controls-left > .movi-time,
@@ -19166,9 +23512,20 @@ export class MoviElement extends HTMLElement {
            every other button again. Specificity, not order: the narrow-viewport
            block further down sizes buttons with !important. */
         :host .movi-controls-left > .movi-play-pause,
-        :host .movi-controls-left > .movi-custom-btn {
+        :host .movi-controls-left > .movi-custom-btn,
+        :host .movi-controls-center > .movi-custom-btn {
           width: var(--movi-btn-size) !important;
           height: var(--movi-btn-size) !important;
+        }
+        /* …except a host control that isn't an icon: the width above is a
+           square, and a pill drawn wider than it spills over the clock beside
+           it. Height stays pinned — it is the row's own rhythm — and the width
+           follows the content with the square as its floor. See the base rule
+           for the same override. */
+        :host .movi-controls-left > .movi-custom-btn,
+        :host .movi-controls-center > .movi-custom-btn {
+          width: auto !important;
+          min-width: var(--movi-btn-size);
         }
         /* Text needs a little air from the icons either side, but far less
            than a capsule's worth. */
@@ -19211,6 +23568,12 @@ export class MoviElement extends HTMLElement {
              the one piece of chrome permanently over the picture; every pixel
              it does not need is picture. */
           padding: 8px 0 4px;
+        }
+
+        /* Six pixels under the track here, not ten: the band stops at the
+           button row. */
+        .movi-progress-bar::before {
+          bottom: -6px;
         }
 
         .movi-progress-bar {
@@ -19374,8 +23737,22 @@ export class MoviElement extends HTMLElement {
         }
 
         /* If right is expanded, hide the left group to make space */
-        .movi-buttons-row:has(.movi-controls-right.expanded) .movi-controls-left {
+        .movi-buttons-row:has(.movi-controls-right.expanded) .movi-controls-left,
+        /* …and the middle with it. The tray takes the row's whole width, and
+           the centre cluster floats over it — a host control would have been
+           drawn straight across the icons the viewer just opened. */
+        .movi-buttons-row:has(.movi-controls-right.expanded) .movi-controls-center {
            display: none !important;
+        }
+
+        /* …and with the left group goes the play capsule, which is the tallest
+           thing in the row (42px against the 38px icon buttons beside it). So
+           the bar lost 4mm of height at the moment it opened and got it back on
+           close — a row that twitches as you use it. Hold the row at the taller
+           of its two states: opening the tray changes WHAT is in the row, not
+           how tall the row is. */
+        .movi-buttons-row {
+          min-height: 42px;
         }
         
         /* Alternative for older browsers: shrink left instead of hiding if :has not supported */
@@ -19533,7 +23910,7 @@ export class MoviElement extends HTMLElement {
       @container movi-host (min-width: 721px) and (max-width: 1024px) {
         /* Top-right button: tucked closer to the edge than the bar - see the
            --movi-chrome-inset note on :host. */
-        .movi-gear-btn {
+        .movi-top-controls {
           right: 10px;
         }
         .movi-controls-bar {
@@ -19648,7 +24025,7 @@ export class MoviElement extends HTMLElement {
       @container movi-host (min-width: 1025px) {
         /* Top-right button: tucked closer to the edge than the bar - see the
            --movi-chrome-inset note on :host. */
-        .movi-gear-btn {
+        .movi-top-controls {
           right: 16px;
         }
         .movi-controls-bar {
@@ -19727,11 +24104,27 @@ export class MoviElement extends HTMLElement {
            filter-induced white flash on some mobile GPUs that's no
            longer applicable since we don't use backdrop-filter. */
 
-        /* Remove the slide-up/down effect */
+        /* The slide-up/down, which the phone used to do without: the bar
+           blinked out where the desktop's drops away. It was removed here
+           wholesale because a transformed container is the containing block
+           for the fixed-position sheets inside it — the settings panel was
+           laid out against the control group and left the screen. That only
+           matters while a sheet is OPEN, and the bar does not auto-hide then.
+           So: no transform while one is open, the slide the rest of the time.
+           The visible state rests at none — a transform of zero is still a
+           containing block, and a transition out of none animates anyway. */
         .movi-controls-container,
-        .movi-controls-container.movi-controls-hidden,
-        .movi-controls-container.movi-controls-visible {
+        .movi-controls-container.movi-controls-visible,
+        :host(.movi-bottom-menu-open) .movi-controls-container.movi-controls-hidden {
           transform: none !important;
+        }
+        :host(:not(.movi-bottom-menu-open)) .movi-controls-container {
+          transition:
+            opacity 0.2s ease,
+            transform 0.26s var(--movi-motion-out) !important;
+        }
+        :host(:not(.movi-bottom-menu-open)) .movi-controls-container.movi-controls-hidden {
+          transform: translateY(10px) !important;
         }
 
         /* Ensure opacity toggle is instant */
@@ -19742,13 +24135,28 @@ export class MoviElement extends HTMLElement {
            opacity: 1 !important;
         }
 
-        /* Center button focus/hover reset for touch devices */
+        /* Center button focus/hover reset for touch devices.
+           :hover and :focus both STICK to this element after a tap — until
+           something else is tapped — so whatever they say here is what the
+           button wears for the rest of the session. They therefore say the
+           resting look, not a brighter one: a tapped button that keeps a
+           halo reads as a button still being pressed. */
         .movi-center-play-pause:hover,
         .movi-center-play-pause:focus,
         .movi-center-play-pause:active {
-           background: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 40%, transparent) !important;
-           border-color: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 60%, transparent) !important;
-           box-shadow: 0 8px 32px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 40%, transparent) !important;
+           background: transparent !important;
+           /* No border-color here. Stating one made this block the thing that
+              changed the button: on the dark theme the disc rests on a border
+              this rule does not name, so a tap moved it OFF the resting colour
+              rather than holding it there. Everything it used to undo is now
+              gated — the hovers behind (hover: hover), the ring behind
+              :focus-visible — so the resting rule can simply stand. */
+           /* Measured on a phone: the button rests here with no shadow at
+              all — this block flattens it with the rest of the touch
+              chrome. So a press must not hand one back, or the halo it
+              leaves behind is the only thing on screen that says the button
+              was touched, minutes after it was. */
+           box-shadow: none !important;
         }
 
         .movi-center-play-pause svg {
@@ -19767,11 +24175,15 @@ export class MoviElement extends HTMLElement {
         .movi-center-play-pause:focus svg {
            color: var(--movi-controls-color) !important;
            fill: var(--movi-controls-color) !important;
-           /* Outline restated — see the base hover rule. */
+           /* The RESTING outline, not the hover one. Both states stick here
+              after a tap, so an accent glow handed back on :hover is a glow the
+              glyph then wears for the rest of the session — the same stuck
+              hover the block above it exists to undo, arriving by way of the
+              filter instead of the background. */
            filter:
              drop-shadow(0 0 1px rgba(0, 0, 0, 0.5))
              drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35))
-             drop-shadow(0 0 8px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 60%, transparent)) !important;
+             drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3)) !important;
         }
 
         .movi-btn:hover svg,
@@ -19877,84 +24289,22 @@ export class MoviElement extends HTMLElement {
         transition: top var(--movi-transition-normal);
       }
 
-      /* The play mark, with a segment running round it.
+      ${loadingIndicatorStyles}
 
-         A ring is a ring: plain, comet-tailed or dotted, it is the spinner
-         every other page uses. This is that same arc-chasing-its-track idea
-         drawn on the player's own triangle — outlined rather than solid, so it
-         reads as a mark waiting on something rather than a button asking to be
-         pressed, and stationary, so the shape stays legible while the segment
-         laps it.
+      /* No ring at all - the middle is cleared for the host's own.
+         !important because the element writes the ring's display inline
+         (applySpinnerVisible), and an inline style beats a plain rule.
 
-         Scale lives on the container; everything inside is in the SVG's own
-         48-unit space, so one width change moves the lot. */
-      .movi-loader-container {
-        width: 68px;
-        height: 68px;
-        display: inline-block;
-        color: var(--movi-controls-color);
-        /* Two tight shadows ahead of the soft one.
-           The soft shadow on its own is depth, and depth is exactly what a
-           light backdrop takes away: the white mark goes into the white behind
-           it and all that survives is the blur — a grey rectangle-ish smudge
-           with nothing legible in it, which is what it looks like over a page
-           that has not painted a picture yet. Drop-shadows chain, each applying
-           to the result of the last, so a tight pair traces the outline and
-           gives the shape an edge it keeps on white. On the dark surface a
-           player usually is, they are too small to see and the soft one still
-           does the work it always did. */
-        filter:
-          drop-shadow(0 0 1px rgba(0, 0, 0, 0.55))
-          drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4))
-          drop-shadow(0 2px 8px rgba(0, 0, 0, 0.35));
-      }
-
-      .movi-loader-mark {
-        width: 100%;
-        height: 100%;
-        display: block;
-      }
-
-      .movi-loader-track,
-      .movi-loader-chase {
-        fill: none;
-        stroke: currentColor;
-        stroke-width: 4;
-        /* The round join is what carries the same softened corners the play
-           buttons have; the round cap is what keeps the running segment from
-           ending in a chopped-off square. */
-        stroke-linejoin: round;
-        stroke-linecap: round;
-      }
-
-      /* Present enough to hold the shape, quiet enough that the segment is
-         what the eye follows. */
-      .movi-loader-track {
-        opacity: 0.2;
-      }
-
-      .movi-loader-chase {
-        /* Just over a quarter of the way round — long enough to read as a
-           stroke with a direction, short enough that it is clearly a segment
-           and not the outline itself. */
-        /* 28% and 72% of the triangle's 67.2666-unit perimeter. */
-        stroke-dasharray: 18.8347 48.4319;
-        animation: movi-loader-chase 1.35s linear infinite;
-      }
-
-      @keyframes movi-loader-chase {
-        to {
-          /* One full lap of the perimeter, in the same units as the dash. */
-          stroke-dashoffset: -67.2666;
-        }
-      }
-
-      /* Mobile loader - smaller size */
-      @container movi-host (max-width: 720px) {
-        .movi-loader-container {
-          width: 52px;
-          height: 52px;
-        }
+         Only the drawing goes. is-buffering and is-spinner-pending still ride
+         on the host through every state they always did, because they are what
+         a page draws its own indicator off, and the centre play button still
+         stands down while they are on: a host that has taken the ring away has
+         taken away the thing that stood in the middle, not the reason the
+         button cannot be there either. A host that wants to keep the ring's
+         placement and merely redraw it wants <div slot="spinner"> instead,
+         which leaves all of this alone. */
+      :host([controlslist~="nospinner"]) .movi-loading-indicator {
+        display: none !important;
       }
 
       /* Centre play/pause button. Default placement assumes only the
@@ -19979,9 +24329,17 @@ export class MoviElement extends HTMLElement {
         width: clamp(96px, 10cqw, 112px);
         height: clamp(96px, 10cqw, 112px);
         border-radius: 50%;
-        background: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 25%, transparent);
+        /* This button wears the ACCENT, not the brand colour: --movi-primary
+           is only what it falls back to when no accent was given. A themecolor
+           with two values sets the accent from the second one — see
+           applyThemeColor.
+
+           The tint goes on a layer of its own (::before) at low opacity rather
+           than into the background here, so the picture keeps showing through
+           and the ring, the glow and the fill all read the one colour. */
+        background: transparent;
         padding: 0;
-        border: 2px solid color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 40%, transparent);
+        border: 2px solid color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 40%, transparent);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -19995,7 +24353,7 @@ export class MoviElement extends HTMLElement {
            backdrop, leaving the soft coloured glow as the only thing drawn —
            which reads as a smudge, not a button. Too dark to see over a
            picture, enough to hold the circle's edge over a blank page. */
-        box-shadow: 0 8px 32px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 25%, transparent), 0 0 0 1px rgba(0, 0, 0, 0.18), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+        box-shadow: 0 8px 32px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 25%, transparent), 0 0 0 1px rgba(0, 0, 0, 0.18), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
       }
 
       .movi-center-play-pause.movi-center-visible {
@@ -20028,28 +24386,64 @@ export class MoviElement extends HTMLElement {
 
          Not display:none — the button transitions, and cutting it out
          mid-fade is the flicker this file has fought before. */
-      :host(.is-buffering) .movi-center-play-pause {
+      /* …and for a spinner that is deliberately being held back.
+         spinnerdelay withholds the RING, not the fact that the player is
+         loading, and this button is the one thing that must not be read as an
+         invitation while it is. Without the second selector a delayed opening
+         showed the play triangle for the length of the wait — on a video that
+         was about to start on its own. is-buffering cannot carry this on its
+         own: strip mode pulses its progress bar off that same class, and a
+         withheld ring must stay withheld there too. */
+      :host(.is-buffering) .movi-center-play-pause,
+      :host(.is-spinner-pending) .movi-center-play-pause {
         opacity: 0 !important;
         visibility: hidden !important;
         pointer-events: none !important;
       }
 
 
-      /* Default (the base rule) is the true geometric centre. When the controls
-         bar is visible, lift the centre button AND the loading spinner a little
-         so they read as centred in the band above the bar. Keyed off a host
-         class toggled in show/hideControls, because :host:has() checks against
-         the shadow tree don't apply in every engine (notably Electron). The
-         transition on top (in each base rule) animates the move. */
-      :host(.movi-bar-visible) .movi-center-play-pause,
-      :host(.movi-bar-visible) .movi-loading-indicator {
+      /* The centre is the centre — on a player with room to spare.
+         The button used to lift by a quarter of the bar's height whenever the
+         bar was up, at every size, and on a large player that reads as a
+         mistake: the bar is a thin strip along the bottom and the circle is
+         visibly off the middle of the picture.
+         On a SHORT player it is the other way round. The bar is 72px of a
+         300px frame — a quarter of everything — so the true centre sits right
+         on top of it and the button looks stuck to the controls. There the
+         lift is what centring means.
+         So: only while the bar is on screen, and only when the player is
+         short enough for the bar to be a real share of it. The spinner moves
+         with the button, because it stands exactly where the button it
+         replaces stood. */
+      :host(.movi-short.movi-bar-visible) .movi-center-play-pause,
+      :host(.movi-short.movi-bar-visible) .movi-loading-indicator {
         top: calc(50% - var(--movi-controls-height) / 4);
       }
 
-      .movi-center-play-pause:hover {
-        background: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 40%, transparent);
-        border-color: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 60%, transparent);
-        box-shadow: 0 8px 40px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 40%, transparent), inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+      .movi-center-play-pause::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: var(--movi-accent, var(--movi-primary));
+        opacity: 0.3;
+        pointer-events: none;
+        transition: opacity var(--movi-transition-normal);
+      }
+      /* Both of these are what a POINTER hovering says. A tap leaves :hover
+         stuck on the element until the next tap lands somewhere else, so on
+         touch the disc darkened from 0.3 to 0.48 the moment it was pressed
+         and stayed that way — a dark blob sitting over the picture. The
+         scale below is already gated for the same reason. */
+      @media (hover: hover) {
+        .movi-center-play-pause:hover::before {
+          opacity: 0.48;
+        }
+
+        .movi-center-play-pause:hover {
+          border-color: color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 60%, transparent);
+          box-shadow: 0 8px 40px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 40%, transparent), inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+        }
       }
 
       /* Toggle receipt: pop in, fade out, gone. Carries !important because the
@@ -20100,7 +24494,7 @@ export class MoviElement extends HTMLElement {
         filter:
           drop-shadow(0 0 1px rgba(0, 0, 0, 0.5))
           drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35))
-          drop-shadow(0 0 8px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 60%, transparent));
+          drop-shadow(0 0 8px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 60%, transparent));
       }
 
       /* Play icon — bumped up ~15% so the triangle isn't dwarfed by
@@ -20109,15 +24503,44 @@ export class MoviElement extends HTMLElement {
          small optical-centre nudge — 5px read as too far right in
          practice, so 2px is enough to take the visual edge off the
          left-leaning mass without making the tip look pushed. */
+      /* A triangle centred by its box reads as sitting left, so it is nudged
+         right — by an eighth of its own width, the same proportion the bar's
+         play icon uses. The nudge was 4px when the icon was a bare triangle;
+         rounding the tip pushed its outline a further 1.2px right and the two
+         together put it visibly off centre against the pause icon.
+
+         A PROPORTION, so it cannot be a constant. This button scales with the
+         player, and 2.75px was only ever right at one size: measured against
+         the glyph's own ink, it came to a full sixth of it on a 72px button —
+         the whole centroid correction, which reads as pushed right, gaps of
+         28.0 and 20.7 — and barely two thirds of that at 112px, where the mass
+         instead fell 1.96px LEFT of the circle's middle. One value, opposite
+         errors at the two ends of the range.
+
+         A percentage resolves against this SVG's own layout width, which is
+         what scales, so the same fraction holds everywhere. 4.58% is the 112px
+         button's number kept exactly: the shape that was being aimed for is
+         the one the big players were already drawing, so desktop does not move
+         and every smaller size comes to meet it. The glyph's outline carries
+         about 3.9% of its ink rightward on its own (the rounded tip), and this
+         sits on top of that. */
       .movi-center-icon-play {
         display: block;
-        transform: translateX(4px) scale(1.15);
+        transform: translateX(4.58%) scale(1.15);
       }
 
+      /* :focus-visible, not :focus. A tap focuses this button and the focus
+         stays until something else takes it, so a plain :focus ring is a
+         pointer-less decoration the viewer then wears for the rest of the
+         session. :focus-visible is the same ring for the people it is actually
+         for — keyboard — and nothing at all for a tap or a click. */
       .movi-center-play-pause:focus {
         outline: none !important;
-        border-color: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 50%, transparent);
-        box-shadow: 0 0 0 3px color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 30%, transparent), 0 8px 32px rgba(0, 0, 0, 0.4);
+      }
+
+      .movi-center-play-pause:focus-visible {
+        border-color: color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 50%, transparent);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 30%, transparent), 0 8px 32px rgba(0, 0, 0, 0.4);
       }
       
       /* Mobile center button — previously shrank to 72px here, but the
@@ -20140,6 +24563,13 @@ export class MoviElement extends HTMLElement {
         clip-path: inset(50%);
         white-space: nowrap;
       }
+      /* Under an end screen the captions stand down - see syncFillOverlayClass.
+         Visibility, not display: the renderer places this element with inline
+         styles of its own, and !important is what outranks them. */
+      :host(.movi-fill-overlay-open) .movi-subtitle-overlay {
+        visibility: hidden !important;
+      }
+
       .movi-subtitle-overlay {
         position: absolute;
         /* How far off the bottom the caption sits. A variable rather than the
@@ -20160,6 +24590,18 @@ export class MoviElement extends HTMLElement {
       }
 
       /* Subtitle shift is handled via JS in showControls/hideControls */
+
+      /* With the bar up the caption is lifted clear of it (that same shift), so
+         the two never meet and this z-index is the one that counts. With the
+         bar DOWN the caption drops back into the strip the bar occupies — and
+         the bar's own children keep pointer-events:auto even while the bar is
+         invisible, so an unreachable control was sitting on top of the caption:
+         a drag, or a click meant for the transcript, landed on the progress
+         container instead. Nothing is painted there to be covered up, so the
+         caption simply takes the higher card while the bar is away. */
+      :host(.movi-bar-collapsed) .movi-subtitle-overlay {
+        z-index: 11;
+      }
 
       /* Full-width anchor row; padding-left set inline by the renderer
          pushes the inline-block backdrop to the position where the
@@ -20187,9 +24629,97 @@ export class MoviElement extends HTMLElement {
         box-sizing: border-box;
         /* Make the block itself clickable while keeping the overlay
            transparent — clicking the live caption opens the transcript
-           browser, scrolled to the current cue. */
+           browser, scrolled to the current cue. It is also the handle the
+           caption is dragged by, so it says grab rather than pointer: the
+           drag is the gesture you cannot otherwise guess is there, and the
+           transcript stays one click away either way.
+           touch-action, or the first finger-drag scrolls the page out from
+           under the caption instead of moving it. */
         pointer-events: auto;
-        cursor: pointer;
+        cursor: grab;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      /* Image subtitles (PGS / VOBSUB) are one bitmap, positioned by the
+         renderer — same handle, same gesture. */
+      .movi-subtitle-image {
+        pointer-events: auto;
+        cursor: grab;
+        touch-action: none;
+      }
+
+      .movi-subtitle-overlay.movi-subtitle-dragging .movi-subtitle-block,
+      .movi-subtitle-overlay.movi-subtitle-dragging .movi-subtitle-image {
+        cursor: grabbing;
+      }
+
+      /* Nothing about a caption being carried across the picture should
+         animate: it goes where the pointer is, this frame. */
+      .movi-subtitle-overlay.movi-subtitle-dragging .movi-subtitle-block {
+        animation: none;
+      }
+
+      /* The overlay eases its padding when the bar comes and goes, which is
+         right for the bar and wrong for a hand: eased, the caption arrives
+         where it was put a third of a second late, trailing the pointer. */
+      .movi-subtitle-overlay.movi-subtitle-dragging {
+        transition: none;
+      }
+
+      /* The one thing a drag cannot say for itself: that it can be undone.
+         A note, not a control — it takes no pointer, carries no button, and
+         is gone a moment after the caption is let go. Small enough to read
+         past, at the far end of the picture from the caption it is about. */
+      .movi-caption-hint {
+        position: absolute;
+        top: 18px;
+        left: 50%;
+        /* Over the caption, which can be dragged underneath it. */
+        z-index: 12;
+        max-width: calc(100% - 32px);
+        padding: 6px 13px;
+        border-radius: 999px;
+        background: var(--movi-chrome-bg);
+        border: 1px solid var(--movi-chrome-border);
+        /* White in both themes, like every other surface built on
+           --movi-chrome-bg: that surface is dark whichever theme is set, and
+           a light-theme text colour here is black on black. */
+        color: rgba(255, 255, 255, 0.85);
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        font-size: 12px;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+        pointer-events: none;
+        transform: translateX(-50%);
+        animation: movi-caption-hint-in 0.2s ease both;
+      }
+
+      .movi-caption-hint.movi-caption-hint-leaving {
+        animation: movi-caption-hint-out 0.4s ease both;
+      }
+
+      @keyframes movi-caption-hint-in {
+        from { opacity: 0; transform: translate(-50%, -6px); }
+        to { opacity: 1; transform: translate(-50%, 0); }
+      }
+
+      @keyframes movi-caption-hint-out {
+        from { opacity: 1; }
+        to { opacity: 0; }
+      }
+
+      @container movi-host (max-width: 480px) {
+        .movi-caption-hint { font-size: 11px; padding: 5px 11px; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .movi-caption-hint { animation: none; }
       }
 
       /* VTT gets its backdrop PER LINE, not one box around the cue. A shared
@@ -20315,6 +24845,12 @@ export class MoviElement extends HTMLElement {
         font-size: 14px;
         color: var(--movi-controls-color);
         overflow-y: auto;
+        /* Never sideways. These are vertical lists, and once the content is
+           tall enough for a vertical scrollbar that bar eats into the width —
+           which on a menu with a fixed min-width is enough to put a HORIZONTAL
+           scrollbar under it for a second. overflow-y alone computes overflow-x
+           to auto, so it has to be said. */
+        overflow-x: hidden;
         overflow-x: hidden;
         overscroll-behavior: contain;
         scrollbar-width: thin;
@@ -20375,7 +24911,10 @@ export class MoviElement extends HTMLElement {
         padding: 9px 16px;
         cursor: pointer;
         user-select: none;
-        transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        transition:
+          background-color 160ms ease,
+          color 160ms ease,
+          transform 220ms var(--movi-motion-out);
         position: relative;
         margin: 4px 6px;
         border-radius: var(--movi-radius-row);
@@ -20409,14 +24948,19 @@ export class MoviElement extends HTMLElement {
         pointer-events: none;
       }
 
-      /* An active row is drawn as a flat card — a tint of the theme's SECOND
-         colour, no outline and no bloom. The glow that used to sit under it
-         spread past the row and, on a light secondary, haloed the rows either
-         side of it. The fill is the shape; the rail, the icon and the state
-         word carry the accent. Falls back to primary where no secondary is
-         set, so a single-colour theme is unaffected. */
+      /* An active row is drawn as a flat card — a tint of the ACCENT, no
+         outline and no bloom. The glow that used to sit under it spread past
+         the row and, on a light accent, haloed the rows either side of it. The
+         fill is the shape; the rail, the icon and the state word carry the
+         same colour. --movi-primary is only the fallback, for a player given
+         no accent.
+
+         A transparent tint rather than a scrim over an opaque fill: the tint
+         takes the card's own shade with it, so the light theme needs no rule
+         of its own — a white card gets a light wash where a dark one gets a
+         dark one. That is what the layered version had to special-case. */
       .movi-context-menu-item.movi-context-menu-active {
-        background-color: color-mix(in srgb, var(--movi-secondary, var(--movi-primary)) 13%, transparent);
+        background-color: color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 14%, transparent);
       }
 
       /* The rail: small, rounded, tucked inside the card's left edge.
@@ -20433,13 +24977,15 @@ export class MoviElement extends HTMLElement {
         transform: translateY(-50%);
         width: 3px;
         height: 20px;
-        background: var(--movi-primary-light, var(--movi-primary));
+        background: var(--movi-accent-light, var(--movi-primary-light, var(--movi-primary)));
         border-radius: 999px;
       }
 
-      /* The icon takes the accent and nothing else — no tinted square behind
-         it. The card already carries the row; a second patch of colour around
-         the glyph only muddied it. */
+      /* The glyph stays on the BRAND while everything else in the row wears the
+         accent: it is the same icon the row has when it is off, so it keeps the
+         player's own colour and the accent is left to say which row is on. No
+         tinted square behind it either — the card already carries the row, and
+         a second patch of colour around the glyph only muddied it. */
       .movi-context-menu-item.movi-context-menu-active .movi-context-menu-icon {
         color: var(--movi-primary-light, var(--movi-primary));
       }
@@ -20447,12 +24993,12 @@ export class MoviElement extends HTMLElement {
       /* …and the value + its shortcut key pick up the accent, so the row reads
          as one object rather than a line with a highlight on it. */
       .movi-context-menu-item.movi-context-menu-active .movi-context-menu-status {
-        color: var(--movi-primary-light, var(--movi-primary));
+        color: var(--movi-accent-light, var(--movi-primary-light, var(--movi-primary)));
         font-weight: 600;
       }
       .movi-context-menu-item.movi-context-menu-active .movi-context-menu-shortcut {
-        color: var(--movi-primary-light, var(--movi-primary));
-        background: color-mix(in srgb, var(--movi-primary) 22%, transparent);
+        color: var(--movi-accent-light, var(--movi-primary-light, var(--movi-primary)));
+        background: color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 22%, transparent);
       }
 
       /* The rail needs room, and the label has to clear the icon's new square.
@@ -20465,7 +25011,7 @@ export class MoviElement extends HTMLElement {
          itself — the card, rail and icon chip have nothing to sit on there. */
       .movi-context-menu-item.movi-context-menu-active[data-speed],
       .movi-context-menu-item.movi-context-menu-active[data-fit] .movi-context-menu-label {
-        color: var(--movi-primary-light, var(--movi-primary));
+        color: var(--movi-accent-light, var(--movi-primary-light, var(--movi-primary)));
         font-weight: 600;
       }
 
@@ -20512,6 +25058,12 @@ export class MoviElement extends HTMLElement {
         pointer-events: none;
         max-height: 250px;
         overflow-y: auto;
+        /* Never sideways. These are vertical lists, and once the content is
+           tall enough for a vertical scrollbar that bar eats into the width —
+           which on a menu with a fixed min-width is enough to put a HORIZONTAL
+           scrollbar under it for a second. overflow-y alone computes overflow-x
+           to auto, so it has to be said. */
+        overflow-x: hidden;
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
         font-size: 14px;
         color: var(--movi-controls-color);
@@ -20542,6 +25094,12 @@ export class MoviElement extends HTMLElement {
         pointer-events: none;
         max-height: 250px;
         overflow-y: auto;
+        /* Never sideways. These are vertical lists, and once the content is
+           tall enough for a vertical scrollbar that bar eats into the width —
+           which on a menu with a fixed min-width is enough to put a HORIZONTAL
+           scrollbar under it for a second. overflow-y alone computes overflow-x
+           to auto, so it has to be said. */
+        overflow-x: hidden;
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
         font-size: 14px;
         color: var(--movi-controls-color);
@@ -20588,6 +25146,12 @@ export class MoviElement extends HTMLElement {
         min-width: 200px;
         max-height: 280px;
         overflow-y: auto;
+        /* Never sideways. These are vertical lists, and once the content is
+           tall enough for a vertical scrollbar that bar eats into the width —
+           which on a menu with a fixed min-width is enough to put a HORIZONTAL
+           scrollbar under it for a second. overflow-y alone computes overflow-x
+           to auto, so it has to be said. */
+        overflow-x: hidden;
         box-shadow: var(--movi-shadow-lg);
         z-index: 1001;
         pointer-events: auto !important;
@@ -20726,6 +25290,19 @@ export class MoviElement extends HTMLElement {
            show up in a text selection drag. */
         user-select: none;
       }
+      /* The chip's text is drawn against --movi-primary, which the page picks,
+         so it cannot be one fixed colour: white vanished on a yellow or amber
+         theme. Black or white from the primary's own lightness (OKLCH L above
+         0.7 is a light fill). Behind @supports because the rule reads the
+         primary through var(), which a browser without relative colours
+         would only reject after the fact, leaving the text no colour at all;
+         there the white above stands. */
+      @supports (color: oklch(from red l c h)) {
+        .movi-settings-btn-badge,
+        .movi-quality-btn-badge {
+          color: oklch(from var(--movi-primary) clamp(0, (0.7 - l) * 1000, 1) 0 0);
+        }
+      }
       .movi-settings-container,
       .movi-quality-btn {
         overflow: visible;
@@ -20779,6 +25356,20 @@ export class MoviElement extends HTMLElement {
          line rather than generated, so a token that does not exist matches
          nothing instead of half-working. */
       :host([controlslist~="noplay"]) .movi-play-pause,
+      :host([controlslist~="nocenterplay"]) .movi-center-play-pause,
+      :host(.movi-fill-overlay-open) .movi-center-play-pause,
+      :host([controlslist~="noplaylist"]) .movi-prev-btn,
+      :host([controlslist~="noplaylist"]) .movi-next-btn,
+      /* One end at a time — the BUTTON only. Shift+P, the queue and the lock
+         screen's own pair carry on: a host taking Previous off a crowded bar is
+         making room, not saying the viewer may never go back. noplaylist above
+         is the one that means that. */
+      :host([controlslist~="noprev"]) .movi-prev-btn,
+      :host([controlslist~="nonext"]) .movi-next-btn,
+      /* …and the rows in the shortcuts sheet that name keys the token has just
+         switched off, which would otherwise be the sheet teaching a press that
+         does nothing. */
+      :host([controlslist~="noplaylist"]) [data-playlist-only],
       :host([controlslist~="noseekbuttons"]) .movi-seek-backward,
       :host([controlslist~="noseekbuttons"]) .movi-seek-forward,
       :host([controlslist~="novolume"]) .movi-volume-container,
@@ -20804,15 +25395,71 @@ export class MoviElement extends HTMLElement {
         display: none !important;
       }
       /* …and the context-menu rows that reach the same controls, so a control
-         that is off is not simply one click further away. */
+         that is off is not simply one click further away. !important because
+         several of these rows are shown by script (display:flex inline, per
+         source), and the host's decision outranks the source's. The click
+         handler refuses them as well — see MENU_ACTION_CONTROL. */
       :host([controlslist~="nospeed"]) .movi-context-menu-item[data-action="speed"],
       :host([controlslist~="noaspect"]) .movi-context-menu-item[data-action="fit"],
+      :host([controlslist~="noaudio"]) .movi-context-menu-item[data-action="audio-track"],
+      :host([controlslist~="noaudio"]) .movi-context-menu-divider-audio,
+      :host([controlslist~="nocc"]) .movi-context-menu-item[data-action="subtitle-track"],
+      :host([controlslist~="nocc"]) .movi-context-menu-divider-subtitle,
+      :host([controlslist~="nohdr"]) .movi-context-menu-item[data-action="hdr-toggle"],
+      :host([controlslist~="nohdr"]) .movi-hdr-divider,
       :host([controlslist~="nopip"]) .movi-context-menu-item[data-action="pip"],
-      :host([controlslist~="noloop"]) .movi-context-menu-item[data-action="loop-toggle"],
       :host([controlslist~="nofullscreen"]) .movi-context-menu-item[data-action="fullscreen"],
+      :host([controlslist~="norotate"]) .movi-context-menu-item[data-action="rotate-video"],
+      :host([controlslist~="noloop"]) .movi-context-menu-item[data-action="loop-toggle"],
+      :host([controlslist~="noplaylist"]) .movi-context-menu-item[data-action="shuffle-toggle"],
+      :host([controlslist~="nostableaudio"]) .movi-context-menu-item[data-action="stable-audio-toggle"],
+      :host([controlslist~="nocrop"]) .movi-context-menu-item[data-action="crop-toggle"],
+      :host([controlslist~="noambient"]) .movi-context-menu-item[data-action="ambient-toggle"],
+      :host([controlslist~="nosnapshot"]) .movi-context-menu-item[data-action="snapshot"],
+      :host([controlslist~="notimeline"]) .movi-context-menu-item[data-action="timeline"],
       :host([controlslist~="nostats"]) .movi-context-menu-item[data-action="nerd-stats"],
-      :host([controlslist~="noshortcuts"]) .movi-context-menu-item[data-action="keyboard-shortcuts"] {
+      :host([controlslist~="noshortcuts"]) .movi-context-menu-item[data-action="keyboard-shortcuts"],
+      /* …and the Keyboard Shortcuts sheet's rows for the same controls, whose
+         keys now do nothing — the sheet should not teach a dead press. (The
+         queue's rows already go with noplaylist, above.) */
+      :host([controlslist~="nofullscreen"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="fullscreen"]),
+      :host([controlslist~="nopip"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="pip"]),
+      :host([controlslist~="nospeed"]) .movi-shortcut-row:has(> kbd[data-shortcut-pair="speedup,speeddown"]),
+      :host([controlslist~="nocc"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="subtitles"]),
+      :host([controlslist~="nocc"]) .movi-shortcut-row:has(> kbd[data-shortcut-pair="subtitledelayback,subtitledelayforward"]),
+      :host([controlslist~="noaudio"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="audiotrack"]),
+      :host([controlslist~="noaspect"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="aspect"]),
+      :host([controlslist~="norotate"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="rotate"]),
+      :host([controlslist~="nocrop"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="crop"]),
+      :host([controlslist~="noloop"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="loop"]),
+      :host([controlslist~="nostableaudio"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="stableaudio"]),
+      :host([controlslist~="nohdr"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="hdr"]),
+      :host([controlslist~="nosnapshot"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="snapshot"]),
+      :host([controlslist~="nostats"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="stats"]),
+      :host([controlslist~="notimeline"]) .movi-shortcut-row:has(> kbd[data-shortcut-action="timeline"]),
+      /* A host control switched off after it was added — see
+         syncCustomControl. */
+      [data-custom-control][data-controlslist-off] {
         display: none !important;
+      }
+
+      /* No queue, no queue controls. This is the default state of nearly every
+         player on the page, so the two buttons and their shortcut rows start
+         hidden and the class is what brings them in - not the other way round,
+         which would flash them onto the bar of every single video for the one
+         frame before the playlist was read. */
+      :host(:not(.movi-has-playlist)) .movi-prev-btn,
+      :host(:not(.movi-has-playlist)) .movi-next-btn,
+      :host(:not(.movi-has-playlist)) [data-playlist-only] {
+        display: none !important;
+      }
+      /* An end of the queue. Dimmed rather than removed: a Next that vanishes
+         on the last item moves Play under the pointer that was aiming at it. */
+      .movi-prev-btn[disabled],
+      .movi-next-btn[disabled] {
+        opacity: 0.4;
+        cursor: default;
+        pointer-events: none;
       }
 
       .movi-custom-btn .movi-custom-btn-text {
@@ -20828,10 +25475,11 @@ export class MoviElement extends HTMLElement {
          class changes on the descendant, so the turn was skipped on open and
          then unwound on close. */
       .movi-settings-container.is-open .movi-settings-btn svg {
-        transform: rotate(30deg);
+        transform: rotate(90deg);
       }
       .movi-settings-btn svg {
-        transition: transform 0.2s ease;
+        transform-origin: center;
+        transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
       }
 
       /* Anchored to the button ROW, so its right edge lands on the frame's
@@ -20861,6 +25509,12 @@ export class MoviElement extends HTMLElement {
         color: var(--movi-chrome-fg, #fff);
         z-index: 40;
         overflow-y: auto;
+        /* Never sideways. These are vertical lists, and once the content is
+           tall enough for a vertical scrollbar that bar eats into the width —
+           which on a menu with a fixed min-width is enough to put a HORIZONTAL
+           scrollbar under it for a second. overflow-y alone computes overflow-x
+           to auto, so it has to be said. */
+        overflow-x: hidden;
         opacity: 0;
         /* Fade + a few pixels of rise, and NO scale. Scaling from a corner
            origin moves the opposite edge sideways — on a 268px panel that 2%
@@ -20874,6 +25528,24 @@ export class MoviElement extends HTMLElement {
       .movi-settings-menu.is-open {
         opacity: 1;
         transform: translateY(0);
+      }
+
+      @keyframes movi-settings-view-forward {
+        from { opacity: 0; transform: translateX(18px); }
+        to { opacity: 1; transform: translateX(0); }
+      }
+
+      @keyframes movi-settings-view-back {
+        from { opacity: 0; transform: translateX(-18px); }
+        to { opacity: 1; transform: translateX(0); }
+      }
+
+      .movi-settings-view-forward {
+        animation: movi-settings-view-forward 240ms var(--movi-motion-out) both;
+      }
+
+      .movi-settings-view-back {
+        animation: movi-settings-view-back 240ms var(--movi-motion-out) both;
       }
 
       /* On a small player the panel stops being a dropdown and becomes a
@@ -20929,6 +25601,152 @@ export class MoviElement extends HTMLElement {
         :host(:not(.movi-audio-strip)) .movi-settings-row {
           padding: 13px 12px;
         }
+        /* The popup is centred in the frame, so on a short player it may take
+           nearly all of it rather than leaving 16px of picture above and below. */
+        :host(.movi-short:not(.movi-audio-strip)) .movi-settings-menu {
+          max-height: min(calc(var(--movi-player-height, 70vh) - 16px), 460px);
+        }
+        /* A way out that can be seen, for a mouse. The popup covers the gear
+           that opened it, and on a short player it covers nearly the whole
+           frame, so the dimmed margin that dismisses it is a few pixels wide
+           and says nothing about being the way out. A finger has the grabber
+           and the swipe; a pointer had only Escape.
+           A round button floating just above the panel, clear of it. It
+           cannot live inside the panel - the panel scrolls, and would clip
+           anything outside its edge - so it is the panel's sibling, and the
+           panel hangs from a fixed line under it instead of being centred,
+           which is the only way CSS knows where the panel's top edge is. The
+           panel gives up the same height, so the pair still fits the frame. */
+        @media (hover: hover) and (pointer: fine) {
+          :host(:not(.movi-audio-strip)) .movi-settings-menu,
+          :host(.movi-short:not(.movi-audio-strip)) .movi-settings-menu {
+            top: 52px;
+            transform: translate(-50%, 8px);
+            max-height: min(calc(var(--movi-player-height, 70vh) - 60px), 460px);
+          }
+          :host(:not(.movi-audio-strip)) .movi-settings-menu.is-open {
+            transform: translate(-50%, 0);
+          }
+          :host(:not(.movi-audio-strip)) .movi-settings-close {
+            display: flex;
+            position: fixed;
+            top: 10px;
+            left: 50%;
+            z-index: 41;
+            width: 34px;
+            height: 34px;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            border-radius: 50%;
+            border: 1px solid var(--movi-glass-border);
+            background: var(--movi-glass-bg);
+            box-shadow: var(--movi-shadow-sm);
+            color: var(--movi-chrome-fg, #fff);
+            cursor: pointer;
+            opacity: 0;
+            pointer-events: none;
+            transform: translate(-50%, 8px);
+            transition: opacity 0.16s ease, transform 0.16s ease;
+          }
+          :host(:not(.movi-audio-strip)) .movi-settings-menu.is-open + .movi-settings-close {
+            opacity: 1;
+            pointer-events: auto;
+            transform: translate(-50%, 0);
+          }
+          :host(:not(.movi-audio-strip)) .movi-settings-close-icon {
+            opacity: 0.8;
+          }
+          :host(:not(.movi-audio-strip)) .movi-settings-close:hover .movi-settings-close-icon {
+            opacity: 1;
+          }
+        }
+      }
+
+      /* A short player (see SHORT_PLAYER_PX): the panel is capped at the
+         frame's height, so the rows give up spacing rather than the list giving
+         up rows. On a 263px-tall phone player this is five rows in view instead
+         of two and a half. Rows stay ~37px, still a thumb's width. */
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-menu {
+        padding: 6px;
+      }
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-row,
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-choice,
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-page-body .movi-quality-item,
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-page-body .movi-speed-item,
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-page-body .movi-audio-track-item,
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-page-body .movi-subtitle-track-item {
+        padding-top: 9px;
+        padding-bottom: 9px;
+      }
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-section-label {
+        padding: 5px 12px 3px;
+      }
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-section-label-secondary {
+        padding-top: 9px;
+      }
+      :host(.movi-short:not(.movi-audio-strip)) .movi-settings-back {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        margin-bottom: 4px;
+      }
+
+      /* The drag handle on a touch popup — see setupSettingsPanel's swipe. A
+         16px strip to put a thumb on, the pill drawn in the middle of it. */
+      .movi-settings-grabber {
+        display: none;
+      }
+      /* Shown only where the panel is a popup over the frame - see the
+         max-width 480px block. */
+      .movi-settings-close {
+        display: none;
+      }
+      .movi-settings-close-icon {
+        width: 18px;
+        height: 18px;
+      }
+      @container movi-host (max-width: 480px) {
+        @media (pointer: coarse) {
+          :host(:not(.movi-audio-strip)) .movi-settings-grabber {
+            display: block;
+            position: relative;
+            height: 16px;
+            margin: -4px 0 2px;
+            touch-action: none;
+            cursor: grab;
+          }
+          :host(:not(.movi-audio-strip)) .movi-settings-grabber::before {
+            content: "";
+            position: absolute;
+            left: 50%;
+            top: 6px;
+            width: 36px;
+            height: 4px;
+            margin-left: -18px;
+            border-radius: 2px;
+            background: currentColor;
+            opacity: 0.28;
+          }
+          /* A pull past the top of the list is the swipe, not the page. */
+          :host(:not(.movi-audio-strip)) .movi-settings-menu {
+            overscroll-behavior: contain;
+          }
+        }
+      }
+
+      .movi-settings-section-label {
+        padding: 7px 12px 5px;
+        color: var(--movi-text-mute, rgba(255, 255, 255, 0.48));
+        font-size: 10px;
+        font-weight: 650;
+        line-height: 1.2;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        pointer-events: none;
+      }
+
+      .movi-settings-section-label-secondary {
+        padding-top: 13px;
       }
 
       .movi-settings-row {
@@ -20949,7 +25767,9 @@ export class MoviElement extends HTMLElement {
         /* Every other control in the player fades its hover; these rows
            switched instantly, which on a list you run the pointer down reads
            as a block snapping from row to row. */
-        transition: background var(--movi-transition-fast);
+        transition:
+          background-color 160ms ease,
+          transform 220ms var(--movi-motion-out);
       }
 
       /* A row that is offered but cannot be operated yet — before a source
@@ -20962,6 +25782,10 @@ export class MoviElement extends HTMLElement {
       }
       .movi-settings-row:hover {
         background: rgba(255, 255, 255, 0.08);
+        transform: translateX(2px);
+      }
+      .movi-settings-row:active {
+        transform: translateX(1px) scale(0.985);
       }
       /* Informational, not interactive: same type, quieter, no affordances. */
       .movi-settings-row.is-static,
@@ -20969,6 +25793,7 @@ export class MoviElement extends HTMLElement {
         background: transparent;
         cursor: default;
         opacity: 0.62;
+        transform: none;
       }
       .movi-settings-icon {
         flex: 0 0 auto;
@@ -21058,10 +25883,10 @@ export class MoviElement extends HTMLElement {
         /* A groove, not a lighter patch of the panel — at 0.22 over a
            translucent surface the off state read as nothing at all. */
         background: rgba(255, 255, 255, 0.3);
-        transition: background 0.16s ease;
+        transition: background-color 180ms ease;
       }
       .movi-settings-switch.is-on {
-        background: var(--movi-primary);
+        background: var(--movi-brand-fill, var(--movi-primary));
       }
       .movi-settings-knob {
         display: block;
@@ -21069,10 +25894,19 @@ export class MoviElement extends HTMLElement {
         height: 14px;
         border-radius: 50%;
         background: #fff;
-        transition: transform 0.16s ease;
+        transition: transform 260ms var(--movi-motion-spring);
       }
       .movi-settings-switch.is-on .movi-settings-knob {
         transform: translateX(14px);
+      }
+
+      @keyframes movi-settings-switch-confirm {
+        0%, 100% { scale: 1; }
+        48% { scale: 1.12; }
+      }
+
+      .movi-settings-switch-confirmed {
+        animation: movi-settings-switch-confirm 380ms var(--movi-motion-spring);
       }
 
       .movi-settings-choice {
@@ -21090,9 +25924,16 @@ export class MoviElement extends HTMLElement {
         font-size: 14.5px;
         text-align: left;
         cursor: pointer;
+        transition:
+          background-color 160ms ease,
+          transform 220ms var(--movi-motion-out);
       }
       .movi-settings-choice:hover {
         background: rgba(255, 255, 255, 0.1);
+        transform: translateX(2px);
+      }
+      .movi-settings-choice:active {
+        transform: translateX(1px) scale(0.985);
       }
       .movi-settings-choice-main {
         display: inline-flex;
@@ -21266,6 +26107,23 @@ export class MoviElement extends HTMLElement {
         border: 1px solid var(--movi-glass-border, transparent);
         box-shadow: var(--movi-shadow-md, 0 4px 8px rgba(0, 0, 0, 0.6));
       }
+      .movi-thumbnail-tile {
+        width: var(--movi-preview-w, 168px);
+        height: var(--movi-preview-h, 94px);
+        max-height: var(--movi-preview-h, 158px);
+        background-repeat: no-repeat;
+        background-color: #000;
+        /* The image's frame, for the same reason .movi-thumbnail-placeholder
+           wears it: all three of these stand in the same place in the card, so
+           a different corner or lift is visible the moment one replaces
+           another. "inherit" was the odd one out — it takes the value from
+           .movi-seek-thumbnail, which carries no radius of its own, so the
+           storyboard tile was the one preview surface with square corners and
+           no lift while the decoded frame beside it had both. */
+        border-radius: var(--movi-preview-img-radius);
+        box-shadow: var(--movi-shadow-md, 0 4px 8px rgba(0, 0, 0, 0.6));
+      }
+
       .movi-thumbnail-img {
         display: block;
         /* A box the SOURCE's shape decides, not the individual frame's — and
@@ -21287,7 +26145,16 @@ export class MoviElement extends HTMLElement {
            player. Follows the box once there IS one — as a flat 158 it silently
            clipped the taller frames a wide player now asks for. */
         max-height: var(--movi-preview-h, 158px);
-        object-fit: contain;
+        /* The box is built from the SOURCE's own shape (see updatePreviewBox),
+           so the picture and the box are the same picture — and contain was
+           letting the difference between two roundings show as a hairline of
+           the card's backdrop along one edge. Both ends round: the box to whole
+           pixels, and the preview itself to a whole-pixel height when it is
+           made. In the light theme that hairline is #f0f0f0, which reads as a
+           white line under the thumbnail.
+           Filling the box instead crops that same fraction of a pixel, which
+           nobody can see, from a picture that is meant to fill it anyway. */
+        object-fit: cover;
         /* No outline. The frame stands off the picture on its shadow alone —
            a hairline around a moving image at this size reads as a stray edge
            drawn over the video rather than as the border of a card. */
@@ -21449,9 +26316,13 @@ export class MoviElement extends HTMLElement {
         align-items: center;
         justify-content: center;
         color: var(--movi-chrome-fg, #FFFFFF);
-        /* Subtle primary halo around the icon — keeps the OSD
-           visually anchored to the brand without painting the bg. */
-        filter: drop-shadow(0 0 6px color-mix(in srgb, var(--movi-primary) 45%, transparent));
+        /* Subtle halo around the icon — keeps the OSD visually anchored to the
+           brand without painting the bg. The ACCENT, falling back to the brand
+           colour, the way every other tinted control here reads it: a
+           themecolor with two values sets the accent from the second one, and
+           this was the one glow still reaching past it to --movi-primary, so a
+           player with an accent had an OSD that did not match its own chrome. */
+        filter: drop-shadow(0 0 6px color-mix(in srgb, var(--movi-accent, var(--movi-primary)) 45%, transparent));
       }
 
       .movi-osd-icon svg {
@@ -21478,18 +26349,28 @@ export class MoviElement extends HTMLElement {
         left: 0;
         width: 100%;
         height: 100%;
-        background: radial-gradient(circle at center, rgba(30, 30, 30, 0.4) 0%, rgba(10, 10, 10, 0.95) 100%);
+        background: #000;
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
         z-index: 10000;
         color: white;
-        font-family: 'Inter', sans-serif;
+        font-family: inherit;
         text-align: center;
-        padding: clamp(16px, 5%, 40px);
         opacity: 0;
         animation: movi-fade-in 0.5s ease forwards;
+        /* Query source for the sizes below. The screen is inset: 0 over the
+           player, so its box IS the player's box -- as long as it carries no
+           padding of its own, because a query measures the CONTENT box. The
+           inset lives on the stage and on slotted markup instead. */
+        container-type: size;
+        container-name: movi-error;
+      }
+
+      ::slotted([slot="error"]) {
+        box-sizing: border-box;
+        padding: clamp(16px, 5%, 40px);
       }
 
       @keyframes movi-fade-in {
@@ -21497,11 +26378,32 @@ export class MoviElement extends HTMLElement {
         to { opacity: 1; }
       }
       
+      /* The card sits in a stage rather than directly in the screen, because a
+         container query can style anything EXCEPT the container it measures --
+         and the screen is what defines the query box. The stage is that same
+         box, one level down, so it can be told to step off the control bar. */
+      .movi-broken-stage {
+        position: absolute;
+        inset: 0;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: clamp(16px, 5%, 40px);
+        /* The reserve comes and goes with the bar, so the card glides rather
+           than jumping when the chrome appears. */
+        transition: padding 0.2s ease;
+      }
+
       .movi-broken-container {
         display: flex;
         flex-direction: column;
         align-items: center;
         max-width: min(320px, 90%);
+        /* Everything inside sizes off the PLAYER, not the window (see the
+           container-type on the screen above): a 400px player embedded in a
+           desktop page was reading vw and painting a phone-sized icon at its
+           full 80px, tall enough to sit under the control bar. */
         animation: movi-slide-up 0.6s cubic-bezier(0.16, 1, 0.3, 1);
       }
 
@@ -21509,7 +26411,7 @@ export class MoviElement extends HTMLElement {
          rather than stacking on top of it. The backdrop stays — it is what
          covers the last painted frame — and is overridable through
          ::part(error-screen) for hosts that want their own. */
-      .movi-broken-indicator.movi-custom-error .movi-broken-container {
+      .movi-broken-indicator.movi-custom-error .movi-broken-stage {
         display: none;
       }
 
@@ -21520,32 +26422,39 @@ export class MoviElement extends HTMLElement {
       
       .movi-broken-icon-wrapper {
         position: relative;
-        width: clamp(48px, 12vw, 80px);
-        height: clamp(48px, 12vw, 80px);
-        margin-bottom: clamp(12px, 3vw, 24px);
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: clamp(12px, 3vw, 20px);
+        width: clamp(64px, min(22cqw, 30cqh), 176px);
+        aspect-ratio: 140 / 100;
+        height: auto;
+        margin-bottom: clamp(6px, 2.6cqh, 16px);
         display: flex;
         align-items: center;
         justify-content: center;
-        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+        opacity: 0.92;
       }
 
       .movi-broken-icon-wrapper svg {
-        width: clamp(28px, 7vw, 44px);
-        height: clamp(28px, 7vw, 44px);
-        filter: drop-shadow(0 0 15px rgba(255, 68, 68, 0.4));
+        width: 100%;
+        height: 100%;
+        overflow: visible;
+      }
+      .movi-broken-card-back { fill: var(--movi-chrome-fg, #fff); opacity: 0.1; }
+      .movi-broken-card-front { fill: var(--movi-chrome-fg, #fff); opacity: 0.16; }
+      .movi-broken-card-badge { fill: #ff5a5f; opacity: 0.55; }
+      .movi-broken-card-mark {
+        stroke: #fff;
+        stroke-opacity: 0.9;
+        stroke-width: 2.4;
+        stroke-linecap: round;
       }
 
       .movi-broken-title {
         font-size: clamp(16px, 4vw, 22px);
-        font-weight: 700;
-        margin: 0 0 10px 0;
-        letter-spacing: -0.02em;
-        background: linear-gradient(to bottom, var(--movi-chrome-fg, #fff), #bbb);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        font-size: clamp(12px, min(4cqw, 5cqh), 18px);
+        font-weight: 600;
+        margin: 0 0 6px 0;
+        margin-bottom: clamp(3px, 1cqh, 6px);
+        letter-spacing: -0.01em;
+        color: rgba(255, 255, 255, 0.9);
         text-align: center;
         /* Same reasoning as the message below — a three-word title that wraps
            after its second word reads badly. */
@@ -21560,8 +26469,9 @@ export class MoviElement extends HTMLElement {
       
       .movi-broken-message {
         font-size: clamp(11px, 2.5vw, 14px);
-        line-height: 1.6;
-        color: rgba(255, 255, 255, 0.6);
+        font-size: clamp(9px, min(3cqw, 3.6cqh), 13px);
+        line-height: 1.5;
+        color: rgba(255, 255, 255, 0.5);
         margin: 0;
         font-weight: 400;
         text-align: center;
@@ -21589,17 +26499,85 @@ export class MoviElement extends HTMLElement {
         align-items: center;
         justify-content: center;
         gap: 8px;
+        gap: 0.55em;
         margin-top: 16px;
+        margin-top: clamp(6px, 2.5cqh, 16px);
         padding: 10px 20px;
+        /* em, so the box follows the font-size below instead of staying a
+           full-size button wrapped around shrunken text. */
+        padding: 0.7em 1.4em;
         background: rgba(255, 255, 255, 0.15);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: var(--movi-radius-control);
         color: var(--movi-chrome-fg, #fff);
         font-size: 14px;
+        font-size: clamp(10px, min(3cqw, 3.6cqh), 14px);
         font-weight: 500;
         cursor: pointer;
         transition: all 0.2s ease;
       }
+
+      /* Short players: the stack still has to clear the control bar, and there
+         is no room left for everything. Drop the decorative parts first -- the
+         icon, then the sentence -- so the title and the one button that can fix
+         anything are the last things standing. */
+      @container movi-error (max-height: 250px) {
+        .movi-broken-stage {
+          padding: 6px 10px;
+          justify-content: center;
+        }
+        /* No reserve for the bar. There used to be one — 52px of it — so the
+           card would not sit under the control row, and it cost the one
+           thing an error screen owes the viewer: being in the middle of the
+           box they are looking at. The bar does not auto-hide on an error
+           (there is nothing playing to hide it for), so the reserve applied
+           always, and the card sat 23px high in a 180px player, every time.
+           The card is above the bar in any case — the screen is z-index
+           10000 — and the bar under an error is inert. */
+      }
+
+      @container movi-error (max-height: 190px) {
+        .movi-broken-icon-wrapper { display: none; }
+      }
+
+      /* Thumbnail-sized players: the button row alone eats half the height, so
+         stacking title over button no longer fits above it. Lay them side by
+         side instead -- both survive, in the strip of picture that is left. */
+      @container movi-error (max-height: 130px) {
+        .movi-broken-stage { padding: 3px 8px; }
+        .movi-broken-message { display: none; }
+        .movi-broken-container {
+          flex-direction: row;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          max-width: 100%;
+        }
+        .movi-broken-title { margin-bottom: 0; }
+        .movi-sw-fallback-btn,
+        .movi-retry-btn { margin-top: 0; padding: 0.45em 0.9em; }
+      }
+
+      /* Quieter than Retry: it doesn't fix anything, it just gets you out. */
+      .movi-error-exit-fs-btn {
+        display: none;
+        align-items: center;
+        justify-content: center;
+        gap: 0.55em;
+        margin-top: clamp(4px, 1.4cqh, 10px);
+        padding: 0.55em 1.1em;
+        background: transparent;
+        border: 0;
+        border-radius: var(--movi-radius-control);
+        color: rgba(255, 255, 255, 0.7);
+        font-size: clamp(10px, min(2.8cqw, 3.4cqh), 13px);
+        font-weight: 500;
+        cursor: pointer;
+        transition: color 0.2s ease, background 0.2s ease;
+      }
+      :host(.movi-fullscreen-active) .movi-error-exit-fs-btn { display: flex; }
+      .movi-error-exit-fs-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
+      .movi-error-exit-fs-btn svg { flex-shrink: 0; width: 1.15em; height: 1.15em; }
 
       .movi-sw-fallback-btn:hover,
       .movi-retry-btn:hover {
@@ -21611,6 +26589,8 @@ export class MoviElement extends HTMLElement {
       .movi-sw-fallback-btn svg,
       .movi-retry-btn svg {
         flex-shrink: 0;
+        width: 1.15em;
+        height: 1.15em;
       }
 
       /* Empty State Indicator */
@@ -21761,9 +26741,19 @@ export class MoviElement extends HTMLElement {
         .movi-empty-container {
           gap: 8px !important;
         }
+        /* Scaled to the frame rather than one size for everything under
+           720px: at 148px it was more than half the height of a 232px phone
+           player, the mark towering over the two lines it introduces. The
+           lesser of a fifth of the width and three tenths of the height, kept
+           in the artwork's 140:100 shape. */
         .movi-empty-icon-wrapper {
-          width: 56px !important;
-          height: 56px !important;
+          width: clamp(
+            64px,
+            min(22cqw, calc(var(--movi-player-height, 400px) * 0.3)),
+            148px
+          ) !important;
+          height: auto !important;
+          aspect-ratio: 140 / 100;
         }
         .movi-empty-title {
           font-size: 14px !important;
@@ -21781,8 +26771,8 @@ export class MoviElement extends HTMLElement {
       }
 
       .movi-empty-icon-wrapper {
-        width: 96px;
-        height: 96px;
+        width: 176px;
+        height: 126px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -21799,6 +26789,26 @@ export class MoviElement extends HTMLElement {
       }
       .movi-empty-logo-fill {
         fill: var(--movi-chrome-fg, #fff);
+      }
+
+      .movi-empty-card-back {
+        fill: var(--movi-chrome-fg, #fff);
+        opacity: 0.1;
+      }
+
+      .movi-empty-card-front {
+        fill: var(--movi-chrome-fg, #fff);
+        opacity: 0.16;
+      }
+
+      .movi-empty-card-detail {
+        fill: var(--movi-chrome-fg, #fff);
+        opacity: 0.22;
+      }
+
+      .movi-empty-card-play {
+        fill: var(--movi-chrome-fg, #fff);
+        opacity: 0.48;
       }
 
       .movi-empty-icon-wrapper svg {
@@ -21833,6 +26843,190 @@ export class MoviElement extends HTMLElement {
         text-wrap: balance;
         max-width: 40ch;
         hyphens: none;
+      }
+
+      /* Motion is concentrated on compositor-friendly opacity and transforms.
+         Keeping the travel under eight pixels gives the interface a physical
+         response without making frequent control reveals feel theatrical. */
+      .movi-controls-container .movi-progress-container,
+      .movi-controls-container .movi-controls-left,
+      .movi-controls-container .movi-controls-center,
+      .movi-controls-container .movi-controls-right {
+        opacity: 1;
+        /* none, not translateY(0): any transform — an identity one included —
+           makes the element the containing block for position: fixed inside
+           it, and the gear's panel is fixed to the viewport on a phone. With
+           translateY(0) resting here the bottom sheet was laid out against the
+           right-hand control group instead: shifted right, off the screen and
+           clipped to three rows. */
+        transform: none;
+        transition:
+          opacity 160ms ease,
+          transform 260ms var(--movi-motion-out);
+      }
+
+      .movi-controls-container.movi-controls-hidden .movi-progress-container,
+      .movi-controls-container.movi-controls-hidden .movi-controls-left,
+      .movi-controls-container.movi-controls-hidden .movi-controls-center,
+      .movi-controls-container.movi-controls-hidden .movi-controls-right {
+        opacity: 0;
+        transform: translateY(6px);
+        transition-delay: 0ms;
+      }
+
+      .movi-controls-container.movi-controls-visible .movi-progress-container {
+        transition-delay: 20ms;
+      }
+      .movi-controls-container.movi-controls-visible .movi-controls-left {
+        transition-delay: 45ms;
+      }
+      .movi-controls-container.movi-controls-visible .movi-controls-center {
+        transition-delay: 65ms;
+      }
+      .movi-controls-container.movi-controls-visible .movi-controls-right {
+        transition-delay: 85ms;
+      }
+
+      @keyframes movi-surface-arrive {
+        from {
+          opacity: 0;
+          transform: translateY(8px) scale(0.985);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+
+      @keyframes movi-row-arrive {
+        from {
+          opacity: 0;
+          transform: translateY(5px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @keyframes movi-empty-arrive {
+        from {
+          opacity: 0;
+          transform: translateY(10px) scale(0.97);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+
+      @keyframes movi-empty-drift {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-4px); }
+      }
+
+      .movi-empty-container {
+        animation: movi-empty-arrive 520ms var(--movi-motion-out) backwards;
+      }
+
+      .movi-empty-icon-wrapper svg {
+        animation: movi-empty-drift 5.2s ease-in-out 700ms infinite;
+      }
+
+      .movi-context-menu[style*="display: block"],
+      .movi-context-menu[style*="display: flex"],
+      .movi-timeline-panel[style*="display: flex"],
+      .movi-pip-placeholder[style*="display: flex"],
+      .movi-broken-indicator[style*="display: flex"] {
+        /* backwards, not both: a fill that outlives the animation leaves a
+           transform on the surface for good, and a transform turns the
+           surface into the containing block for anything fixed inside it
+           (see the controls rule above). Before and during, the from-frame
+           and the keyframes apply exactly as they did. */
+        animation: movi-surface-arrive 260ms var(--movi-motion-out) backwards;
+      }
+
+      /* The error screen rests at opacity 0 in its base rule and relied on its
+         own fade's forwards fill to become visible. The arrive animation above
+         replaces that fade and fills backwards only, so the moment it ended the
+         screen dropped back to 0 — shown for a quarter of a second, then gone.
+         Its resting state is visible; the animation still fades it in. */
+      .movi-broken-indicator[style*="display: flex"] {
+        opacity: 1;
+      }
+
+      .movi-settings-menu.is-open .movi-settings-root > * {
+        animation: movi-row-arrive 220ms var(--movi-motion-out) backwards;
+      }
+
+      .movi-settings-menu.is-open .movi-settings-root > :nth-child(2) {
+        animation-delay: 20ms;
+      }
+      .movi-settings-menu.is-open .movi-settings-root > :nth-child(3) {
+        animation-delay: 40ms;
+      }
+      .movi-settings-menu.is-open .movi-settings-root > :nth-child(4) {
+        animation-delay: 60ms;
+      }
+      .movi-settings-menu.is-open .movi-settings-root > :nth-child(n + 5) {
+        animation-delay: 80ms;
+      }
+
+      @media (hover: hover) and (pointer: fine) {
+        .movi-timeline-arrow svg {
+          transition: transform 220ms var(--movi-motion-spring);
+        }
+        .movi-timeline-arrow:hover svg {
+          transform: scale(1.08);
+        }
+        .movi-btn:hover svg,
+        .movi-top-controls .movi-btn:hover svg {
+          transform: translateY(-1px) scale(1.035);
+        }
+        .movi-btn:active svg,
+        .movi-top-controls .movi-btn:active svg {
+          transform: translateY(0) scale(0.96);
+        }
+      }
+
+      /* Reduced motion keeps every state change and affordance, but removes
+         travel, stagger and decorative looping rather than merely slowing it. */
+      @media (prefers-reduced-motion: reduce) {
+        :host {
+          --movi-transition-fast: 1ms linear;
+          --movi-transition-normal: 1ms linear;
+          --movi-transition-slow: 1ms linear;
+          --movi-transition-bounce: 1ms linear;
+        }
+
+        .movi-empty-container,
+        .movi-empty-icon-wrapper svg,
+        .movi-context-menu,
+        .movi-timeline-panel,
+        .movi-pip-placeholder,
+        .movi-broken-indicator,
+        .movi-settings-view-forward,
+        .movi-settings-view-back,
+        .movi-settings-switch-confirmed,
+        .movi-settings-menu.is-open .movi-settings-root > * {
+          animation: none !important;
+        }
+
+        .movi-controls-container,
+        .movi-controls-container .movi-progress-container,
+        .movi-controls-container .movi-controls-left,
+        .movi-controls-container .movi-controls-center,
+        .movi-controls-container .movi-controls-right,
+        .movi-btn,
+        .movi-btn svg,
+        .movi-settings-row,
+        .movi-settings-choice,
+        .movi-settings-knob,
+        .movi-progress-handle,
+        .movi-timeline-arrow svg {
+          transition-duration: 1ms !important;
+          transition-delay: 0ms !important;
+        }
       }
 
       /* Mobile Responsiveness for Context Menu - Side Panel Mode */
@@ -22089,7 +27283,6 @@ export class MoviElement extends HTMLElement {
       :host(.movi-audio-strip) video,
       :host(.movi-audio-strip) .movi-poster-overlay,
       :host(.movi-audio-strip) .movi-cover-art-overlay,
-      :host(.movi-audio-strip) .movi-subtitle-overlay,
       :host(.movi-audio-strip) .movi-loading-indicator,
       :host(.movi-audio-strip) .movi-loader-container,
       :host(.movi-audio-strip) .movi-center-play-pause,
@@ -22097,6 +27290,161 @@ export class MoviElement extends HTMLElement {
       :host(.movi-audio-strip) .movi-broken-indicator,
       :host(.movi-audio-strip) .movi-empty-state {
         display: none !important;
+      }
+      /* Everything above is picture furniture, which a 56px bar has no room
+         for and no use for. A caption is not furniture — it is the content of
+         a track the viewer asked for — so it was the one entry in that list
+         that made a selected subtitle track produce nothing anywhere. It was
+         being rendered all along: the cue matched, the clock ran, the text was
+         written into the overlay, and "display: none !important" beat the
+         inline "display: flex" the renderer sets every 100ms.
+         It still hides while nothing is selected, which is the ordinary case. */
+      :host(.movi-audio-strip:not(.movi-has-caption)) .movi-subtitle-overlay {
+        display: none !important;
+      }
+      /* The caption band. The strip only grows when a track is on, so an
+         audio file nobody has asked for subtitles on is the same bar it was.
+         Laid out like the title band above it — absolutely placed inside the
+         host, with the control row pushed below — rather than floated over
+         the page: the OSD is allowed to do that because it is gone in a
+         second, and a caption is not.
+         The geometry is !important because CanvasRenderer rewrites this
+         element's position, width, height and padding inline on every pass of
+         the subtitle clock, sized to a canvas that strip mode has hidden. */
+      /* The band is sized FROM the caption, so the viewer's font-size
+         setting still means something here. It was pinned at 13px, which
+         made the size slider do nothing at all in strip mode — the one
+         setting that could not simply be inherited, because the normal size
+         is a fraction of the player's WIDTH (20-40px) and a full-width strip
+         would put 40px type in a 24px band. So: the same multiplier, applied
+         to a base the band can hold, and a band that grows with it. Clamped
+         so an extreme setting cannot turn the bar into a page.
+         Colour and edge style need none of this — they are inherited through
+         --movi-sub-color and --movi-sub-edge and were working already. */
+      :host(.movi-audio-strip.movi-has-caption) {
+        /* Two lines' worth, always. A cue is one line or two — that is what
+           subtitling does — and a band sized for one had the second line
+           bleeding out of it at both ends: measured on a two-line cue, the
+           block ran 21..67 inside a band of 33..57, which put its top INSIDE
+           the title above (10..26) and its bottom INSIDE the control row
+           below (55..105). That is the crowding.
+           Sized for two rather than for the cue in hand on purpose: the bar
+           would otherwise change height every time a one-line cue followed a
+           two-line one, which is the twitch the band was built to avoid. */
+        --movi-strip-cap-line: clamp(
+          15px,
+          calc(19px * var(--movi-sub-size-mult, 1)),
+          44px
+        );
+        /* Plus a little air. Sized to the line alone, the block still touched
+           both edges — the band has to hold the block, not equal it. */
+        --movi-strip-cap-h: calc(2 * var(--movi-strip-cap-line) + 10px);
+      }
+      :host(.movi-audio-strip.movi-has-caption) .movi-subtitle-overlay {
+        position: absolute !important;
+        left: 12px !important;
+        right: 14px !important;
+        width: auto !important;
+        height: var(--movi-strip-cap-h, 24px) !important;
+        bottom: auto !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        transform: none !important;
+        display: flex !important;
+        flex-direction: row !important;
+        align-items: center !important;
+        justify-content: center !important;
+        /* A cue with more lines than the band was sized for is clipped here
+           rather than allowed to paint over the title and the buttons. */
+        overflow: hidden !important;
+        z-index: 6;
+      }
+      /* Centre it in the BAND, not where the renderer thinks the picture is.
+         CanvasRenderer centres a caption by writing padding-left on the
+         anchor, computed from the overlay's own inline width — which is the
+         canvas box it sized the overlay to, and in strip mode that canvas is
+         hidden and a different width from this band. The caption came out
+         pushed off to one side by exactly that difference. Flex on the
+         overlay could not correct it because the offset is padding inside a
+         full-width child, not the child's position. */
+      :host(.movi-audio-strip.movi-has-caption) .movi-subtitle-anchor {
+        padding-left: 0 !important;
+        width: 100% !important;
+        text-align: center !important;
+      }
+      :host(.movi-audio-strip.movi-has-caption) .movi-subtitle-line {
+        /* The normal size is a fraction of the player's width, which in a
+           full-width strip is far taller than the band. */
+        text-align: center !important;
+        font-size: clamp(
+          11px,
+          calc(13px * var(--movi-sub-size-mult, 1)),
+          34px
+        ) !important;
+        line-height: var(--movi-strip-cap-line) !important;
+        /* A caption parsed as VTT gets 2px of padding per line, which is a
+           video affordance: over a picture it separates the lines' own
+           backdrops. Here the backdrop is one block around both, so the
+           padding only made each line box 4px taller than the band was told
+           to expect — which is how a two-line cue kept overflowing a band
+           sized from the line height. */
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        /* Same rule, the other half of it: a VTT line is "width: fit-content"
+           with a backdrop of its own, so over a picture each line wears its
+           own plate. Here the block already carries one plate around both,
+           and a fit-content line cannot be centred by text-align — it is a
+           box the width of its text, so the short second line of a two-line
+           cue sat against the left edge of a block sized by the first. */
+        width: auto !important;
+        background: none !important;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      /* A caption is white by default because it is normally read against a
+         picture. The strip is a surface that follows the theme, and on the
+         light one that is white on near-white. The colour itself is the
+         viewer's setting, so it is not overridden — instead the band wears
+         the backdrop the player already derives FROM that colour for exactly
+         this purpose (contrastBackdropRgb), which the video path applies over
+         the picture and this one had nothing to apply it to. */
+      :host(.movi-audio-strip.movi-has-caption) .movi-subtitle-block {
+        background: rgba(
+          var(--movi-sub-bg-rgb, 8, 8, 8),
+          var(--movi-sub-bg-alpha, 0.75)
+        ) !important;
+        padding: 1px 10px !important;
+        max-width: 100% !important;
+        text-align: center !important;
+      }
+
+      /* Untitled + caption: band at the top, controls below it. */
+      :host(.movi-audio-strip.movi-has-caption) {
+        min-height: calc(65px + var(--movi-strip-cap-h)) !important;
+        height: calc(65px + var(--movi-strip-cap-h)) !important;
+        max-height: calc(65px + var(--movi-strip-cap-h)) !important;
+      }
+      :host(.movi-audio-strip.movi-has-caption) .movi-subtitle-overlay {
+        top: 6px !important;
+      }
+      :host(.movi-audio-strip.movi-has-caption) .movi-controls-container,
+      :host(.movi-audio-strip.movi-has-caption) .movi-controls-container.movi-controls-hidden {
+        top: calc(9px + var(--movi-strip-cap-h)) !important;
+      }
+
+      /* Titled + caption: title, then caption, then controls. */
+      :host(.movi-audio-strip.movi-has-title.movi-has-caption) {
+        min-height: calc(87px + var(--movi-strip-cap-h)) !important;
+        height: calc(87px + var(--movi-strip-cap-h)) !important;
+        max-height: calc(87px + var(--movi-strip-cap-h)) !important;
+      }
+      :host(.movi-audio-strip.movi-has-title.movi-has-caption) .movi-subtitle-overlay {
+        top: 32px !important;
+      }
+      :host(.movi-audio-strip.movi-has-title.movi-has-caption) .movi-controls-container,
+      :host(.movi-audio-strip.movi-has-title.movi-has-caption) .movi-controls-container.movi-controls-hidden {
+        top: calc(35px + var(--movi-strip-cap-h)) !important;
       }
       /* Title + OSD in strip mode.
          Floating the title ABOVE the host collided with whatever sits above
@@ -22119,7 +27467,11 @@ export class MoviElement extends HTMLElement {
         position: absolute;
         top: 9px !important;
         bottom: auto !important;
-        left: 14px;
+        /* The control row's own gutter, so the two rows start on one line.
+           At 14 the band sat two pixels inside the play button below it —
+           not a gap anyone reads as a gap, just a row that looks askew. The
+           right stays at 14, which is where the corner gear's edge is. */
+        left: 12px;
         right: 14px;
         /* !important: a desktop host may inject a ":host(:not(:fullscreen))
            .movi-title-bar { padding-top: 46px }" rule (macOS traffic-light
@@ -22134,6 +27486,22 @@ export class MoviElement extends HTMLElement {
         pointer-events: none;
         z-index: 6;
         transition: opacity 0.2s ease;
+      }
+      /* The back arrow at the bar's own scale. It is built for a phone
+         player's top bar over a picture — a 40px box around a 26px arrow —
+         and in a 78px strip that is bigger than everything under it: its
+         stroke landed five pixels right of the play glyph in the row below,
+         where the eye reads the two as one column. Same box, same icon, same
+         left edge as that row's first button. */
+      :host(.movi-audio-strip) .movi-title-back {
+        width: 32px;
+        height: 32px;
+        padding: 7px;
+        margin: calc((var(--movi-title-line) - 32px) / 2) 0;
+      }
+      :host(.movi-audio-strip) .movi-title-back svg {
+        width: 18px;
+        height: 18px;
       }
       :host(.movi-audio-strip) .movi-title-text {
         font-size: 13px;
@@ -22157,7 +27525,7 @@ export class MoviElement extends HTMLElement {
       }
       /* The gear button otherwise centres a few px BELOW the small strip title
          text — nudge it up so their icon/text vertical centres line up. */
-      :host(.movi-audio-strip) .movi-gear-btn {
+      :host(.movi-audio-strip) .movi-top-controls {
         top: 1px !important;
         /* Strip mode positions the gear from the top edge, not from a title
            line, so the midpoint anchoring the normal layout uses would push it
@@ -22281,6 +27649,145 @@ export class MoviElement extends HTMLElement {
       }
       /* Controls live in the host's natural flow instead of floating above
          a video canvas — and stay visible regardless of hover state. */
+      /* The track lists cap themselves against the PLAYER's height, and in
+         strip mode that is the bar's own 78px: min(78 - 180, 360) floors at
+         zero, so the subtitle menu opened as a 12px scroll box with a
+         scrollbar beside it and the tracks hidden behind it. A strip's menus
+         are bounded by the viewport instead (the same reasoning the context
+         menu above already follows, and what applyStripFixedMenuPosition does
+         for the menu itself). */
+      :host(.movi-audio-strip) .movi-audio-track-list,
+      :host(.movi-audio-strip) .movi-subtitle-track-list {
+        max-height: min(calc(100vh - 160px), 360px);
+      }
+
+      /* ── Cover art: the scrubber is the level meter ──
+         The dots are painted over the real bar (see startCoverEqualizer) and
+         never take a click, so seeking, the handle and the keyboard work as
+         they always did — what changes is what the row LOOKS like: the plain
+         track would sit under the dots as a second, duller line. */
+      :host(.movi-cover-art) .movi-cover-eq {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 1;
+      }
+      /* Only once the bar has gone: while the controls are up this is an
+         ordinary scrubber, and the meter would be a second, livelier line
+         drawn over it. */
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-progress-bar {
+        background: transparent !important;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-progress-paint,
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-progress-buffer,
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-progress-handle {
+        opacity: 0 !important;
+      }
+      /* Idle cover art, the same shape the strip takes: the clock at the head
+         of the row and the total at its tail, with the meter between them and
+         nothing else. */
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden {
+        opacity: 1 !important;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-controls-left,
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-progress-container,
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-time {
+        opacity: 1 !important;
+        transform: none !important;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-time {
+        background: none !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+      }
+      :host(.movi-cover-art) .movi-controls-left > *:not(.movi-time),
+      :host(.movi-cover-art) .movi-controls-right,
+      :host(.movi-cover-art) .movi-controls-center {
+        max-width: 400px;
+        overflow: hidden;
+        transition:
+          max-width 260ms var(--movi-motion-out),
+          opacity 160ms ease;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-controls-left > *:not(.movi-time),
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-controls-right,
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-controls-center {
+        max-width: 0 !important;
+        min-width: 0 !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+      /* …but a menu opens OUT of those clusters, and the clip that makes the
+         collapse look like a collapse cuts it off — the settings panel came up
+         in the DOM, with a real box in the middle of the player, and painted
+         nothing at all: its cluster is 42px wide with overflow:hidden, and the
+         button row it sits in is clipped the same way on the other axis.
+         While a bottom menu is open the bar is necessarily up and nothing is
+         collapsing, so the clip can stand down for exactly that long. */
+      :host(.movi-cover-art.movi-bottom-menu-open) .movi-controls-left > *:not(.movi-time),
+      :host(.movi-cover-art.movi-bottom-menu-open) .movi-controls-right,
+      :host(.movi-cover-art.movi-bottom-menu-open) .movi-controls-center,
+      :host(.movi-cover-art.movi-bottom-menu-open) .movi-buttons-row {
+        overflow: visible;
+      }
+
+      /* The button row stands down entirely when the bar is idle — its clock
+         is drawn into the meter instead (see drawCoverEqualizer), on the same
+         line as the dots rather than a row below them. */
+      :host(.movi-cover-art) .movi-buttons-row {
+        transition: max-height 220ms var(--movi-motion-out), opacity 160ms ease;
+        max-height: 80px;
+        overflow: hidden;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-buttons-row {
+        max-height: 0 !important;
+        /* A flex item's automatic minimum is its content, and that minimum
+           BEATS max-height — the row kept its 42px on a phone and pushed the
+           meter that far off the bottom edge. */
+        min-height: 0 !important;
+        margin: 0 !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-progress-container {
+        /* Room for the meter to breathe once it is the only thing in the bar,
+           and clear of the very bottom edge. */
+        padding: 6px 0 20px !important;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-time-separator {
+        max-width: 0 !important;
+        opacity: 0 !important;
+        overflow: hidden !important;
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-duration {
+        position: absolute;
+        /* Flush with the row's end, which is where the elapsed sits at the
+           other one: both are then the container's 12px in from the player's
+           edge. At 2px the total hung 2px further out than the elapsed hung
+           in — not a gap anyone can name, and exactly the kind of thing that
+           reads as crooked. */
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+      }
+      :host(.movi-cover-art) .movi-controls-container.movi-controls-hidden .movi-progress-container {
+        /* Room at the scrubber's tail for the total parked over it. A fixed
+           58px was a guess at one duration's width: "01:31" left 33px of slack
+           after it, so the space before the total came out at twice the space
+           after the elapsed and the row sat lopsided — while "1:23:45" would
+           have had none to spare. The clock publishes the width it actually
+           occupies (see updateTimeDisplay), and the +4px mirrors the 4px that
+           sits after the elapsed inside its own cluster — the row's flex gap
+           supplies the rest, on both sides, whatever it currently is. */
+        padding-right: calc(var(--movi-clock-total-w, 36px) + 4px) !important;
+      }
+
       :host(.movi-audio-strip) .movi-controls-overlay {
         display: none !important;
       }
@@ -22324,6 +27831,13 @@ export class MoviElement extends HTMLElement {
       :host(.movi-audio-strip) .movi-buttons-row {
         display: contents !important;
       }
+      /* With the row out of layout there is no middle to be in the middle of:
+         the centre cluster would centre itself on the BAR, which in strip mode
+         is the scrubber. A host control that asked for the middle of a control
+         bar is asking for something this presentation does not have. */
+      :host(.movi-audio-strip) .movi-controls-center {
+        display: none !important;
+      }
       :host(.movi-audio-strip) .movi-controls-left {
         order: 0 !important;
         flex: 0 0 auto !important;
@@ -22339,6 +27853,23 @@ export class MoviElement extends HTMLElement {
         order: 2 !important;
         flex: 0 0 auto !important;
       }
+
+      /* The strip does not thin out at rest.
+         A picture's bar can go away because the picture is still there to
+         look at. The strip IS the player, so the same move takes the controls
+         off the screen and leaves a clock and a line where the player was:
+         play, volume and the gear all stood down, and the first press after a
+         pause went on bringing them back rather than on doing anything. The
+         row is now what it is at every moment — hideControls() stands down in
+         strip mode (see there), and these keep the row whole even if the
+         hidden class arrives by some other road. */
+      :host(.movi-audio-strip) .movi-controls-container.movi-controls-hidden .movi-controls-left,
+      :host(.movi-audio-strip) .movi-controls-container.movi-controls-hidden .movi-controls-right,
+      :host(.movi-audio-strip) .movi-controls-container.movi-controls-hidden .movi-progress-container {
+        opacity: 1 !important;
+        transform: none !important;
+        pointer-events: auto !important;
+      }
       /* Linear playback (no Range support, over-cap file): the scrubber and
          skip buttons stay — seeking is allowed but clamped in JS to the
          buffered RAM window. Only the timeline *strip* (thumbnail grid across
@@ -22347,8 +27878,8 @@ export class MoviElement extends HTMLElement {
         display: none !important;
       }
       /* Keep the right-side cluster visible but trim it to controls that
-         actually apply to audio playback. Subtitles, HDR, quality, PiP,
-         fullscreen, and rotation are video-only — hiding the buttons
+         actually apply to audio playback. HDR, quality, PiP and rotation
+         are video-only — hiding the buttons
          instead of the whole container preserves audio-track switching
          (multi-lang files), speed, and the stable-audio compressor. */
       :host(.movi-audio-strip) .movi-controls-right {
@@ -22402,14 +27933,16 @@ export class MoviElement extends HTMLElement {
          sound as over a picture — lyrics, a translation, a podcast transcript —
          and hiding the picker also took the row out of the settings panel,
          which reads its availability from this container. Audio tracks were
-         never hidden here for the same reason. */
+         never hidden here for the same reason.
+         Nor is fullscreen: audio has a full-screen view of its own — the
+         cover art, or a drawn sleeve when there is none (see
+         updateCoverArtOverlay). */
       :host(.movi-audio-mode) .movi-quality-container,
       :host(.movi-audio-mode) .movi-hdr-container,
       :host(.movi-audio-mode) .movi-aspect-ratio-btn,
       :host(.movi-audio-mode) .movi-pip-btn,
       :host(.movi-audio-mode) .movi-snapshot-btn,
-      :host(.movi-audio-mode) .movi-rotate-btn,
-      :host(.movi-audio-mode) .movi-fullscreen-btn {
+      :host(.movi-audio-mode) .movi-rotate-btn {
         display: none !important;
       }
       /* Host controls registered with media:"video" / media:"audio" — the
@@ -22425,6 +27958,20 @@ export class MoviElement extends HTMLElement {
       :host(:not(.movi-audio-mode)) .movi-context-menu-item[data-audio-only] {
         display: none !important;
       }
+      /* And the same for screen:"fullscreen" / "windowed". Fullscreen is a
+         different amount of room and a different amount of attention: a
+         "Suggestions" button has a screen to sit in there and would crowd a
+         360px embed, and a control that only makes sense beside the page it
+         came from should not follow the viewer out of it. The class is set on
+         every fullscreen route — see applyFullscreenUiState. */
+      :host(:not(.movi-fullscreen-active)) .movi-custom-btn[data-fullscreen-only],
+      :host(:not(.movi-fullscreen-active)) .movi-context-menu-item[data-fullscreen-only] {
+        display: none !important;
+      }
+      :host(.movi-fullscreen-active) .movi-custom-btn[data-windowed-only],
+      :host(.movi-fullscreen-active) .movi-context-menu-item[data-windowed-only] {
+        display: none !important;
+      }
       /* In audio mode the album art is painted by the cover-art canvas (which
          persists through playback, unlike the pre-play poster overlay) — hide
          the raw poster <img> so it doesn't double up over the canvas. The
@@ -22438,21 +27985,61 @@ export class MoviElement extends HTMLElement {
          blur's soft edges stay outside the (overflow:hidden) overlay. */
       .movi-cover-art-bg {
         position: absolute;
-        inset: -12%;
+        inset: -14%;
         background-size: cover;
         background-position: center;
         background-repeat: no-repeat;
-        filter: blur(40px) brightness(0.5);
-        transform: scale(1.18);
+        filter: blur(54px) brightness(0.42) saturate(1.22);
+        transform: scale(1.2);
         will-change: filter;
+      }
+      /* The blurred sleeve supplies the colour, while these scrims supply the
+         lighting. A single dark filter made pale artwork turn into one flat,
+         muddy rectangle; the offset glow keeps the surface dimensional and
+         the bottom vignette gives the waveform a reliably calm backdrop. */
+      .movi-cover-art-overlay::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        pointer-events: none;
+        background:
+          radial-gradient(ellipse 52% 62% at 26% 32%, rgba(var(--movi-cover-accent, 255, 255, 255), 0.24), transparent 72%),
+          radial-gradient(ellipse 50% 58% at 80% 24%, rgba(var(--movi-cover-secondary, 255, 255, 255), 0.14), transparent 70%),
+          linear-gradient(180deg, rgba(7, 7, 9, 0.04) 0%, rgba(7, 7, 9, 0.12) 58%, rgba(7, 7, 9, 0.58) 100%);
+      }
+      .movi-cover-art-overlay::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 3;
+        pointer-events: none;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.18'/%3E%3C/svg%3E");
+        background-size: 180px 180px;
+        mix-blend-mode: soft-light;
+        opacity: 0.34;
+        box-shadow:
+          inset 0 0 0 1px rgba(255, 255, 255, 0.035),
+          inset 0 -80px 110px rgba(0, 0, 0, 0.16);
+      }
+      .movi-cover-art-overlay > canvas {
+        z-index: 2;
+        animation: movi-cover-art-enter 520ms var(--movi-motion-out) both;
+      }
+      @keyframes movi-cover-art-enter {
+        from { opacity: 0; transform: translateY(8px) scale(0.992); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .movi-cover-art-overlay > canvas { animation: none; }
       }
       /* Strip-mode keyboard-shortcuts panel: the base CSS centres it
          inside the host via position:absolute + top:50%/left:50%, but
          the host is only 56px tall in strip mode so the panel lands
          half-off-screen above the bar. Switch to viewport-fixed
          centring so the panel sits cleanly in the page area below the
-         strip. Also drop the video-only rows — fullscreen, PiP,
-         frame-step, subtitle keys, aspect, rotate, HDR, snapshot,
+         strip. Also drop the video-only rows — PiP, frame-step,
+         subtitle keys, aspect, rotate, HDR, snapshot,
          timeline don't apply to audio playback. */
       :host(.movi-audio-strip) .movi-shortcuts-panel {
         position: fixed !important;
@@ -22464,6 +28051,12 @@ export class MoviElement extends HTMLElement {
         display: none !important;
       }
       :host(:not(.movi-audio-mode)) .movi-shortcut-row[data-audio-only] {
+        display: none !important;
+      }
+      :host(:not(.movi-fullscreen-active)) .movi-shortcut-row[data-fullscreen-only] {
+        display: none !important;
+      }
+      :host(.movi-fullscreen-active) .movi-shortcut-row[data-windowed-only] {
         display: none !important;
       }
       /* Same treatment for the Stats-for-Nerds panel — its default
@@ -22486,13 +28079,12 @@ export class MoviElement extends HTMLElement {
       }
 
       /* Mirror the same gate inside the right-click context menu —
-         aspect ratio / PiP / fullscreen / rotate / ambient / snapshot
-         / timeline make no sense for an audio-only source. Keep
-         play-pause, speed, loop, stable-audio, nerd-stats and
-         keyboard-shortcuts; everything else is video-frame work. */
+         aspect ratio / PiP / rotate / ambient / snapshot / timeline make
+         no sense for an audio-only source. Keep play-pause, speed, loop,
+         stable-audio, fullscreen, nerd-stats and keyboard-shortcuts;
+         everything else is video-frame work. */
       :host(.movi-audio-mode) .movi-context-menu-item[data-action="fit"],
       :host(.movi-audio-mode) .movi-context-menu-item[data-action="pip"],
-      :host(.movi-audio-mode) .movi-context-menu-item[data-action="fullscreen"],
       :host(.movi-audio-mode) .movi-context-menu-item[data-action="rotate-video"],
       :host(.movi-audio-mode) .movi-context-menu-item[data-action="ambient-toggle"],
       :host(.movi-audio-mode) .movi-context-menu-item[data-action="snapshot"],
@@ -22525,6 +28117,11 @@ export class MoviElement extends HTMLElement {
         display: none !important;
       }
       :host(.movi-native-video) .movi-context-menu-item[data-action="fit"],
+      /* Cropping the bars is the canvas drawing a smaller rectangle; a native
+         <video> has no such lever, so the row would take the click and change
+         nothing. (The settings panel's own crop row already follows Aspect's
+         availability and is gone here for the same reason.) */
+      :host(.movi-native-video) .movi-context-menu-item[data-action="crop-toggle"],
       :host(.movi-native-video) .movi-context-menu-item[data-action="rotate-video"],
       :host(.movi-native-video) .movi-context-menu-item[data-action="ambient-toggle"],
       :host(.movi-native-video) .movi-context-menu-item[data-action="snapshot"],
@@ -22715,8 +28312,6 @@ export class MoviElement extends HTMLElement {
         font-size: 12px !important;
         white-space: nowrap;
       }
-      /* The seek thumbnail tooltip is tied to a non-existent video frame
-         in strip mode — suppress so the hover preview doesn't pop up. */
       /* Audio: there is no frame to preview, so the card is just its readout.
          The FRAME goes (it would shimmer forever waiting for a picture that is
          never fetched — see applyAudioOnly) and the pill stays, because where
@@ -22726,8 +28321,27 @@ export class MoviElement extends HTMLElement {
       :host(.movi-audio-mode) .movi-thumbnail-placeholder {
         display: none !important;
       }
+      /* The strip gets that readout too. It used to take the whole card away
+         on the grounds that there was no frame behind it — but the frame is
+         what the rule above already removes, and what is left is the one thing
+         a scrubber this short needs most: where the pointer is actually
+         pointing. The card clears the top of the row (the host does not clip
+         it, the same way its menus open past the bar) and sits above the title
+         band when there is one. */
       :host(.movi-audio-strip) .movi-seek-thumbnail {
-        display: none !important;
+        bottom: 22px;
+      }
+      :host(.movi-audio-strip.movi-has-title) .movi-seek-thumbnail {
+        bottom: 26px;
+      }
+      /* The card rides in the title band, because there is nowhere else in a
+         56px row for it to go and floating it above the host would put it over
+         whatever the page keeps there. So the title steps aside while it is
+         up — the same arrangement the OSD pill already has with the title, and
+         for the same reason: the two want the same line, and only one of them
+         is being pointed at. */
+      :host(.movi-audio-strip):has(.movi-seek-thumbnail.visible) .movi-title-bar {
+        opacity: 0 !important;
       }
     `;
     shadowRoot.appendChild(style);
@@ -22804,6 +28418,16 @@ export class MoviElement extends HTMLElement {
     // the first load with every attribute already applied.
     this._hasConnected = true;
 
+    // …and `data-setup` is attributes too, just written as JSON. Applied first
+    // so everything below reads one settled set.
+    this.applyDataSetup();
+
+    // Before anything measures anything: a player given a width and no height
+    // has to get its height from its own shape, not from its contents. See
+    // applyIntrinsicAspect.
+    this.applySizeAttributes();
+    this.applyIntrinsicAspect();
+
     // Remembered settings go on BEFORE the first load, so the player opens on
     // the viewer's last choices rather than snapping to them a moment after.
     this.applyPersistedSettings();
@@ -22829,7 +28453,10 @@ export class MoviElement extends HTMLElement {
     // the "No Video" placeholder) on a bare, controls-less player — done with a
     // class rather than :host(:not([controls])), which is flaky in Safari/FF.
     this.classList.toggle("movi-no-controls", !this._controls);
-    this._loop = this.hasAttribute("loop");
+    this.applyLoop(this.getAttribute("loop"));
+    this._shuffle = this.hasAttribute("shuffle");
+    this._smoothWarning = this.isSmoothWarningOn(this.getAttribute("smoothwarning"));
+    this._noLinkWarning = this.hasAttribute("nolinkwarning");
     this._muted = this.hasAttribute("muted");
     this._playsinline = this.hasAttribute("playsinline");
     this._preload =
@@ -22844,6 +28471,17 @@ export class MoviElement extends HTMLElement {
     if (subtitleDelayAttr) {
       const parsed = parseFloat(subtitleDelayAttr);
       if (Number.isFinite(parsed)) this._subtitleDelay = parsed;
+    }
+    const spinnerDelayAttr = this.getAttribute("spinnerdelay");
+    if (spinnerDelayAttr) {
+      const spin = MoviElement.parseSpinnerDelay(spinnerDelayAttr);
+      this._spinnerDelay = spin.stall;
+      this._spinnerDelayOpening = spin.opening;
+    }
+    const posterDelayAttr = this.getAttribute("posterdelay");
+    if (posterDelayAttr) {
+      const ms = parseFloat(posterDelayAttr);
+      if (Number.isFinite(ms) && ms >= 0) this._posterDelayMs = ms;
     }
     this._ambientMode = this.hasAttribute("ambientmode");
     this._ambientWrapper = this.getAttribute("ambientwrapper");
@@ -22872,6 +28510,14 @@ export class MoviElement extends HTMLElement {
     this.updateFitMode();
 
     this._thumb = this.hasAttribute("thumb");
+    this._thumbPrecise = MoviElement.wantsPrecisePreviews(
+      this.getAttribute("thumb"),
+    );
+    // A spec set through the property outranks a declared track — the property
+    // is the richer form, and a wrapper that sets both means the object.
+    if (typeof this._storyboard !== "object" || this._storyboard === null) {
+      this._storyboard = MoviElement.thumbnailTrackSrc(this);
+    }
     this._hdr = this.hasAttribute("hdr") || this.getAttribute("hdr") === null; // Default to true if attribute is missing
     const themeAttr = this.getAttribute("theme");
     if (themeAttr === "light" || themeAttr === "dark") {
@@ -22927,6 +28573,11 @@ export class MoviElement extends HTMLElement {
     // time webglcontextlost fires the GPU buffer is already gone, so snapshot
     // proactively. Used as a poster during context-loss recovery.
     document.addEventListener("visibilitychange", this._onVisibilityChange);
+    // The last two moments a page can still write anything before the browser
+    // takes its memory back: `freeze` is what Chrome fires ahead of a discard,
+    // `pagehide` covers the rest.
+    document.addEventListener("freeze", this._onPageLeaving);
+    window.addEventListener("pagehide", this._onPageLeaving);
 
     // Initial state: disable controls except volume
     this.updateControlsState();
@@ -22955,6 +28606,12 @@ export class MoviElement extends HTMLElement {
       // Track menus (subtitle / audio / quality) cap themselves at this
       // height so the panel never grows taller than the player itself.
       if (h > 0) this.style.setProperty("--movi-player-height", `${h}px`);
+      // A player too short for the settings panel's full rows: the panel is
+      // capped at the frame's height, and on a 260px phone player that left
+      // two and a half rows showing. The class tightens its spacing instead —
+      // a height the @container query on this host cannot see, being
+      // inline-size only.
+      if (h > 0) this.classList.toggle("movi-short", h < MoviElement.SHORT_PLAYER_PX);
       this.syncPictureRounding();
     };
     publishPlayerWidth();
@@ -22989,14 +28646,17 @@ export class MoviElement extends HTMLElement {
     // Listen for resize events
     if (typeof ResizeObserver !== "undefined") {
       const resizeObserver = new ResizeObserver(() => {
+        this._previewCapsCache = null; // the hover card's box is sized off the player
         publishPlayerWidth();
         this.syncTinyLayout();
         this.updateCanvasSize();
+        this.refreshChapterGaps();
       });
       resizeObserver.observe(this);
     } else {
       // Fallback for browsers without ResizeObserver
       window.addEventListener("resize", () => {
+        this._previewCapsCache = null;
         publishPlayerWidth();
         this.syncTinyLayout();
         this.updateCanvasSize();
@@ -23017,6 +28677,7 @@ export class MoviElement extends HTMLElement {
     this._videoUrl = this.getAttribute("videourl") || "";
     this._videoId = this.getAttribute("videoid") || "";
     this._resume = this.hasAttribute("resume");
+    this._resumeKey = (this.getAttribute("resumekey") || "").trim();
     this._stableVolume = this.hasAttribute("stablevolume");
     this._bindAV = MoviElement.readBindAV(this.getAttribute("bindav"));
     this._audioOnly = this.hasAttribute("audioonly");
@@ -23055,6 +28716,14 @@ export class MoviElement extends HTMLElement {
     SettingsStorage.getInstance()
       .load()
       .then((settings) => {
+        // Asked again now that the store has answered. A framework sets its
+        // props AFTER connecting the element (see the `persist` case in
+        // attributeChangedCallback), so a host that opted into `persist` — or
+        // passed an empty one to switch remembering off, the way a muted,
+        // cover-fitted hover preview must — was not yet saying so when this
+        // started, and the always-on store went on to put last session's
+        // volume, mute and fit over that host's markup anyway.
+        if (!this.legacySettingsEnabled()) return;
         let changed = false;
 
         // Restoring persisted settings is not a user action, so it must not
@@ -23087,7 +28756,12 @@ export class MoviElement extends HTMLElement {
         if (settings.volume !== undefined) {
           this._volume = settings.volume;
           this.noteStoredChoice("volume", true, String(settings.volume));
-          this.updateVolume();
+          // Silent: this is last session's volume coming back, not someone
+          // reaching for the slider. It read as a change of its own because
+          // the OSD's key includes `muted`, and a blocked autoplay had muted
+          // us in between — so a restore of the SAME volume announced itself
+          // as "muted 90%" seconds into a video the viewer had just opened.
+          this.updateVolume(true);
           changed = true;
         }
 
@@ -23148,6 +28822,9 @@ export class MoviElement extends HTMLElement {
         // Apply crop-bars preference
         if (settings.cropBars !== undefined) {
           this._cropBars = settings.cropBars;
+          // Recorded like the toggles above it — without it a host that
+          // re-reflects its own `cropbars` on render takes the answer back.
+          this.noteStoredChoice("cropbars", settings.cropBars);
           if (settings.cropBars) {
             this.setAttribute("cropbars", "");
           } else {
@@ -23224,11 +28901,36 @@ export class MoviElement extends HTMLElement {
       this.handleContextRestored,
     );
     document.removeEventListener("visibilitychange", this._onVisibilityChange);
+    document.removeEventListener("freeze", this._onPageLeaving);
+    window.removeEventListener("pagehide", this._onPageLeaving);
+    if (this._outsideTapHandler) {
+      document.removeEventListener("pointerdown", this._outsideTapHandler, true);
+      this._outsideTapHandler = null;
+    }
+    if (this._settingsOutsideHandler) {
+      document.removeEventListener(
+        "pointerdown",
+        this._settingsOutsideHandler,
+        true,
+      );
+      this._settingsOutsideHandler = null;
+    }
+    // A spinner still waiting out its delay, for a player that is no longer in
+    // the document.
+    if (this._spinnerDelayTimer !== null) {
+      clearTimeout(this._spinnerDelayTimer);
+      this._spinnerDelayTimer = null;
+    }
+    this._spinnerEarned = false;
+
     // Cleanup nerd stats interval
     if (this.nerdStatsInterval) {
       clearInterval(this.nerdStatsInterval);
       this.nerdStatsInterval = null;
     }
+    // A queued next item, for a player that is no longer in the document.
+    // Removal is not a reason to load another video.
+    this.cancelAutoAdvance();
 
     // Save position and stop resume saving
     if (this._resume) this.saveResumePosition();
@@ -23321,6 +29023,8 @@ export class MoviElement extends HTMLElement {
         break;
       case "thumb":
         this._thumb = newValue !== null;
+        this._thumbPrecise = MoviElement.wantsPrecisePreviews(newValue);
+        this.player?.setPrecisePreviews(this._thumbPrecise);
         // Sync an already-created player so toggling `thumb` at runtime — or
         // declaring it after `src` (whose callback builds the player first) —
         // enables/disables scrub previews live instead of silently no-opping.
@@ -23328,7 +29032,13 @@ export class MoviElement extends HTMLElement {
         break;
       case "hdr":
         if (this.hostOverridingStoredChoice("hdr", newValue)) return;
-        this.hdr = newValue !== null;
+        // Applied, not chosen. Routed through the public setter this was the
+        // one attribute that saved the HOST's value into the viewer's store and
+        // announced it as `hdrchange` — every neighbour (ambientmode,
+        // stablevolume, cropbars) applies its attribute silently, and the
+        // events are for choices a host could not have seen. The setter still
+        // runs for the viewer's own toggles, and it is what reflects to here.
+        if ((newValue !== null) !== this._hdr) this.applyHdr(newValue !== null);
         break;
       case "theme":
         this.theme = (newValue as "light" | "dark") || "dark";
@@ -23391,11 +29101,56 @@ export class MoviElement extends HTMLElement {
       case "titlemode":
         this.applyTitleMode(newValue);
         break;
+      case "smoothwarning":
+        this._smoothWarning = this.isSmoothWarningOn(newValue);
+        if (this._smoothWarning) {
+          // Turned on with something already loaded: ask now, not at the next load.
+          this._smoothWarnKey = null;
+          void this.checkSmoothPlayback();
+        } else {
+          this.hideSmoothWarning();
+        }
+        break;
+      case "nolinkwarning":
+        this._noLinkWarning = newValue !== null;
+        if (this._noLinkWarning) this._linkProbeAbort?.abort();
+        break;
+      case "subtitlepicker":
+        this._subtitlePicker = newValue !== null;
+        this.updateSubtitleTrackMenu();
+        break;
       case "chapters":
         this.applyChapters(newValue);
         break;
+      case "playlist":
+        this.applyPlaylist(newValue);
+        break;
+      case "playlistindex": {
+        // Only ever a REQUEST to be at an index. Before the list has arrived it
+        // is remembered and applied with it — markup order puts playlistindex
+        // before playlist as often as not.
+        const n = newValue == null ? 0 : parseInt(newValue, 10);
+        this._playlistStartIndex = Number.isFinite(n) && n > 0 ? n : 0;
+        if (this._playlist.length) this.playItem(this._playlistStartIndex);
+        break;
+      }
+      case "autoadvance":
+        this.applyAutoAdvance(newValue);
+        break;
+      case "shuffle": {
+        const on = newValue !== null && newValue !== "false" && newValue !== "off";
+        if (on !== this._shuffle) {
+          this._shuffle = on;
+          this.rebuildPlayOrder();
+          this.refreshPlaylistUi();
+        }
+        break;
+      }
       case "resume":
         this._resume = newValue !== null;
+        break;
+      case "resumekey":
+        this._resumeKey = (newValue || "").trim();
         break;
       case "vr": {
         // Tokens: (bare)/360 → 360°, 180 → VR180, sbs/3d → stereo SBS,
@@ -23418,6 +29173,8 @@ export class MoviElement extends HTMLElement {
         WasmBindings.probeAnalyzeMs = Math.max(0, parseInt(newValue || "0", 10) || 0);
         break;
       case "cropbars":
+        // The same guard its neighbours have — see the setter.
+        if (this.hostOverridingStoredChoice("cropbars", newValue)) return;
         this._cropBars = newValue !== null;
         this.applyBarCrop();
         this.updateCropUI();
@@ -23487,6 +29244,9 @@ export class MoviElement extends HTMLElement {
         this._videoId = newValue || "";
         break;
       case "src": {
+        // The attribute is the other half of the property setter — a framework
+        // writes this one. Same reading of "was the board written with it".
+        this.noteSourceAssigned();
         // When switching from a File source to a URL, clear the File reference
         // so the URL path can proceed. Without this, the File instanceof check
         // blocks the URL from loading.
@@ -23505,40 +29265,16 @@ export class MoviElement extends HTMLElement {
           // `el.src = url` announced the load but `el.setAttribute("src", url)`
           // — the same thing to a host, and what frameworks emit — stayed
           // silent. A <video> fires it for both.
-          this.dispatchEvent(
-            new CustomEvent("loadstart", { detail: { src: this._src } }),
-          );
+          this.announceLoadStart(this._src);
           // New source → reset the "has been played" flag so the
           // next source's initial poster-seek "paused" transition
           // doesn't trigger a premature bar surface.
-          // Any src (re)set — even to the same URL — is a fresh load, so clear
-          // the DASH-fallback guards: the fallback must be able to run again,
-          // and a stale forced-quality pick must not carry over. (The
-          // quality-switch re-init calls load() directly, not setAttribute, so
-          // it never reaches here — no risk of clearing its own forced pick.)
-          this._streamDemuxTried = false;
-          this._streamEngineTried = false;
-          // Same for the `engine` priority walk — the new source starts at the
-          // top of the author's list, not wherever the last one gave up.
-          this._engineTried.clear();
-          // Fresh source → fresh pre-play speed test.
-          this._startProbeDone = false;
-          this._measuredStartBps = 0;
-          this._forcedDashRendition = null;
-          // A quality switch on a premuxed ladder DOES come through here — each
-          // rung is its own URL, so it sets the src attribute (only the DASH
-          // path calls load() directly). The url differs, but the CONTENT is the
-          // one already playing, so this must not read as a new source: clearing
-          // the flag makes the poster eligible again, and the switch then paints
-          // the static thumbnail over a video that never stopped playing. That
-          // is what the last-frame snapshot is meant to cover, but the snapshot
-          // is best-effort (a tainted or already-wiped canvas gives nothing back)
-          // — which is exactly why the cover appeared only sometimes.
+          this.resetForFreshSource();
+          // A rebuild rewrites the attribute mid-flight; the empty-source check
+          // further down reads this to tell that apart from a host clearing the
+          // source outright.
           const isRebuild =
             this._qualitySwitchInProgress || this._fullRecreateInFlight;
-          if (newValue !== oldSrc && !isRebuild) {
-            this._hasEverPlayed = false;
-          }
 
           // Show/hide empty state indicator based on src
           if (this.emptyStateIndicator) {
@@ -23632,6 +29368,10 @@ export class MoviElement extends HTMLElement {
         break;
       case "disablepictureinpicture":
         this._disablePip = newValue !== null;
+        this.syncVideoPipBlock();
+        break;
+      case "controlslist":
+        this.applyControlsList();
         break;
       case "disableremoteplayback":
         this._disableRemote = newValue !== null;
@@ -23641,7 +29381,7 @@ export class MoviElement extends HTMLElement {
         }
         break;
       case "loop":
-        this._loop = newValue !== null;
+        this.applyLoop(newValue);
         this.updateLoopUI();
         // Update loop handler if player exists
         if (this.player) {
@@ -23686,6 +29426,12 @@ export class MoviElement extends HTMLElement {
         this._preload = (newValue as "none" | "metadata" | "auto") || "auto";
         break;
       case "poster":
+        // A poster set (or changed) after the handoff has to reach the element
+        // that is actually showing it — see engageNativeFallback.
+        if (this._nativeFallbackActive && this.video) {
+          if (newValue) this.video.setAttribute("poster", newValue);
+          else this.video.removeAttribute("poster");
+        }
         this._poster = newValue || "";
         this.updatePoster();
         break;
@@ -23717,6 +29463,12 @@ export class MoviElement extends HTMLElement {
         break;
       case "width":
       case "height":
+        // The attribute is a size, the way it is on <video> — see
+        // applySizeAttributes.
+        this.applySizeAttributes();
+        // A height of the author's own retires the fallback ratio (and setting
+        // one back to nothing brings it back) — see applyIntrinsicAspect.
+        this.applyIntrinsicAspect();
         this.updateCanvasSize();
         break;
       case "crossorigin":
@@ -23756,10 +29508,77 @@ export class MoviElement extends HTMLElement {
           }
         }
         break;
+      case "posterdelay": {
+        const ms = parseFloat(newValue ?? "");
+        this._posterDelayMs = Number.isFinite(ms) && ms >= 0 ? ms : 0;
+        // The same late-arrival problem spinnerdelay documents below, and the
+        // same answer. A React or Vue wrapper reflects its props in a post-mount
+        // effect, so this number lands a frame AFTER the element connected and
+        // started loading — by which point the opening poster has been painted
+        // under the default of 0 and the delay the page asked for could never
+        // take effect. Measured on this app: posterdelay="600" arrived, and the
+        // cover still went up at 208ms.
+        //
+        // So take it back down and re-arm. Nothing has painted yet (that is
+        // what the flag says), so there is no picture being uncovered — and in
+        // practice this lands while showPoster is still awaiting its decode,
+        // before the poster was ever on screen at all.
+        if (
+          this._posterDelayMs > 0 &&
+          !this._hasEverPlayed &&
+          this.posterElement &&
+          this.posterElement.style.display === "block" &&
+          !this._snapshotPosterActive
+        ) {
+          const url = this._poster || this._generatedPosterUrl;
+          this.hidePoster();
+          if (url) void this.showPoster(url);
+        }
+        break;
+      }
+      case "spinnerdelay": {
+        const spin = MoviElement.parseSpinnerDelay(newValue);
+        this._spinnerDelay = spin.stall;
+        this._spinnerDelayOpening = spin.opening;
+        // A wait already running was measured against the old number and means
+        // nothing now. Drop it and let the next tick ask again — which it will,
+        // within a frame or two, if whatever asked for it is still loading.
+        if (this._spinnerDelayTimer !== null) {
+          clearTimeout(this._spinnerDelayTimer);
+          this._spinnerDelayTimer = null;
+        }
+        // And a spinner already SHOWN was earned against that same old number,
+        // so it means nothing now either. This is not a corner case: a React or
+        // Vue wrapper reflects its props in a post-mount effect, so the value
+        // arrives a frame AFTER the element connected and began loading — by
+        // which point the opening had already put the ring up under the default
+        // of 0 and latched `_spinnerEarned`, and the number the page went to
+        // the trouble of setting could not take effect until the next
+        // interruption. Measured on a React host asking for a one-second
+        // opening: mount, ring up 22ms later, attribute landing on that same
+        // frame, ring then sitting there for 441ms. Ending the run here lets
+        // the next tick re-ask under the number the page actually set.
+        if (this._spinnerEarned) {
+          this._spinnerEarned = false;
+          // Down, then asked again under the new number. The hide is the full
+          // one — is-buffering means the ring is UP, and leaving it behind had
+          // strip mode pulsing its progress bar and the PiP window showing its
+          // spinner through a wait that was deliberately keeping quiet. What
+          // covers the gap is the re-ask: it arms the new wait, and a pending
+          // wait is still a player that is loading, so the centre play button
+          // stays off. Without that the button came through for a frame on a
+          // video that was already autoplaying.
+          this.applySpinnerVisible(false);
+          this.setSpinnerVisible(true);
+        }
+        break;
+      }
       case "ambientmode":
         if (this.hostOverridingStoredChoice("ambientmode", newValue)) return;
         this._ambientMode = newValue !== null;
         this.updateAmbientMode();
+        // The menus' switch too — see the setter.
+        this.updateAmbientUI();
         break;
       case "ambientwrapper":
         this._ambientWrapper = newValue;
@@ -23852,6 +29671,270 @@ export class MoviElement extends HTMLElement {
   private _lastCanvasW: number = 0;
   private _lastCanvasH: number = 0;
 
+  /**
+   * Keep the element from having to measure its own content to know how tall
+   * it is.
+   *
+   * `:host` is `height: 100%`, which against a parent of auto height resolves
+   * to auto — and the canvas inside is `height: 100%` of THAT, so it falls back
+   * to its intrinsic size: the backbuffer, in device pixels. The host then
+   * takes its content height from the canvas, updateCanvasSize measures the
+   * host, and sets a backbuffer bigger again. Measured on a player given a
+   * width and no height: 8,694px tall on the first sample and climbing ~840px
+   * a second, with the picture a sliver at the top of a canvas tens of
+   * thousands of pixels long — which reads as "it never played".
+   *
+   * An aspect ratio breaks the loop: the height comes from the width, and
+   * nothing downstream can feed back into it. Only when the author hasn't
+   * given a height of their own — with one, `height: 100%` is definite and CSS
+   * ignores `aspect-ratio` anyway, so this stays out of the way.
+   */
+  /**
+   * `width` / `height` attributes, as a `<video>` would answer them.
+   *
+   * On a replaced element those are presentational hints the browser turns into
+   * a CSS size. A custom element gets no such treatment: the attribute sits
+   * there meaning nothing, so markup carried over from a `<video>` — or written
+   * by someone who reasonably expects HTML to behave like HTML — rendered at
+   * whatever width the container gave it. A page that said 620 got 1710.
+   *
+   * Written as inline style, and only over a size this element put there
+   * itself: a host that styles the player in its own CSS is saying something
+   * more specific than the attribute, and setting the attribute back to nothing
+   * takes the size away again.
+   */
+  private applySizeAttributes(): void {
+    for (const [attr, prop] of [
+      ["width", "width"],
+      ["height", "height"],
+    ] as const) {
+      const raw = (this.getAttribute(attr) || "").trim();
+      if (!raw) {
+        if (this.style.getPropertyValue(prop) && this._sizedByAttr[attr]) {
+          this.style.removeProperty(prop);
+          this._sizedByAttr[attr] = false;
+        }
+        continue;
+      }
+      // A bare number is pixels, as in HTML; anything else (a percentage, a
+      // calc) is taken as the CSS the author wrote.
+      const value = /^\d+(\.\d+)?$/.test(raw) ? `${raw}px` : raw;
+      const current = this.style.getPropertyValue(prop);
+      if (current && !this._sizedByAttr[attr]) continue; // the host's own size wins
+      this.style.setProperty(prop, value);
+      this._sizedByAttr[attr] = true;
+    }
+  }
+
+  private applyIntrinsicAspect(): void {
+    if (this.hasAttribute("height") || this.style.height) {
+      this.style.removeProperty("aspect-ratio");
+      return;
+    }
+    const w = this._lastVideoWidth;
+    const h = this._lastVideoHeight;
+    // Before the first track resolves there is nothing to go on but the
+    // convention — better a 16:9 box than a runaway one.
+    this.style.aspectRatio = w > 0 && h > 0 ? `${w} / ${h}` : "16 / 9";
+  }
+
+  /**
+   * Keep the two ends of the bottom row from running into each other.
+   *
+   * The row is a left cluster (transport + clock) and a right cluster
+   * (settings run), and neither can give way: the clock is nowrap text and the
+   * icons are fixed boxes. When they don't both fit, the left one overflows and
+   * the two draw on top of each other — a host's own control landing across
+   * "00:01 / 04:12" is the same collision as a 200px player having no room for
+   * the clock.
+   *
+   * A width breakpoint can't decide this. `addControl` lets the host put as
+   * many buttons in the row as it likes, and a 2-hour duration is wider than a
+   * 3-minute one, so what fits is a question about the CONTENT, not the
+   * viewport. Measure instead, and give up the clock in the order the parts are
+   * worth keeping: the duration first (the seek bar shows it, and it doesn't
+   * change), then the position.
+   *
+   * Cheap because it is rare — a resize, a duration arriving, a control being
+   * added — and it always measures from the un-hidden state, so a row that
+   * gains space takes its clock back.
+   */
+  /**
+   * Hide any control capsule that has nothing visible left in it.
+   *
+   * The bar's capsules are pills with 2px of padding, and they are drawn by the
+   * container, not by the controls inside it. Take the controls away — a
+   * `controlslist` token, a `fastseek` mode, a source with no track to offer —
+   * and the container stays: 4px of rounded background sitting in the row as a
+   * dot with no meaning. It showed up between play and volume when the ±10s
+   * pair was off, and as the entire right-hand cluster when a host switched
+   * every control in it off.
+   *
+   * Emptiness is measured, not inferred: a child that lays out to nothing is
+   * gone whatever hid it, so this covers hiding done in the stylesheet, in an
+   * attribute and at runtime without having to know which.
+   */
+  private syncEmptyCapsules(): void {
+    const sr = this.shadowRoot;
+    if (!sr) return;
+    const capsules = Array.from(
+      sr.querySelectorAll<HTMLElement>(
+        ".movi-controls-right, .movi-seek-group, .movi-control-group, .movi-controls-center",
+      ),
+    );
+    const was = capsules.map((c) => c.classList.contains("movi-capsule-empty"));
+
+    // Measure from the UN-hidden state, or the verdict feeds itself.
+    //
+    // `movi-capsule-empty` is `display:none`, and a child of a display:none
+    // parent has an offsetWidth of 0 whatever it is. So the moment a capsule
+    // was called empty ONCE, every later measurement agreed with it and it
+    // could never come back. Seen on the watch page: the whole right-hand
+    // cluster — gear, aspect ratio, PiP, fullscreen — gone, with the capsule
+    // still holding five perfectly visible controls, because one early sync
+    // had measured it before the row was laid out.
+    for (const capsule of capsules) {
+      capsule.classList.remove("movi-capsule-empty");
+    }
+
+    capsules.forEach((capsule, i) => {
+      // Nothing on this row is laid out at all — the bar is hidden (auto-hide,
+      // a poster still up), or this is running before the first paint. Every
+      // capsule would measure empty and every capsule would be hidden, which is
+      // how the latch got set in the first place. Keep what we had and leave
+      // the decision to a sync that can actually see the row.
+      if (capsule.getClientRects().length === 0) {
+        capsule.classList.toggle("movi-capsule-empty", was[i]);
+        return;
+      }
+      // A divider is not content: a capsule holding only a line is empty.
+      const filled = Array.from(capsule.children).some(
+        (child) =>
+          !child.classList.contains("movi-controls-divider") &&
+          (child as HTMLElement).offsetWidth > 0,
+      );
+      capsule.classList.toggle("movi-capsule-empty", !filled);
+    });
+    this.syncStrandedDividers();
+  }
+
+  /**
+   * Hide a host's divider that has nothing visible on one side of it, or only
+   * another divider — its neighbour is unavailable for this source, or was
+   * removed. A line at the end of a pill divides nothing and reads as a
+   * rendering fault.
+   *
+   * Neighbours are found by where things ARE, not by DOM siblings: the bar
+   * nests controls in display: contents wrappers (the mobile tray), so the
+   * control drawn beside a divider is often not its sibling. Only what shares
+   * the divider's own capsule counts — a control in the next capsule is on the
+   * other side of a gap already. Left alone while the row isn't laid out.
+   */
+  private syncStrandedDividers(): void {
+    const sr = this.shadowRoot;
+    if (!sr) return;
+    const CAPSULE =
+      ".movi-control-group, .movi-seek-group, .movi-controls-left, .movi-controls-right, .movi-controls-center, .movi-top-controls";
+    const ITEM =
+      ".movi-btn, .movi-controls-divider, .movi-time, .movi-volume-slider-container";
+    // Every divider on the bar, not only the ones a host added. The built-in
+    // one between the track controls and the viewing controls carries
+    // .movi-controls-divider but not .movi-custom-divider, so it was never
+    // considered — and in native fallback, where the subtitle button is gone,
+    // it was left standing with nothing on its left: a stray line at the edge
+    // of the pill. Custom dividers carry both classes, so this still reaches
+    // them.
+    const dividers = Array.from(
+      sr.querySelectorAll<HTMLElement>(".movi-controls-divider"),
+    );
+    for (const d of dividers) {
+      const capsule = d.parentElement?.closest(CAPSULE);
+      if (!capsule || capsule.getClientRects().length === 0) continue;
+      d.classList.remove("movi-divider-stranded");
+    }
+    for (const d of dividers) {
+      const capsule = d.parentElement?.closest(CAPSULE);
+      if (!capsule || capsule.getClientRects().length === 0) continue;
+      const items = Array.from(capsule.querySelectorAll<HTMLElement>(ITEM))
+        .filter((n) => n.offsetWidth > 0 && n.closest(CAPSULE) === capsule)
+        .map((n) => ({ n, r: n.getBoundingClientRect() }))
+        .filter(({ r }) => r.width > 0)
+        .sort((x, y) => x.r.left - y.r.left);
+      const at = items.findIndex(({ n }) => n === d);
+      const side = (i: number) =>
+        i >= 0 && i < items.length &&
+        !items[i].n.classList.contains("movi-controls-divider");
+      d.classList.toggle("movi-divider-stranded", !(side(at - 1) && side(at + 1)));
+    }
+  }
+
+
+  private fitControlsRow(): void {
+    const sr = this.shadowRoot;
+    if (!sr) return;
+    const left = sr.querySelector(".movi-controls-left") as HTMLElement | null;
+    const right = sr.querySelector(".movi-controls-right") as HTMLElement | null;
+    if (!left || !right) return;
+    const centre = sr.querySelector(
+      ".movi-controls-center",
+    ) as HTMLElement | null;
+    // Two ways the row runs out of room, and the second one is the common one.
+    //
+    //  1. The left cluster reaches the settings run. 6px so the two never
+    //     touch, let alone overlap.
+    //  2. The left cluster is SQUEEZED (it shrinks; the settings run does not)
+    //     and its own contents — nowrap text and fixed boxes — spill out of it.
+    //     What they spill onto is whatever the row puts next, which is not
+    //     always the settings run: a host control given its own group sits
+    //     between the two clusters, and movi-tube's autoplay pill is exactly
+    //     that. Measured there: the clusters were 54px apart while the clock
+    //     hung 17px past its own cluster, straight across the pill. Comparing
+    //     the two clusters saw nothing wrong.
+    const collides = () => {
+      const l = left.getBoundingClientRect();
+      const r = right.getBoundingClientRect();
+      if (l.width === 0) return false;
+      if (r.width > 0 && l.right > r.left - 6) return true;
+      let contentRight = 0;
+      for (const kid of Array.from(left.children)) {
+        const el = kid as HTMLElement;
+        if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") {
+          continue;
+        }
+        contentRight = Math.max(contentRight, el.getBoundingClientRect().right);
+      }
+      return contentRight > l.right + 1;
+    };
+    // The middle is out of flow, so nothing in the row gives way for it and
+    // the check above cannot see it: a centre control simply gets drawn across
+    // whichever cluster reaches it first. Measured separately, and measured
+    // from the shown state — a cluster hidden for being crowded has a zero-width
+    // rect that agrees with every later reading, which is how a latch like this
+    // one gets stuck on.
+    const centreCrowded = () => {
+      if (!centre || centre.getClientRects().length === 0) return false;
+      const c = centre.getBoundingClientRect();
+      if (c.width === 0) return false;
+      const l = left.getBoundingClientRect();
+      const r = right.getBoundingClientRect();
+      return (
+        (l.width > 0 && l.right > c.left - 8) ||
+        (r.width > 0 && r.left < c.right + 8)
+      );
+    };
+    this.classList.remove("movi-clock-compact", "movi-clock-hidden");
+    centre?.classList.remove("movi-center-crowded");
+    if (collides()) {
+      this.classList.add("movi-clock-compact");
+      if (collides()) this.classList.add("movi-clock-hidden");
+    }
+    // Measured last, after the row has settled into whichever of those states
+    // it needed. The row gives nothing up for the middle — the clock is the
+    // player's own and the control in the middle is an offer — so when the two
+    // meet, the middle is what steps aside.
+    if (centreCrowded()) centre?.classList.add("movi-center-crowded");
+  }
+
   private updateCanvasSize() {
     const widthAttr = this.getAttribute("width");
     const heightAttr = this.getAttribute("height");
@@ -23871,9 +29954,18 @@ export class MoviElement extends HTMLElement {
       width = this.clientWidth;
       height = this.clientHeight;
     } else {
+      // The LAYOUT box, not getBoundingClientRect: the rect includes any CSS
+      // transform on an ancestor, and a host that animates the player with one
+      // (a miniplayer growing back to full size scales it from the small box)
+      // got a drawing buffer sized to the SCALED box. The transform then ended
+      // with no layout change, the observer never fired again, and the picture
+      // stayed at the small resolution — pixelated. The rect stays the fallback
+      // for a box with no layout size (display: contents and the like).
       const rect = this.getBoundingClientRect();
-      width = widthAttr ? parseInt(widthAttr, 10) : rect.width;
-      height = heightAttr ? parseInt(heightAttr, 10) : rect.height;
+      const layoutW = this.clientWidth || rect.width;
+      const layoutH = this.clientHeight || rect.height;
+      width = widthAttr ? parseInt(widthAttr, 10) : layoutW;
+      height = heightAttr ? parseInt(heightAttr, 10) : layoutH;
     }
 
     if (width > 0 && height > 0) {
@@ -23901,6 +29993,9 @@ export class MoviElement extends HTMLElement {
       // when the overlay is hidden (no bitmap / has video track) since
       // it bails before any drawImage work.
       this.updateCoverArtOverlay();
+      // The row got wider or narrower; re-decide what still fits in it.
+      this.fitControlsRow();
+      this.syncEmptyCapsules();
     }
   }
 
@@ -23912,6 +30007,15 @@ export class MoviElement extends HTMLElement {
    * Cheap + idempotent — safe to call on every timeupdate.
    */
   private updateLiveState(): void {
+    // A playing file whose container never wrote a duration down is the other
+    // timeline with no end: the bar runs to the edge like a live one (see
+    // updateProgressBar) and the total is hidden rather than shown as 0:00.
+    // Comes off by itself if the background rescan finds the real length.
+    this.classList.toggle(
+      "movi-unknown-duration",
+      !!this.player?.hasUnknownDuration?.(),
+    );
+
     const isLive = !!this.player?.isLiveStream?.();
     this.classList.toggle("movi-live", isLive);
     if (!isLive) return;
@@ -24002,8 +30106,164 @@ export class MoviElement extends HTMLElement {
     img.src = url;
   }
 
+  /**
+   * The scrubber, drawn as a row of dots that move with the sound.
+   *
+   * Cover art leaves a whole surface with nothing happening on it: a plain
+   * line under a sleeve reads as a still image with a progress bar bolted on.
+   * The dots carry the position the same way — bright behind the playhead,
+   * dim ahead of it — and ripple with the level, so the picture is playing
+   * something. It is drawn over the real scrubber and never takes its clicks
+   * (pointer-events stay off), so seeking, keyboard and the handle are
+   * untouched.
+   */
+  private startCoverEqualizer(): void {
+    if (this._eqRaf !== null) return;
+    const container = this.shadowRoot?.querySelector(
+      ".movi-progress-container",
+    ) as HTMLElement | null;
+    if (!container) return;
+    if (!this._eqCanvas) {
+      const canvas = document.createElement("canvas");
+      canvas.className = "movi-cover-eq";
+      canvas.setAttribute("aria-hidden", "true");
+      this._eqCanvas = canvas;
+    }
+    if (this._eqCanvas.parentElement !== container) {
+      container.appendChild(this._eqCanvas);
+    }
+    const tick = (): void => {
+      this._eqRaf = requestAnimationFrame(tick);
+      this.drawCoverEqualizer();
+    };
+    this._eqRaf = requestAnimationFrame(tick);
+  }
+
+  private stopCoverEqualizer(): void {
+    if (this._eqRaf !== null) {
+      cancelAnimationFrame(this._eqRaf);
+      this._eqRaf = null;
+    }
+    this._eqCanvas?.remove();
+    this._eqSmoothed = null;
+  }
+
+  private drawCoverEqualizer(): void {
+    const canvas = this._eqCanvas;
+    if (!canvas || !this.classList.contains("movi-cover-art")) return;
+    const rect = canvas.getBoundingClientRect();
+    const cssW = Math.floor(rect.width);
+    const cssH = Math.floor(rect.height);
+    if (cssW < 8 || cssH < 4) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (canvas.width !== Math.floor(cssW * dpr)) {
+      canvas.width = Math.floor(cssW * dpr);
+    }
+    if (canvas.height !== Math.floor(cssH * dpr)) {
+      canvas.height = Math.floor(cssH * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    // A finer cadence reads as an audio waveform rather than a row of loading
+    // dots, especially across a wide desktop player.
+    const spacing = cssW < 520 ? 7 : 8;
+    const count = Math.max(4, Math.floor(cssW / spacing));
+    const levels = this.player?.getAudioLevels?.(count) ?? null;
+    // Ease each dot towards its level: the raw analyser output flickers, and a
+    // row of flickering dots reads as noise rather than as the music.
+    if (!this._eqSmoothed || this._eqSmoothed.length !== count) {
+      this._eqSmoothed = new Float32Array(count);
+    }
+    const smoothed = this._eqSmoothed;
+    let frameMax = 0;
+    for (let i = 0; i < count; i++) {
+      const target = levels ? levels[i] : 0;
+      smoothed[i] += (target - smoothed[i]) * (target > smoothed[i] ? 0.5 : 0.12);
+      if (smoothed[i] > frameMax) frameMax = smoothed[i];
+    }
+    // Scale the row against its own loudest band, and let that reference fall
+    // slowly. Absolute levels pin most of the row at the ceiling on anything
+    // loud — every dot the same height, which is a line, not a meter. Relative
+    // to the peak, the shape of the sound shows at any volume.
+    this._eqPeak = Math.max(frameMax, (this._eqPeak ?? 0) * 0.94);
+    const scale = 1 / Math.max(0.12, this._eqPeak);
+
+    const duration = this.duration || 0;
+    const played = duration > 0 ? Math.min(1, this.currentTime / duration) : 0;
+    const midY = cssH / 2;
+    const idle = !!this.controlsContainer?.classList.contains(
+      "movi-controls-hidden",
+    );
+    const idleDots = idle;
+    // The meter is the idle face of the bar. With the controls up the real
+    // scrubber is on screen and this would sit on top of it.
+    if (!idle) return;
+    const base = idleDots ? 1.45 : 1.25;
+    // How far a dot may rise. Kept short on purpose: this is a line that
+    // breathes with the music, not a spectrum analyser. At ten pixels a loud
+    // passage threw the whole row into tall bars and it stopped reading as a
+    // scrubber at all.
+    const swing = Math.min(cssH / 2 - base - 1, idleDots ? 6 : 5);
+
+    // With the bar idle the clock is drawn here instead of in the button row,
+    // so the elapsed time, the meter and the total read as one line — in the
+    // row itself they sit on separate rows with the meter above them.
+    let from = 0;
+    let to = cssW;
+    if (idle && duration > 0) {
+      const font = "500 11px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.font = font;
+      ctx.textBaseline = "middle";
+      const elapsedText = this.formatTime(this.currentTime || 0);
+      const totalText = this.formatTime(duration);
+      const pad = 12;
+      ctx.fillStyle = "rgba(255,255,255,0.92)";
+      ctx.fillText(elapsedText, 0, midY);
+      const totalW = ctx.measureText(totalText).width;
+      ctx.fillStyle = "rgba(255,255,255,0.6)";
+      ctx.fillText(totalText, cssW - totalW, midY);
+      from = ctx.measureText(elapsedText).width + pad;
+      to = cssW - totalW - pad;
+    }
+    const span = Math.max(1, to - from);
+    const step = span / count;
+    for (let i = 0; i < count; i++) {
+      const x = from + (i + 0.5) * step;
+      const level = Math.min(1, smoothed[i] * scale);
+      // The width never moves — only the height. Growing both turned a
+      // mid-level dot into a block as wide as it was tall, which read as a row
+      // of squares rather than a meter.
+      // Every dot keeps a third of the swing whatever the band is doing, and
+      // the rest is what the music adds. Left as a bare level the row came out
+      // in two camps — a few flat dots and a few spikes; this makes it one
+      // line that ripples.
+      const shaped = 0.18 + 0.82 * level;
+      const h = Math.max(base * 2, shaped * swing * 2);
+      const isPlayed = i / count <= played;
+      ctx.beginPath();
+      ctx.fillStyle = isPlayed
+        ? "rgba(255, 255, 255, 0.96)"
+        : "rgba(255, 255, 255, 0.34)";
+      if (h > base * 2 + 0.5) {
+        // Taller than it is wide: a capsule, with the ends as round as the dot
+        // it grew out of.
+        if (typeof ctx.roundRect === "function") {
+          ctx.roundRect(x - base, midY - h / 2, base * 2, h, base);
+        } else {
+          ctx.rect(x - base, midY - h / 2, base * 2, h);
+        }
+      } else {
+        ctx.arc(x, midY, base, 0, Math.PI * 2);
+      }
+      ctx.fill();
+    }
+  }
+
   /** Downscale an album-art bitmap to a tiny JPEG data URL for the blurred
-   *  backdrop. The backdrop is blurred to 40px, so ~96px is indistinguishable
+   *  backdrop. The backdrop is blurred to 54px, so ~96px is indistinguishable
    *  from full-res while keeping the URL small and the draw cheap. */
   private makeCoverArtBgUrl(bitmap: ImageBitmap): string {
     try {
@@ -24023,6 +30283,83 @@ export class MoviElement extends HTMLElement {
     }
   }
 
+  /** Pull two restrained ambient colours from opposite halves of a sleeve.
+   *  Using a tiny downsample keeps this off the hot path; weighting colourful
+   *  midtones prevents a white title block or black border dominating it. */
+  private applyCoverArtPalette(
+    bitmap: ImageBitmap,
+  ): {
+    accent: [number, number, number];
+    secondary: [number, number, number];
+  } {
+    if (this._coverPaletteBitmap === bitmap && this._coverPalette) {
+      return this._coverPalette;
+    }
+
+    const fallback = {
+      accent: [122, 106, 92] as [number, number, number],
+      secondary: [72, 63, 58] as [number, number, number],
+    };
+    try {
+      const size = 16;
+      const sample = document.createElement("canvas");
+      sample.width = size;
+      sample.height = size;
+      const sampleCtx = sample.getContext("2d", { willReadFrequently: true });
+      if (!sampleCtx) throw new Error("2D canvas unavailable");
+      sampleCtx.drawImage(bitmap, 0, 0, size, size);
+      const pixels = sampleCtx.getImageData(0, 0, size, size).data;
+      const collect = (fromX: number, toX: number): [number, number, number] => {
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        let total = 0;
+        for (let y = 0; y < size; y++) {
+          for (let x = fromX; x < toX; x++) {
+            const i = (y * size + x) * 4;
+            if (pixels[i + 3] < 180) continue;
+            const r = pixels[i];
+            const g = pixels[i + 1];
+            const b = pixels[i + 2];
+            const high = Math.max(r, g, b);
+            const low = Math.min(r, g, b);
+            const luminance = (r * 0.2126 + g * 0.7152 + b * 0.0722) / 255;
+            if (luminance < 0.035 || luminance > 0.96) continue;
+            const saturation = high ? (high - low) / high : 0;
+            const weight = 0.22 + saturation * 1.6;
+            red += r * weight;
+            green += g * weight;
+            blue += b * weight;
+            total += weight;
+          }
+        }
+        if (!total) return fallback.accent;
+        return [
+          Math.round(red / total),
+          Math.round(green / total),
+          Math.round(blue / total),
+        ];
+      };
+      this._coverPalette = {
+        accent: collect(0, size / 2),
+        secondary: collect(size / 2, size),
+      };
+    } catch {
+      this._coverPalette = fallback;
+    }
+    this._coverPaletteBitmap = bitmap;
+    const palette = this._coverPalette ?? fallback;
+    this.coverArtOverlay?.style.setProperty(
+      "--movi-cover-accent",
+      palette.accent.join(", "),
+    );
+    this.coverArtOverlay?.style.setProperty(
+      "--movi-cover-secondary",
+      palette.secondary.join(", "),
+    );
+    return palette;
+  }
+
   private updateCoverArtOverlay(): void {
     const overlay = this.coverArtOverlay;
     const canvas = this.coverArtCanvas;
@@ -24034,14 +30371,17 @@ export class MoviElement extends HTMLElement {
     // Two related-but-distinct host states for an audio source (audio
     // track, no real video stream):
     //   .movi-audio-mode  — ANY audio source (with or without cover art).
-    //     Drives hiding of video-only controls (PiP, fullscreen, rotate,
-    //     aspect, snapshot, ambient, timeline, …) which make no sense for
-    //     audio. Applies in cover-art mode too, so the artwork view isn't
-    //     littered with inapplicable buttons.
+    //     Drives hiding of video-only controls (PiP, rotate, aspect,
+    //     snapshot, ambient, timeline, …) which make no sense for audio.
+    //     Applies in cover-art mode too, so the artwork view isn't littered
+    //     with inapplicable buttons.
     //   .movi-audio-strip — audio source WITHOUT artwork. Collapses the
     //     player to a native-<audio>-style 56px control strip. Cover art
     //     needs the full surface to paint, so strip layout is suppressed
     //     when a bitmap is present (audio-mode still hides the controls).
+    //     Fullscreen suppresses it too: a 56px bar across a black screen is
+    //     not a fullscreen view, so the surface paints a drawn sleeve in the
+    //     art's place instead, and the strip comes back on the way out.
     // A failed load has NO tracks, so hasVideoTrack is always false and the
     // audio renderer (built at construction) makes hasAudibleSource() read true
     // — which wrongly flags a failed VIDEO/manifest as audio and, on the next
@@ -24122,10 +30462,40 @@ export class MoviElement extends HTMLElement {
     // loading, hold the strip off so we don't flash strip → album-art.
     const posterCoverPending =
       audioMode && !bitmap && this._posterCoverLoading;
-    const stripMode =
+    // What the WINDOWED player is: the page-facing decision, and the one the
+    // audiostripchange event reports. Fullscreen only changes what is drawn
+    // while it lasts — telling the page would reflow its wrapper out from
+    // under a native fullscreen and back again on exit, which is the layout
+    // shift the strip's own height is meant to avoid.
+    const stripLayout =
       audioMode && !bitmap && !coverArtPending && !posterCoverPending;
+    const fullscreen = this.isFullscreenActive();
+    const stripMode = stripLayout && !fullscreen;
+    // No art, fullscreen: the cover surface with a drawn sleeve in the art's
+    // place. The same surface (not a second one) so the controls, the meter
+    // and every .movi-cover-art rule behave exactly as they do over real art.
+    const drawnSleeve = stripLayout && fullscreen;
     this.classList.toggle("movi-audio-mode", audioMode);
     this.classList.toggle("movi-audio-strip", stripMode);
+    // Strip mode and the caption band arrive together on an audio-only source
+    // that already had a track selected, so the band has to be reconsidered
+    // here as well as on a track change.
+    this.updateStripCaptionBand();
+    // A switch between sound and picture while fullscreen (audioOnly toggled,
+    // a queue moving from a film to a track) stays fullscreen — audio has a
+    // full-screen view now, and the viewer never asked to leave. What changes
+    // is the rotation: a film may have locked the phone to landscape, and a
+    // sleeve has no reason to hold it there (nor, going back, to stay free).
+    //
+    // Against what the player last WAS, not against the class: load() clears
+    // both classes on every source change, so the class would have read
+    // "wasn't audio" for a playlist moving from one track to the next.
+    const wasAudioMode = this._lastAudioModeSeen;
+    this._lastAudioModeSeen = audioMode;
+    if (wasAudioMode !== null && wasAudioMode !== audioMode && fullscreen) {
+      this.applyFullscreenOrientation(true);
+      this.updatePseudoFsRotation();
+    }
     // Keep a portaled menu's host classes in sync so a video→audio switch made
     // while the menu is open updates it live (the cloned :host(.movi-audio-mode)
     // rules hide the video-only items).
@@ -24137,6 +30507,14 @@ export class MoviElement extends HTMLElement {
       this.shadowRoot
         ?.querySelector(".movi-gear-btn")
         ?.classList.add("movi-gear-visible");
+      // The first paint starts every bar hidden (chrome arrives on the first
+      // interaction). hideControls() stands down in strip mode, so nothing
+      // would have taken that state off again — the row would have sat in the
+      // hidden state for good, which is now a state that shows the whole row
+      // but still tells the rest of the player the bar is away.
+      if (this.controlsContainer?.classList.contains("movi-controls-hidden")) {
+        this.showControls();
+      }
     }
     // Notify the embedding page when the strip state changes vs what we LAST
     // TOLD it — not vs the current class. load() clears movi-audio-strip on
@@ -24145,15 +30523,15 @@ export class MoviElement extends HTMLElement {
     // unchanged: the event never fired and the page's wrapper stayed collapsed
     // at 56/78px, squashing the album art into a black bar. _lastStripDispatched
     // survives load(), so the transition is detected and the wrapper reflows.
-    if (stripMode !== this._lastStripDispatched) {
-      this._lastStripDispatched = stripMode;
+    if (stripLayout !== this._lastStripDispatched) {
+      this._lastStripDispatched = stripLayout;
       // Tell the embedding page so it can collapse/restore its own wrapper. The
       // host shrinks to 56px via :host CSS, but a parent .player-stage with
       // aspect-ratio: 16/9 (or any fixed height) would still reserve its old
       // box and leave a black gap. Consumers listen on this — see index.html.
       this.dispatchEvent(
         new CustomEvent("audiostripchange", {
-          detail: { strip: stripMode },
+          detail: { strip: stripLayout },
           bubbles: true,
           composed: true,
         }),
@@ -24181,9 +30559,12 @@ export class MoviElement extends HTMLElement {
     // Keying off !audioMode (not hasVideoTrack) is what makes audio-only work on
     // a VIDEO source: the video track still exists (we just don't decode it), so
     // the old hasVideoTrack guard hid the art and left a black screen.
-    if (!bitmap || !audioMode) {
+    // A drawn sleeve stands in for missing art while fullscreen (see above).
+    if (!audioMode || (!bitmap && !drawnSleeve)) {
       overlay.style.display = "none";
       if (this._coverArtBgEl) this._coverArtBgEl.style.backgroundImage = "none";
+      this.classList.remove("movi-cover-art");
+      this.stopCoverEqualizer();
       return;
     }
 
@@ -24202,6 +30583,43 @@ export class MoviElement extends HTMLElement {
     if (!ctx) return;
     ctx.save();
     ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssW, cssH); // transparent — let the blurred bg show
+
+    // A drawn sleeve is square.
+    const bitmapAR = bitmap ? bitmap.width / bitmap.height : 1;
+
+    // What the sleeve says about itself. A cover with no words beside it is a
+    // picture; with the track and the artist it is a record being played.
+    const meta = (this.player?.getMediaInfo?.()?.metadata ?? {}) as Record<
+      string,
+      string
+    >;
+    const readMeta = (...keys: string[]): string => {
+      for (const key of keys) {
+        for (const spelling of [key, key.toUpperCase(), key.toLowerCase()]) {
+          const value = meta[spelling];
+          if (value && value.trim()) return value.trim();
+        }
+      }
+      return "";
+    };
+    // The player's own resolved title, not the title bar's text: a host that
+    // shows the bar only in fullscreen (titlemode="fullscreen") leaves that
+    // text empty until the first fullscreen trip, so the audio view had no
+    // title beside its art until the viewer had been fullscreen once.
+    const trackTitle = readMeta("title") || (this._title || "").trim();
+    const artistName = readMeta("artist", "album_artist", "performer", "author");
+    const albumName = readMeta("album");
+    const releaseDate = readMeta("date", "year", "originaldate");
+    const releaseYear = releaseDate.match(/\b(?:19|20)\d{2}\b/)?.[0] ?? "";
+    const eyebrow = [
+      albumName && albumName.toLocaleLowerCase() !== trackTitle.toLocaleLowerCase()
+        ? albumName
+        : "",
+      releaseYear,
+    ]
+      .filter(Boolean)
+      .join("  ·  ");
 
     // Blurred backdrop is now a CSS-blurred DOM element BEHIND this canvas — a
     // real Gaussian in every browser (canvas ctx.filter "blur()" is unsupported
@@ -24209,32 +30627,387 @@ export class MoviElement extends HTMLElement {
     // baked-down data URL of the embedded album art (an ImageBitmap has no URL
     // of its own), so both cover-art sources get the same blurred surround. The
     // canvas paints only the sharp art.
+    // A drawn sleeve has no picture to blur, so the surround is its own two
+    // colours instead — the same wash real art gives, not a black screen.
+    const palette = bitmap
+      ? this.applyCoverArtPalette(bitmap)
+      : this.applyDrawnSleevePalette(
+          trackTitle ||
+            artistName ||
+            (this._src instanceof File
+              ? this._src.name
+              : typeof this._src === "string"
+                ? this._src
+                : ""),
+        );
     if (this._coverArtBgEl) {
-      const bgUrl = this.coverArtBitmap ? this._coverArtBgUrl : this._posterCoverUrl;
-      this._coverArtBgEl.style.backgroundImage = bgUrl
-        ? `url("${bgUrl.replace(/"/g, '\\"')}")`
-        : "none";
+      if (bitmap) {
+        const bgUrl = this.coverArtBitmap ? this._coverArtBgUrl : this._posterCoverUrl;
+        this._coverArtBgEl.style.backgroundImage = bgUrl
+          ? `url("${bgUrl.replace(/"/g, '\\"')}")`
+          : "none";
+      } else {
+        const [ar, ag, ab] = palette.accent;
+        const [sr, sg, sb] = palette.secondary;
+        this._coverArtBgEl.style.backgroundImage = `linear-gradient(135deg, rgb(${ar}, ${ag}, ${ab}), rgb(${sr}, ${sg}, ${sb}))`;
+      }
     }
-    ctx.clearRect(0, 0, cssW, cssH); // transparent — let the blurred bg show
 
-    const bitmapAR = bitmap.width / bitmap.height;
+    // Side by side when there is room for both, the sleeve alone when there is
+    // not. The composition intentionally occupies the upper-middle of the
+    // player: the artwork and copy feel like one editorial lockup, while the
+    // lower quarter stays quiet for the waveform and the revealed controls.
+    const words = trackTitle || artistName;
+    const sideBySide = !!words && cssW >= 560 && cssW / cssH >= 1.1;
+    // Narrow and tall — a phone held upright, fullscreen: the words go UNDER
+    // the sleeve rather than nowhere. Fullscreen only: a windowed portrait
+    // player (a Shorts card) carries its own title chrome and would show the
+    // title twice, and a short windowed box has no room below the art.
+    const stacked =
+      !!words && !sideBySide && fullscreen && cssH >= 360 && cssH / cssW >= 1.05;
 
-    // Centred sharp artwork — square, 60% of the smaller dimension. The
-    // bitmap itself is rarely a perfect square, so contain it inside the
-    // square frame (no crop) and let the blur backdrop fill the surround.
-    const frameSize = Math.min(cssW, cssH) * 0.6;
-    const artW = bitmapAR >= 1 ? frameSize : frameSize * bitmapAR;
-    const artH = bitmapAR >= 1 ? frameSize / bitmapAR : frameSize;
-    const artX = (cssW - artW) / 2;
-    const artY = (cssH - artH) / 2;
-    // Subtle shadow so the art doesn't bleed into its own blur.
-    ctx.shadowColor = "rgba(0,0,0,0.55)";
-    ctx.shadowBlur = 30;
-    ctx.shadowOffsetY = 6;
-    ctx.drawImage(bitmap, artX, artY, artW, artH);
+    let frameSize = sideBySide
+      ? Math.min(cssH * 0.43, cssW * 0.24)
+      : Math.min(cssW, cssH) * (cssW < 420 ? 0.66 : 0.56);
+    let artW = bitmapAR >= 1 ? frameSize : frameSize * bitmapAR;
+    let artH = bitmapAR >= 1 ? frameSize / bitmapAR : frameSize;
+    // Fullscreen, with words: fit the art to a BOX rather than to one square
+    // edge. The square rule sizes a wide poster by its width alone, so a 16:9
+    // sleeve came out 345x194 on a 1440x900 screen — a thumbnail in a void.
+    // The box lets wide art spend the width the screen has, and square art
+    // the height. Stacked, the box is the phone's width and a third of its
+    // height, leaving the rest for the words and the bar.
+    if (fullscreen && (sideBySide || stacked)) {
+      const boxW = cssW * (stacked ? 0.82 : 0.38);
+      const boxH = cssH * (stacked ? 0.36 : 0.46);
+      artW = Math.min(boxW, boxH * bitmapAR);
+      artH = artW / bitmapAR;
+      frameSize = Math.max(artW, artH);
+    }
+
+    const gap = Math.max(30, Math.round(frameSize * 0.2));
+    // Fullscreen lifts the cap a little: the ceiling is sized for an embed,
+    // and at 1080p it left a 42px title beside a sleeve read from a sofa.
+    const titleSize = stacked
+      ? Math.max(20, Math.min(30, Math.round(cssW * 0.06)))
+      : Math.max(
+          20,
+          Math.min(fullscreen ? 48 : 42, Math.round(frameSize * 0.105)),
+        );
+    const artistSize = Math.max(15, Math.round(titleSize * 0.68));
+    // Keep a deliberate text measure instead of donating every remaining pixel
+    // to it. The previous full-width column pinned the sleeve against the left
+    // edge and made the layout feel like a settings screen rather than a cover.
+    const sidePad = Math.max(24, Math.round(cssW * 0.04));
+    const textW = sideBySide
+      ? Math.min(
+          Math.max(220, cssW * 0.39),
+          cssW - artW - gap - sidePad * 2,
+        )
+      : stacked
+        ? Math.min(cssW - sidePad * 2, 640)
+        : 0;
+
+    const setFont = (size: number, weight: string): void => {
+      ctx.font = `${weight} ${size}px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
+    };
+    // Titles are long ("… feat. …", a remix note, the year) and a single
+    // line of them is mostly ellipsis. Wrap to two, then give up.
+    const wrap = (text: string, size: number, weight: string, maxLines: number): string[] => {
+      setFont(size, weight);
+      if (ctx.measureText(text).width <= textW) return [text];
+      const words = text.split(/\s+/);
+      const lines: string[] = [];
+      let line = "";
+      for (const word of words) {
+        const next = line ? line + " " + word : word;
+        if (ctx.measureText(next).width <= textW || !line) {
+          line = next;
+        } else {
+          lines.push(line);
+          line = word;
+          if (lines.length === maxLines) break;
+        }
+      }
+      if (lines.length < maxLines && line) lines.push(line);
+      if (lines.length === maxLines) {
+        let last = lines[maxLines - 1];
+        const rest = text.slice(lines.join(" ").length).trim();
+        if (rest || ctx.measureText(last).width > textW) {
+          while (last.length > 1 && ctx.measureText(last + "…").width > textW) {
+            last = last.slice(0, -1);
+          }
+          lines[maxLines - 1] = last.trimEnd() + "…";
+        }
+      }
+      return lines;
+    };
+    const showWords = sideBySide || stacked;
+    const titleLines = showWords && trackTitle ? wrap(trackTitle, titleSize, "400", 2) : [];
+    const artistLines = showWords && artistName ? wrap(artistName, artistSize, "400", 1) : [];
+    const eyebrowSize = Math.max(10, Math.round(titleSize * 0.29));
+    const eyebrowGap = eyebrow ? Math.round(titleSize * 0.48) : 0;
+    const lineGap = Math.round(titleSize * 0.42);
+    const textBlockH =
+      (eyebrow ? eyebrowSize + eyebrowGap : 0) +
+      titleLines.length * titleSize * 1.22 +
+      (artistLines.length ? lineGap + artistSize * 1.24 : 0);
+    // Stacked, the words sit a little closer than beside: the gap is read
+    // down a narrow screen, not across a wide one.
+    const stackGap = Math.round(Math.max(22, frameSize * 0.12));
+
+    const blockW = sideBySide ? artW + gap + textW : artW;
+    const artX = Math.round((cssW - blockW) / 2);
+    const compositionCenterY = sideBySide ? cssH * 0.38 : cssH * 0.43;
+    // Stacked, the sleeve sits on the player's middle — where the touch play
+    // button appears while the chrome is up — and the words hang below it.
+    // Centring the whole block instead put that button across the title.
+    // Lifted only if the words would run into the bar.
+    const artY = stacked
+      ? Math.round(
+          Math.min(
+            cssH * 0.46 - artH / 2,
+            cssH * 0.86 - (artH + stackGap + textBlockH),
+          ),
+        )
+      : Math.round(compositionCenterY - artH / 2);
+
+    // Rounded sleeve, and a shadow under it so it doesn't bleed into its own
+    // blurred backdrop.
+    const radius = Math.max(7, Math.min(18, Math.round(frameSize * 0.035)));
+    // A low, coloured pool of light anchors the sleeve to the surface. It is
+    // deliberately broader than the physical shadow and borrows its hue from
+    // the art, avoiding the generic grey drop-shadow look.
+    ctx.save();
+    const haloX = artX + artW * 0.5;
+    const haloY = artY + artH * 0.58;
+    const haloRadius = Math.max(artW, artH) * 0.82;
+    const halo = ctx.createRadialGradient(
+      haloX,
+      haloY,
+      0,
+      haloX,
+      haloY,
+      haloRadius,
+    );
+    halo.addColorStop(
+      0,
+      `rgba(${palette.accent[0]},${palette.accent[1]},${palette.accent[2]},0.2)`,
+    );
+    halo.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = halo;
+    ctx.fillRect(
+      artX - haloRadius * 0.55,
+      artY - haloRadius * 0.35,
+      artW + haloRadius * 1.1,
+      artH + haloRadius * 0.8,
+    );
+    ctx.restore();
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.58)";
+    ctx.shadowBlur = Math.max(28, Math.round(frameSize * 0.1));
+    ctx.shadowOffsetY = Math.max(8, Math.round(frameSize * 0.025));
+    ctx.beginPath();
+    if (typeof ctx.roundRect === "function") {
+      ctx.roundRect(artX, artY, artW, artH, radius);
+    } else {
+      ctx.rect(artX, artY, artW, artH);
+    }
+    ctx.fillStyle = "#000";
+    ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.beginPath();
+    if (typeof ctx.roundRect === "function") {
+      ctx.roundRect(artX, artY, artW, artH, radius);
+    } else {
+      ctx.rect(artX, artY, artW, artH);
+    }
+    ctx.clip();
+    if (bitmap) {
+      ctx.drawImage(bitmap, artX, artY, artW, artH);
+    } else {
+      this.paintDrawnSleeve(ctx, artX, artY, artW, artH, palette);
+    }
+    ctx.restore();
+    // A restrained top/side highlight separates dark sleeves from dark ambient
+    // backgrounds without putting a generic card border around the artwork.
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.13)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    if (typeof ctx.roundRect === "function") {
+      ctx.roundRect(artX + 0.5, artY + 0.5, artW - 1, artH - 1, radius);
+    } else {
+      ctx.rect(artX + 0.5, artY + 0.5, artW - 1, artH - 1);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    if (showWords) {
+      // Beside: set against the middle of the sleeve, not the middle of the
+      // player — the pair reads as one object that way. Below: centred under
+      // it, one column down the screen.
+      const textX = sideBySide ? artX + artW + gap : cssW / 2;
+      let y = sideBySide
+        ? artY + artH / 2 - textBlockH / 2
+        : artY + artH + stackGap;
+      ctx.save();
+      ctx.textBaseline = "middle";
+      ctx.textAlign = sideBySide ? "left" : "center";
+      ctx.shadowColor = "rgba(0,0,0,0.38)";
+      ctx.shadowBlur = 16;
+      if (eyebrow) {
+        const markerW = Math.max(16, Math.round(titleSize * 0.5));
+        setFont(eyebrowSize, "600");
+        const eyebrowText = eyebrow.toLocaleUpperCase();
+        const markerGap = Math.round(titleSize * 0.22);
+        const maxEyebrowW = Math.max(20, textW - markerW - markerGap);
+        let fittedEyebrow = eyebrowText;
+        while (
+          fittedEyebrow.length > 1 &&
+          ctx.measureText(fittedEyebrow + "…").width > maxEyebrowW
+        ) {
+          fittedEyebrow = fittedEyebrow.slice(0, -1);
+        }
+        if (fittedEyebrow !== eyebrowText) fittedEyebrow += "…";
+        // Centred, the marker and the words are centred as one line.
+        const markerX = sideBySide
+          ? textX
+          : textX -
+            (markerW + markerGap + ctx.measureText(fittedEyebrow).width) / 2;
+        ctx.fillStyle = `rgba(${palette.accent[0]},${palette.accent[1]},${palette.accent[2]},0.92)`;
+        if (typeof ctx.roundRect === "function") {
+          ctx.beginPath();
+          ctx.roundRect(markerX, y + eyebrowSize / 2 - 1, markerW, 2, 1);
+          ctx.fill();
+        } else {
+          ctx.fillRect(markerX, y + eyebrowSize / 2 - 1, markerW, 2);
+        }
+        ctx.fillStyle = "rgba(255,255,255,0.56)";
+        ctx.textAlign = "left";
+        ctx.fillText(fittedEyebrow, markerX + markerW + markerGap, y + eyebrowSize / 2);
+        ctx.textAlign = sideBySide ? "left" : "center";
+        y += eyebrowSize + eyebrowGap;
+      }
+      y += titleSize * 0.62;
+      ctx.fillStyle = "rgba(255,255,255,0.94)";
+      setFont(titleSize, "400");
+      for (const line of titleLines) {
+        ctx.fillText(line, textX, y);
+        y += titleSize * 1.22;
+      }
+      if (artistLines.length) {
+        y += lineGap;
+        ctx.fillStyle = "rgba(255,255,255,0.7)";
+        setFont(artistSize, "400");
+        ctx.fillText(artistLines[0], textX, y);
+      }
+      ctx.restore();
+    }
     ctx.restore();
 
     overlay.style.display = "block";
+    this.classList.add("movi-cover-art");
+    this.startCoverEqualizer();
+  }
+
+  /** Two colours for a sleeve that has no picture to sample, derived from its
+   *  title so a track keeps its colour from one visit to the next and two
+   *  tracks in a queue don't look like the same record. Sets the same CSS
+   *  hooks applyCoverArtPalette does, so the surround's glow follows. */
+  private applyDrawnSleevePalette(seed: string): {
+    accent: [number, number, number];
+    secondary: [number, number, number];
+  } {
+    let hash = 2166136261;
+    for (let i = 0; i < seed.length; i++) {
+      hash = Math.imul(hash ^ seed.charCodeAt(i), 16777619);
+    }
+    const hue = (hash >>> 0) % 360;
+    const rgb = (h: number, s: number, l: number): [number, number, number] => {
+      const k = (n: number) => (n + h / 30) % 12;
+      const a = s * Math.min(l, 1 - l);
+      const f = (n: number) =>
+        Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
+      return [f(0), f(8), f(4)];
+    };
+    // Muted rather than saturated: this sits where artwork would, and a
+    // full-strength swatch reads as a UI colour, not a record sleeve.
+    const palette = {
+      accent: rgb(hue, 0.46, 0.5),
+      secondary: rgb((hue + 42) % 360, 0.4, 0.3),
+    };
+    this.coverArtOverlay?.style.setProperty(
+      "--movi-cover-accent",
+      palette.accent.join(", "),
+    );
+    this.coverArtOverlay?.style.setProperty(
+      "--movi-cover-secondary",
+      palette.secondary.join(", "),
+    );
+    return palette;
+  }
+
+  /** The sleeve for a track with no art: its palette as a lit card with a
+   *  note on it — plainly "no artwork", but composed like the real thing so
+   *  the fullscreen view is the same view either way. Drawn into the
+   *  caller's clip, so the rounding and the edge highlight come for free. */
+  private paintDrawnSleeve(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    palette: {
+      accent: [number, number, number];
+      secondary: [number, number, number];
+    },
+  ): void {
+    const [ar, ag, ab] = palette.accent;
+    const [sr, sg, sb] = palette.secondary;
+    const base = ctx.createLinearGradient(x, y, x + w, y + h);
+    base.addColorStop(0, `rgb(${ar},${ag},${ab})`);
+    base.addColorStop(1, `rgb(${sr},${sg},${sb})`);
+    ctx.fillStyle = base;
+    ctx.fillRect(x, y, w, h);
+    // Light from the upper left, so it reads as a printed card rather than a
+    // flat swatch of colour.
+    const lightX = x + w * 0.26;
+    const lightY = y + h * 0.2;
+    const light = ctx.createRadialGradient(lightX, lightY, 0, lightX, lightY, w * 0.95);
+    light.addColorStop(0, "rgba(255,255,255,0.2)");
+    light.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = light;
+    ctx.fillRect(x, y, w, h);
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    // A few faint grooves around the note: the record, without drawing one.
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.07)";
+    ctx.lineWidth = Math.max(1, w * 0.004);
+    for (const r of [0.3, 0.37, 0.44]) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, w * r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+    if (typeof Path2D !== "function") return;
+    // Material's music note, a 12x18 glyph centred at (12,12) in a 24 box.
+    const note = new Path2D(
+      "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z",
+    );
+    const scale = (h * 0.34) / 18;
+    ctx.save();
+    ctx.translate(cx - 12 * scale, cy - 12 * scale);
+    ctx.scale(scale, scale);
+    ctx.shadowColor = "rgba(0,0,0,0.25)";
+    // Shadow sizes ignore the transform, so these are plain pixels.
+    ctx.shadowBlur = 24;
+    ctx.shadowOffsetY = 4;
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fill(note);
+    ctx.restore();
   }
 
   /**
@@ -24299,9 +31072,15 @@ export class MoviElement extends HTMLElement {
       //  - cold start: only long enough to cover a warm-up. A genuine block
       //    still gets its pill, just a few hundred ms later — and the video is
       //    silent either way, so nothing is lost in the meantime.
+      // …and a third: the browser has as good as said no (no gesture on the
+      // page, nothing unlocked). There is no warm-up to wait for, and every
+      // frame of waiting is the picture held under a play button — only a
+      // beat, for a high-engagement site Chromium lets through anyway.
       const graceFrames = this.player.wasAudioContextActivated()
         ? 40 // ~650ms
-        : 24; // ~400ms
+        : this.player.isAudioStartRefused()
+          ? 6 // ~100ms
+          : 24; // ~400ms
       if (attempt < graceFrames) {
         requestAnimationFrame(() => this.maybeFallbackToMutedAutoplay(attempt + 1));
         return;
@@ -24325,6 +31104,9 @@ export class MoviElement extends HTMLElement {
     );
     this._autoMutedForAutoplay = true;
     this._muted = true;
+    // Keep the OSD's key in step with a mute the viewer did not ask for, so a
+    // later volume apply cannot mistake OUR mute for their change and toast it.
+    this._lastOsdVolumeKey = `${this._volume}|${this._muted}`;
     // Ours, not theirs — so the pill is allowed to appear.
     this._userChoseMute = false;
     this.updateMuted(); // pushes mute to player + surfaces the pill
@@ -24384,6 +31166,12 @@ export class MoviElement extends HTMLElement {
     const shouldShow =
       this._muted &&
       hasAudio &&
+      // Nothing to unmute. When the native fallback is carrying a file whose
+      // audio this browser has no decoder for, the pill is an offer of sound
+      // that tapping cannot deliver — and it sits there over the picture
+      // inviting the tap again. Detection takes a few seconds of playback, so
+      // this hides a pill that is already up as well as suppressing the next.
+      !this._noAudibleAudio &&
       // A mute the VIEWER asked for is not a mute to offer a way out of. The
       // autoplay clause below cannot tell the two apart: on a player with
       // `controls autoplay` — which is most of them — pressing mute produced
@@ -24401,14 +31189,21 @@ export class MoviElement extends HTMLElement {
       // sound, and it is the case the pill exists for — so it shows however
       // many times they have unmuted before.
       (this._autoMutedForAutoplay ||
-        (!this._userHasUnmuted && this._controls && this._autoplay));
+        (!this._userHasUnmuted &&
+          this._controls &&
+          (this._autoplay || this._playUnprompted)));
     overlay.style.display = shouldShow ? "flex" : "none";
   }
 
-  private updateVolume() {
+  /**
+   * @param silent Apply the volume without the OSD. For the paths that are not
+   * a viewer changing the volume — restoring a stored preference, replaying an
+   * attribute — where a toast reports a change nobody made.
+   */
+  private updateVolume(silent = false) {
     // Muted state is part of what the OSD reports, so it's part of the key.
     const osdKey = `${this._volume}|${this._muted}`;
-    const volumeChanged = osdKey !== this._lastOsdVolumeKey;
+    const volumeChanged = !silent && osdKey !== this._lastOsdVolumeKey;
     this._lastOsdVolumeKey = osdKey;
 
     if (this.player) {
@@ -24426,11 +31221,11 @@ export class MoviElement extends HTMLElement {
       const volumePercent = Math.round(this._volume * 100);
       let icon = "";
       if (this._muted || this._volume === 0) {
-        icon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"></path><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`;
+        icon = `${symbolSvg("volumeOff")}`;
       } else if (this._volume < 0.5) {
-        icon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"></path><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
+        icon = `${symbolSvg("volumeWave")}`;
       } else {
-        icon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
+        icon = `${symbolSvg("volumeWaves")}`;
       }
 
       // Only show if user interacting or specifically requested (simple logic: just check if player exists to avoid startup spam)
@@ -24450,6 +31245,7 @@ export class MoviElement extends HTMLElement {
   }
 
   private updatePlaybackRate() {
+    const previousOsdRate = this._lastOsdRate;
     const rateChanged = this._playbackRate !== this._lastOsdRate;
     this._lastOsdRate = this._playbackRate;
 
@@ -24486,8 +31282,18 @@ export class MoviElement extends HTMLElement {
       !this._isUnsupported &&
       this.player
     ) {
+      // Said with where it came from. A "1x" has been seen arriving with
+      // nobody touching anything, and no log said what re-applied the rate.
+      Logger.info(
+        TAG,
+        `Speed OSD ${this._playbackRate}x (last shown ${previousOsdRate}x) via ${(new Error().stack || "")
+          .split("\n")
+          .slice(2, 5)
+          .map((l) => l.trim().replace(/^at /, "").split(" (")[0])
+          .join(" < ")}`,
+      );
       this.showOSD(
-        `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5.64 18.36a9 9 0 1 1 12.72 0"></path><path d="m12 12 4-4"></path></svg>`,
+        `${symbolSvg("stopwatch")}`,
         `${this._playbackRate}x`,
       );
     }
@@ -24567,8 +31373,27 @@ export class MoviElement extends HTMLElement {
   private hasUnfetchableSrcScheme(): boolean {
     if (this._sourceAdapter) return false;
     if (typeof this._src !== "string" || !this._src) return false;
-    // Resolve against the page so relative paths ("video.mp4") stay valid.
-    return !isOpenableScheme(this._src, location.href);
+    const src = this._src.trim();
+    // A src carrying no scheme of its own — "/videos/a.mp4", "./a.mp4",
+    // "a.mp4", "//cdn/a.mp4" — is resolved by the browser against the page and
+    // inherits the page's scheme. The page loaded, so that scheme fetches:
+    // there is no typo here to report, whatever the resolution comes out as.
+    // Resolving it was also the bug — a document the URL parser can't use as a
+    // base (about:blank, about:srcdoc, a blob:/data: document) throws, and the
+    // unparseable "" scheme fell straight through to "unfetchable", painting
+    // "Invalid Link" over an ordinary root-relative path.
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(src)) return false;
+    // Same reasoning for an explicit scheme that IS the page's own: an Electron
+    // app:// page, an extension page, capacitor://. Those aren't built-in
+    // schemes, but the document was served over one, so a same-scheme src is
+    // as fetchable as the page itself.
+    try {
+      if (new URL(src).protocol === location.protocol) return false;
+    } catch {
+      // Malformed beyond parsing ("http://[bad]") — that IS a bad link.
+      return true;
+    }
+    return !isOpenableScheme(src, location.href);
   }
 
   /**
@@ -24606,7 +31431,6 @@ export class MoviElement extends HTMLElement {
       // native reports with `waitingforkey`.
       this.dispatchEvent(new Event("waitingforkey"));
       try {
-        const { generateFingerprint } = await import("../utils/Fingerprint");
         const fingerprint = await generateFingerprint();
         await this.loadEncrypted({
           videoUrl: this._videoUrl,
@@ -24723,6 +31547,12 @@ export class MoviElement extends HTMLElement {
       // point and previews would silently never enable. hasAttribute reads the
       // live parsed attribute, which is already present, so order stops mattering.
       this._thumb = this.hasAttribute("thumb");
+      this._thumbPrecise = MoviElement.wantsPrecisePreviews(
+        this.getAttribute("thumb"),
+      );
+      if (typeof this._storyboard !== "object" || this._storyboard === null) {
+        this._storyboard = MoviElement.thumbnailTrackSrc(this);
+      }
 
       // Create MoviPlayer instance
       // Configure MoviPlayer options
@@ -24732,7 +31562,7 @@ export class MoviElement extends HTMLElement {
         cache: { type: "lru", maxSizeMB: 520 },
         // Audio-only disables scrub-preview thumbnails too — they'd decode video
         // frames and defeat the CPU saving.
-        enablePreviews: this._thumb && !this._audioOnly,
+        enablePreviews: (this._thumb || !!this._storyboard) && !this._audioOnly,
         ...(this._fps > 0 && { frameRate: this._fps }),
         ...(this._headers && { headers: this._headers }),
         ...(this._audioOnly && { audioOnly: true }),
@@ -24836,6 +31666,11 @@ export class MoviElement extends HTMLElement {
         playerConfig.forceStreamEngine = this._streamEngineNext;
         this._streamEngineNext = null;
       }
+      // Re-load knowing what the server said this URL is.
+      if (this._forcedStreamNext) {
+        playerConfig.forceStream = this._forcedStreamNext;
+        this._forcedStreamNext = null;
+      }
       // A DASH quality pick forces that Representation on the demuxer re-load.
       if (this._forcedDashRendition) {
         playerConfig.forceVideoRendition = this._forcedDashRendition;
@@ -24861,7 +31696,12 @@ export class MoviElement extends HTMLElement {
       }
       Logger.info(TAG, `Initializing MoviPlayer (${mode} Mode)`);
       created = new MoviPlayer(playerConfig);
+      // enablePreviews rides in the config; these two are runtime switches, so
+      // they have to be handed over once the instance exists.
+      created.setPrecisePreviews(this._thumbPrecise);
+      created.setStoryboard(this._storyboard);
       this.player = created;
+      this.warmStoryboardSheets();
 
       // Re-apply a host subtitle renderer to the fresh player (it's registered on
       // the element, which outlives per-source player recreates).
@@ -24916,6 +31756,8 @@ export class MoviElement extends HTMLElement {
           streamVideo.style.objectFit = "contain";
           this.video.replaceWith(streamVideo);
           this.video = streamVideo;
+          // A fresh element knows nothing of nopip / disablepictureinpicture.
+          this.syncVideoPipBlock();
           Logger.info(TAG, "DRM: Swapped in native stream video element");
         }
       }
@@ -25078,9 +31920,54 @@ export class MoviElement extends HTMLElement {
       // background. _preloadGateActive stays false, so every gate branch below
       // (defer play, force spinner, release-on-preloadcomplete) is a no-op.
 
-      // Auto-play if requested
-      // Seek to initial position if set
-      if (this._startAt > 0 && this.player) {
+      // Coming back from a discarded tab: put the viewer where they were.
+      // Ahead of startat, because startat describes where a fresh visit should
+      // begin and this is not a fresh visit — see takeDiscardState.
+      const discarded = this.takeDiscardState();
+      if (discarded && this.player) {
+        await this.player.seek(discarded.t).catch((e: unknown) => {
+          Logger.warn(TAG, "Failed to restore the position of a discarded tab", e);
+        });
+        // Already there — a "Resume from X?" prompt at X is noise.
+        this._resumeDialogPending = false;
+        // …and this is a video that has played, not one waiting for its
+        // first press. A source swap clears _hasEverPlayed, and left clear it
+        // put the big centre play button over a paused restore — the
+        // poster's call to action, on a frame the viewer had paused on
+        // themselves (MoviTube renewing its links after a long pause).
+        this._hasEverPlayed = true;
+        // The poster, too. The source swap put the cover up before anyone
+        // knew it was the same media, and it is the move to "playing" that
+        // takes a cover down — which a paused restore never makes, so the
+        // title card sat over the frame the viewer had paused on. The seek
+        // above has landed and painted that frame; it is the picture now.
+        this.hidePoster();
+        // …and the clock and the bar say so. The swap cleared the timeline to
+        // 0:00, and a paused restore sends no time updates to redraw it — the
+        // bar caught up only if something else happened to repaint it (the
+        // chrome coming back up), and otherwise read 0:00 and an empty track
+        // over a frame from the middle of the film. Announced as well, for a
+        // host that draws its own time from the event.
+        this.updateTimeDisplay();
+        this.updateProgressBar();
+        this.dispatchEvent(
+          new CustomEvent("timeupdate", { detail: this.currentTime }),
+        );
+        if (discarded.rate > 0 && discarded.rate !== this.playbackRate) {
+          this.playbackRate = discarded.rate;
+        }
+        // Play again only if it was playing, and only in a visible tab. With no
+        // gesture on the reloaded page the browser may refuse; then it simply
+        // stays paused on the right frame, which is still the point.
+        if (discarded.playing && document.visibilityState === "visible") {
+          void this.play()?.catch?.(() => {});
+        } else if (!discarded.playing) {
+          // …and a video that was paused stays paused. `autoplay` runs after
+          // this and would otherwise start it: the host asked for autoplay on a
+          // NEW video, not for this one to begin again on its own.
+          this._startCancelled = true;
+        }
+      } else if (this._startAt > 0 && this.player) {
         await this.player.seek(this._startAt).catch((e: unknown) => {
           Logger.warn(TAG, "Failed to seek to start time", e);
         });
@@ -25133,14 +32020,39 @@ export class MoviElement extends HTMLElement {
         document.visibilityState !== "visible" &&
         !this._pipWindow &&
         !this._backgroundPlay;
-      if (this._autoplay && this.player) {
+      // A start the viewer has already cancelled is not a start. It has to fall
+      // through to the poster branch, not merely skip the play(): that branch is
+      // where the opening seek happens, and skipping it leaves the source having
+      // never seeked at all — so the FIRST seek, with everything it has to read
+      // to do one, is deferred to the moment the viewer presses play.
+      //
+      // Measured on a 19.9GB MKV over HTTP. Paused during the load, 50MB of the
+      // head buffered, then play: `seek(0.00) seekSessionId=0` — the first seek
+      // this source ever did — sent the demuxer to the Cues at the tail,
+      // `Read: offset=19865229333, gap=19384143KB`, and the sliding window
+      // abandoned the head to go and get them. The buffered bar emptied in front
+      // of the viewer at exactly the moment they asked for playback. The
+      // autoplay-off path never shows this because it pays that read during the
+      // load, while the viewer is already waiting.
+      const startArmed = this._autoplay && !this._startCancelled;
+      if (startArmed && this.player) {
         if (hiddenAndNotInPip) {
           this._autoplayPendingVisible = true;
           Logger.info(TAG, "Autoplay deferred — tab hidden; will start when visible");
         } else {
           await this._startAutoplay();
         }
-      } else if (this._startAt === 0 && this.player && !this._poster) {
+      } else if (
+        this._startAt === 0 &&
+        // …and not over a restored position. This branch paints the opening
+        // frame by seeking to 0 (or to postertime and then resetting the clock
+        // to 0), so run after a discard restore it put the viewer straight back
+        // at the start — 5ms after the restore had put them where they were.
+        // startat escapes it by being non-zero; the restore has to say so.
+        !discarded &&
+        this.player &&
+        !this._poster
+      ) {
         // Render the poster frame on canvas via a seek on the main decoder
         // (never the thumbnail pipeline). With a `postertime`, seek to that
         // timestamp to paint the poster frame, then — once it lands — reset
@@ -25159,25 +32071,31 @@ export class MoviElement extends HTMLElement {
           // and loses it. Instead wait for the "seeked" event (fired from
           // notifySeekCompletion once the frame has actually landed), THEN
           // reset the clock to 0 with the poster frame already on the canvas.
+          // On `seekcomplete` rather than `seeked`, because a poster seek is
+          // the player's own business and does not announce itself.
           // _posterSeekActive blocks resume-saves through this window so the
           // poster timestamp isn't persisted as the resume position.
           this._posterSeekActive = true;
-          this.player.once("seeked", () => {
+          this.player.once("seekcomplete", () => {
             this.player?.resetClockToStartForPoster();
             this._posterSeekActive = false;
             // Poster frame is now on the canvas — snapshot it for lock-screen art.
             this.captureMediaSessionArtwork();
           });
           this.player
-            .seek(posterTime, { suppressSpinner: true })
+            .seek(posterTime, { suppressSpinner: true, internal: true })
             .catch(() => {
               this._posterSeekActive = false;
             });
         } else {
           // Frame 0 lands on the canvas when "seeked" fires (the seek promise
           // resolves earlier, before paint) — snapshot it there for artwork.
-          this.player.once("seeked", () => this.captureMediaSessionArtwork());
-          this.player.seek(0, { suppressSpinner: true }).catch(() => {});
+          // `seekcomplete`, not `seeked`: this seek is the player's own and
+          // says nothing to the page.
+          this.player.once("seekcomplete", () => this.captureMediaSessionArtwork());
+          this.player
+            .seek(0, { suppressSpinner: true, internal: true })
+            .catch(() => {});
         }
       }
 
@@ -25231,9 +32149,10 @@ export class MoviElement extends HTMLElement {
       // dropping straight to the overlay. Only mid-recovery; a first-load failure
       // still surfaces normally below.
       if (this._tryQualityRecovery(initMsg)) return;
+      if (this._trySiblingSource()) return;
 
       this.noteMediaError(error);
-      this.dispatchEvent(new CustomEvent("error", { detail: error }));
+      this.dispatchMediaError(error);
       Logger.error(TAG, "Failed to initialize MoviPlayer", error);
 
       // "Initialization Failed" is our vocabulary, not the viewer's — it reads
@@ -25257,7 +32176,27 @@ export class MoviElement extends HTMLElement {
         // scheme) fails at fetch() with a generic "Failed to fetch" that reads
         // as a network problem — blame the URL up front, BEFORE the CORS/fetch
         // branches that would otherwise swallow it. See hasUnfetchableSrcScheme.
+        // Protected content, checked FIRST: it is the one failure here that the
+        // person embedding the player can usually fix, and every other branch
+        // would rather tell them the network or the file is at fault. The
+        // engines already produce a viewer-ready sentence for it — Shaka's
+        // friendlyMessage, dash.js's "No license server URL specified!" — which
+        // fell through to the generic line for want of a branch to catch it.
+        // Written to match what the engines actually say, in every spelling they
+        // say it: Shaka's own wording and its SCREAMING_CASE codes
+        // (REQUESTED_KEY_SYSTEM_CONFIG_UNAVAILABLE), dash.js's sentence, and
+        // either spelling of licence. None of the branches below own a message
+        // containing any of these words, so running first is safe.
         if (
+          /protected and can't be played|licen[cs]e|key[ _-]?system|\bdrm\b|widevine|playready|fairplay/i.test(
+            raw,
+          )
+        ) {
+          title = "Protected Video";
+          message = this.hasAttribute("licenseurl")
+            ? "This video is protected and the licence was refused. It may have expired, or it isn't available in your region."
+            : "This video is protected and needs a licence to play here.";
+        } else if (
           this.hasUnfetchableSrcScheme() ||
           /invalid url|failed to construct 'url'/i.test(raw)
         ) {
@@ -25374,7 +32313,7 @@ export class MoviElement extends HTMLElement {
         // Flush any play() calls deferred while loading was in flight.
         if (this._pendingPlay && this.player && !this._isUnsupported) {
           this._pendingPlay = false;
-          this.player.play().catch(() => {});
+          this.startDeferredPlay();
         } else {
           this._pendingPlay = false;
         }
@@ -25394,11 +32333,24 @@ export class MoviElement extends HTMLElement {
   private setupEventHandlers(): void {
     if (!this.player) return;
 
+    // The loop flag is usually set before there is a player to tell — it comes
+    // off the attribute at connect time, and the player is not built until a
+    // source loads. This runs on a fresh player, so it is where the setting
+    // catches up; without it the player never learns and every loop takes the
+    // restart path.
+    this.player.setLoop(this._loop);
+
     // Remove existing listeners
     this.eventHandlers.forEach((unsubscribe) => unsubscribe());
     this.eventHandlers.clear();
 
-    // Handle loop
+    // Handle loop.
+    //
+    // The player wraps a looping file without ending it (see its gapless-loop
+    // note), so on that path this never fires. It stays as the fallback for
+    // every case the priming cannot cover — no video track, a paused or
+    // seeking player at the turn, a preroll that failed — where "ended" still
+    // arrives and the file has to be started again the old way.
     if (this._loop) {
       const loopHandler = () => {
         this.play();
@@ -25444,6 +32396,7 @@ export class MoviElement extends HTMLElement {
     // Handle subtitle track changes
     const subtitleTrackChangeHandler = () => {
       this.updateSubtitleTrackMenu();
+      this.updateStripCaptionBand();
       this.dispatchEvent(new Event("subtitletrackchange"));
       // The docs have always listed the camelCase spelling for this one (with a
       // note about keeping it for backward compatibility) while the code only
@@ -25461,6 +32414,18 @@ export class MoviElement extends HTMLElement {
         "subtitleTrackChange",
         subtitleTrackChangeHandler,
       ),
+    );
+    // An EXTERNAL subtitle never reaches the track manager — exactly the gap
+    // the audio handler above documents for a language switch. selectSubtitleLang
+    // fetches and parses the file itself and announces it on the PLAYER, and
+    // nothing was listening: an SRT the viewer picked fired no
+    // `subtitletrackchange` at the host at all, and the menu only looked
+    // right because the click that opened it redrew it. Same handler, both
+    // emitters, whichever kind of subtitle changed.
+    const subPlayer = this.player;
+    subPlayer.on("subtitleTrackChange" as any, subtitleTrackChangeHandler);
+    this.eventHandlers.set("subtitleTrackChangePlayer", () =>
+      subPlayer.off("subtitleTrackChange" as any, subtitleTrackChangeHandler),
     );
 
     // Handle tracks change (when media loads)
@@ -25529,6 +32494,9 @@ export class MoviElement extends HTMLElement {
       if (vw > 0 && vhh > 0 && (vw !== this._lastVideoWidth || vhh !== this._lastVideoHeight)) {
         this._lastVideoWidth = vw;
         this._lastVideoHeight = vhh;
+        // The box the picture is drawn into follows the picture's own shape
+        // when the author hasn't dictated a height — see applyIntrinsicAspect.
+        this.applyIntrinsicAspect();
         this.dispatchEvent(
           new CustomEvent("resize", { detail: { width: vw, height: vhh } }),
         );
@@ -25595,8 +32563,52 @@ export class MoviElement extends HTMLElement {
       // for data (`waiting`) and when it genuinely resumed (`playing`). Without
       // these, a host had to subscribe to our non-standard `statechange` and
       // know our internal PlayerState names just to drive a spinner.
-      if (state === "playing") this.dispatchEvent(new Event("playing"));
-      else if (state === "buffering") this.dispatchEvent(new Event("waiting"));
+      if (state === "playing") {
+        // `play` first, then `playing` — the order a media element uses, and
+        // the order page code is written against: the intent, then the fact.
+        // Both were fired here, but `playing` came out first because it sits at
+        // the top of this branch and `play` further down among the autoplay
+        // bookkeeping, so a listener pair saw the fact before the intent.
+        if (this._pauseAnnounceTimer !== null) {
+          clearTimeout(this._pauseAnnounceTimer);
+          this._pauseAnnounceTimer = null;
+        }
+        this.announcePlay();
+        this.dispatchEvent(new Event("playing"));
+        // And ask again whether audio was actually allowed.
+        //
+        // The check after autoplay's play() can be asked too early to know.
+        // A post-seek audio prime holds the context suspended DELIBERATELY,
+        // and isBlockedSuspended() reports "not blocked" for exactly that
+        // reason — so a real block sitting underneath the prime read as fine,
+        // the fallback concluded audio was working, and no pill was ever
+        // raised. By the time the picture is moving the prime is over, and a
+        // context still suspended is the browser's answer, not ours.
+        //
+        // Cheap and self-limiting: it returns immediately unless autoplay is
+        // in play, the viewer has not unmuted, and there is audio to offer.
+        if (this._autoplay && !this._muted && !this._userHasUnmuted) {
+          this.maybeFallbackToMutedAutoplay();
+        }
+      } else if (state === "buffering") this.dispatchEvent(new Event("waiting"));
+      // The glyph must not blink across a seek. Arm on the way in — only from
+      // a state that says playback is meant to continue — and let go once it
+      // genuinely has, or once the video has stopped for a reason of its own.
+      // See _iconHeldForSeek for what the gap looks like without this.
+      if (
+        (state === "seeking" || state === "buffering") &&
+        this.player?.isPlaybackIntended?.()
+      ) {
+        this.holdIconThroughSeek();
+      } else if (
+        state === "playing" ||
+        state === "ended" ||
+        state === "error" ||
+        state === "idle" ||
+        state === "loading"
+      ) {
+        this.releaseIconHold();
+      }
       // The replacement player is up — stop holding the controls open on the
       // rebuild's behalf and let the normal state gating take over again.
       if (
@@ -25627,6 +32639,26 @@ export class MoviElement extends HTMLElement {
       // QoE: track stalls. Entering "buffering" starts a rebuffer timer; any
       // other state ends it (the first stall, before first frame, is startup).
       if (state === "buffering") this._qoe.bufferingStartNow();
+      // Evidence for sampleLinkBudget. A measured throughput on its own proves
+      // nothing — a source parked at the prefetch gate reports a floor, not the
+      // link's capacity — so the verdict waits for playback to actually stop.
+      //
+      // But only for stops the DELIVERY could be responsible for. A decoder
+      // that cannot keep up stops playback too — the catch-up hold does it on
+      // purpose — and counting those would let a slow device arm a verdict
+      // about the connection. See MoviPlayer.deviceIsBottleneck.
+      //
+      // …unless the delivery ran dry at the same moment. A picture presenting
+      // below rate (a busy host page holding rAF down, a heavy decode) makes
+      // deviceIsBottleneck say "device" for the whole session, and then a
+      // stall that was plainly the next bytes not arriving went uncounted:
+      // an 8K file on Google Drive stalled every few seconds and never got
+      // its notice. See MoviPlayer.deliveryStarved.
+      if (state === "buffering") {
+        const starved = !!this.player?.deliveryStarved?.();
+        if (starved) this._deliveryStalls++;
+        if (starved || !this.player?.deviceIsBottleneck?.()) this._linkStalls++;
+      }
       else this._qoe.bufferingEndNow();
       // A seek requested before the player was ready was held — apply it now
       // that we've reached a seekable state (fixes e.g. a PiP/handoff seek that
@@ -25675,6 +32707,7 @@ export class MoviElement extends HTMLElement {
           if (resumed) {
             this._hideSnapshotPoster();
             this.hidePoster();
+            this.endRecoveryResume();
           }
         } else {
           this._hideSnapshotPoster();
@@ -25693,12 +32726,30 @@ export class MoviElement extends HTMLElement {
       // reject in that case and no "playing" event fires, so without this the
       // flag would stay set and keep the centre play button hidden. Clear it and
       // repaint so the big play affordance surfaces for a manual start.
-      if (
-        this._autoplayStarting &&
-        (state === "paused" || state === "ended" || state === "error")
-      ) {
+      if (this._autoplayStarting && (state === "ended" || state === "error")) {
         this._autoplayStarting = false;
         this.updatePlayPauseIcon();
+      } else if (this._autoplayStarting && state === "paused") {
+        // "paused" is no longer proof that startup stopped short.
+        //
+        // The player's own post-seek gate passes THROUGH paused on its way to
+        // playing — buffering, paused, "Buffers refilled, resuming playback",
+        // playing — so clearing the suppression here put the big play icon
+        // over a video that was about to start by itself, for the second or
+        // two until it did. Which is the opposite of what autoplay means.
+        //
+        // So wait, and let the next state answer. A startup that genuinely
+        // stopped stays paused and gets its button; one that was mid-resume
+        // reaches "playing" first and clears the flag there, cancelling this.
+        // Longer than the audio resume grace (see AudioRenderer), because a
+        // blocked context is exactly when that gap is at its widest.
+        clearTimeout(this._autoplayPausedTimer);
+        this._autoplayPausedTimer = setTimeout(() => {
+          if (!this._autoplayStarting) return;
+          if (this.player?.getState() !== "paused") return;
+          this._autoplayStarting = false;
+          this.updatePlayPauseIcon();
+        }, 1600) as unknown as number;
       }
 
       if (state === "playing") {
@@ -25706,6 +32757,7 @@ export class MoviElement extends HTMLElement {
         // first so we can skip the click-confirmation UI below.
         const wasAutoplayStart = this._autoplayStarting;
         this._autoplayStarting = false;
+        clearTimeout(this._autoplayPausedTimer);
         // Surface the resume prompt the moment playback first starts — i.e.
         // the first time the bottom-bar play icon flips to pause. Checked
         // before _hasEverPlayed flips below so it only fires on the very
@@ -25716,7 +32768,8 @@ export class MoviElement extends HTMLElement {
           this.maybeShowResumeDialog();
         }
         this._hasEverPlayed = true;
-        this.dispatchEvent(new Event("play"));
+        this.flushStoryboardWarm();
+        this.announcePlay();
         // Autoplay had no user gesture, so there's no click to confirm —
         // hide the controls immediately rather than running the 200ms
         // pause-confirmation flash below.
@@ -25781,7 +32834,25 @@ export class MoviElement extends HTMLElement {
         this._qoe.playing();
         this.startQoeHeartbeat();
       } else if (state === "paused") {
-        this.dispatchEvent(new Event("pause"));
+        // A media element only pauses something that was playing. Startup goes
+        // through this state on its way to the poster frame — the same
+        // synthetic pause _hasEverPlayed already exists to recognise — and
+        // announcing it flipped the play/pause state of any page tracking us
+        // before the viewer had pressed anything.
+        if (this._playFired) {
+          // …and a pause the pipeline passes through on its way somewhere else
+          // is not one either. A seek stops and restarts playback internally,
+          // which a media element never reports: it fires seeking and seeked
+          // and stays "playing" throughout. Held for a moment so a resume can
+          // cancel it, which is what a seek's resume does.
+          if (this._pauseAnnounceTimer !== null) clearTimeout(this._pauseAnnounceTimer);
+          this._pauseAnnounceTimer = window.setTimeout(() => {
+            this._pauseAnnounceTimer = null;
+            if (!this._playFired) return; // already answered
+            this._playFired = false;
+            this.dispatchEvent(new Event("pause"));
+          }, 80);
+        }
         this.updateMediaSession();
         this.stopStutterMonitor();
         this._qoe.paused();
@@ -25795,7 +32866,29 @@ export class MoviElement extends HTMLElement {
         // surfaces the bar manually.
         if (this._resume) this.saveResumePosition();
       } else if (state === "ended") {
-        this.dispatchEvent(new Event("ended"));
+        // Reaching the end pauses, and says so first. A media element sets
+        // paused, fires pause, and only then fires ended — a page that tracks
+        // playing/paused through the events (a button's icon, an analytics
+        // ping) would otherwise still believe this was playing after it
+        // stopped. The pending 80ms debounce is dropped: this pause is
+        // certain, and nothing is going to resume past it.
+        if (this._pauseAnnounceTimer !== null) {
+          clearTimeout(this._pauseAnnounceTimer);
+          this._pauseAnnounceTimer = null;
+        }
+        // …unless `loop` is on, where an element reports neither: it seeks
+        // back to the start and keeps playing, and never left the playing
+        // state at all.
+        if (!this._loop) this.announcePause();
+        // A looping element does not end. It reaches the last frame, seeks
+        // back and carries on — seeking and seeked, no `ended` — so a page
+        // that shows a replay button on ended never saw one, and neither
+        // should it here.
+        if (!this._loop) this.dispatchEvent(new Event("ended"));
+        // …and the queue's turn, after the host has been told. `loop` never
+        // reaches here, which is the whole of how the two settle: an item set
+        // to repeat has no end for the next item to follow.
+        if (!this._loop) this.handleItemEnded();
         // Only surface the chrome when the player is actually
         // stopping. With `loop` on, the player immediately restarts
         // playback, so popping the bar for the brief end→play
@@ -25880,7 +32973,7 @@ export class MoviElement extends HTMLElement {
       this.updateLoadingIndicator(this.player?.getState() || "idle");
       if (this._pendingPlay && this.player && !this._isUnsupported) {
         this._pendingPlay = false;
-        this.player.play().catch(() => {});
+        this.startDeferredPlay();
       }
       this.updateControlsState();
       this.updatePlayPauseIcon();
@@ -25902,18 +32995,52 @@ export class MoviElement extends HTMLElement {
     // "seeked"|"durationchange")` silently did nothing, and the element's OWN
     // quality-switch resume path listened for `durationchange` on itself — a
     // listener that could never fire.
-    const seekingHandler = (time: number) =>
+    // One seek, one `seeking`. The pipeline announces a seek more than once
+    // for a single request — the entry point and the internal restart both say
+    // so — which a media element never does: a page counting seeking against
+    // seeked to drive a spinner was left holding one that never balanced. A
+    // genuinely new destination still announces itself, so a scrub's stream of
+    // targets is reported the way an element reports it.
+    const seekingHandler = (time: number) => {
+      if (this._seekAnnouncedFor !== null && Math.abs(this._seekAnnouncedFor - time) < 0.01) {
+        return;
+      }
+      this._seekAnnouncedFor = time;
       this.dispatchEvent(new CustomEvent("seeking", { detail: time }));
+    };
     this.player.on("seeking", seekingHandler);
     this.eventHandlers.set("seeking", () =>
       this.player?.off("seeking", seekingHandler),
     );
 
-    const seekedHandler = (time: number) =>
+    const seekedHandler = (time: number) => {
+      this._seekAnnouncedFor = null;
       this.dispatchEvent(new CustomEvent("seeked", { detail: time }));
+      // Landing somewhere new is a readiness announcement too. A media element
+      // drops to "not enough data" while it seeks and says canplay again on
+      // the other side — a page that arms work on canplay after a seek (a
+      // custom spinner, an overlay it hides) never heard from us a second
+      // time. Only once the first one has been said, and canplaythrough only
+      // if it was earned.
+      if (this._loadedDataFired) this.dispatchEvent(new Event("canplay"));
+      if (this._canPlayThroughFired) {
+        this.dispatchEvent(new Event("canplaythrough"));
+      }
+    };
     this.player.on("seeked", seekedHandler);
     this.eventHandlers.set("seeked", () =>
       this.player?.off("seeked", seekedHandler),
+    );
+
+    // The file came back round. A native element has nothing to say here — a
+    // page has to infer the turn from a seek nobody asked for — so this is the
+    // one place the count is available directly. Fires on both routes: the
+    // gapless turn and the restart a file with a soundtrack still takes.
+    const loopTurnHandler = (detail: { count: number }) =>
+      this.dispatchEvent(new CustomEvent("loop", { detail }));
+    this.player.on("loop", loopTurnHandler);
+    this.eventHandlers.set("loop", () =>
+      this.player?.off("loop", loopTurnHandler),
     );
 
     const durationChangeHandler = (duration: number) =>
@@ -25945,6 +33072,7 @@ export class MoviElement extends HTMLElement {
         this._fullRecreates = 0;
         this._decodeDownshifts = 0; // fresh budget for a later, unrelated decode error
         this._connectionRetries = 0; // link steadied — reset the reconnect budget
+        this.endRecoveryResume();
         this._recoveryResumeTime = -1;
       }
       this.updateLiveState();
@@ -25988,10 +33116,16 @@ export class MoviElement extends HTMLElement {
       // another quality frequently still loads. Only for network-ish errors, and
       // capped so a genuinely dead link still ends at the overlay.
       if (this._tryQualityRecovery(rawMsg)) return;
+      // Same walk as the init path: while the <source> list still has an
+      // untried candidate, this failure is not the element's failure. Nothing
+      // is announced — an element reports `error` once, when the list is
+      // spent — so a page that swaps in a placeholder on error doesn't flash
+      // one for a source that was only ever a first guess.
+      if (this._trySiblingSource()) return;
 
       this._qoe.error(rawMsg, true);
       this.noteMediaError(error);
-      this.dispatchEvent(new CustomEvent("error", { detail: error }));
+      this.dispatchMediaError(error);
       // Always log the raw error before the message gets prettified for
       // the overlay — without this, "State: ... -> error" appears in
       // the log without any "what crashed" line and debugging requires
@@ -26010,6 +33144,20 @@ export class MoviElement extends HTMLElement {
         raw = error.message;
       } else if (typeof error === "string") {
         raw = error;
+      }
+
+      // Protected content, first and by itself. Playback reaching this point
+      // means the clear lead ran out, which is not a fault in the file or the
+      // connection — the two things every branch below would otherwise blame.
+      // The player has already phrased it for a viewer, so pass it through
+      // rather than mapping it again.
+      if (/protected|licen[cs]e|key[ _-]?system|\bdrm\b|widevine|playready|fairplay/i.test(raw)) {
+        title = "Protected Video";
+        message = this.hasAttribute("licenseurl")
+          ? "This video is protected and the licence was refused. It may have expired, or it isn't available in your region."
+          : "This video is protected and needs a licence to play here.";
+        this.handleUnsupportedVideo(title, message);
+        return;
       }
 
       // Prettify the raw HttpSource messages — surfaced verbatim they read
@@ -26052,10 +33200,23 @@ export class MoviElement extends HTMLElement {
       } else if (raw.includes("Stream failed after")) {
         title = "Connection Lost";
         message = "The connection dropped while playing. Check your network, then try again.";
+      } else if (raw.includes("the decoder produced no frames")) {
+        // The stuck watchdog gave up having never seen a frame presented, with
+        // the source reporting no fault — so the bytes were arriving and the
+        // DECODE is what stopped. Seen on 4K/8K AV1 HDR, where the rendition
+        // configures happily on hardware and then emits nothing. "Playback
+        // Error" is the title that classifies as a decoder fault, which is what
+        // puts the "Try Software Decoding" button on the overlay; sending this
+        // to the byte-starved branch below offered a connection check instead,
+        // for a link that was delivering several MB/s.
+        title = "Playback Error";
+        message =
+          "The decoder stopped producing frames for this quality. Try software decoding — it handles more.";
       } else if (raw.includes("Playback stalled")) {
         // The stuck watchdog ran out of nudges without the source naming a
-        // reason. Nothing here points at the decoder, so this must not fall
-        // through to the generic branch — that one offers "Try Software
+        // reason, AND frames had been flowing before it stopped — so this is a
+        // pipeline that ran dry, not one that cannot decode. It must not fall
+        // through to the generic branch: that one offers "Try Software
         // Decoding", which cannot help a pipeline that is receiving no bytes.
         title = "Playback Stopped";
         message = "The video stopped loading. Check your connection, then try again.";
@@ -26245,6 +33406,13 @@ export class MoviElement extends HTMLElement {
       if (markers) markers.innerHTML = "";
     }
 
+    // Was this element carrying media before this load? Read BEFORE the
+    // teardown below, which is what makes the answer no.
+    // hasMediaSource() is NOT the test: the src that triggered this load is
+    // already set by the time we get here, so it answers yes on a first load.
+    // What matters is whether anything was playing, loaded, or loading BEFORE.
+    const hadMedia = !!this.player || this._loadedDataFired || this.isLoading;
+
     if (this.player) {
       // If player exists, destroy and recreate
       this.player.destroy();
@@ -26259,6 +33427,15 @@ export class MoviElement extends HTMLElement {
     this._lastProgressBufferEnd = -1;
     this._canPlayThroughFired = false;
     this._loadedDataFired = false;
+    // A fresh source is a paused one, and has said nothing yet: loading media
+    // sets the paused flag, so the next play() is a new run of playback with
+    // its own `play` — and `autoplay` re-asserts the intent when it starts.
+    this._playIntent = false;
+    this._playFired = false;
+    this._seekAnnouncedFor = null;
+    // The previous video's thumbnails go with the previous video.
+    this.dropStaleStoryboard(hadMedia);
+    this.clearPreviewSurfaces();
     // A genuine video→audio source change must still be able to reach audio
     // mode, so this memory is per-source.
     this._sourceHadVideoTrack = false;
@@ -26274,10 +33451,18 @@ export class MoviElement extends HTMLElement {
     // "In flight" is broader than the isLoading flag, which a finished fetch
     // clears while the pipeline is still building: a load that never reached
     // playable data was still aborted.
-    if (this.isLoading || (this.hasMediaSource() && !this._loadedDataFired)) {
-      this.dispatchEvent(new Event("abort"));
+    // …but only when there WAS something. A fresh element being given its
+    // first source has nothing to empty and nothing was aborted, and a media
+    // element says neither: `<video>` on its first src fires `loadstart` and
+    // that is all. Announcing an abort there told page code — analytics, state
+    // machines counting failed loads — that a load had been interrupted before
+    // any load had started.
+    if (hadMedia) {
+      if (this.isLoading || (this.hasMediaSource() && !this._loadedDataFired)) {
+        this.dispatchEvent(new Event("abort"));
+      }
+      this.dispatchEvent(new Event("emptied"));
     }
-    this.dispatchEvent(new Event("emptied"));
     // Drop any autoplay deferred for the previous source — initializePlayer
     // re-arms it for the new one if still hidden.
     this._autoplayPendingVisible = false;
@@ -26303,7 +33488,31 @@ export class MoviElement extends HTMLElement {
    */
   async play(): Promise<void> {
     if (this._isUnsupported) return;
+    // Read now, while any gesture behind this call is still live — the awaits
+    // below outlast it.
+    //
+    // A page that autoplays by CALLING play() is doing what `autoplay` does,
+    // and is refused sound the same way; it just never went through
+    // _startAutoplay, so neither the muted fallback nor the pill ever ran. On
+    // a <video> the upgrade took over — whose page starts it from script, and
+    // whose play() now lands here — the film rolled in silence with nothing to
+    // say so and nothing to tap, while a <movi-player autoplay> beside it
+    // showed "Tap to unmute". Browsers without the API are taken as a gesture:
+    // the old behaviour, rather than a pill nobody asked for.
+    const activation = (
+      navigator as Navigator & { userActivation?: { isActive: boolean } }
+    ).userActivation;
+    this._playUnprompted = !!activation && !activation.isActive;
+    this.updateUnmuteOverlay();
     this._startCancelled = false;
+    this._pauseWasAskedFor = false;
+    // `play` is the sound of the request, not of the picture moving: an
+    // element fires it when play() is called and reports paused === false from
+    // that instant, whether or not a single frame has decoded yet. Announcing
+    // it from the playing state instead meant a clip short enough to finish
+    // inside its own start-up — or one whose start was deferred behind a load
+    // — was played without ever saying so.
+    this.announcePlay();
     // If a load is in flight, defer the play. initializePlayer() flushes
     // this once loading settles, matching HTMLMediaElement.play() semantics.
     if (this.isLoading) {
@@ -26332,6 +33541,15 @@ export class MoviElement extends HTMLElement {
       // pipeline; the player suppresses the spinner for those internal seeks
       // itself (suppressSeekSpinner), so no element-side handling is needed.
       await this.player.play();
+      if (this._playUnprompted) this.maybeFallbackToMutedAutoplay();
+    }
+  }
+
+  /** Start a play() that was held back behind a load — see play(). */
+  private startDeferredPlay(): void {
+    const started = this.player?.play().catch(() => {});
+    if (this._playUnprompted) {
+      void started?.then(() => this.maybeFallbackToMutedAutoplay());
     }
   }
 
@@ -26347,11 +33565,47 @@ export class MoviElement extends HTMLElement {
     // while the spinner is up did nothing at all — the press was swallowed and
     // the video started by itself the moment the data arrived.
     this._startCancelled = true;
+    this._pauseWasAskedFor = true;
     this._autoplayStarting = false;
+    // A pause the viewer asked for is the one thing that outranks the seek
+    // hold: the glyph must answer the press even mid-scrub.
+    this.releaseIconHold();
+    // The viewer pressing pause during startup is the answer the timer was
+    // waiting for; it must not fire later against a player they stopped.
+    clearTimeout(this._autoplayPausedTimer);
     if (this.player && !this.isLoading && !this._isUnsupported) {
       this.player.pause();
     }
+    // Asked for outright, so answered outright. The 80ms hold in the state
+    // handler is there to swallow the pauses a seek passes through; a pause
+    // the caller requested is never one of those, and holding it back lost the
+    // event entirely when the element was torn down in the same breath.
+    this.announcePause();
     this.updatePlayPauseIcon();
+  }
+
+  /** Say `play` once per run of playback, and remember that we did. */
+  private announcePlay(): void {
+    this._playIntent = true;
+    if (this._pauseAnnounceTimer !== null) {
+      clearTimeout(this._pauseAnnounceTimer);
+      this._pauseAnnounceTimer = null;
+    }
+    if (this._playFired) return;
+    this._playFired = true;
+    this.dispatchEvent(new Event("play"));
+  }
+
+  /** …and `pause` once, for a stop that is real. */
+  private announcePause(): void {
+    this._playIntent = false;
+    if (this._pauseAnnounceTimer !== null) {
+      clearTimeout(this._pauseAnnounceTimer);
+      this._pauseAnnounceTimer = null;
+    }
+    if (!this._playFired) return;
+    this._playFired = false;
+    this.dispatchEvent(new Event("pause"));
   }
 
   /**
@@ -26608,6 +33862,8 @@ export class MoviElement extends HTMLElement {
   dispose(): void {
     // Whatever the outgoing source still had in flight is waste now.
     this.abortSourceRequests();
+    // A pause belongs to the video it was asked for, and that one is leaving.
+    this._pauseWasAskedFor = false;
     // Every open panel belongs to the source that is going away. The track
     // menus emptied themselves by rebuilding, which is why they LOOKED like
     // they closed; the settings panel did not, and it was left standing over a
@@ -26617,10 +33873,17 @@ export class MoviElement extends HTMLElement {
     // changes are: setting src to a File — which is what a file picker does —
     // goes straight to initializePlayer() and never touches load(). dispose()
     // is the one thing every route runs through.
-    this.closeAllBottomMenus();
-    this.closeSettingsPage();
+    //
+    // Without the re-arm: that exists for a viewer who just closed a menu, and
+    // nobody closed one here. Run on a source change, it put the bar up on
+    // every new src — an autoplay embed opened with its chrome showing.
+    this.closeAllBottomMenus(undefined, false);
+    this.closeSettingsPage(false);
 
-    // Cancel any queued play intent
+    // Cancel any queued play intent — and any queued NEXT ITEM with it. The
+    // advance was scheduled by the source being torn down here; whatever
+    // replaces it has already decided what plays.
+    this.cancelAutoAdvance();
     this._pendingPlay = false;
     this._preloadGateActive = false;
     this._resumeDialogPending = false;
@@ -26641,6 +33904,12 @@ export class MoviElement extends HTMLElement {
     this._mediaSessionLastPos = -1;
     this._mediaSessionArtworkUrl = null;
     this.stopStutterMonitor();
+    this._smoothWarnedByMeasurement = false;
+    this._warnedLinkBudget = false;
+    this._linkProbeAbort?.abort();
+    this._linkProbeAbort = null;
+    this._linkStalls = 0;
+    this._deliveryStalls = 0;
     this.resetStutterHint();
     if (this._captionLive) this._captionLive.textContent = "";
     this._lastCaptionText = "";
@@ -26671,7 +33940,13 @@ export class MoviElement extends HTMLElement {
       this._carryAudioEl = null;
     }
 
-    // Clear subtitle overlay
+    // Clear subtitle overlay. Where the viewer dragged the caption to is
+    // theirs and stays; the transcript this caption was about to open is the
+    // outgoing source's, and does not.
+    if (this._captionClickTimer !== null) {
+      window.clearTimeout(this._captionClickTimer);
+      this._captionClickTimer = null;
+    }
     if (this.subtitleOverlay) {
       this.subtitleOverlay.innerHTML = "";
     }
@@ -26699,6 +33974,13 @@ export class MoviElement extends HTMLElement {
     // Movi's own canvas pipeline (the previous source may have degraded to the
     // browser <video> via fallback="native").
     this._nativeFallbackAttempted = false;
+    this._nativeAudioSilentReported = false;
+    if (this._noAudibleAudio) this.setNoAudibleAudio(false);
+    if (this._nativeAudioCheckTimer !== null) {
+      clearTimeout(this._nativeAudioCheckTimer);
+      this._nativeAudioCheckTimer = null;
+    }
+    this._deferredError = undefined;
     this._engineTried.clear();
     if (this._nativeFallbackActive) {
       this._nativeFallbackActive = false;
@@ -26719,6 +34001,12 @@ export class MoviElement extends HTMLElement {
       this.classList.remove("movi-native-video");
       this.syncMenuPortalAudioClasses();
     }
+
+    // Subtitle files the viewer picked belong to the video that was playing;
+    // the next source gets its own. Revoking here rather than on select keeps
+    // them re-selectable for as long as that video is up.
+    for (const url of this._pickedSubtitleUrls) URL.revokeObjectURL(url);
+    this._pickedSubtitleUrls = [];
 
     // Revoke any postertime-generated poster URL and hide the overlay so
     // the next source doesn't briefly flash the old frame.
@@ -26782,6 +34070,9 @@ export class MoviElement extends HTMLElement {
         resumeDialog.style.display = "none";
         resumeDialog.style.animation = "";
       }
+      // Likewise a smoothness notice: it was about the source that just left.
+      this.hideSmoothWarning();
+      this._smoothWarnKey = null;
       if (!this._title) {
         const titleText = sr.querySelector(".movi-title-text") as HTMLElement | null;
         if (titleText) titleText.textContent = "";
@@ -26817,6 +34108,9 @@ export class MoviElement extends HTMLElement {
       } else {
         this.removeAttribute("theme");
       }
+      // A menu that is open right now lives in the body portal, where the
+      // theme is read off the PORTAL host — keep that one in step too.
+      this.syncMenuPortalAudioClasses();
     }
   }
 
@@ -26866,19 +34160,42 @@ export class MoviElement extends HTMLElement {
     // the raw isPlaying above — that's the resume affordance, not a state
     // indicator, and has its own flicker handling.)
     const isPlayingIntended =
-      (this.player?.isPlaybackIntended() ?? isPlaying) || this.isStartPending();
+      (this.player?.isPlaybackIntended() ?? isPlaying) ||
+      this.isStartPending() ||
+      // …and across a seek that is meant to end in playback, whatever the
+      // state does in between. See _iconHeldForSeek.
+      this._iconHeldForSeek;
     const loadingIndicator = this.shadowRoot?.querySelector(
       ".movi-loading-indicator",
     ) as HTMLElement;
-    const isLoading = loadingIndicator?.style.display === "flex";
+    // …or a ring that is only down because a receipt is covering it.
+    //
+    // flashCenterIcon takes the spinner off for the length of its animation,
+    // which means the display it leaves behind says "not loading" for ~800ms
+    // of a load that is still running. A tick landing in that gap took the
+    // else-branch below, found `!_hasEverPlayed`, and added movi-center-visible
+    // — declaring the receipt a persistent control. settleCenterFlashSolid then
+    // did what that class asks for and dropped the fade tail, and the returning
+    // ring's !important rule snapped the button off instead: pause during the
+    // opening load popped, held, and then vanished on one frame rather than
+    // fading, which is not the receipt every other pause draws. The flag the
+    // flash already sets says what the display cannot.
+    const isLoading =
+      loadingIndicator?.style.display === "flex" || this._spinnerDeferredByFlash;
 
-    const contextMenuPlayIcon = this.shadowRoot?.querySelector(
+    // Through contextMenuRoot(): this runs on the UI tick, and the desktop
+    // menu spends its whole visible life in the body portal — which is exactly
+    // when these need updating. Looked up in the shadow root they came back
+    // null for as long as the menu was open, so pressing space with the menu
+    // up left its row reading "Play" over a playing video.
+    const menuRoot = this.contextMenuRoot();
+    const contextMenuPlayIcon = menuRoot.querySelector(
       ".movi-context-menu-play-icon",
     ) as HTMLElement;
-    const contextMenuPauseIcon = this.shadowRoot?.querySelector(
+    const contextMenuPauseIcon = menuRoot.querySelector(
       ".movi-context-menu-pause-icon",
     ) as HTMLElement;
-    const contextMenuLabel = this.shadowRoot?.querySelector(
+    const contextMenuLabel = menuRoot.querySelector(
       '.movi-context-menu-item[data-action="play-pause"] .movi-context-menu-label',
     ) as HTMLElement;
 
@@ -26926,10 +34243,11 @@ export class MoviElement extends HTMLElement {
       // is the small bar icon. So on touch it rides with the chrome, the way it
       // does in every phone player.
       if (centerPlayPauseBtn) {
-        // A flash owns the glyph while it runs — it shows the ACTION taken
-        // (the pause bars when you paused), which is the opposite of what the
-        // resulting state would draw here.
-        if (!this._centerFlashAnim) {
+        // A POP owns the glyph while it runs — it shows the ACTION taken (the
+        // pause bars when you paused), which is the opposite of what the
+        // resulting state would draw here. A press does not; see
+        // _centerFlashOwnsGlyph for why this button must not wait for it.
+        if (!this._centerFlashOwnsGlyph) {
           centerPlayIcon?.style.setProperty("display", "none");
           centerPauseIcon?.style.setProperty("display", "block");
         }
@@ -26981,14 +34299,14 @@ export class MoviElement extends HTMLElement {
           // glyph from the receipt. Guarded on the flash for the same reason
           // as below: while one runs it owns the glyph, because it shows the
           // action taken rather than the resulting state.
-          if (!this._centerFlashAnim) {
+          if (!this._centerFlashOwnsGlyph) {
             centerPlayIcon?.style.setProperty("display", "block");
             centerPauseIcon?.style.setProperty("display", "none");
           }
         }
       } else {
         if (centerPlayPauseBtn) {
-          if (!this._centerFlashAnim) {
+          if (!this._centerFlashOwnsGlyph) {
             centerPlayIcon?.style.setProperty("display", "block");
             centerPauseIcon?.style.setProperty("display", "none");
           }
@@ -27081,6 +34399,8 @@ export class MoviElement extends HTMLElement {
   private _lastVideoHeight = 0;
   /** `canplaythrough` is once-per-source. */
   private _canPlayThroughFired = false;
+  /** Characters in the clock at the last fit — see fitControlsRow. */
+  private _lastClockLen = -1;
   /**
    * Whether THIS source has ever resolved a video track. Lets the cover-art
    * decision tell "the track list is being rebuilt" (quality switch) apart from
@@ -27094,6 +34414,29 @@ export class MoviElement extends HTMLElement {
    * <video> fires it once per load; this keeps the triple coherent.
    */
   private _loadedDataFired = false;
+  /** The `<source>` children in document order, and how far along them we are. */
+  private _childSourceUrls: string[] = [];
+  private _childSourceIndex = -1;
+
+  /**
+   * `loadstart`, once per load.
+   *
+   * `el.src = url` announces the load and then writes the attribute, whose
+   * change callback announces it again — so a host counting loads, or arming a
+   * one-shot per `loadstart`, saw two for one source. The two run in the same
+   * task (setAttribute calls attributeChangedCallback synchronously), so a
+   * microtask-scoped latch collapses them while leaving a genuine later re-set
+   * — a different task — free to announce again.
+   */
+  private _loadStartPending = false;
+  private announceLoadStart(src: string | null): void {
+    if (this._loadStartPending) return;
+    this._loadStartPending = true;
+    queueMicrotask(() => {
+      this._loadStartPending = false;
+    });
+    this.dispatchEvent(new CustomEvent("loadstart", { detail: { src } }));
+  }
 
   /** Dispatch the loaded/ready triple once per load, in native order. */
   private _emitLoadedData(withMetadata: boolean): void {
@@ -27102,6 +34445,9 @@ export class MoviElement extends HTMLElement {
     if (withMetadata) this.dispatchEvent(new Event("loadedmetadata"));
     this.dispatchEvent(new Event("loadeddata"));
     if (withMetadata) this.dispatchEvent(new Event("canplay"));
+    // Every pipeline's load ends here exactly once, which makes it the one
+    // place to ask whether what just loaded will play smoothly.
+    void this.checkSmoothPlayback();
   }
   /** Byte cursor / timer backing the `stalled` no-data window. */
   private _lastStalledBytes = -1;
@@ -27212,6 +34558,15 @@ export class MoviElement extends HTMLElement {
   }
 
   set cropbars(value: boolean) {
+    const changed = !!value !== this._cropBars;
+    // Before the attribute write, as stableVolume does: this IS the viewer's
+    // answer, and the record has to agree with it or the guard in
+    // attributeChangedCallback takes it for a host talking over one. Without
+    // the record there was no guard at all — a React host that declares
+    // `cropbars` (movi-tube's watch page does) re-reflects it on its next
+    // render, so C, the gear switch and the context-menu row all turned the
+    // crop off for a second or two and then it came back on by itself.
+    this.noteStoredChoice("cropbars", !!value);
     if (value) this.setAttribute("cropbars", "");
     else this.removeAttribute("cropbars");
     // Remembered by default, like ambient mode and stable volume beside it in
@@ -27222,6 +34577,12 @@ export class MoviElement extends HTMLElement {
     // legacySettingsEnabled.
     if (this.legacySettingsEnabled()) {
       SettingsStorage.getInstance().save({ cropBars: this._cropBars });
+    }
+    // Announced like its neighbours in the menu (ambient, stable volume). Not
+    // `cropchange`: that one reports what the renderer FOUND to crop, and
+    // fires for the host's own attribute too — it says nothing about a switch.
+    if (changed) {
+      this.emitSettingChange("cropbarschange", { enabled: this._cropBars });
     }
   }
 
@@ -27526,6 +34887,30 @@ export class MoviElement extends HTMLElement {
     if (durationEl) {
       durationEl.textContent = this.formatTime(this.duration);
     }
+    // What the clock is WIDE enough to need, which is a question of how many
+    // characters it holds — not which ones, since the readout is tabular. It
+    // changes when the duration first arrives, when the position crosses an
+    // hour, and when a host adds a control beside it. Each of those can be the
+    // difference between the row fitting and the row colliding, so re-decide
+    // then and not on every tick. See fitControlsRow.
+    const clockLen =
+      (currentTimeEl?.textContent?.length ?? 0) +
+      (durationEl?.textContent?.length ?? 0);
+    if (clockLen !== this._lastClockLen) {
+      this._lastClockLen = clockLen;
+      this.fitControlsRow();
+      // The idle strip and the idle cover art park the total at the end of the
+      // row and hold that much room open in the scrubber. Only the element
+      // itself knows how wide that is — the readout is tabular, so the count
+      // of characters decides it, and that is what has just changed.
+      const totalW = durationEl?.getBoundingClientRect().width ?? 0;
+      if (totalW > 0) {
+        this.style.setProperty(
+          "--movi-clock-total-w",
+          `${Math.round(totalW)}px`,
+        );
+      }
+    }
 
     this.updateSeekAria();
 
@@ -27673,10 +35058,27 @@ export class MoviElement extends HTMLElement {
     }
 
     const half = 1.5; // px either side of the boundary
+
+    // A cut too close to either end eats that end's ROUND.
+    //
+    // The track is a pill, and the last few pixels at each end are the cap that
+    // makes it one. A chapter boundary landing inside that cap opens a gap
+    // straight through it, and what is left reads as a square-ended bar with a
+    // crumb floating beside it — which is exactly how a film with a 21-second
+    // opening chapter in a 2h42m runtime came out: the cut sat 1.3px from the
+    // left of a 620px bar and took the whole left cap with it.
+    //
+    // Nothing is lost by leaving those boundaries uncut: a section thinner than
+    // its own corner has no shape to show anyway. The guard is that corner
+    // (half the track's height) plus the gap the cut would have opened.
+    const geom = bar?.getBoundingClientRect();
+    const capPx = (geom && geom.height > 0 ? geom.height / 2 : 3) + half;
+    const capPct = geom && geom.width > 0 ? (capPx / geom.width) * 100 : 1;
+
     const cuts: number[] = [];
     for (let i = 1; i < chapters.length; i++) {
       const pct = (chapters[i].start / duration) * 100;
-      if (pct > 0 && pct < 100) cuts.push(pct);
+      if (pct > capPct && pct < 100 - capPct) cuts.push(pct);
     }
 
     // Every hole in the track as a percent range, boundary gaps and the raised
@@ -27737,6 +35139,20 @@ export class MoviElement extends HTMLElement {
     const mask = `linear-gradient(to right, ${stops.join(", ")})`;
     paint.style.setProperty("-webkit-mask-image", mask);
     paint.style.maskImage = mask;
+  }
+
+  /**
+   * Re-apply the chapter cuts for the bar's current size. The end-cap guard in
+   * applyChapterGaps is measured in pixels, so a player that changed width may
+   * now want a boundary it was hiding — or want to hide one it was showing.
+   */
+  private refreshChapterGaps(): void {
+    const sr = this.shadowRoot;
+    if (!sr || !this.player) return;
+    const chapters = this.player.getChapters?.() ?? [];
+    const duration = this.player.getDuration?.() ?? 0;
+    if (chapters.length < 2 || duration <= 0) return;
+    this.applyChapterGaps(sr, chapters, duration);
   }
 
   private renderChapterMarkers(): void {
@@ -27860,6 +35276,25 @@ export class MoviElement extends HTMLElement {
       // current run began, and a buffered edge to the LEFT of the played one
       // would invert the gradient's stops and paint the section solid.
       seg.style.setProperty("--movi-seg-buffered", pct(Math.max(played, buffered)));
+      // The hover range, clipped to this section. The thin bar's own band is
+      // masked out under a raised section (the track is CUT there — see
+      // applyChapterGaps), so without this the band stopped dead at the edge
+      // of whichever chapter the pointer was in — the one place it was being
+      // asked about. Both ends are clamped into the section, so a playhead in
+      // an earlier chapter simply anchors the band at this one's left edge.
+      //
+      // Read from the pointer's own position, NOT from `time`: the playback
+      // tick repaints a raised section with the section's MIDPOINT when the
+      // pointer's position isn't known (it only needs to re-pick the same
+      // section), and taken as a hover position that painted a band from the
+      // middle of the chapter to the playhead — so clicking past the halfway
+      // mark washed the played bar out and left it that way until the pointer
+      // left the bar. With no pointer the band collapses to nothing.
+      const pointer = this._hoverBarTime;
+      const hoverFrom = pointer >= 0 ? Math.min(played, pointer) : played;
+      const hoverTo = pointer >= 0 ? Math.max(played, pointer) : played;
+      seg.style.setProperty("--movi-seg-hover-from", pct(hoverFrom));
+      seg.style.setProperty("--movi-seg-hover-to", pct(hoverTo));
     });
     // Cut the track under the raised section — see applyChapterGaps. Only when
     // the section CHANGES: rebuilding a gradient on every pointer move is work
@@ -27894,6 +35329,65 @@ export class MoviElement extends HTMLElement {
       return start + f * Math.max(0, end - start);
     }
     return f * this.duration;
+  }
+
+  /**
+   * The inverse of barFractionToTime: where on the bar a media time sits, as a
+   * percentage. Live streams scale against the seekable DVR window, so a bare
+   * time/duration would put every live position in the wrong place.
+   */
+  private barTimeToPercent(time: number): number {
+    if (this.player?.isLiveStream?.()) {
+      const start = this.player.getSeekRangeStart?.() ?? 0;
+      const end = this.player.getLiveEdge?.() ?? 0;
+      const span = end - start;
+      if (span <= 0) return 0;
+      return Math.max(0, Math.min(100, ((time - start) / span) * 100));
+    }
+    if (this.duration <= 0) return 0;
+    return Math.max(0, Math.min(100, (time / this.duration) * 100));
+  }
+
+  /**
+   * Paint the stretch between the playhead and the pointer — what clicking
+   * here would skip forward over, or go back and replay. The bar already says
+   * where playback is and how far it has loaded; this says what the seek you
+   * are considering would COST, before you commit to it.
+   *
+   * Called with the hovered time, and with nothing to clear it. Never during a
+   * drag: there the fill itself follows the pointer, so the playhead and the
+   * pointer are the same place and the band would be a sliver chasing the
+   * handle.
+   */
+  private paintSeekRangeHover(time?: number): void {
+    const band = this.shadowRoot?.querySelector(
+      ".movi-progress-hover",
+    ) as HTMLElement | null;
+    if (!band) return;
+    if (
+      time === undefined ||
+      this.isDragging ||
+      this.isTouchDragging ||
+      this.duration <= 0
+    ) {
+      this._hoverBarTime = -1;
+      band.classList.remove("visible");
+      band.style.width = "0%";
+      return;
+    }
+    this._hoverBarTime = time;
+    const played = this.barTimeToPercent(
+      this._posterSeekActive ? 0 : this._uiCurrentTime(),
+    );
+    const hovered = this.barTimeToPercent(time);
+    const from = Math.min(played, hovered);
+    const width = Math.abs(hovered - played);
+    band.style.left = `${from}%`;
+    band.style.width = `${width}%`;
+    // Under about a third of a percent the band is narrower than the handle
+    // that is already sitting there — a flicker at the playhead rather than a
+    // distance worth showing.
+    band.classList.toggle("visible", width > 0.3);
   }
 
   private updateProgressBar(): void {
@@ -27940,13 +35434,27 @@ export class MoviElement extends HTMLElement {
       return;
     }
 
+    // The band's left edge IS the playhead, which keeps moving while the
+    // pointer holds still — so it is repainted on the tick like everything
+    // else, not only when the cursor moves.
+    if (this._hoverBarTime >= 0) {
+      this.paintSeekRangeHover(this._hoverBarTime);
+    }
+
     // A raised chapter paints its own copy of the fill and buffer, so it has
     // to move with them — otherwise the section under the pointer freezes at
     // whatever the progress was when the cursor arrived.
     if (this._hoveredChapter) {
       const start = Number(this._hoveredChapter.dataset.start ?? 0);
       const end = Number(this._hoveredChapter.dataset.end ?? 0);
-      if (end > start) this.paintChapterHover((start + end) / 2);
+      // The pointer's own time when we have it — the midpoint is only good
+      // enough to re-pick the same section, and the hover band's far end is a
+      // real position that would otherwise snap to the middle of the chapter.
+      if (end > start) {
+        this.paintChapterHover(
+          this._hoverBarTime >= 0 ? this._hoverBarTime : (start + end) / 2,
+        );
+      }
     }
 
     if (this.duration > 0) {
@@ -28006,6 +35514,16 @@ export class MoviElement extends HTMLElement {
           progressBuffer.style.width = "0%";
         }
       }
+    } else if (this.player?.hasUnknownDuration?.()) {
+      // Playing, but the container never stored a length and the scan hasn't
+      // recovered one. There is no scale to place a playhead on, and a handle
+      // parked at 0 while the picture plays reads as a stuck bar. Run it to
+      // the edge instead, the way a live stream does — the honest picture of
+      // "we are at the far end of everything known". It becomes a real bar on
+      // its own if the background rescan lands a duration.
+      if (progressFilled) progressFilled.style.width = "100%";
+      if (progressHandle) progressHandle.style.left = "100%";
+      if (progressBuffer) progressBuffer.style.width = "0%";
     } else if (!this._qualitySwitchInProgress) {
       // No media loaded yet (duration 0 — initial load or a source change to a
       // new track). Without this the filled/handle/buffer keep the PREVIOUS
@@ -28028,6 +35546,9 @@ export class MoviElement extends HTMLElement {
   private updateVolumeIcon(): void {
     const volumeHigh = this.shadowRoot?.querySelector(
       ".movi-icon-volume-high",
+    ) as HTMLElement;
+    const volumeMid = this.shadowRoot?.querySelector(
+      ".movi-icon-volume-mid",
     ) as HTMLElement;
     const volumeLow = this.shadowRoot?.querySelector(
       ".movi-icon-volume-low",
@@ -28065,13 +35586,19 @@ export class MoviElement extends HTMLElement {
 
     // Reset all first
     volumeHigh?.style.setProperty("display", "none");
+    volumeMid?.style.setProperty("display", "none");
     volumeLow?.style.setProperty("display", "none");
     volumeMute?.style.setProperty("display", "none");
 
+    // Three steps of sound, not two: the icon used to show both waves or
+    // neither, so anything under half looked the same as almost-silent and
+    // anything over it looked the same as full.
     if (this._muted || this._volume === 0) {
       volumeMute?.style.setProperty("display", "block");
-    } else if (this._volume < 0.5) {
+    } else if (this._volume < 0.34) {
       volumeLow?.style.setProperty("display", "block");
+    } else if (this._volume < 0.67) {
+      volumeMid?.style.setProperty("display", "block");
     } else {
       volumeHigh?.style.setProperty("display", "block");
     }
@@ -28101,7 +35628,184 @@ export class MoviElement extends HTMLElement {
   }
 
   /**
-   * Put the spinner up or take it down — the ONLY way to do either.
+   * Is the bar the only play/pause control on screen right now?
+   *
+   * Exactly one moment answers yes: a ring up over the OPENING load. The
+   * centre button is off whenever a spinner is up (centerHiddenBySpinner says
+   * why), and before the first play there is no picture for the bar to be in
+   * the way of — so the auto-hide has nothing to protect and everything to
+   * take away. Measured on a ~8s open: the bar was never raised at all, so a
+   * viewer watching a spinner at 00:00 had nothing to press, and on touch,
+   * where a tap on the picture only toggles the chrome, that meant no way at
+   * all to stop a start they had changed their mind about. The press itself
+   * has worked since isStartPending() landed; there was simply no button.
+   *
+   * Keyed to the RING, not to `isLoading`: a load that resolves inside
+   * `spinnerdelay` never tells the viewer to wait, so it must not pop the
+   * chrome either — an autoplay embed that opens in 300ms still opens bare.
+   * And `_hasEverPlayed` keeps it to the opening load: a mid-play stall or a
+   * quality switch has a picture on screen and a bar the viewer already knows
+   * how to summon.
+   *
+   * Not under `autoplay`: there the start was the host's decision, not the
+   * viewer's, and a bar rising the moment a src is set is chrome nobody asked
+   * for. The viewer can still summon it — hover, or a tap on touch.
+   */
+  private openingLoadHoldsControls(): boolean {
+    return (
+      this._controls &&
+      !this._autoplay &&
+      !this._isUnsupported &&
+      !this._hasEverPlayed &&
+      this.hasMediaSource() &&
+      this.centerHiddenBySpinner()
+    );
+  }
+
+  /**
+   * How long the player has to keep saying "loading" before the viewer is
+   * told. `spinnerdelay`, in seconds; 0 — the default — is no wait at all.
+   *
+   * Every reason a spinner goes up already funnels through one decision
+   * (updateLoadingIndicator) and one switch (setSpinnerVisible), so a single
+   * timer in front of that switch covers all of them: the opening load, a
+   * seek, a mid-play stall, a rendition switch, judder, the software retry.
+   *
+   * Whether the wait is worth having is not ours to decide. A local file on a
+   * fast machine interrupts itself for a tenth of a second at a time and every
+   * one of those flashes a ring the viewer cannot read, which reads as a
+   * player in trouble; a phone on a thin link stalls for real, and hiding that
+   * for a second reads as a player that has died. Same code, opposite right
+   * answers — so it is a number the page sets, and it defaults to the
+   * behaviour that was there before it existed.
+   *
+   * This is a floor under the per-reason graces above it
+   * (SEEK_SPINNER_GRACE_MS, CATCHUP_SPINNER_GRACE_MS), not a replacement: they
+   * know which interruptions are ordinarily brief, and this knows how patient
+   * this particular page wants to be. Both have to pass.
+   */
+  private spinnerDelayMs(): number {
+    // Before this source has put a frame up, `_hasEverPlayed` is false — the
+    // same flag the poster and the controls read to know the opening is not
+    // over. A host that gave the opening its own number is asking to be held
+    // to it here and nowhere else.
+    const opening = this._spinnerDelayOpening;
+    const seconds =
+      opening !== null && !this._hasEverPlayed ? opening : this._spinnerDelay;
+    return Math.max(0, seconds) * 1000;
+  }
+
+  /**
+   * `spinnerdelay`, parsed. One number, which is the form this attribute has
+   * always taken, still means what it meant: the whole policy. Two split it —
+   * how long a mid-play stall has to last before it is reported, then how long
+   * an OPENING has.
+   *
+   * They are different waits, and a single number cannot be right for both. A
+   * video that has not started yet has its poster up and is doing exactly what
+   * a video that is starting does; a video that stops mid-picture has frozen,
+   * and the viewer is looking at a still that was moving a moment ago. The
+   * first can be left alone for a while, the second wants reporting quickly.
+   *
+   * Measured on a page that hit this: an ordinary cold open put the ring on
+   * screen for 925ms of a 1205ms startup — a whole second of "something is
+   * wrong" over a video that was merely beginning. Raising the single number
+   * far enough to cover that would have bought the silence by going quiet on
+   * real stalls too, so that host gave up on this attribute and re-implemented
+   * the spinner itself. Two numbers are what it actually needed.
+   */
+  private static parseSpinnerDelay(value: string | null): {
+    stall: number;
+    opening: number | null;
+  } {
+    // Absent, or present and saying nothing — the defaults, not zero. An
+    // attribute that was never written must not be a stricter policy than the
+    // one a page gets for leaving it off.
+    const fallback = {
+      stall: MoviElement.DEFAULT_SPINNER_DELAY_S,
+      opening: MoviElement.DEFAULT_SPINNER_DELAY_OPENING_S,
+    };
+    if (value === null) return fallback;
+    const parts = value
+      .trim()
+      .split(/[\s,]+/)
+      .map((n) => parseFloat(n))
+      .filter((n) => Number.isFinite(n));
+    if (parts.length === 0) return fallback;
+    return {
+      stall: Math.max(0, parts[0]),
+      opening: parts.length > 1 ? Math.max(0, parts[1]) : null,
+    };
+  }
+
+  /** Pending "show the spinner if this is still true when it fires". */
+  private _spinnerDelayTimer: number | null = null;
+  /** The current run of wanting the spinner has already served its wait, so
+   *  the next ask puts it up at once. Cleared by a real hide. */
+  private _spinnerEarned = false;
+
+  /**
+   * Ask for the spinner, or take it down — the ONLY way to do either.
+   *
+   * Asking is not showing. A show starts the delay and returns; the spinner
+   * appears only if nothing takes the ask back before the timer fires, which
+   * is the whole point — an interruption shorter than the delay is one the
+   * viewer never hears about. A hide is immediate and unconditional: it
+   * cancels a pending show, and it ends the run, so the NEXT interruption
+   * serves the wait again from the top rather than flashing on the strength of
+   * a wait some earlier stall paid for.
+   *
+   * Once a run has been shown it stays shown — repeated asks during it (a tick
+   * re-stating the same load) do not restart the timer, or a spinner would
+   * only ever appear in the gap between two ticks.
+   */
+  private setSpinnerVisible(on: boolean): void {
+    if (!on) {
+      if (this._spinnerDelayTimer !== null) {
+        clearTimeout(this._spinnerDelayTimer);
+        this._spinnerDelayTimer = null;
+      }
+      this._spinnerEarned = false;
+      this.applySpinnerPending(false);
+      this.applySpinnerVisible(false);
+      return;
+    }
+
+    // Already past the wait for this run — including a spinner that is up and
+    // was momentarily covered by a centre flash. Show it now.
+    if (this._spinnerEarned) {
+      this.applySpinnerVisible(true);
+      return;
+    }
+    // A wait is already running for this run. Let it finish — but say so again,
+    // because a receipt that cleared the pending class on its way past (see
+    // flashCenterIcon) asks through here to have it back, and the timer it is
+    // waiting on cannot re-assert it: that timer only ever fires once, at the
+    // end.
+    if (this._spinnerDelayTimer !== null) {
+      this.applySpinnerPending(true);
+      return;
+    }
+
+    const wait = this.spinnerDelayMs();
+    if (wait <= 0) {
+      this._spinnerEarned = true;
+      this.applySpinnerVisible(true);
+      return;
+    }
+    // The player is loading from this moment; only the ring is waiting.
+    this.applySpinnerPending(true);
+    this._spinnerDelayTimer = window.setTimeout(() => {
+      this._spinnerDelayTimer = null;
+      this._spinnerEarned = true;
+      this.applySpinnerVisible(true);
+    }, wait);
+  }
+
+  /**
+   * Put the spinner on the screen or take it off — the raw half, past the
+   * delay. Call setSpinnerVisible instead unless you are the centre flash
+   * covering a spinner it has already earned.
    *
    * The host carries is-buffering for as long as the spinner is displayed, and
    * CSS leans on that: it is what keeps the centre play button off the screen
@@ -28109,8 +35813,11 @@ export class MoviElement extends HTMLElement {
    * paths could guarantee on its own. Setting the display directly leaves the
    * class behind, and a spinner the CSS cannot see is a spinner with a play
    * triangle sitting inside it. Three call sites did exactly that.
+   *
+   * Strip mode reads the same class — it has no ring, and pulses its progress
+   * bar instead — so the delay reaches that surface for free.
    */
-  private setSpinnerVisible(on: boolean): void {
+  private applySpinnerVisible(on: boolean): void {
     // One at a time, in order: the receipt, then the spinner.
     //
     // "Never the button and the spinner together" is settled by the stylesheet
@@ -28134,7 +35841,31 @@ export class MoviElement extends HTMLElement {
       ".movi-loading-indicator",
     ) as HTMLElement | null;
     if (loadingIndicator) loadingIndicator.style.display = on ? "flex" : "none";
+    // A shown ring is no longer pending, and a hidden one is not either — the
+    // wait is over both ways.
+    this.applySpinnerPending(false);
     this.classList.toggle("is-buffering", on);
+    // The ring is what takes the centre button off the screen, so the ring is
+    // what has to put the bar up in its place — but only where the bar is the
+    // last control left, which openingLoadHoldsControls decides. Raised here,
+    // at the one choke point every spinner goes through, so the delayed ring
+    // and the immediate one both bring the chrome with them.
+    if (on && this.openingLoadHoldsControls()) this.showControls();
+  }
+
+  /**
+   * "Loading, ring withheld" — the state a `spinnerdelay` wait puts the player
+   * in, and the one thing the stylesheet needs to know about it: keep the
+   * centre play button off. It cannot be said with `is-buffering`, which means
+   * the ring is UP and which strip mode reads to pulse its progress bar; a wait
+   * that is holding the ring back has to hold that back too.
+   */
+  private applySpinnerPending(on: boolean): void {
+    // Never over a centre flash, for the same reason applySpinnerVisible defers
+    // there: the rule above is !important and erases the flash mid-frame, and
+    // the flash is the receipt for something the viewer just did.
+    if (on && this._centerFlashAnim) return;
+    this.classList.toggle("is-spinner-pending", on);
   }
 
   /** A spinner that wanted to come up while a centre flash was still running. */
@@ -28171,6 +35902,24 @@ export class MoviElement extends HTMLElement {
     // framesPresented restarts from zero on a seek, so a negative delta is a
     // new run rather than time going backwards — take the sample and wait.
     const drawn = frames - this._movingFrames;
+    // The clock going BACKWARDS is the same thing said the other way: a seek,
+    // or a loop coming round to the top. Both readings below are differences
+    // against the previous sample, and a restart makes both of them lie — the
+    // frame count falls to zero and the time falls to the new position, so a
+    // picture that never stopped reads as stopped, for the whole 600ms until
+    // the next sample. That is long enough to put a spinner up over playback
+    // that is running, which is exactly what this method exists to prevent:
+    // on a loop the turn is a seek back to 0, so every turn scored a "not
+    // moving" and the ring appeared with nothing behind it.
+    //
+    // So re-base and keep the verdict we had. A restart is not evidence of
+    // stopping; the next sample is a real measurement and decides.
+    if (!first && (drawn < 0 || time < this._movingTime)) {
+      this._movingAt = now;
+      this._movingFrames = frames;
+      this._movingTime = time;
+      return this._moving;
+    }
     const fps = (drawn * 1000) / Math.max(1, elapsed);
     this._moving =
       !first &&
@@ -28280,6 +36029,12 @@ export class MoviElement extends HTMLElement {
       performance.now() - this._seekRunSince <
         MoviElement.SEEK_SPINNER_GRACE_MS
     ) {
+      shouldShow = false;
+    }
+
+    // …and the ring stands down entirely while the centre button is holding
+    // that spot as the touch play control — see centrePinnedForSeek.
+    if (shouldShow && this.centrePinnedForSeek()) {
       shouldShow = false;
     }
 
@@ -28402,6 +36157,26 @@ export class MoviElement extends HTMLElement {
     if (this.posterElement) this.posterElement.style.display = "none";
     this.setSpinnerVisible(false);
     v.controls = false;
+    // The poster goes WITH the picture.
+    //
+    // Movi paints its own poster over the canvas, and the canvas is what just
+    // went away — so hiding that overlay (above) without handing the poster to
+    // the element now doing the showing left a black box where the artwork was.
+    // The native element has its own poster machinery, and it is better than a
+    // borrowed overlay: it clears itself the moment playback starts, and it
+    // comes along into fullscreen and Picture-in-Picture.
+    const posterUrl = this._poster || this._generatedPosterUrl || "";
+    if (posterUrl) v.setAttribute("poster", posterUrl);
+    else v.removeAttribute("poster");
+    // Auto-PiP is the browser's own behaviour on a media element, not something
+    // a canvas can imitate — so it goes where it can mean something.
+    if (this.hasAttribute("autopictureinpicture")) {
+      v.setAttribute("autopictureinpicture", "");
+    } else {
+      v.removeAttribute("autopictureinpicture");
+    }
+    // …and so does refusing it — this is the element the browser would offer.
+    this.syncVideoPipBlock();
     v.style.display = "block";
     v.style.objectFit =
       this._objectFit === "cover" || this._objectFit === "fill"
@@ -28415,7 +36190,33 @@ export class MoviElement extends HTMLElement {
 
     // The polled UI loop (startUIUpdates) drives time/progress/icons off
     // this.player; these keep the play/pause state + controls snappy on change.
-    wrapper.on("stateChange", () => {
+    wrapper.on("stateChange", (state: PlayerState) => {
+      // …and the one piece of the WASM path's own state handler that the
+      // centre button depends on.
+      //
+      // `_hasEverPlayed` is what tells the UI that the poster moment is over.
+      // Only that handler sets it, and it doesn't run here — so on this path it
+      // stayed false for the whole session, and the button's two rules read it
+      // and disagreed: showControls treats "never played" as the poster state
+      // and puts the big button up on every pointer move, while
+      // updatePlayPauseIcon takes it back down on every tick because the
+      // pointer isn't a touch one. Add, remove, add — a flicker at the tick's
+      // own 4Hz, for as long as the bar was up.
+      if (state === "playing") {
+        this._hasEverPlayed = true;
+        this.flushStoryboardWarm();
+        // The standard "it is actually running now" event, which the WASM path
+        // sends from the same place — with the intent that precedes it, so a
+        // handed-off source reports play/pause and `paused` the way it did
+        // before the handoff. The viewer cannot tell which engine is running;
+        // neither should a listener.
+        this.announcePlay();
+        this.dispatchEvent(new Event("playing"));
+        // …and from here we can tell whether the browser took the sound with
+        // it. See watchNativeAudio.
+        this.watchNativeAudio(v);
+      }
+      if (state === "paused") this.announcePause();
       this.updatePlayPauseIcon();
       this.updateControlsState();
     });
@@ -28454,7 +36255,12 @@ export class MoviElement extends HTMLElement {
         wrapper.seek(0);
         wrapper.play().catch(() => {});
       } else {
+        this.announcePause();
         this.dispatchEvent(new Event("ended"));
+        // The wrapper engines end their own way, so the queue is joined on
+        // both paths — a fallback to native is not a reason for a playlist to
+        // stop halfway through.
+        this.handleItemEnded();
       }
     });
     // Native can't render it either (unreadable, OR a codec the browser can't
@@ -28464,6 +36270,13 @@ export class MoviElement extends HTMLElement {
     wrapper.on("error", () => {
       if (!this._nativeFallbackActive) return; // torn down already
       this._nativeFallbackActive = false;
+      // The handoff was the last hope for this source, so the failure that led
+      // here is real after all — release it to the host (see _deferredError).
+      const held = this._deferredError;
+      if (held !== undefined) {
+        this._deferredError = undefined;
+        this.dispatchEvent(new CustomEvent("error", { detail: held }));
+      }
       try {
         wrapper.destroy();
       } catch {}
@@ -28471,7 +36284,40 @@ export class MoviElement extends HTMLElement {
       // Restore Movi's surfaces — this path doesn't go through dispose().
       if (this.canvas) this.canvas.style.display = "block";
       v.style.display = "none";
-      this.handleUnsupportedVideo(origTitle, origMessage);
+      // What to tell the viewer when BOTH engines are out.
+      //
+      // The message carried in here is the one the WASM path failed with, and
+      // for the case that brought us to a handoff at all — a host that won't
+      // let this page read the bytes — that reads "Couldn't load it. Check your
+      // connection, then try again." The connection is fine, and no amount of
+      // trying again will change either half of the problem: we can't read the
+      // file, and the browser can't play it. Say that instead, so the viewer
+      // stops retrying something that cannot work.
+      const fetchFailed = [origMessage, (held as { message?: string } | undefined)
+        ?.message].some((m) =>
+          /cors|failed to fetch|fetch video resource/i.test(String(m ?? "")),
+        );
+      if (!fetchFailed) {
+        this.handleUnsupportedVideo(origTitle, origMessage);
+        return;
+      }
+      // "Failed to fetch" is what Chrome says both when a host refuses to share
+      // its bytes with this page AND when the host isn't there at all — the two
+      // are deliberately indistinguishable to script. They call for opposite
+      // advice, so ask the one question that separates them: a no-cors HEAD,
+      // which needs no permission from the host and only has to answer at all.
+      void this.serverAnswers(url).then((reachable) => {
+        if (this._nativeFallbackActive) return; // a newer source took over
+        if (reachable) {
+          this.handleUnsupportedVideo(
+            "Can't Play This",
+            "Your browser can't play this file, and the site hosting it " +
+              "doesn't allow this page to read it.",
+          );
+        } else {
+          this.handleUnsupportedVideo(origTitle, origMessage);
+        }
+      });
     });
 
     wrapper
@@ -28560,7 +36406,126 @@ export class MoviElement extends HTMLElement {
     this.isLoading = wasLoading;
 
     this.dispatchEvent(new CustomEvent("nativefallback", { detail: { src: url } }));
-    this.dispatchEvent(new Event("loadeddata"));
+
+    // A host learns a source loaded from `durationchange` → `loadedmetadata` →
+    // `loadeddata` → `canplay`, the way a <video> announces itself. This path
+    // used to fire one bare `loadeddata` HERE — at the handoff, before the
+    // element had opened anything — and nothing afterwards: no duration, no
+    // metadata, no canplay, ever. Anything waiting on those waited forever over
+    // a video that was in fact playing (issue #14). Announce off the element's
+    // own metadata instead, and if it already has some, right away.
+    const announceNativeReady = () => {
+      if (!this._nativeFallbackActive) return;
+      // The handoff worked, so the failure that led here is not the host's
+      // problem any more — see _deferredError.
+      this._deferredError = undefined;
+      // The picture's own shape, which on this path only the <video> knows —
+      // the track manager that normally supplies it belongs to the WASM
+      // pipeline that just stood down. Without it the box keeps the 16:9
+      // placeholder and a portrait video sits letterboxed in a landscape
+      // frame. See applyIntrinsicAspect.
+      if (v.videoWidth > 0 && v.videoHeight > 0) {
+        this._lastVideoWidth = v.videoWidth;
+        this._lastVideoHeight = v.videoHeight;
+        this.applyIntrinsicAspect();
+        this.dispatchEvent(
+          new CustomEvent("resize", {
+            detail: { width: v.videoWidth, height: v.videoHeight },
+          }),
+        );
+      }
+      if (Number.isFinite(v.duration) && v.duration > 0) {
+        this.dispatchEvent(
+          new CustomEvent("durationchange", { detail: v.duration }),
+        );
+      }
+      this._emitLoadedData(true);
+    };
+    if (v.readyState >= 1 /* HAVE_METADATA */) {
+      announceNativeReady();
+    } else {
+      v.addEventListener("loadedmetadata", announceNativeReady, { once: true });
+      this.eventHandlers.set("nativeloadedmetadata", () =>
+        v.removeEventListener("loadedmetadata", announceNativeReady),
+      );
+    }
+  }
+
+  /**
+   * The load error, held back because a native handoff is about to be tried.
+   *
+   * `error` is how a host is told the source failed, and most treat it as
+   * final — they tear the player down, or report it. Firing it and THEN
+   * recovering through `fallback="native"` (which reached playing state a few
+   * milliseconds later) told them the load had failed when it had not; the
+   * viewer saw a playing video while the page reported an error (issue #14).
+   * So it is deferred: released if the native element can't play it either,
+   * dropped the moment it can.
+   */
+  private _deferredError: unknown = undefined;
+
+  /**
+   * Is a native <video> handoff still to come for this source? Then the load
+   * hasn't finished failing yet.
+   */
+  private willHandOffToNative(): boolean {
+    if (typeof this._src !== "string" || this._nativeFallbackActive) return false;
+    if (this._fallbackMode() === "native" && !this._nativeFallbackAttempted) {
+      return true;
+    }
+    const order = this._enginePriority();
+    return (
+      order.includes("native") &&
+      !this._engineTried.has("native") &&
+      order.some((e) => this._engineTried.has(e))
+    );
+  }
+
+  /** Tell the host the source failed — unless a fallback may yet rescue it. */
+  private dispatchMediaError(error: unknown): void {
+    if (this.willHandOffToNative()) {
+      this._deferredError = error;
+      Logger.info(
+        TAG,
+        "Load failed, but a native handoff is still to come — holding the `error` event back until it is decided",
+      );
+      return;
+    }
+    this._deferredError = undefined;
+    // One failure, one `error`. A failed load arrives twice — once as the
+    // player's own error event and once as the init-catch — which the overlay
+    // has always collapsed (see handleUnsupportedVideo) while the event did
+    // not, so a host that counts failures, or retries on each one, saw two of
+    // everything. Same message inside the same moment is that pair, not two
+    // things going wrong.
+    const message = error instanceof Error ? error.message : String(error);
+    if (this._lastErrorAnnounced === message) return;
+    this._lastErrorAnnounced = message;
+    window.setTimeout(() => {
+      if (this._lastErrorAnnounced === message) this._lastErrorAnnounced = null;
+    }, 300);
+    this.dispatchEvent(new CustomEvent("error", { detail: error }));
+  }
+
+  /** The message of the error just announced, while its double is still due. */
+  private _lastErrorAnnounced: string | null = null;
+
+  /**
+   * Is the origin answering at all? A no-cors HEAD gets an opaque response the
+   * page can't read, but resolving at all proves the server replied — which is
+   * the whole question. Rejects (or takes too long) → the network or the host
+   * is the problem, not permissions. Only used to word an error screen, so a
+   * slow host is treated as unreachable rather than kept waiting on.
+   */
+  private serverAnswers(url: string, timeoutMs = 1500): Promise<boolean> {
+    let done: (v: boolean) => void;
+    const settled = new Promise<boolean>((r) => (done = r));
+    const timer = setTimeout(() => done(false), timeoutMs);
+    fetch(url, { method: "HEAD", mode: "no-cors", cache: "no-store" })
+      .then(() => done(true))
+      .catch(() => done(false))
+      .finally(() => clearTimeout(timer));
+    return settled;
   }
 
   private handleUnsupportedVideo(title?: string, message?: string): void {
@@ -28613,6 +36578,33 @@ export class MoviElement extends HTMLElement {
           this.load().catch(() => {});
           return;
         }
+      }
+    }
+
+    // A manifest the URL never admitted to.
+    //
+    // Which of the two a source is — a playlist or a media file — is read off
+    // the URL, and that holds only while a manifest ends in .m3u8 or .mpd. A
+    // signed endpoint like "/share/streaming?type=M3U8_FLV_264_480" serves a
+    // playlist and says so in its Content-Type, while its path says nothing;
+    // it goes to the demuxer, which is handed a text playlist where it
+    // expected a container, and the open fails.
+    //
+    // Asked only now, and only of a source that has already failed, so a URL
+    // that works never pays for the question — the answer comes from a header
+    // on a request HttpSource had already made, not from a probe of our own.
+    if (!this.player?.isStreamPlayback?.() && !this._forcedStreamTried) {
+      const served = this.player?.getSourceContentType?.() || "";
+      const kind = MANIFEST_CONTENT_TYPES[served];
+      if (kind) {
+        this._forcedStreamTried = true;
+        this._forcedStreamNext = kind;
+        Logger.info(
+          TAG,
+          `Server calls this ${served} — re-loading as ${kind.toUpperCase()} rather than as a file`,
+        );
+        this.load().catch(() => {});
+        return;
       }
     }
 
@@ -29337,6 +37329,35 @@ export class MoviElement extends HTMLElement {
   };
   private _initialEnabledControls: string[] | null = null;
 
+  /**
+   * Context-menu rows (and submenus, by their data-submenu key) that answer to
+   * a `controlslist` token — read by the menu's click handler, which refuses a
+   * switched-off one before any branch runs.
+   *
+   * Not ACTION_CONTROL_NAME: that one decides what is live before playback,
+   * and widening it would change that answer too. Two things are left out on
+   * purpose. `play-pause`, because `noplay` is the bar's button only — Space
+   * and a click on the picture still pause, and a host cannot take pausing
+   * away from a viewer. And the rows that open or close a place — PiP,
+   * fullscreen, stats, timeline, the shortcuts sheet — whose own toggles
+   * refuse to OPEN when switched off but still let the viewer out; gating
+   * them here as well would trap someone already inside.
+   */
+  private static readonly MENU_ACTION_CONTROL: Record<string, string> = {
+    speed: "speed",
+    fit: "aspect",
+    "audio-track": "audio",
+    "subtitle-track": "cc",
+    "hdr-toggle": "hdr",
+    "rotate-video": "rotate",
+    "loop-toggle": "loop",
+    "shuffle-toggle": "playlist",
+    "stable-audio-toggle": "stableaudio",
+    "crop-toggle": "crop",
+    "ambient-toggle": "ambient",
+    snapshot: "snapshot",
+  };
+
   /** The action keys that are ENABLED before playback — see
    *  setInitialEnabledControls for what that governs. */
   getInitialEnabledControls(): string[] {
@@ -29398,12 +37419,12 @@ export class MoviElement extends HTMLElement {
    */
   /** The canvas renderer, when there is one — it owns the shader-side cut. */
   private pictureRenderer():
-    | { setCornerRadius?: (px: number) => void; presentFpsCap?: number }
+    | { setCornerRadius?: (px: number | number[]) => void; presentFpsCap?: number }
     | undefined {
     return (
       this.player as unknown as {
         videoRenderer?: {
-          setCornerRadius?: (px: number) => void;
+          setCornerRadius?: (px: number | number[]) => void;
           presentFpsCap?: number;
         };
       } | null
@@ -29477,10 +37498,11 @@ export class MoviElement extends HTMLElement {
     // border-radius and clip-path on it, so a rounded page frame ended up with
     // square video inside it. The clip below stays for the browsers that do
     // honour it (and for the <video> element, which has no shader).
-    // One radius for the picture: a shader cut per corner is a lot of machinery
-    // for a case (four different radii on a video) nobody asks for.
+    // Each corner its own radius, as the page sets them: a picture rounded only
+    // along its top (sitting on a caption bar, say) must keep square bottom
+    // corners, which a single radius taken from the top-left could not do.
     this.pictureRenderer()?.setCornerRadius?.(
-      rounded ? parseFloat(corners[0]) || 0 : 0,
+      rounded ? corners.map((c) => parseFloat(c) || 0) : 0,
     );
     for (const el of [this.canvas, this.video] as (HTMLElement | null)[]) {
       if (!el) continue;
@@ -29736,7 +37758,12 @@ export class MoviElement extends HTMLElement {
     // (The old radial gradient of one averaged colour lived here. Both paths
     // draw the drifting wash below now.)
     if (this._ambientMode) {
-      const isFullscreen = document.fullscreenElement === this;
+      // Any fullscreen the player is in, not only element fullscreen: a host
+      // that drives its own (setHostFullscreen — e.g. a page that fullscreens
+      // the whole document so the viewer can scroll past the picture) left
+      // this reading false, so the wash kept going to the page's wrapper — which
+      // such a host hides — and the bars inside the picture stayed black.
+      const isFullscreen = this.isFullscreenActive();
       // The wash: black at both edges into the sampled colour, wider than what
       // it fills so it can be slid. Brighter than the old flat fill dared to be
       // — that one covered its whole area edge to edge, so anything strong read
@@ -29793,11 +37820,18 @@ export class MoviElement extends HTMLElement {
         // colour itself was pulled down for the bars, and out here it is laid
         // over black, so matching the level the wrapper already had means
         // meeting the dimmer colour partway.
-        const alpha =
+        const w = this.ambientWrapperElement;
+        // A host can turn the glow up (or down) without restyling it: the
+        // wrapper's --movi-ambient-strength multiplies these alphas. The
+        // defaults suit a wrapper that fills the space around the player; one
+        // that only shows a rim past a framed player needs more to be seen.
+        const strength =
+          parseFloat(getComputedStyle(w).getPropertyValue("--movi-ambient-strength")) || 1;
+        const alpha = (
           this._theme === "light"
             ? [0.66, 0.4, 0.2, 0.07]
-            : [0.45, 0.24, 0.11, 0.03];
-        const w = this.ambientWrapperElement;
+            : [0.45, 0.24, 0.11, 0.03]
+        ).map((a) => Math.min(1, +(a * strength).toFixed(3)));
         w.style.backgroundImage = `radial-gradient(ellipse 110% 100% at ${centre.toFixed(
           1,
         )}% 50%, rgba(${wr}, ${wg}, ${wb}, ${alpha[0]}) 0%, rgba(${wr}, ${wg}, ${wb}, ${alpha[1]}) 30%, rgba(${wr}, ${wg}, ${wb}, ${alpha[2]}) 60%, rgba(${wr}, ${wg}, ${wb}, ${alpha[3]}) 100%)`;
@@ -30282,6 +38316,45 @@ export class MoviElement extends HTMLElement {
 
   /* ── the two attributes native has and this did not ──────────────────── */
 
+  /**
+   * Bring what the stylesheet cannot reach in step with a `controlslist` that
+   * changed after the player was built. The stylesheet hides buttons and rows
+   * on its own; these are the surfaces that were built from the old list, or
+   * that live outside the shadow tree.
+   */
+  private applyControlsList(): void {
+    // The menu portal matches `:host([controlslist~=…])` against its OWN host,
+    // which only copies the attribute when the menu opens — so a menu already
+    // open kept offering what the page had just switched off.
+    this.syncMenuPortalAudioClasses();
+    // The gear's rows are built from the list (see buildSettingsRoot), not
+    // hidden by CSS.
+    this.buildSettingsRoot();
+    // The lock screen's skip pair is registered, not styled. Only with a queue:
+    // the session is one per page, and a player with no queue clearing the
+    // pair would take it from the one that has.
+    if (this._playlist.length) this.updatePlaylistMediaSession();
+    for (const id of this._customControls.keys()) this.syncCustomControl(id);
+    this.syncVideoPipBlock();
+    // The bar lost or regained buttons: re-decide what fits, and drop (or
+    // bring back) any capsule left with nothing in it.
+    this.syncMobileExtras();
+    this.fitControlsRow();
+    this.syncEmptyCapsules();
+  }
+
+  /**
+   * Refuse Picture-in-Picture on the internal <video> too, not only on the
+   * player's own paths. The browser offers PiP on any media element by itself
+   * — the global media controls, the video's own menu — and none of that goes
+   * through togglePiP. Mirrored the way disableRemotePlayback already is.
+   */
+  private syncVideoPipBlock(): void {
+    if (!this.video) return;
+    this.video.disablePictureInPicture =
+      this.isControlDisabled("pip") || this.disablePictureInPicture;
+  }
+
   private _disablePip = false;
   get disablePictureInPicture(): boolean {
     return this._disablePip || this.hasAttribute("disablepictureinpicture");
@@ -30346,7 +38419,7 @@ export class MoviElement extends HTMLElement {
   /**
    * Get available external subtitle tracks
    */
-  getSubtitleLangs(): { lang: string; label: string; active: boolean }[] {
+  getSubtitleLangs(): { lang: string; label: string; active: boolean; pending?: boolean }[] {
     if (this.player) return this.player.getSubtitleLangs();
     return this._subtitleTracks.map((t) => ({
       lang: t.lang,
@@ -30364,6 +38437,10 @@ export class MoviElement extends HTMLElement {
   }
 
   set src(value: string | File | null) {
+    this.noteSourceAssigned();
+    // A source the QUEUE did not choose means the queue is no longer describing
+    // what is playing — unless the host happened to assign one of its items.
+    if (!this._playlistSwitching) this.notePlaylistDetached(value);
     // Save position before switching source, then stop saving
     if (this._resume) this.saveResumePosition();
     this.stopResumeSaving();
@@ -30377,12 +38454,20 @@ export class MoviElement extends HTMLElement {
     // Switching to a URL/File source supersedes any custom adapter.
     this._sourceAdapter = null;
 
-    this.dispatchEvent(new CustomEvent("loadstart", { detail: { src: value instanceof File ? value.name : value } }));
+    this.announceLoadStart(value instanceof File ? value.name : value);
 
     if (value instanceof File) {
       // For File objects, store in memory (can't store in attributes)
       this._src = value;
-      this._hasEverPlayed = false;
+      // Through resetForFreshSource, not by clearing _hasEverPlayed here. This
+      // branch hand-rolled a subset of it, and the rest of what a fresh source
+      // has to forget was simply missed — including the bar lift that rides on
+      // that flag. A file picker or a local playlist reaches the element ONLY
+      // here (a File cannot be an attribute, so attributeChangedCallback never
+      // runs), so the whole path was reset-free: the centre button stayed 18px
+      // high with the title still up and the bar's contents disabled, until the
+      // previous video's auto-hide timer fired a second later and dropped it.
+      this.resetForFreshSource();
       // Remove the src attribute if it was a string
       this.removeAttribute("src");
       // updatePoster gates on hasSource — re-evaluate now that _src is set.
@@ -30406,6 +38491,9 @@ export class MoviElement extends HTMLElement {
         this.setAttribute("src", value);
         if (sameValue) {
           this._src = value;
+          // The callback that normally does this was never called — see
+          // resetForFreshSource.
+          this.resetForFreshSource();
           this.updatePoster();
           if (this.isConnected) {
             this.load();
@@ -30514,6 +38602,20 @@ export class MoviElement extends HTMLElement {
    *
    *   player.audioOnly = true;  // data saver on
    */
+  /**
+   * Take the sound down a slope over `ms`, and leave it down.
+   *
+   * For a player that is about to go away — a desktop window closing, a page
+   * unloading. Sound that stops dead on whatever sample it was on is what
+   * makes closing an app feel like pulling a plug; a fifth of a second of
+   * slope is all it takes to feel like a door closing instead. There is no
+   * way back from it on purpose: whoever calls this is not expecting to play
+   * again.
+   */
+  fadeOutAudio(ms: number = 200): void {
+    this.player?.fadeOutAudio(ms);
+  }
+
   get audioOnly(): boolean {
     return this._audioOnly;
   }
@@ -30767,10 +38869,13 @@ export class MoviElement extends HTMLElement {
         renderer: "canvas",
         decoder: this._sw,
         canvas: this.canvas,
-        enablePreviews: this._thumb,
+        enablePreviews: this._thumb || !!this._storyboard,
         frameRate: this._fps || undefined,
         ...(this._headers && { headers: this._headers }),
       });
+      this.player.setPrecisePreviews(this._thumbPrecise);
+      this.player.setStoryboard(this._storyboard);
+      this.warmStoryboardSheets();
 
       if (this._chapters) this.player.setChapters(this._chapters);
     // The renderer is new, and the crop setting lives on it — an attribute set
@@ -30833,7 +38938,7 @@ export class MoviElement extends HTMLElement {
         await this.player.play().catch(() => {});
       } else if (this.player) {
         if (this._startAt === 0) {
-          this.player.seek(0).catch(() => {});
+          this.player.seek(0, { internal: true }).catch(() => {});
         }
       }
 
@@ -30846,7 +38951,7 @@ export class MoviElement extends HTMLElement {
       this.isLoading = false;
       if (this._pendingPlay && this.player && !this._isUnsupported) {
         this._pendingPlay = false;
-        this.player.play().catch(() => {});
+        this.startDeferredPlay();
       } else {
         this._pendingPlay = false;
       }
@@ -30887,17 +38992,85 @@ export class MoviElement extends HTMLElement {
     return this._loop;
   }
 
-  set loop(value: boolean) {
-    const enabled = !!value;
-    const changed = enabled !== this._loop;
-    this._loop = enabled;
-    if (this._loop) {
-      this.setAttribute("loop", "");
+  /**
+   * Play the queue in a random order. Off by default.
+   *
+   * Its own attribute rather than a `loop` token, because it is its own
+   * question: a queue can be shuffled and played through once, and it can be
+   * looped in the order it was given. They compose — `shuffle loop="all"` is
+   * the pair most people mean — but neither implies the other.
+   */
+  get shuffle(): boolean {
+    return this._shuffle;
+  }
+
+  set shuffle(value: boolean) {
+    const on = !!value;
+    if (on === this._shuffle) return;
+    this._shuffle = on;
+    if (on) {
+      this.setAttribute("shuffle", "");
     } else {
-      this.removeAttribute("loop");
+      this.removeAttribute("shuffle");
     }
+    this.rebuildPlayOrder();
+    this.refreshPlaylistUi();
+    this.emitSettingChange("shufflechange", { enabled: on });
+  }
+
+  /**
+   * Draw a fresh order. No-op unless shuffle is on; the item playing now keeps
+   * its place, so this changes what comes next and nothing that is on screen.
+   */
+  reshuffle(): void {
+    if (!this._shuffle) return;
+    this.rebuildPlayOrder();
+    this.refreshPlaylistUi();
+  }
+
+  /** How many times the current source has looped, from 0. Resets with the
+   *  source. The `loop` event carries the same number as it happens. */
+  get loopCount(): number {
+    return this.player?.getLoopCount() ?? 0;
+  }
+
+  set loop(value: boolean) {
+    // Stays a boolean, and stays the ITEM. A page that has always written
+    // `el.loop = true` means the thing in front of it repeats, and that is
+    // what it keeps meaning; the queue is asked for by name, through loopMode
+    // or the attribute.
+    this.loopMode = value ? "one" : "off";
+  }
+
+  /**
+   * What `loop` is set to: "off", "one" (this item, over and over) or "all"
+   * (the queue — the next item plays, and the last leads back to the first).
+   *
+   * `loop` the boolean property is the "one" half of this, kept because that
+   * is what it has always meant.
+   */
+  get loopMode(): "off" | "one" | "all" {
+    return this._loopMode;
+  }
+
+  set loopMode(mode: "off" | "one" | "all") {
+    const next = mode === "all" ? "all" : mode === "one" ? "one" : "off";
+    const changed = next !== this._loopMode;
+    // Reflect it; the attribute is the single parser, so let it do the work.
+    if (next === "off") {
+      this.removeAttribute("loop");
+    } else {
+      this.setAttribute("loop", next === "all" ? "all" : "");
+    }
+    // An attribute that is already what we are setting fires no callback.
+    if (this._loopMode !== next) this.applyLoop(next === "off" ? null : next);
     this.updateLoopUI();
-    if (changed) this.emitSettingChange("loopchange", { enabled });
+    if (changed) {
+      this.emitSettingChange("loopchange", {
+        enabled: next !== "off",
+        mode: next,
+      });
+    }
   }
 
   /**
@@ -30913,6 +39086,36 @@ export class MoviElement extends HTMLElement {
       return this._menuPortalRoot;
     }
     return this.shadowRoot!;
+  }
+
+  /**
+   * The context menu's Shuffle item: on/off state, and whether it is there at
+   * all. Driven from refreshPlaylistUi, which every change to the queue and to
+   * shuffle itself already passes through — so there is no path that can move
+   * one without the other.
+   *
+   * Visibility is set here rather than by a :host() rule because the menu
+   * portals to a body-level shadow root while it is open, where this
+   * element's host selectors do not reach.
+   */
+  private updateShuffleUI(): void {
+    const menuRoot = this.contextMenuRoot();
+    const item = menuRoot.querySelector(
+      '.movi-context-menu-item[data-action="shuffle-toggle"]',
+    ) as HTMLElement | null;
+    if (!item) return;
+    item.style.display = this._playlist.length > 1 ? "" : "none";
+    item.classList.toggle("movi-context-menu-active", this._shuffle);
+    const status = menuRoot.querySelector(".movi-shuffle-status");
+    if (status) status.textContent = this._shuffle ? "On" : "Off";
+    const outline = menuRoot.querySelector(
+      ".movi-context-menu-shuffle-outline",
+    ) as HTMLElement | null;
+    const filled = menuRoot.querySelector(
+      ".movi-context-menu-shuffle-filled",
+    ) as HTMLElement | null;
+    if (outline) outline.style.display = this._shuffle ? "none" : "block";
+    if (filled) filled.style.display = this._shuffle ? "block" : "none";
   }
 
   private updateLoopUI(): void {
@@ -30962,7 +39165,7 @@ export class MoviElement extends HTMLElement {
     // does all three. Writing "On" and leaving the row grey read as a row that
     // had not taken the click.
     row?.classList.toggle("movi-context-menu-active", this._cropBars);
-    this.buildSettingsRoot();
+    this.refreshOpenSettingsSurfaces();
   }
 
   private updateAmbientUI(): void {
@@ -31001,7 +39204,7 @@ export class MoviElement extends HTMLElement {
     }
     // The gear panel carries the same switch, so it has to hear about this
     // however the mode was changed — the row, the panel, or G.
-    this.buildSettingsRoot();
+    this.refreshOpenSettingsSurfaces();
   }
 
   // ---------------------------------------------------------------------------
@@ -31130,6 +39333,10 @@ export class MoviElement extends HTMLElement {
    */
   private noteTrackChoice(name: string, lang: string | null): void {
     if (this._applyingPersisted) return; // restoring, not choosing
+    // The viewer has answered for this file; a restore still waiting for its
+    // track to show up must not come along later and re-pick over them.
+    if (name === "audiolang") this._audioRestored = true;
+    else this._subsRestored = true;
     const opted = this._persistNames().has(name);
     // Two stores, one decision: `persist` takes it over completely when the
     // host uses it, and otherwise the always-on store remembers these the same
@@ -31225,7 +39432,15 @@ export class MoviElement extends HTMLElement {
     const wantSubs =
       storedSubs === "off" ? "off" : MoviElement.usableLang(storedSubs);
     if (!wantAudio && !wantSubs) return;
-    this._persistedTracksApplied = true;
+    // Latched only once each remembered language has actually found its track
+    // (below), not on the first attempt. The first attempt can come before the
+    // file's list is complete — a host's declared subtitle files register after
+    // the first tracksChange when the open is quick (a fixed rung, no speed
+    // test first) — and latching then meant the remembered captions never came
+    // back for that video, although the store said "en" and the V key, the
+    // gear and the menu had all saved it. The per-kind flags keep a later pass
+    // from re-selecting what has been restored; a language the file really
+    // does not have just costs a lookup per track change.
     this._applyingPersisted = true;
     try {
       for (const loose of [false, true]) {
@@ -31280,8 +39495,12 @@ export class MoviElement extends HTMLElement {
           }
         }
       }
+      this._persistedTracksApplied =
+        (!wantAudio || this._audioRestored) &&
+        (!wantSubs || this._subsRestored);
     } catch (err) {
       Logger.warn(TAG, "restoring remembered tracks failed", err);
+      this._persistedTracksApplied = true; // don't retry a throwing restore
     } finally {
       this._applyingPersisted = false;
       this.updateAudioTrackMenu();
@@ -31395,6 +39614,9 @@ export class MoviElement extends HTMLElement {
         if (def.boolean) {
           if (stored === "1") this.setAttribute(def.attr, "");
           else this.removeAttribute(def.attr);
+          // HDR reads an absent attribute as ON, so removing one that was
+          // never there changed nothing and a remembered "off" came back on.
+          if (name === "hdr") this.applyHdr(stored === "1");
         } else if (name === "aspect") {
           // Not straight onto the attribute: under objectfit="control" that
           // would take the element out of control mode. See restoreFit.
@@ -31500,6 +39722,8 @@ export class MoviElement extends HTMLElement {
   /** Built-in controls a custom one can be positioned against. */
   private static readonly CONTROL_ANCHORS: Record<string, string> = {
     play: ".movi-play-pause",
+    prev: ".movi-prev-btn",
+    next: ".movi-next-btn",
     back10: ".movi-seek-backward",
     forward10: ".movi-seek-forward",
     volume: ".movi-volume-container",
@@ -31513,10 +39737,15 @@ export class MoviElement extends HTMLElement {
     hdr: ".movi-hdr-container",
     loop: ".movi-loop-btn",
     settings: ".movi-settings-container",
+    /* The player's own divider, between the track controls and the gear. */
+    divider: ".movi-controls-right-divider",
     aspect: ".movi-aspect-ratio-btn",
     pip: ".movi-pip-btn",
     fullscreen: ".movi-fullscreen-btn",
     more: ".movi-more-btn",
+    /* The corner's three-dots — the anchor that makes placement: "top" fully
+       orderable. after: "dots" is the only way to sit further right than it. */
+    dots: ".movi-gear-btn",
   };
 
   /**
@@ -31538,6 +39767,11 @@ export class MoviElement extends HTMLElement {
   /** The context menu's item-click delegate, kept so panels created after the
    *  menu was wired can be given it too. See setupContextMenu. */
   private _menuItemClickHandler: ((e: Event) => void) | null = null;
+  /** The context menu's own close, so callers outside setupContextMenu can
+   *  close it PROPERLY — the desktop close is a portal dance (freeze the host,
+   *  hide, move menu + panels home), and skipping it leaves the menu parked in
+   *  the portal with the element's own state saying it is still open. */
+  private _hideContextMenu: (() => void) | null = null;
 
   private _customControls = new Map<
     string,
@@ -31550,7 +39784,31 @@ export class MoviElement extends HTMLElement {
    * Adding the same id twice replaces the first — so a host that re-runs its
    * setup (a framework re-render, a source change) does not end up with two.
    */
-  addControl(spec: MoviControlSpec): void {
+  addControl(spec: MoviControlSpec | MoviDividerSpec): void {
+    if ((spec as MoviDividerSpec)?.divider === true) {
+      this.addDivider(spec as MoviDividerSpec);
+      return;
+    }
+    this.addButtonControl(spec as MoviControlSpec);
+  }
+
+  /** A divider is a control with nothing to press: registered in the same map
+   *  so removeControl, controlslist and re-registration all treat it alike. */
+  private addDivider(spec: MoviDividerSpec): void {
+    if (!spec.id) {
+      Logger.warn(TAG, "addControl: a divider needs an id");
+      return;
+    }
+    if (this.isControlDisabled(spec.id)) return;
+    this.teardownCustomControl(spec.id);
+    this._customControls.set(spec.id, {
+      spec: { ...spec, label: "" } as MoviControlSpec,
+      active: false,
+    });
+    this.renderCustomControl(spec.id);
+  }
+
+  private addButtonControl(spec: MoviControlSpec): void {
     if (!spec?.id) {
       Logger.warn(TAG, "addControl: a control needs an id");
       return;
@@ -31719,6 +39977,19 @@ export class MoviElement extends HTMLElement {
    * control that comes and goes with the source never leaves a row behind for
    * a key that no longer does anything.
    */
+  /** Open or shut the Keyboard Shortcuts sheet — the ? key and the menu row.
+   *  `noshortcuts` stops it opening; one already up still closes. */
+  private toggleShortcutsPanel(): void {
+    const panel = this.shadowRoot?.querySelector(
+      ".movi-shortcuts-panel",
+    ) as HTMLElement | null;
+    if (!panel) return;
+    const open = panel.style.display !== "none";
+    if (!open && this.isControlDisabled("shortcuts")) return;
+    if (!open) this.syncShortcutsPanel();
+    panel.style.display = open ? "none" : "flex";
+  }
+
   private syncShortcutsPanel(): void {
     const panel = this.shadowRoot?.querySelector(".movi-shortcuts-panel");
     const body = panel?.querySelector(".movi-shortcuts-body");
@@ -31728,14 +39999,14 @@ export class MoviElement extends HTMLElement {
     );
     const cols = body.querySelectorAll(".movi-shortcuts-col");
     const target = (cols[cols.length - 1] ?? body) as HTMLElement;
-    for (const [, entry] of this._customControls) {
+    for (const [id, entry] of this._customControls) {
       const key = this.formatHotkey(entry.spec.hotkey);
-      if (!key) continue;
+      if (!key || this.isControlDisabled(id)) continue;
       const row = document.createElement("div");
       row.className = "movi-shortcut-row movi-custom-shortcut";
       // The panel promises what the keyboard does, and a scoped-out control's
       // key does nothing — see customHotkeyFor.
-      this.markCustomMediaScope(row, entry.spec);
+      this.markCustomScopes(row, entry.spec);
       const kbd = document.createElement("kbd");
       kbd.textContent = key;
       const label = document.createElement("span");
@@ -31749,6 +40020,8 @@ export class MoviElement extends HTMLElement {
   removeControl(id: string): void {
     this.teardownCustomControl(id);
     this._customControls.delete(id);
+    // A divider beside it may have just lost the thing it divided.
+    this.syncStrandedDividers();
     // The capsule it asked for goes with it, and anything of the player's own
     // that was wrapped to make room goes back to standing on its own.
     this.pruneControlGroups();
@@ -31825,6 +40098,32 @@ export class MoviElement extends HTMLElement {
     this.fillOverlay(el, spec.content);
     layer.appendChild(el);
     this._overlays.set(spec.id, { spec, el });
+    this.syncFillOverlayClass();
+  }
+
+  /**
+   * Is a "fill" overlay — an end screen — covering the picture?
+   *
+   * The centre button still came up under it: at `ended` it is the replay
+   * button, and an end screen is usually a translucent wash over the last
+   * frame, so a big play mark showed through behind the host's suggestions,
+   * under a layer that takes every click aimed at it. An overlay that covers
+   * the picture is the host's answer to "what now", so the button stands down
+   * while one is up. `controlslist="nocenterplay"` takes it away for good.
+   *
+   * The captions go with it, for the same reason: they sit under the overlay
+   * too, and a line of dialogue running through the middle of a grid of
+   * suggestions is noise. They come back with the picture.
+   */
+  private syncFillOverlayClass(): void {
+    let covered = false;
+    for (const { spec } of this._overlays.values()) {
+      if ((spec.placement || "fill") === "fill") {
+        covered = true;
+        break;
+      }
+    }
+    this.classList.toggle("movi-fill-overlay-open", covered);
   }
 
   /** Change an overlay in place. Content given here REPLACES what is there. */
@@ -31838,6 +40137,7 @@ export class MoviElement extends HTMLElement {
     }
     if (patch.placement) {
       entry.el.className = `movi-overlay movi-overlay-${patch.placement}`;
+      this.syncFillOverlayClass();
     }
     if (patch.interactive !== undefined) {
       entry.el.style.pointerEvents = patch.interactive === false ? "none" : "auto";
@@ -31850,6 +40150,7 @@ export class MoviElement extends HTMLElement {
     if (!entry) return;
     this._overlays.delete(id);
     entry.el.remove();
+    this.syncFillOverlayClass();
     try {
       entry.spec.onDismiss?.(reason, this);
     } catch (e) {
@@ -31945,7 +40246,11 @@ export class MoviElement extends HTMLElement {
     for (const action of Object.keys(SHORTCUT_ACTIONS)) {
       out[action] = this.getShortcut(action);
     }
-    for (const id of this._customControls.keys()) out[id] = this.getShortcut(id);
+    for (const [id, entry] of this._customControls) {
+      // A divider has nothing to press, so nothing to bind.
+      if ((entry.spec as unknown as MoviDividerSpec).divider === true) continue;
+      out[id] = this.getShortcut(id);
+    }
     return out;
   }
 
@@ -31985,17 +40290,25 @@ export class MoviElement extends HTMLElement {
     ]
       .filter(Boolean)
       .join("+");
+    // The full combination first, so a host can bind Shift+M — and across EVERY
+    // action before any of them is offered the bare key, not per action. Those
+    // two passes used to be one, which quietly meant "the earlier action wins"
+    // rather than "the more specific binding wins": Shift+P reached the pip
+    // case, because pip claims a bare "p" and is declared above anything that
+    // could claim the combination. Whoever asked for both keys gets both.
     for (const action of Object.keys(SHORTCUT_ACTIONS)) {
-      const keys = this.getShortcut(action);
-      // The full combination first, so a host can bind Shift+M. Then the bare
-      // key, but only when nothing beyond Shift is held: Shift is how "+" and
-      // "?" are typed in the first place, and the switch has always treated a
-      // shifted letter as its lowercase self.
-      if (
-        keys.includes(combo) ||
-        (!e.ctrlKey && !e.metaKey && !e.altKey && keys.includes(bare))
-      ) {
+      if (this.getShortcut(action).includes(combo)) {
         return SHORTCUT_ACTIONS[action].canonical;
+      }
+    }
+    // Then the bare key, but only when nothing beyond Shift is held: Shift is
+    // how "+" and "?" are typed in the first place, and the switch has always
+    // treated a shifted letter as its lowercase self.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      for (const action of Object.keys(SHORTCUT_ACTIONS)) {
+        if (this.getShortcut(action).includes(bare)) {
+          return SHORTCUT_ACTIONS[action].canonical;
+        }
       }
     }
     // Claimed by nobody. If it is a key the player ships with, the host has
@@ -32083,14 +40396,23 @@ export class MoviElement extends HTMLElement {
       .filter(Boolean)
       .join("+");
     const audio = this.classList.contains("movi-audio-mode");
+    const fs = this.isFullscreenActive();
     for (const [id, entry] of this._customControls) {
       const want = entry.spec.hotkey;
       if (!want) continue;
+      // Switched off after it was added — addControl refuses one that is off
+      // at the time, but the token can arrive later.
+      if (this.isControlDisabled(id)) continue;
       // A control scoped out of the current presentation is not on screen, and
       // its key should be as absent as its button — otherwise "Cast to TV"
       // still fires on a podcast, invisibly.
       const scope = entry.spec.media ?? "both";
       if ((scope === "video" && audio) || (scope === "audio" && !audio)) continue;
+      // Same for a control that only exists on one side of fullscreen.
+      const screen = entry.spec.screen ?? "both";
+      if ((screen === "fullscreen" && !fs) || (screen === "windowed" && fs)) {
+        continue;
+      }
       if (this.normaliseHotkey(want) === pressed) return id;
     }
     return null;
@@ -32116,6 +40438,9 @@ export class MoviElement extends HTMLElement {
         ?.querySelectorAll(`[data-custom-control="${sel}"]`)
         .forEach((n) => n.remove());
     }
+    // The corner may have just lost one, and the title bar's clearance is
+    // counted from what is actually there.
+    this.syncTopControlCount();
   }
 
   /**
@@ -32161,51 +40486,257 @@ export class MoviElement extends HTMLElement {
     }
   }
 
+  /** Glyphs the host has replaced, and how many times — see setIcon. The count
+   *  is what tells a painted node apart from one the player has just rebuilt,
+   *  without holding the markup twice. */
+  private _iconOverrides = new Map<string, string | Element>();
+  private _iconRevs = new Map<string, number>();
+  private _iconObserver: MutationObserver | null = null;
+
+  /** Every glyph setIcon will answer to. */
+  static get iconNames(): string[] {
+    return Object.keys(SYMBOLS);
+  }
+
+  /**
+   * Replace one of the player's own glyphs with the host's.
+   *
+   *   player.setIcon("play", '<svg viewBox="0 0 24 24">…</svg>');
+   *   player.setIcon("play", null);   // back to the built-in
+   *
+   * Every drawing of that symbol changes together — the bar button, the
+   * context-menu row, the OSD flash, the lock screen's twin in the PiP window —
+   * because they are all the same symbol and a player whose menu disagrees with
+   * its bar is worse than one that cannot be themed at all.
+   *
+   * The replacement keeps the class list, the inline `display` and the data-
+   * marks the player finds and toggles the glyph by, so a swapped play mark
+   * still hides itself when pause comes up. Sizing and colour are better said
+   * in CSS — `::part(icon)`, or `--movi-controls-color` — and this is for the
+   * cases where a different SHAPE is wanted.
+   *
+   * Markup is parsed the way addControl's `icon` is: inert document, scripts
+   * and on* handlers stripped, host trust. Names are MoviElement.iconNames.
+   */
+  setIcon(name: string, icon: string | Element | null): void {
+    if (!(name in SYMBOLS)) {
+      Logger.warn(
+        TAG,
+        `setIcon("${name}"): no such icon — see MoviElement.iconNames`,
+      );
+      return;
+    }
+    // Setting the same icon again is nothing, and saying so matters: a React
+    // effect with no dependency array and a Vue watchEffect both re-run on
+    // renders that have nothing to do with the player, and each bumped
+    // revision repaints every drawing of that symbol.
+    const current = this._iconOverrides.get(name);
+    if (icon ? current === icon : current === undefined) return;
+    if (icon) this._iconOverrides.set(name, icon);
+    else this._iconOverrides.delete(name);
+    this._iconRevs.set(name, (this._iconRevs.get(name) ?? 0) + 1);
+    this.watchIcons();
+    this.repaintIcons();
+  }
+
+  /**
+   * Draw a glyph the way the overrides currently say, if it is not already.
+   *
+   * The revision check is not an optimisation, it is what stops the observer
+   * below from chasing its own tail: replacing the node is a childList mutation
+   * on its parent, which the observer sees, which would paint it again.
+   */
+  private repaintIcon(node: Element): void {
+    const name = node.getAttribute("data-icon");
+    if (!name || !(name in SYMBOLS)) return;
+    const rev = this._iconRevs.get(name) ?? 0;
+    if ((node.getAttribute("data-icon-rev") ?? "0") === String(rev)) return;
+
+    const override = this._iconOverrides.get(name);
+    const classes = [...node.classList].filter((c) => c !== "movi-symbol");
+    const filled = node.hasAttribute("data-filled");
+    let next = override ? this.buildCustomIcon(override) : null;
+    if (!next) {
+      const holder = document.createElement("div");
+      // eslint-disable-next-line no-unsanitized/property -- player's own symbol table
+      holder.innerHTML = symbolSvg(name as SymbolName, classes.join(" "), {
+        filled,
+      });
+      next = holder.firstElementChild;
+    }
+    if (!next) return;
+
+    next.classList.add("movi-symbol", ...classes);
+    next.setAttribute("data-icon", name);
+    next.setAttribute("data-icon-rev", String(rev));
+    next.setAttribute("part", "icon");
+    next.setAttribute("aria-hidden", "true");
+    if (filled) next.setAttribute("data-filled", "");
+    // The player shows and hides these by writing display on them. A glyph that
+    // arrived hidden has to stay hidden, or a swapped pause mark appears over
+    // the play one the moment it is installed.
+    const display = (node as HTMLElement).style?.display;
+    if (display) (next as HTMLElement).style.display = display;
+    node.replaceWith(next);
+  }
+
+  /** Every glyph currently in the DOM, in both roots — the desktop menu spends
+   *  its visible life in a body-level portal. */
+  private repaintIcons(root?: ParentNode | null): void {
+    const roots = root ? [root] : [this.shadowRoot, this._menuPortalRoot];
+    for (const r of roots) {
+      if (!r) continue;
+      for (const node of Array.from(r.querySelectorAll("[data-icon]")))
+        this.repaintIcon(node);
+    }
+  }
+
+  /**
+   * Watch for glyphs the player draws AFTER the override was set — a menu page
+   * built on first open, a track list rebuilt when the source changes, the OSD.
+   * There is no single place those go through, and a host that has to re-call
+   * setIcon every time the player rebuilds something has not been given an API.
+   *
+   * Installed only once a host has actually overridden something, so a page
+   * that never calls setIcon pays nothing. Not torn down on disconnect: it
+   * holds nothing but this element's own shadow tree, so it is collected with
+   * the element, and a reconnect would otherwise have to remember to re-arm it.
+   */
+  private watchIcons(): void {
+    if (!this._iconObserver) {
+      this._iconObserver = new MutationObserver((records) => {
+        for (const record of records) {
+          for (const added of Array.from(record.addedNodes)) {
+            if (!(added instanceof Element)) continue;
+            if (added.hasAttribute("data-icon")) this.repaintIcon(added);
+            this.repaintIcons(added);
+          }
+        }
+      });
+    }
+    const opts = { childList: true, subtree: true };
+    if (this.shadowRoot) this._iconObserver.observe(this.shadowRoot, opts);
+    // observe() on a root already being watched with the same options is a
+    // no-op, so re-arming the portal every time setIcon is called is how it
+    // gets watched at all — the portal does not exist until a menu opens.
+    if (this._menuPortalRoot)
+      this._iconObserver.observe(this._menuPortalRoot, opts);
+  }
+
+  /**
+   * The button a custom control is, wherever it is going.
+   *
+   * One builder for the bar and the corner: the two differ in where they are
+   * appended and in how they are named (see the tooltip note at the corner's
+   * call site), not in what the control IS — and a second copy of this would
+   * be the thing that drifts the next time a control gains a state.
+   */
+  private buildCustomButton(
+    id: string,
+    entry: { spec: MoviControlSpec; active: boolean },
+    corner: boolean,
+  ): HTMLButtonElement {
+    const { spec } = entry;
+    const btn = document.createElement("button");
+    btn.className = "movi-btn movi-custom-btn";
+    btn.type = "button";
+    btn.dataset.customControl = id;
+    this.markCustomScopes(btn, spec);
+    btn.setAttribute("aria-label", spec.label);
+    // Through the player's own tooltip rather than the browser's, so a host
+    // control is named the same way, in the same style, at the same moment
+    // as every built-in beside it. title: null still means none — recorded
+    // as an EMPTY tip rather than an absent one, since absent falls back to
+    // the aria-label, which every control has. The corner has no such
+    // tooltip to join, so it is not given the hooks for one.
+    if (!corner) {
+      btn.dataset.tip = spec.title === null ? "" : (spec.title ?? spec.label);
+      if (spec.hotkey) btn.dataset.tipKey = formatHotkey(spec.hotkey);
+    }
+    if (spec.toggle) btn.setAttribute("aria-pressed", String(entry.active));
+    const icon = this.buildCustomIcon(spec.icon);
+    if (icon) btn.appendChild(icon);
+    else {
+      // No icon is not an error — a word is a perfectly good control, and
+      // it is better than a button nobody can see.
+      const text = document.createElement("span");
+      text.className = "movi-custom-btn-text";
+      text.textContent = spec.label;
+      btn.appendChild(text);
+    }
+    btn.classList.toggle("movi-custom-active", !!spec.toggle && entry.active);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.triggerCustomControl(id);
+    });
+    return btn;
+  }
+
+  /**
+   * How many controls the corner is holding, as a number the stylesheet can
+   * do arithmetic with — the title bar keeps clear of them (see its padding).
+   *
+   * A count rather than a measured width because the buttons are sized from
+   * --movi-btn-size, which changes at every breakpoint: a width read once
+   * would be wrong the moment the player was resized, while a count multiplied
+   * by the CURRENT button size is right at every size without being watched.
+   */
+  private syncTopControlCount(): void {
+    const corner = this.shadowRoot?.querySelector(".movi-top-controls");
+    // The host's own, not every child: the three-dots is in this row too, and
+    // the base 62px of the title bar's padding is already its clearance.
+    this.style.setProperty(
+      "--movi-top-controls-n",
+      String(corner?.querySelectorAll("[data-custom-control]").length ?? 0),
+    );
+  }
+
   private renderCustomControl(id: string): void {
     const entry = this._customControls.get(id);
     const sr = this.shadowRoot;
     if (!entry || !sr) return;
     const { spec } = entry;
-    const wantsBar = spec.placement !== "menu";
-    const wantsMenu = spec.placement === "menu" || spec.placement === "both";
+    // "both" is bar + menu, as it always was; a list says exactly which
+    // surfaces, and a bare word is that one surface. Absent means the bar.
+    const on = new Set<string>(
+      Array.isArray(spec.placement)
+        ? spec.placement
+        : spec.placement === "both"
+          ? ["bar", "menu"]
+          : [spec.placement ?? "bar"],
+    );
+    const wantsBar = on.has("bar");
+    const wantsMenu = on.has("menu");
+    const wantsTop = on.has("top");
+    const wantsCenter = on.has("center");
+
+    if ((spec as unknown as MoviDividerSpec).divider === true) {
+      this.renderCustomDivider(id, spec, { wantsBar, wantsMenu, wantsTop, wantsCenter });
+      return;
+    }
+
+    if (wantsTop) {
+      const corner = sr.querySelector(".movi-top-controls");
+      if (corner) {
+        const btn = this.buildCustomButton(id, entry, true);
+        // The bar's tooltip is drawn INSIDE the bar and positioned against it
+        // (see positionControlTip), so a corner button borrowing it would be
+        // named down at the other end of the player. The browser's own is what
+        // the three-dots beside it uses, and it appears where the pointer is.
+        if (spec.title !== null) btn.title = spec.title ?? spec.label;
+        this.insertAtAnchor(corner, btn, spec, false, {
+          defaultBefore: corner.querySelector(".movi-gear-btn"),
+        });
+        this.syncTopControlCount();
+      }
+    }
 
     if (wantsBar) {
       const side =
         spec.side === "left" ? ".movi-controls-left" : ".movi-controls-right";
       const row = sr.querySelector(side);
       if (row) {
-        const btn = document.createElement("button");
-        btn.className = "movi-btn movi-custom-btn";
-        btn.type = "button";
-        btn.dataset.customControl = id;
-        this.markCustomMediaScope(btn, spec);
-        btn.setAttribute("aria-label", spec.label);
-        // Through the player's own tooltip rather than the browser's, so a host
-        // control is named the same way, in the same style, at the same moment
-        // as every built-in beside it. title: null still means none — recorded
-        // as an EMPTY tip rather than an absent one, since absent falls back to
-        // the aria-label, which every control has.
-        btn.dataset.tip = spec.title === null ? "" : (spec.title ?? spec.label);
-        if (spec.hotkey) btn.dataset.tipKey = formatHotkey(spec.hotkey);
-        if (spec.toggle) btn.setAttribute("aria-pressed", String(entry.active));
-        const icon = this.buildCustomIcon(spec.icon);
-        if (icon) btn.appendChild(icon);
-        else {
-          // No icon is not an error — a word is a perfectly good control, and
-          // it is better than a button nobody can see.
-          const text = document.createElement("span");
-          text.className = "movi-custom-btn-text";
-          text.textContent = spec.label;
-          btn.appendChild(text);
-        }
-        btn.classList.toggle(
-          "movi-custom-active",
-          !!spec.toggle && entry.active,
-        );
-        btn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          this.triggerCustomControl(id);
-        });
+        const btn = this.buildCustomButton(id, entry, false);
         if (spec.group) {
           // A named group decides the parent; before/after still order the
           // control inside it.
@@ -32217,17 +40748,48 @@ export class MoviElement extends HTMLElement {
         } else {
           this.insertAtAnchor(row, btn, spec);
         }
+        // A control the host just added is more content in a row that may not
+        // have had room for what was already there — see fitControlsRow.
+        this.fitControlsRow();
+      }
+    }
+
+    if (wantsCenter) {
+      const centre = sr.querySelector(".movi-controls-center");
+      if (centre) {
+        const btn = this.buildCustomButton(id, entry, false);
+        // Ordered against the host's OWN other centre controls only: no
+        // built-in is in this cluster to anchor against, and insertAtAnchor
+        // searches the parent it is given, so a `before: "cc"` here simply
+        // finds nothing and the control goes to the end of the middle. That is
+        // the right answer rather than a silent jump to the settings run.
+        this.insertAtAnchor(centre, btn, spec, false, undefined, "center");
+        // The middle stands down when the two clusters need the room, and it
+        // has just gained something to measure.
+        this.fitControlsRow();
+        this.syncEmptyCapsules();
       }
     }
 
     if (wantsMenu) {
-      const menu = this.shadowRoot?.querySelector(".movi-context-menu");
+      // The menu's CURRENT root, not the shadow one it usually lives in.
+      //
+      // The desktop menu is MOVED into the body portal while it is open (see
+      // ensureMenuPortal), so for as long as the viewer is looking at it,
+      // `shadowRoot.querySelector(".movi-context-menu")` is null. Rendering
+      // through that lookup meant a control updated while the menu was open —
+      // toggling Autoplay by its hotkey with the menu up — was torn down from
+      // both roots and then rebuilt into neither: the row simply vanished from
+      // the menu the viewer was reading, and stayed gone until something
+      // re-registered the control. teardownCustomControl already knew about
+      // the portal; this is the other half of that.
+      const menu = this.contextMenuRoot().querySelector(".movi-context-menu");
       if (menu) {
         const item = document.createElement("div");
         item.className = "movi-context-menu-item";
         item.dataset.action = `custom:${id}`;
         item.dataset.customControl = id;
-        this.markCustomMediaScope(item, spec);
+        this.markCustomScopes(item, spec);
         const icon = this.buildCustomIcon(spec.icon);
         if (icon) {
           // An SVG gets the menu's icon class, which sizes it to the column the
@@ -32293,13 +40855,80 @@ export class MoviElement extends HTMLElement {
     }
   }
 
-  /** Stamp a control's media scope onto the node the CSS reads. Reuses
-   *  `data-video-only`, which the shortcuts panel already marks its rows with,
-   *  and adds its mirror for audio. Both are inert until the host class says
-   *  which presentation is on screen — see the rules by the audio-mode block. */
-  private markCustomMediaScope(node: HTMLElement, spec: MoviControlSpec): void {
+  /** The divider flavour of renderCustomControl: same surfaces, same anchors,
+   *  same groups, a line instead of a button. */
+  private renderCustomDivider(
+    id: string,
+    spec: MoviControlSpec,
+    where: { wantsBar: boolean; wantsMenu: boolean; wantsTop: boolean; wantsCenter: boolean },
+  ): void {
+    const sr = this.shadowRoot;
+    if (!sr) return;
+    const line = () => {
+      const node = document.createElement("span");
+      node.className = "movi-controls-divider movi-custom-divider";
+      node.setAttribute("part", "controls-divider");
+      node.setAttribute("aria-hidden", "true");
+      node.dataset.customControl = id;
+      this.markCustomScopes(node, spec);
+      return node;
+    };
+    if (where.wantsTop) {
+      const corner = sr.querySelector(".movi-top-controls");
+      if (corner) {
+        this.insertAtAnchor(corner, line(), spec, false, {
+          defaultBefore: corner.querySelector(".movi-gear-btn"),
+        });
+      }
+    }
+    if (where.wantsBar) {
+      const row = sr.querySelector(
+        spec.side === "left" ? ".movi-controls-left" : ".movi-controls-right",
+      );
+      if (row) {
+        const target = spec.group
+          ? this.controlGroupTarget(row, spec.group, id)
+          : row;
+        this.insertAtAnchor(target, line(), spec);
+        this.fitControlsRow();
+      }
+    }
+    if (where.wantsCenter) {
+      const centre = sr.querySelector(".movi-controls-center");
+      if (centre) {
+        this.insertAtAnchor(centre, line(), spec, false, undefined, "center");
+        this.fitControlsRow();
+      }
+    }
+    if (where.wantsMenu) {
+      const menu = this.contextMenuRoot().querySelector(".movi-context-menu");
+      if (menu) {
+        const rule = document.createElement("div");
+        rule.className = "movi-context-menu-divider";
+        rule.dataset.customControl = id;
+        this.markCustomScopes(rule, spec);
+        this.insertAtAnchor(menu, rule, spec, true);
+      }
+    }
+    this.syncEmptyCapsules();
+  }
+
+  /** Stamp a control's scopes onto the node the CSS reads.
+   *
+   *  Media reuses `data-video-only`, which the shortcuts panel already marks
+   *  its rows with, and adds its mirror for audio. Screen is the same idea for
+   *  fullscreen, against the host class applyFullscreenUiState keeps.
+   *
+   *  All four are inert until the host class says which presentation, and
+   *  which screen, is on — see the rules by the audio-mode block. Done in CSS
+   *  rather than by adding and removing nodes so a control follows a source
+   *  swap, or a viewer pressing F, with no work from the host and no render
+   *  pass here. */
+  private markCustomScopes(node: HTMLElement, spec: MoviControlSpec): void {
     if (spec.media === "video") node.setAttribute("data-video-only", "");
     else if (spec.media === "audio") node.setAttribute("data-audio-only", "");
+    if (spec.screen === "fullscreen") node.setAttribute("data-fullscreen-only", "");
+    else if (spec.screen === "windowed") node.setAttribute("data-windowed-only", "");
   }
 
   /** Place a node before/after a named built-in, or at the end of the row. */
@@ -32397,19 +41026,39 @@ export class MoviElement extends HTMLElement {
     node: Element,
     spec: MoviControlSpec,
     isMenu = false,
+    /** The corner row: which anchors this surface reads, and what a control
+     *  with none of them is placed against (the three-dots, so the corner ends
+     *  with it unless a host asks otherwise). */
+    corner?: { defaultBefore: Element | null },
+    /** The middle of the bar, which reads `anchors.center`. */
+    surface?: "center",
   ): void {
     const one = (name: string): Element | null => {
       if (isMenu) {
-        return parent.querySelector(
+        const built = parent.querySelector(
           `.movi-context-menu-item[data-action="${name}"]`,
+        );
+        // A host's OTHER control, by its id. Rows carry data-action
+        // "custom:<id>", so a built-in and a custom control cannot collide
+        // even when they share a name — and the built-in is looked up first
+        // either way.
+        return built ?? parent.querySelector(
+          `.movi-context-menu-item[data-action="custom:${this.escapeSel(name)}"]`,
         );
       }
       const sel = MoviElement.CONTROL_ANCHORS[name];
-      if (!sel) return null;
       // The anchor may sit inside the mobile-expandable wrapper; the custom
       // control goes beside the wrapper's child, not beside the wrapper, so
       // the two stay adjacent when the tray collapses.
-      return parent.querySelector(sel);
+      if (sel) return parent.querySelector(sel);
+      // Not a built-in: another of the host's controls, named by its id. What
+      // makes a row of host controls orderable AMONG THEMSELVES — without it,
+      // three controls all asking to sit after the same built-in end up in the
+      // reverse of the order they were registered in, which is nobody's idea
+      // of where they put them.
+      return parent.querySelector(
+        `[data-custom-control="${this.escapeSel(name)}"]`,
+      );
     };
     // A list is a set of fallbacks, in order: the first anchor that is actually
     // on the bar wins. See `before` on the spec for why that matters.
@@ -32422,18 +41071,37 @@ export class MoviElement extends HTMLElement {
       return null;
     };
     // Whatever this surface was given, falling back to the shared pair.
-    const surface = (isMenu ? spec.anchors?.menu : spec.anchors?.bar) ?? {};
-    const before = find(surface.before ?? spec.before);
+    const anchors =
+      (isMenu
+        ? spec.anchors?.menu
+        : corner
+          ? spec.anchors?.top
+          : surface === "center"
+            ? spec.anchors?.center
+            : spec.anchors?.bar) ?? {};
+    const before = find(anchors.before ?? spec.before);
     if (before?.parentElement) {
       before.parentElement.insertBefore(node, before);
       return;
     }
-    const after = find(surface.after ?? spec.after);
+    const after = find(anchors.after ?? spec.after);
     if (after?.parentElement) {
       after.parentElement.insertBefore(node, after.nextSibling);
       return;
     }
+    if (corner?.defaultBefore) {
+      parent.insertBefore(node, corner.defaultBefore);
+      return;
+    }
     parent.appendChild(node);
+  }
+
+  /** A value going into a selector — an id the host chose, which is a string
+   *  and not necessarily an identifier. */
+  private escapeSel(value: string): string {
+    const esc = (window as { CSS?: { escape?: (v: string) => string } }).CSS
+      ?.escape;
+    return esc ? esc(value) : value.replace(/["\\]/g, "\\$&");
   }
 
   /**
@@ -32446,7 +41114,7 @@ export class MoviElement extends HTMLElement {
    */
   private triggerCustomControl(id: string, viaHotkey = false): void {
     const entry = this._customControls.get(id);
-    if (!entry) return;
+    if (!entry || this.isControlDisabled(id)) return;
     if (entry.spec.toggle) entry.active = !entry.active;
     if (entry.spec.toggle && entry.spec.persist) {
       this._prefWrite(`ctl:${id}`, entry.active ? "1" : "0");
@@ -32584,7 +41252,7 @@ export class MoviElement extends HTMLElement {
   /** A submenu choice was made — remember it, mark it, tell the host. */
   private pickCustomItem(id: string, itemId: string): void {
     const entry = this._customControls.get(id);
-    if (!entry?.spec.items?.length) return;
+    if (!entry?.spec.items?.length || this.isControlDisabled(id)) return;
     // Searched to the bottom, not across the top. A nested list's leaves are
     // the only rows that pick, and they are exactly the ones this missed —
     // every deep choice was dropped as if it belonged to another control.
@@ -32643,8 +41311,13 @@ export class MoviElement extends HTMLElement {
     const esc = (window as { CSS?: { escape?: (v: string) => string } }).CSS
       ?.escape;
     const sel = esc ? esc(id) : id;
+    // A token that arrives after addControl hides both faces (the stylesheet
+    // keys off this attribute); the entry is kept, so removing the token
+    // brings the control back as it was.
+    const off = this.isControlDisabled(id);
     sr.querySelectorAll(`[data-custom-control="${sel}"]`).forEach((node) => {
       const el = node as HTMLElement;
+      el.toggleAttribute("data-controlslist-off", off);
       if (el.classList.contains("movi-context-menu-item")) {
         const on = !!entry.spec.toggle && entry.active;
         el.classList.toggle("movi-context-menu-active", on);
@@ -32683,9 +41356,15 @@ export class MoviElement extends HTMLElement {
    *
    * Hiding the button alone is not enough: its hotkey and its context-menu row
    * would go on working, which is a control that is off in one place and on in
-   * two others. The names the availability check below knows are gated there
-   * too, so the button, the row and the key answer together; CSS hides the
-   * rest.
+   * two others. So every way in answers to the token: the stylesheet hides the
+   * button, the menu row and the shortcuts-sheet row; the key, the menu click
+   * (MENU_ACTION_CONTROL), the gear row and the gesture each check it; and the
+   * places a viewer can be IN — fullscreen, PiP, stats, the timeline, the
+   * sheet — refuse only the way in, never the way out (see togglePiP,
+   * toggleFullscreen). A handful of tokens are the bar's chrome and nothing
+   * more — noplay, novolume, noseekbuttons, noprogress, notime, nosettings,
+   * nomore, noprev/nonext — because what they sit over is the viewer's, or
+   * another attribute's (fastseek).
    */
   private _disabledControls(): Set<string> {
     const raw = this.getAttribute("controlslist");
@@ -32787,12 +41466,43 @@ export class MoviElement extends HTMLElement {
   }
 
   /**
+   * Grow the strip for a caption row, and only then.
+   *
+   * The bar is 56px, or 78 with a title, and a caption needs a row of its
+   * own. Reserving it always would make every audio file taller for a track
+   * most of them do not have; reserving it per CUE would make the bar twitch
+   * as lines come and go. So it follows the TRACK: turn subtitles on and the
+   * strip grows once, turn them off and it goes back.
+   */
+  private updateStripCaptionBand(): void {
+    if (!this.classList.contains("movi-audio-strip")) {
+      this.classList.toggle("movi-has-caption", false);
+      return;
+    }
+    // Two kinds of subtitle, and only one of them is a TrackManager track.
+    // An SRT the viewer picked is an EXTERNAL track: it is fetched and parsed
+    // by selectSubtitleLang and its cues go straight to the renderer, while
+    // TrackManager is told subtitles are off — which is exactly what the log
+    // of the reported case said one line after "External subtitle added".
+    // Asking only the track manager meant the band never appeared for the
+    // commonest way anyone adds subtitles to a song.
+    const embedded = !!this.player?.trackManager?.getActiveSubtitleTrack?.();
+    const external = !!this.player
+      ?.getSubtitleLangs?.()
+      ?.some((t) => t.active);
+    this.classList.toggle("movi-has-caption", embedded || external);
+  }
+
+  /**
    * Toggle nerd stats overlay
    */
   private toggleNerdStats(shadowRoot: ShadowRoot | null = this.shadowRoot): void {
     if (!shadowRoot) return;
     const overlay = shadowRoot.querySelector(".movi-nerd-stats") as HTMLElement;
     if (!overlay) return;
+    // `nostats` stops it opening — the I key and the menu row both land here.
+    // A panel already up still closes.
+    if (!this._nerdStatsVisible && this.isControlDisabled("stats")) return;
 
     this._nerdStatsVisible = !this._nerdStatsVisible;
 
@@ -33006,6 +41716,20 @@ export class MoviElement extends HTMLElement {
   private _previewBoxKey = "";
 
   /**
+   * The last caps measured, held until the player changes size.
+   *
+   * clientWidth/clientHeight are layout reads, and previewCaps is called from
+   * updatePreviewBox on every pointer move — after the progress fill and the
+   * chapter paint have already written styles, so each move forced a fresh
+   * layout of the whole player to re-derive a box that only depends on how big
+   * the player is. Measured at 2.6ms a move on a 960px desktop frame, which is
+   * most of what a pointer move cost. The ResizeObserver on the host (and the
+   * window-resize fallback beside it) is what actually changes the answer, so
+   * let that clear this instead.
+   */
+  private _previewCapsCache: { w: number; h: number } | null = null;
+
+  /**
    * How big the preview frame may be, measured against the PLAYER.
    *
    * 168px is a readable thumbnail on a 700px embed and a postage stamp on a
@@ -33025,8 +41749,11 @@ export class MoviElement extends HTMLElement {
    * 300px. The share is right at the size it was measured on and keeps growing
    * past it; on a 1700px frame a fifth is a 360px slab that stops reading as a
    * preview of the picture and starts reading as a second picture.
+   *
+   * Answered from _previewCapsCache once measured — see there.
    */
   private previewCaps(): { w: number; h: number } {
+    if (this._previewCapsCache) return this._previewCapsCache;
     const w = Math.round(
       Math.min(300, Math.max(MoviElement.PREVIEW_MAX_W, this.clientWidth * 0.21)),
     );
@@ -33041,7 +41768,8 @@ export class MoviElement extends HTMLElement {
     // of the HEIGHT as well, with a floor so a very short player still gets
     // something worth looking at rather than a sliver.
     const byHeight = Math.max(56, Math.round(this.clientHeight * 0.3));
-    return { w, h: Math.min(byWidth, byHeight) };
+    this._previewCapsCache = { w, h: Math.min(byWidth, byHeight) };
+    return this._previewCapsCache;
   }
 
   /**
@@ -33059,14 +41787,310 @@ export class MoviElement extends HTMLElement {
    * A manual 90/270 rotation transposes what the viewer sees, and the preview
    * is rotated to match, so the box is transposed with it.
    */
+  /**
+   * Whether a hover on the seek bar can actually produce a preview frame.
+   *
+   * `thumb` asks for previews; it does not make them possible. requestPreview()
+   * puts the card into its loading state the moment it is called and only
+   * leaves it when a blob comes back, so on a source that can never return one
+   * the card sits there loading forever — a spinner for something that is not
+   * coming. Every path that cannot produce a frame has to be ruled out BEFORE
+   * that state is entered, not after the null arrives.
+   */
+  /**
+   * Mosaics the browser has been asked to hold, so a tile from one paints
+   * without a fetch. Keyed by URL; the Image objects are kept alive
+   * deliberately — dropping them is what lets the cache evict the decode.
+   */
+  private _sheetWarm = new Map<string, HTMLImageElement>();
+
+  /**
+   * True when a preview costs nothing to produce — a storyboard whose board
+   * has loaded, where the answer is a background offset rather than a decode.
+   */
+  private hasInstantPreviews(): boolean {
+    if (!this._storyboard) return false;
+    const sheets = (
+      this.player as unknown as { getStoryboardSheets?: () => string[] } | null
+    )?.getStoryboardSheets?.();
+    return !!sheets && sheets.length > 0;
+  }
+
+  /** Ask the browser for a mosaic now, so it is there when a tile needs it. */
+  private warmSheet(url: string | undefined): HTMLImageElement | null {
+    if (!url) return null;
+    const held = this._sheetWarm.get(url);
+    if (held) return held;
+    const img = new Image();
+    img.decoding = "async";
+    img.src = url;
+    this._sheetWarm.set(url, img);
+    return img;
+  }
+
+  /**
+   * Pull the board's first mosaics in NOW, rather than on the first hover.
+   *
+   * The player already fetches the first sheet when the board is set, but that
+   * copy is an ImageBitmap for the crop path — the card paints the mosaic as a
+   * CSS background, which is the browser's own copy of the image and a
+   * separate thing to warm. And warming it at paint time cannot help the paint
+   * that asked for it: an Image is never `complete` in the same task its `src`
+   * was assigned, cached or not, so sheetReady said no and the very first
+   * hover of every source fell back to the slow path and showed the loading
+   * card. Every hover after it was instant, which is exactly the shape of a
+   * cache that is filled one moment too late.
+   *
+   * So fill it ahead of the pointer instead — once playback is running (see
+   * flushStoryboardWarm), and the WHOLE board, not just its opening. A long video's board is several mosaics, and the first hover is
+   * as likely to land in the middle of the timeline as at its start; warming
+   * only the first sheet left every one of those hovers on the slow path,
+   * which is the same symptom one sheet further along.
+   *
+   * The first two go out at once — the sheet a hover lands on, and the one a
+   * scrub reaches next. The rest trickle in one at a time, each starting when
+   * the one before it lands: a board can be a dozen mosaics, and firing them
+   * all at the video is bandwidth taken from the thing being watched. Skipped
+   * entirely under Save-Data or a 2g link, where pictures nobody has asked for
+   * are not worth the bytes.
+   */
+  private warmStoryboardSheets(): void {
+    this._storyboardWarmPending = true;
+    this.flushStoryboardWarm();
+  }
+
+  /**
+   * True while a board is waiting for playback to start before it warms.
+   *
+   * Cleared when the warm actually goes out, and re-armed by every board that
+   * is set — a source change resets `_hasEverPlayed`, so the next video's
+   * mosaics wait for the next video to start the same way.
+   */
+  private _storyboardWarmPending = false;
+
+  /**
+   * Let the warm go, once there is something to spare.
+   *
+   * Mosaics are pictures nobody has asked for yet, and a load has exactly one
+   * thing that matters: the video starting. Fetched alongside it they are
+   * bandwidth taken from the opening buffer, and what that buys is a slower
+   * start for every viewer in exchange for a faster hover for the few who
+   * scrub. So the warm waits for playback to be running — by then the startup
+   * burst is done and the link has room.
+   *
+   * Called from both "playing" handlers (the WASM path and the native
+   * wrapper), and harmless when there is nothing armed.
+   */
+  private flushStoryboardWarm(): void {
+    if (!this._storyboardWarmPending || !this._hasEverPlayed) return;
+    this._storyboardWarmPending = false;
+    this.runStoryboardWarm();
+  }
+
+  private runStoryboardWarm(): void {
+    const owner = this.player;
+    const p = owner as unknown as {
+      whenStoryboardReady?: () => Promise<string[]>;
+    } | null;
+    void p?.whenStoryboardReady?.().then((sheets) => {
+      // A source swapped while the board was loading: those mosaics belong to
+      // a video that is no longer on screen.
+      if (this.player !== owner) return;
+      const head = this.warmSheet(sheets[0]);
+      const second = this.warmSheet(sheets[1]);
+      if (sheets.length < 3) return;
+
+      const link = (
+        navigator as unknown as {
+          connection?: { effectiveType?: string; saveData?: boolean };
+        }
+      ).connection;
+      if (link?.saveData || /^(slow-)?2g$/.test(link?.effectiveType ?? "")) {
+        return;
+      }
+
+      const warmFrom = (i: number): void => {
+        if (this.player !== owner || i >= sheets.length) return;
+        const img = this.warmSheet(sheets[i]);
+        // Already in hand (or nothing to fetch): straight on to the next.
+        if (!img || img.complete) {
+          warmFrom(i + 1);
+          return;
+        }
+        const next = () => warmFrom(i + 1);
+        img.addEventListener("load", next, { once: true });
+        img.addEventListener("error", next, { once: true });
+      };
+
+      const after = second ?? head;
+      if (!after || after.complete) warmFrom(2);
+      else {
+        const go = () => warmFrom(2);
+        after.addEventListener("load", go, { once: true });
+        after.addEventListener("error", go, { once: true });
+      }
+    });
+  }
+
+  /**
+   * Has this mosaic actually arrived?
+   *
+   * Setting a background to an image the browser has not fetched yet paints the
+   * layer's own colour until it lands — a black card for as long as the fetch
+   * takes, which on the first tile of a sheet is about a second. Better to keep
+   * showing the picture that is already up: the caller falls back to the slower
+   * path, which repaints when it has something real.
+   */
+  private sheetReady(url: string): boolean {
+    const img = this.warmSheet(url);
+    return !!img && img.complete && img.naturalWidth > 0;
+  }
+
+  /**
+   * Put the storyboard tile for `time` on the card, if there is one.
+   *
+   * The mosaic is scaled so a single tile fills the card, then offset to the
+   * tile wanted — the browser holds one decoded image and moves a background
+   * origin, which is as close to free as a picture gets. Returns false when
+   * there is no board (or it is still loading), so the caller falls back to
+   * making the frame the expensive way.
+   */
+  private paintStoryboardTile(time: number): boolean {
+    const sr = this.shadowRoot;
+    const tile = (
+      this.player as unknown as {
+        getStoryboardTileSync?: (t: number) => StoryboardTile | null;
+      } | null
+    )?.getStoryboardTileSync?.(time);
+    // A tile with no rectangle is not a failure — it is a whole picture, which
+    // the branch below paints. Only a missing board is a reason to stand down.
+    if (!sr || !tile) return false;
+
+    const layer = sr.querySelector(".movi-thumbnail-tile") as HTMLElement | null;
+    if (!layer) return false;
+
+    // Not here yet — hold what is on the card and let the crop path answer,
+    // which repaints once the picture exists rather than showing black while
+    // it is fetched (see sheetReady).
+    if (!this.sheetReady(tile.url)) return false;
+
+    // A cue with no rectangle is a whole picture — one image per thumbnail,
+    // which is the other half of what a VTT thumbnail track may carry. Nothing
+    // to scale or offset: fit it to the card.
+    if (!tile.sheetWidth || !tile.sheetHeight || tile.width <= 0) {
+      layer.style.backgroundImage = `url("${tile.url}")`;
+      layer.style.backgroundSize = "contain";
+      layer.style.backgroundPosition = "center";
+      layer.style.removeProperty("height");
+      layer.style.display = "block";
+      const wholeImg = sr.querySelector(
+        ".movi-thumbnail-img",
+      ) as HTMLElement | null;
+      if (wholeImg) wholeImg.style.display = "none";
+      const wholePh = sr.querySelector(
+        ".movi-thumbnail-placeholder",
+      ) as HTMLElement | null;
+      if (wholePh) wholePh.style.display = "none";
+      this.warmSheet(tile.url);
+      return true;
+    }
+
+    // Crop in PERCENTAGES, and let the stylesheet keep the box.
+    //
+    // Measuring the card to scale the sheet cannot work here: this paints
+    // BEFORE updatePreviewBox and before the card is shown, so the width read
+    // was the previous hover's — or nothing at all on the first — and the
+    // sheet ended up scaled for a card of the wrong size. What that looks like
+    // is the neighbouring frame leaking in down one side, because a sheet
+    // scaled too small no longer has one tile covering the box.
+    //
+    // Percentages need no measurement. `background-size` in percent scales the
+    // sheet so exactly one tile covers the element whatever size it settles
+    // at, and percentage `background-position` walks the grid in units of
+    // "tiles from the start" rather than pixels — so the same two numbers are
+    // right before layout, after layout, and after a resize.
+    //
+    // The inline `height` went with it: .movi-thumbnail-tile is already sized
+    // from --movi-preview-w/h, which the card derives from the SOURCE's shape
+    // (see updatePreviewBox). Writing a pixel height here fought that, and the
+    // pixel value — computed from the same stale width — is what left the box
+    // looking square.
+    const columns = tile.sheetWidth / tile.width;
+    const rows = tile.sheetHeight / tile.height;
+    const col = tile.x / tile.width;
+    const row = tile.y / tile.height;
+    layer.style.backgroundImage = `url("${tile.url}")`;
+    layer.style.backgroundSize = `${columns * 100}% ${rows * 100}%`;
+    // A single-column (or single-row) sheet has nothing to walk along, and the
+    // division would be by zero.
+    layer.style.backgroundPosition = `${
+      columns > 1 ? (col / (columns - 1)) * 100 : 0
+    }% ${rows > 1 ? (row / (rows - 1)) * 100 : 0}%`;
+    layer.style.removeProperty("height");
+    layer.style.display = "block";
+
+    // Hold this mosaic, and the one after it: a scrub crosses a sheet boundary
+    // at some point, and the sheet it crosses into is a fetch the pointer
+    // should not have to wait through.
+    const sheets = (
+      this.player as unknown as { getStoryboardSheets?: () => string[] } | null
+    )?.getStoryboardSheets?.() ?? [];
+    const at = sheets.indexOf(tile.url);
+    this.warmSheet(tile.url);
+    if (at >= 0) {
+      this.warmSheet(sheets[at + 1]);
+      this.warmSheet(sheets[at - 1]);
+    }
+
+    const img = sr.querySelector(".movi-thumbnail-img") as HTMLElement | null;
+    if (img) img.style.display = "none";
+    const placeholder = sr.querySelector(
+      ".movi-thumbnail-placeholder",
+    ) as HTMLElement | null;
+    if (placeholder) placeholder.style.display = "none";
+    return true;
+  }
+
+  private canPreviewFrames(): boolean {
+    // A storyboard is previews the source already carries, so it answers for
+    // itself — `thumb` is the switch for the DECODE pipeline, which a board
+    // makes unnecessary.
+    if (!this._thumb && !this._storyboard) return false;
+    if (this._audioOnly) return false;
+    // The native <video> fallback has no decoder of its own to thumbnail with:
+    // NativeVideoWrapper.getPreviewFrame() is a hard null, whatever the source.
+    if (this._nativeFallbackActive) return false;
+    const p = this.player as any;
+    // On an adaptive stream the frames come from a thumbnail track in the
+    // manifest (DASH-IF tiled thumbnails / HLS image playlists) rather than
+    // from a decoder — there is no byte-range seek to decode from. Shaka is the
+    // only engine that reads one, and plenty of manifests carry none; the
+    // hls.js and dash.js fallback wrappers don't implement the thumbnail
+    // contract at all, so for them the answer is always no. Same test the
+    // Timeline control already hides itself on.
+    if (p?.isStreamPlayback?.() && !p.streamHasThumbnails?.()) return false;
+    return true;
+  }
+
   private updatePreviewBox(): void {
     const track = this.player?.trackManager?.getActiveVideoTrack?.() as
-      | { width?: number; height?: number }
+      | { width?: number; height?: number; rotation?: number }
       | undefined;
     let w = track?.width || this.video?.videoWidth || 0;
     let h = track?.height || this.video?.videoHeight || 0;
     if (w <= 0 || h <= 0) return; // nothing known yet — the 16:9 fallback stands
-    if (this._currentManualRotation % 180 !== 0) [w, h] = [h, w];
+    // Both rotations, and only the NET of them.
+    //
+    // A track's own rotation is as real as the viewer's: a phone recording is
+    // stored 1080x1920 with a 270° display matrix and watched as 1920x1080.
+    // Only the manual rotation was being counted here, so such a file got a
+    // tall box while the preview renderer — which does honour the metadata —
+    // handed it a wide frame, and object-fit centred a thin strip in it with
+    // empty space above and below. Netting them also gets the case where the
+    // viewer rotates a rotated source back to where it started.
+    const netRotation =
+      (((track?.rotation ?? 0) + this._currentManualRotation) % 360 + 360) % 360;
+    if (netRotation % 180 !== 0) [w, h] = [h, w];
     const caps = this.previewCaps();
     const scale = Math.min(caps.w / w, caps.h / h);
     const boxW = Math.round(w * scale);
@@ -33114,9 +42138,13 @@ export class MoviElement extends HTMLElement {
     if (!this.shadowRoot) return;
     this._currentManualRotation = deg;
 
-    // Get video aspect ratio to determine if portrait
+    // Get video aspect ratio to determine if portrait — as WATCHED, which for a
+    // phone recording is not how it is stored: 1080x1920 with a 270° display
+    // matrix is a landscape picture. See updatePreviewBox.
     const videoTrack = this.player?.getVideoTracks()?.[0];
-    const isPortraitVideo = videoTrack && videoTrack.height > videoTrack.width;
+    const storedPortrait = !!videoTrack && videoTrack.height > videoTrack.width;
+    const metaRotated = ((videoTrack?.rotation ?? 0) % 180) !== 0;
+    const isPortraitVideo = metaRotated ? !storedPortrait : storedPortrait;
     const is90 = deg % 180 !== 0;
     // After 90° rotation: portrait becomes landscape, landscape becomes portrait
     const resultIsPortrait = is90 ? !isPortraitVideo : isPortraitVideo;
@@ -33234,16 +42262,134 @@ export class MoviElement extends HTMLElement {
     }, 10000);
   }
 
+  // ─── Tab discard recovery ───────────────────────────────────────
+
+  /**
+   * When a tab sits in the background long enough, the browser takes its
+   * memory back — Chrome's Memory Saver discards the page outright, and going
+   * back to it RELOADS it. A native <video> and YouTube come back where they
+   * were; this came back at 0:00, which reads as the player having lost the
+   * viewer's place for no reason they can see.
+   *
+   * This is not the `resume` attribute. That one is a page's choice to offer a
+   * position across visits, days apart, behind a prompt. A discard is the
+   * browser interrupting the SAME visit, and nobody asked for it — so there is
+   * no prompt and no opt-in: the position simply comes back, the way it would
+   * on any other player.
+   *
+   * sessionStorage, not localStorage: it is scoped to this one tab, it
+   * survives the discard's reload, and it is gone when the tab closes — which
+   * is exactly the lifetime of "the place you were in this tab".
+   */
+  private static readonly DISCARD_KEY_PREFIX = "movi-discard:";
+
+  /** A URL source only. A File cannot survive a discard — the page that reloads
+   *  has no way to be handed it again — so there is no position worth keeping. */
+  private discardKey(): string {
+    return typeof this._src === "string" && this._src
+      ? `${MoviElement.DISCARD_KEY_PREFIX}${this._src}`
+      : "";
+  }
+
+  private _onPageLeaving = (): void => {
+    this.saveDiscardState();
+  };
+
+  private saveDiscardState(): void {
+    // The poster seek parks currentTime at the poster timestamp for a moment;
+    // that is not where the viewer is.
+    if (this._posterSeekActive) return;
+    const key = this.discardKey();
+    if (!key || !this.player) return;
+    const t = this.currentTime;
+    if (!(t > 0)) return;
+    try {
+      sessionStorage.setItem(
+        key,
+        JSON.stringify({
+          t: Math.round(t * 100) / 100,
+          playing: this.player.getState() === "playing",
+          rate: this.playbackRate,
+        }),
+      );
+    } catch {
+      // Storage unavailable (private mode quota, sandboxed frame) — nothing to do.
+    }
+  }
+
+  /**
+   * The saved place, if and only if this page is the reload of a discard.
+   *
+   * `document.wasDiscarded` is the whole gate. A plain reload, a new visit or a
+   * navigation back all read it false, so none of them are pulled to a
+   * position the viewer did not ask for — that is what `resume` is for.
+   * Positions too close to either end are not worth a seek: near the start it
+   * is where playback begins anyway, and near the end it would only finish.
+   */
+  private takeDiscardState(): {
+    t: number;
+    playing: boolean;
+    rate: number;
+  } | null {
+    // The same media under renewed links (see _reloadFromSourceChildren) is
+    // restored exactly like a discarded tab: same place, same speed, playing
+    // only if it was. Taken once, and only while the host's key still names
+    // the media it was recorded for.
+    const carry = this._refreshCarry;
+    this._refreshCarry = null;
+    if (carry && carry.key === this._resumeKey) {
+      const d = this.duration;
+      if (!(d > 0 && carry.t > d - 1)) {
+        Logger.info(
+          TAG,
+          `Same media under new links (resumekey) — resuming at ${carry.t.toFixed(1)}s, ${carry.playing ? "playing" : "paused"}`,
+        );
+        return { t: carry.t, playing: carry.playing, rate: carry.rate };
+      }
+    }
+    const doc = document as Document & { wasDiscarded?: boolean };
+    if (!doc.wasDiscarded) return null;
+    const key = this.discardKey();
+    if (!key) return null;
+    try {
+      const raw = sessionStorage.getItem(key);
+      if (!raw) return null;
+      const v = JSON.parse(raw) as { t?: unknown; playing?: unknown; rate?: unknown };
+      const t = typeof v.t === "number" ? v.t : NaN;
+      if (!(t > 2)) return null;
+      const d = this.duration;
+      if (d > 0 && t > d - 5) return null;
+      return {
+        t,
+        playing: v.playing === true,
+        rate: typeof v.rate === "number" && v.rate > 0 ? v.rate : 1,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // ─── Resume Playback ────────────────────────────────────────────
 
   /**
    * Get a unique key for the current source (for localStorage)
+   *
+   * The title by default, because it is the one thing about a source that
+   * survives the URL changing underneath it — a signed link, a proxy, a CDN
+   * that rewrites the path on every load. Keying on the URL would lose the
+   * position each time any of those moved.
+   *
+   * But the title is the player's guess, not the host's fact. A host with a
+   * catalogue knows the id, and an id is what it wants the position filed
+   * under: two episodes that happen to share a title are not the same video,
+   * and one video whose title it later corrects is still the same video. So
+   * `resumekey` takes it over outright — and, unlike the title, it is known
+   * before the file opens, so the position is there on the first check rather
+   * than waiting for metadata.
    */
   private getResumeKey(): string {
-    // Use the final clean title — consistent regardless of URL/proxy/CDN variations.
-    if (this._title) {
-      return `movi-resume:${this._title}`;
-    }
+    if (this._resumeKey) return `movi-resume:${this._resumeKey}`;
+    if (this._title) return `movi-resume:${this._title}`;
     return "";
   }
 
@@ -33339,6 +42485,9 @@ export class MoviElement extends HTMLElement {
     if (!shadowRoot) return;
     const panel = shadowRoot.querySelector(".movi-timeline-panel") as HTMLElement;
     if (!panel) return;
+    // `notimeline`: the T key checked, but the menu row and the chapter pill
+    // came straight here. Opening is refused; closing never is.
+    if (panel.style.display === "none" && this.isControlDisabled("timeline")) return;
 
     if (panel.style.display === "none") {
       panel.style.display = "flex";
@@ -33782,10 +42931,32 @@ export class MoviElement extends HTMLElement {
     // Keep the OS lock-screen scrubber's speed indicator in sync.
     this.updateMediaSessionPosition();
     // Each new speed gets a fresh stutter warning if it can't keep up.
+    this._smoothWarnedByMeasurement = false;
+    this._warnedLinkBudget = false;
+    this._linkProbeAbort?.abort();
+    this._linkProbeAbort = null;
+    this._linkStalls = 0;
+    this._deliveryStalls = 0;
     this.resetStutterHint();
+    // …and a fresh prediction, which can say so before it has stuttered at all.
+    void this.checkSmoothPlayback();
     // Speed is the setting most often changed from the keyboard while the panel
     // is open — the row's value and the speed list's tick both have to move.
     this.refreshOpenSettingsSurfaces();
+  }
+
+  /**
+   * Seconds an interruption must last before the viewer is shown a spinner.
+   * Defaults to 1 (and 2 for the opening); `0` shows it the moment the player
+   * says it is loading.
+   */
+  get spinnerDelay(): number {
+    return this._spinnerDelay;
+  }
+
+  set spinnerDelay(value: number) {
+    if (!Number.isFinite(value)) return;
+    this.setAttribute("spinnerdelay", Math.max(0, value).toString());
   }
 
   get subtitleDelay(): number {
@@ -33860,6 +43031,10 @@ export class MoviElement extends HTMLElement {
       this.removeAttribute("ambientmode");
     }
     this.updateAmbientMode();
+    // The context-menu row and the gear switch. Each built-in control used to
+    // call this itself after the setter, so a host's own toggle (or the
+    // property) left an open menu showing the old state.
+    this.updateAmbientUI();
     if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ ambientMode: this._ambientMode });
     if (changed) {
       this.emitSettingChange("ambientchange", { enabled: !!this._ambientMode });
@@ -34103,6 +43278,8 @@ export class MoviElement extends HTMLElement {
   /** Bumped on every poster change, so a slow decode can tell it has been
    *  overtaken and drop its result instead of painting a stale image. */
   private _posterToken = 0;
+  /** The poster URL already retried without CORS — see the error handler. */
+  private _posterNoCorsUrl = "";
 
   /**
    * Put a poster up only once it is fully decoded.
@@ -34122,6 +43299,12 @@ export class MoviElement extends HTMLElement {
     const el = this.posterElement;
     if (!el || !url) return;
     const token = ++this._posterToken;
+    // Every new poster asks for CORS first; only the one that failed for that
+    // reason goes without (see the error handler). Restored here so a retry
+    // for one URL does not quietly disable it for the next.
+    if (el.src && el.src !== this._posterNoCorsUrl) {
+      el.crossOrigin = "anonymous";
+    }
     // Resolved, not as written: el.src reads back absolute while the caller
     // hands in whatever the host wrote. Comparing the two raw strings never
     // matched, so a poster set twice — the attribute and the source both run
@@ -34148,6 +43331,48 @@ export class MoviElement extends HTMLElement {
     if (token !== this._posterToken || !this.posterElement) return;
 
     el.style.objectFit = this.posterObjectFit();
+
+    // Nothing has been painted for this source yet, so there is nothing to fade
+    // FROM. The box is opaque black at this point — both the host and the
+    // canvas are — and ramping a thumbnail up out of it over 220ms is not a
+    // swap anyone chose: it is the flash a host sees on every navigation, and
+    // it lasts as long as the fade rather than as long as the load. Measured in
+    // movi-tube, poster opacity went 0 → 1 across 158ms → 366ms on each click,
+    // which is exactly what "a cover appears for a moment" was.
+    //
+    // So cut to it. The fade still belongs to the case it was written for —
+    // a poster replacing a picture that is ALREADY on screen — which is what
+    // _hasEverPlayed distinguishes, and which a new source resets.
+    if (!this._hasEverPlayed) {
+      const paint = () => {
+        if (token !== this._posterToken || !this.posterElement) return;
+        const keep = el.style.transition;
+        el.style.transition = "none";
+        el.src = url;
+        el.style.display = "block";
+        el.style.opacity = "1";
+        // Commit that paint before the transition goes back on, or the restore
+        // lands in the same task and the browser animates it after all.
+        void el.offsetHeight;
+        el.style.transition = keep;
+      };
+      // `posterdelay`: hold it back, and if the first frame beats the timer the
+      // poster is never shown at all. hidePoster clears the timer, and the
+      // token check above is the second guard for a source that changed while
+      // it was pending. Zero — the default — keeps the immediate paint every
+      // host has today.
+      if (this._posterDelayMs > 0) {
+        if (this._posterDelayTimer) clearTimeout(this._posterDelayTimer);
+        this._posterDelayTimer = setTimeout(() => {
+          this._posterDelayTimer = null;
+          paint();
+        }, this._posterDelayMs);
+        return;
+      }
+      paint();
+      return;
+    }
+
     el.style.opacity = "0";
     el.src = url;
     el.style.display = "block";
@@ -34169,6 +43394,14 @@ export class MoviElement extends HTMLElement {
    */
   private hidePoster(): void {
     if (!this.posterElement) return;
+    // A poster still waiting out `posterdelay` is the one this is really for:
+    // the frame arrived first, so the cover was never needed. Dropping the
+    // timer here is what makes "fast enough" mean "no poster at all" rather
+    // than "a poster that flashes up after the picture".
+    if (this._posterDelayTimer) {
+      clearTimeout(this._posterDelayTimer);
+      this._posterDelayTimer = null;
+    }
     this._posterToken++;
     this.posterElement.style.display = "none";
   }
@@ -34321,6 +43554,14 @@ export class MoviElement extends HTMLElement {
   }
   set resume(value: boolean) {
     this._reflectBool("resume", value);
+  }
+
+  /** What the resume position is filed under. Empty = the title decides. */
+  get resumeKey(): string {
+    return this.getAttribute("resumekey") || "";
+  }
+  set resumeKey(value: string | null) {
+    this._reflectStr("resumekey", value);
   }
 
   /** Encrypted (token-authenticated) source mode. */
@@ -34573,13 +43814,807 @@ export class MoviElement extends HTMLElement {
    *
    *   titlemode="back-mobile"              arrow on phones
    *   titlemode="back-fullscreen"          arrow only while fullscreen
+   *   titlemode="back-windowed"            arrow everywhere BUT fullscreen
    *   titlemode="back-mobile-fullscreen"   arrow only when a phone is fullscreen
    *
+   * `back-windowed` is not the same as the placement token `windowed`: that
+   * one gates the whole bar, taking the title out of fullscreen with the
+   * arrow. This scopes the arrow alone.
+   *
    * `mobile` means touch input or a phone-width container, and is decided in
-   * CSS so a desktop window narrowed to phone width counts. `fullscreen` is
-   * decided here, since the pseudo and host-driven fullscreen routes aren't
-   * visible to a media query.
+   * CSS so a desktop window narrowed to phone width counts. `fullscreen` and
+   * its mirror `windowed` (aliases `inline`, `normal`) are decided here, since
+   * the pseudo and host-driven fullscreen routes aren't visible to a media
+   * query.
    */
+  // ——— The queue ———————————————————————————————————————————————————————
+  //
+  // A player plays one thing. A page that has a next thing has always had to
+  // build the join itself: listen for `ended`, write a new `src`, remember to
+  // move the title and the poster with it, and then draw its own Next button
+  // because the bar has none. Every host wrote the same forty lines, and each
+  // one wrote them slightly differently.
+  //
+  // The queue is a list of items and an index into it. It owns four things per
+  // item — the source, the title, the poster and where to come in — and it owns
+  // them in the strict sense: an item without a title clears the title the last
+  // item set, rather than inheriting it. What it deliberately does NOT own is
+  // anything the host set for the whole player, which is why every one of those
+  // four is only cleared when the queue is the thing that set it.
+
+  private _playlist: MoviPlaylistItem[] = [];
+  /** Where in the list we are; -1 means the current source is not from it. */
+  private _playlistIndex: number = -1;
+  private _shuffle: boolean = false;
+  /**
+   * The order the queue plays in — a permutation of its indices, and the
+   * identity when shuffle is off, so every path below reads the same whether
+   * shuffle is on or not.
+   *
+   * Shuffling the ORDER rather than the queue itself is what keeps the list
+   * the host handed over intact: `playlist`, `playlistIndex` and the rows a
+   * page renders all still mean what they said, and turning shuffle off puts
+   * everything back without reloading anything.
+   */
+  private _playOrder: number[] = [];
+  /** `playlistindex`, which is a request to start somewhere other than the top
+   *  and can arrive either side of the list itself. */
+  private _playlistStartIndex: number = 0;
+  /** Which of the item-owned attributes the queue is currently the author of.
+   *  See the note above: this is what separates "this item has no poster" from
+   *  "this player has a poster, for all of them". */
+  private _playlistOwnsTitle: boolean = false;
+  private _playlistOwnsPoster: boolean = false;
+  private _playlistOwnsStartAt: boolean = false;
+  private _autoAdvance: boolean = false;
+  /** Seconds of quiet between one item ending and the next starting. */
+  /** The gap either attribute asked for, kept apart so the order they are set
+   *  in cannot decide the answer. _autoAdvanceDelay is the settled value. */
+  private _loopGap: number = 0;
+  private _autoAdvanceGap: number = 0;
+  private _autoAdvanceDelay: number = 0;
+  /** Whether the ends of the list join up — for the buttons as much as for
+   *  auto-advance, so Next on the last item and the key that does the same
+   *  thing never disagree. */
+  private _playlistWraps: boolean = false;
+  private _autoAdvanceTimer: number | null = null;
+  /** Set only while the queue itself is writing `src`, so the setter can tell
+   *  its own source change from a host stepping outside the queue. */
+  private _playlistSwitching: boolean = false;
+  /** Bumped per `playlist` attribute write; a fetch whose token is stale has
+   *  been superseded and must not land. */
+  private _playlistFetchToken: number = 0;
+
+  /**
+   * The queue.
+   *
+   *   el.playlist = ["ep1.mkv", "ep2.mkv"]
+   *   el.playlist = [{ src: "ep1.mkv", title: "Pilot", poster: "1.jpg" }]
+   *   <movi-player playlist='[{"src":"ep1.mkv","title":"Pilot"}]'>
+   *   <movi-player playlist="/season-1.json">
+   *
+   * A bare string is `{ src }`. The attribute takes the same array as JSON, or
+   * a URL to fetch it from — anything not starting with `[` is read as one.
+   *
+   * Setting a list loads its first item, unless the element is ALREADY playing
+   * one of them: `<movi-player src="ep2.mkv" playlist="…">` opens on episode 2
+   * and knows it is the second of the queue, rather than restarting at one.
+   *
+   * ### Queues the host loads
+   *
+   * An item's `src` is optional, and a queue of src-less items is one the
+   * ELEMENT never loads. It still owns the queue as a control surface — the two
+   * bar buttons, Shift+N / Shift+P, the lock-screen skip pair, which end is
+   * dead — and announces every move as a cancelable `itemchange`; the host
+   * cancels it and loads the item its own way:
+   *
+   *   el.playlist = videos.map((v) => ({ id: v.id, title: v.title,
+   *                                      poster: v.thumbnail }));
+   *   el.addEventListener("itemchange", (e) => {
+   *     e.preventDefault();            // nothing is written here
+   *     router.push(`/watch/${e.detail.item.id}`);
+   *   });
+   *
+   * This is the shape to use whenever a source is more than a URL. `<source>` /
+   * `<track>` children — a quality ladder, per-language audio, subtitle tracks
+   * — cannot be said in one `src`, and an item that HAS a src would hide those
+   * children outright (_parseChildSources only reads them when there is none).
+   * Swapping the children yourself, from the `itemchange` handler, keeps
+   * fullscreen and the unlocked AudioContext that a src write would keep too —
+   * and keeps the ladder.
+   *
+   * Opening such a queue is deliberately silent: the first item is adopted, not
+   * announced, because the host is already showing it.
+   */
+  get playlist(): MoviPlaylistItem[] {
+    return [...this._playlist];
+  }
+  set playlist(
+    value: Array<MoviPlaylistItem | string> | string | null | undefined,
+  ) {
+    if (typeof value === "string") {
+      this.applyPlaylist(value);
+      return;
+    }
+    this._playlistFetchToken++;
+    this.setPlaylistItems(MoviElement.normalisePlaylistItems(value ?? []));
+  }
+
+  /**
+   * Which item is playing, or -1 when the current source did not come from the
+   * queue (no queue at all, or a host that assigned `src` itself).
+   *
+   * Writing it says where the queue IS. It is not a request to go there —
+   * `playItem()` is that, and it announces the move. The two have to be
+   * separable: a host driving its own loads answers `itemchange` by navigating,
+   * and then has to tell the element where it landed. Saying that with a move
+   * would send the move straight back to it.
+   *
+   * -1 is allowed, and means the current source is not from the queue.
+   */
+  get playlistIndex(): number {
+    return this._playlistIndex;
+  }
+  set playlistIndex(value: number) {
+    if (!Number.isFinite(value)) return;
+    const i = Math.trunc(value);
+    if (i < -1 || i >= this._playlist.length) return;
+    if (i === this._playlistIndex) return;
+    this._playlistIndex = i;
+    // The advance that was queued belonged to where we were, not where the host
+    // has just said we are.
+    this.cancelAutoAdvance();
+    this.refreshPlaylistUi();
+  }
+
+  /** The item playing right now, if it came from the queue. */
+  get playlistItem(): MoviPlaylistItem | null {
+    return this._playlist[this._playlistIndex] ?? null;
+  }
+
+  /** Whether there is anything that way — the same question the buttons and
+   *  the keys ask, so a host's own controls grey out with theirs. */
+  get hasNext(): boolean {
+    return this.resolvePlaylistStep(1) >= 0;
+  }
+  get hasPrevious(): boolean {
+    return this.resolvePlaylistStep(-1) >= 0;
+  }
+
+  /**
+   * Play the next item. Returns false when there isn't one — the last item
+   * with no wrap, or no queue at all — and changes nothing in that case.
+   */
+  next(): boolean {
+    const target = this.resolvePlaylistStep(1, true);
+    return target < 0 ? false : this.loadPlaylistItem(target, true);
+  }
+
+  /** Play the previous item. False when there isn't one. */
+  previous(): boolean {
+    const target = this.resolvePlaylistStep(-1, true);
+    return target < 0 ? false : this.loadPlaylistItem(target, true);
+  }
+
+  /**
+   * Play the item at this index. Out of range is false and no change; the
+   * index the queue is already on RESTARTS it, which is what a click on the
+   * row you are already playing means everywhere else.
+   */
+  playItem(index: number): boolean {
+    if (!Number.isFinite(index)) return false;
+    const i = Math.trunc(index);
+    if (i < 0 || i >= this._playlist.length) return false;
+    return this.loadPlaylistItem(i, true);
+  }
+
+  /**
+   * Whether the end of one item starts the next, and how long it waits.
+   *
+   *   <movi-player autoadvance>          the moment it ends
+   *   <movi-player autoadvance="5">      five seconds later
+   *   <movi-player autoadvance="loop">   …and the last item leads to the first
+   *   <movi-player autoadvance="5 loop">
+   *
+   * Off by default: a queue a host wants to step through itself, and a queue
+   * that plays itself out, are both ordinary, and only one of them can be the
+   * behaviour nobody asked for. `loop` on the element is a different thing and
+   * wins over this one — it repeats the item, so nothing ever ends.
+   */
+  get autoAdvance(): boolean {
+    return this._autoAdvance;
+  }
+  set autoAdvance(value: boolean | number | string) {
+    if (value === false || value == null) {
+      this.removeAttribute("autoadvance");
+      return;
+    }
+    this.setAttribute("autoadvance", value === true ? "" : String(value));
+  }
+
+  /** Attribute form of the queue: a JSON array, or a URL to fetch one from. */
+  private applyPlaylist(raw: string | null): void {
+    const trimmed = raw?.trim();
+    // Any write supersedes a fetch still in the air, including a write that
+    // starts one of its own.
+    const token = ++this._playlistFetchToken;
+    if (!trimmed) {
+      this.setPlaylistItems([]);
+      return;
+    }
+    if (trimmed.startsWith("[")) {
+      try {
+        this.setPlaylistItems(
+          MoviElement.normalisePlaylistItems(JSON.parse(trimmed)),
+        );
+      } catch {
+        Logger.warn(TAG, `playlist: ignoring unparseable value ${trimmed}`);
+        this.setPlaylistItems([]);
+      }
+      return;
+    }
+    // Anything else is a URL the same array comes back from. `{ items: […] }`
+    // is accepted alongside a bare array — it is what an API tends to return,
+    // and refusing it would only mean every host writing the same unwrap.
+    void fetch(trimmed)
+      .then((r) =>
+        r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)),
+      )
+      .then((data) => {
+        if (token !== this._playlistFetchToken) return;
+        const arr = Array.isArray(data) ? data : (data as any)?.items;
+        this.setPlaylistItems(MoviElement.normalisePlaylistItems(arr));
+      })
+      .catch((err) => {
+        if (token !== this._playlistFetchToken) return;
+        Logger.warn(TAG, `playlist: ${trimmed} could not be read (${err})`);
+      });
+  }
+
+  /** Attribute form of auto-advance: presence, a delay in seconds, `loop`, or
+   *  a delay and `loop` together. An explicit false/off/no is the attribute
+   *  present and declining, which is how a framework writes it. */
+  /**
+   * Read the `loop` attribute, which is a token list rather than a flag.
+   *
+   *   loop                 the item, over and over — the original meaning, and
+   *                        what a bare attribute has always done
+   *   loop="all"           the QUEUE: this item ends, the next one plays, and
+   *                        the last leads back to the first
+   *
+   * `all` lives here rather than in `autoadvance` because a viewer asking for
+   * "loop" does not think of it as two features — they mean the thing in front
+   * of them repeats, and whether that thing is one file or a list is the only
+   * question. Aliases are taken generously for the same reason.
+   *
+   * `all` implies advancing: a queue that does not move cannot come round. An
+   * explicit `autoadvance` still owns the GAP between items, so
+   * `autoadvance="5"` with `loop="all"` is a five-second pause and a wrap.
+   */
+  /**
+   * Whose number is the gap between items.
+   *
+   * `autoadvance` wins when it names one — it is the attribute whose whole
+   * job is the timing — and `loop`'s own number covers the case where nobody
+   * wanted a second attribute just to say "five seconds". Settled in one place
+   * so that setting the two in either order lands the same way.
+   */
+  private settleAutoAdvanceGap(): void {
+    this._autoAdvanceDelay =
+      this._autoAdvanceGap > 0 ? this._autoAdvanceGap : this._loopGap;
+  }
+
+  private applyLoop(raw: string | null): void {
+    const tokens = (raw ?? "")
+      .toLowerCase()
+      .split(/[\s,]+/)
+      .filter(Boolean);
+    const declined = tokens.some(
+      (t) => t === "false" || t === "off" || t === "no" || t === "none",
+    );
+    // A number here is the gap between items — the thing autoadvance was the
+    // only way to say. `loop="all 5"`, or just `loop="5"`: asking a loop to
+    // space things out can only mean the queue, so the number implies it.
+    const gap = tokens.map((t) => parseFloat(t)).find((n) => Number.isFinite(n));
+    const saysItem = tokens.some(
+      (t) => t === "one" || t === "item" || t === "single",
+    );
+    const saysQueue = tokens.some(
+      (t) => t === "all" || t === "playlist" || t === "queue" || t === "wrap",
+    );
+    if (raw === null || declined) {
+      this._loopMode = "off";
+    } else if (saysQueue || (gap !== undefined && !saysItem)) {
+      this._loopMode = "all";
+    } else {
+      // Bare, or any of one/item/single/true.
+      this._loopMode = "one";
+    }
+    this._loopGap =
+      this._loopMode === "all" && gap !== undefined && gap > 0 ? gap : 0;
+    this.settleAutoAdvanceGap();
+    this._loop = this._loopMode === "one";
+    // Only the item repeat wants the pass primed ahead — the queue's turn is a
+    // different file and goes through a load.
+    this.player?.setLoop(this._loop);
+    if (this._loopMode === "all") {
+      this._playlistWraps = true;
+      this._autoAdvance = true;
+      this.refreshPlaylistUi();
+    } else if (this.hasAttribute("autoadvance")) {
+      // The queue still moves — but the wrap was the LOOP's, and the loop is
+      // off now. Re-read the attribute instead of leaving the ends joined;
+      // `autoadvance="loop"` is the one that keeps them joined on its own.
+      this.applyAutoAdvance(this.getAttribute("autoadvance"));
+    } else {
+      // Nothing else is asking for the queue to move or to join up.
+      this._playlistWraps = false;
+      this._autoAdvance = false;
+      this.refreshPlaylistUi();
+    }
+  }
+
+  private applyAutoAdvance(raw: string | null): void {
+    this.cancelAutoAdvance();
+    const tokens = (raw ?? "")
+      .toLowerCase()
+      .split(/[\s,]+/)
+      .filter(Boolean);
+    const declined = tokens.some(
+      (t) => t === "false" || t === "off" || t === "no" || t === "none",
+    );
+    if (raw === null || declined) {
+      // …unless loop="all" is the one asking for the queue to move.
+      this._autoAdvance = this._loopMode === "all";
+      this._autoAdvanceGap = 0;
+      this.settleAutoAdvanceGap();
+      this._playlistWraps = this._loopMode === "all";
+      this.refreshPlaylistUi();
+      return;
+    }
+    // `loop="all"` asked for the join too; autoadvance only adds to it.
+    this._playlistWraps =
+      this._loopMode === "all" ||
+      tokens.includes("loop") ||
+      tokens.includes("wrap");
+    const delay = tokens
+      .map((t) => parseFloat(t))
+      .find((n) => Number.isFinite(n));
+    this._autoAdvanceGap = delay && delay > 0 ? delay : 0;
+    this.settleAutoAdvanceGap();
+    this._autoAdvance = true;
+    // The wrap moved, so the ends of the list did too.
+    this.refreshPlaylistUi();
+  }
+
+  /** Anything list-shaped, turned into items.
+   *
+   *  A row is kept if it says what to play OR says what it IS — a `src`, or an
+   *  `id`/`title` for the src-less kind the host loads itself. A row that does
+   *  neither is dropped rather than kept as a hole: an index that lands on
+   *  nothing is a worse answer than a shorter queue. */
+  private static normalisePlaylistItems(value: unknown): MoviPlaylistItem[] {
+    if (!Array.isArray(value)) return [];
+    const out: MoviPlaylistItem[] = [];
+    for (const raw of value) {
+      if (typeof raw === "string") {
+        if (raw) out.push({ src: raw });
+        continue;
+      }
+      if (typeof File !== "undefined" && raw instanceof File) {
+        out.push({ src: raw });
+        continue;
+      }
+      if (!raw || typeof raw !== "object") continue;
+      const row = raw as Record<string, unknown>;
+      // `url` and `source` alongside `src`: the three names every feed in the
+      // world uses for the same field.
+      const rawSrc = row.src ?? row.url ?? row.source;
+      const src =
+        (typeof rawSrc === "string" && rawSrc.length > 0) ||
+        (typeof File !== "undefined" && rawSrc instanceof File)
+          ? (rawSrc as string | File)
+          : undefined;
+      const id = typeof row.id === "string" && row.id ? row.id : undefined;
+      const title = typeof row.title === "string" ? row.title : undefined;
+      if (!src && !id && !title) continue;
+      const startRaw = row.startAt ?? row.startat ?? row.start;
+      const start =
+        typeof startRaw === "number"
+          ? startRaw
+          : typeof startRaw === "string"
+            ? parseFloat(startRaw)
+            : NaN;
+      // The host's row is kept underneath, so whatever else it carries — a
+      // channel, a duration, an id of its own shape — comes back on
+      // `itemchange` instead of having to be looked up by index.
+      out.push({
+        ...row,
+        src,
+        id,
+        title,
+        poster: typeof row.poster === "string" ? row.poster : undefined,
+        startAt: Number.isFinite(start) ? start : undefined,
+      });
+    }
+    return out;
+  }
+
+  /** Replace the queue and decide where it opens. */
+  private setPlaylistItems(items: MoviPlaylistItem[]): void {
+    this.cancelAutoAdvance();
+    this._playlist = items;
+    this._playlistIndex = -1;
+    // A new queue is a new order; the old permutation described other items.
+    this.rebuildPlayOrder();
+    this.dispatchEvent(
+      new CustomEvent("playlistchange", {
+        detail: { items: [...items] },
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    if (!items.length) {
+      this.refreshPlaylistUi();
+      return;
+    }
+
+    // Where the queue opens. An explicit index outranks the adoption below: a
+    // host that says which item it wants has answered the question first.
+    let start = 0;
+    if (this._playlistStartIndex > 0) {
+      start = Math.min(this._playlistStartIndex, items.length - 1);
+    } else {
+      // A source already on the element that IS one of these items is where we
+      // are, not a video to be replaced by itself restarted. This is the common
+      // shape of a page that renders `src` from its own state and hands the same
+      // state over as a queue.
+      const current = this._src;
+      const adopted = current ? items.findIndex((i) => i.src === current) : -1;
+      if (adopted >= 0) {
+        this._playlistIndex = adopted;
+        this.refreshPlaylistUi();
+        return;
+      }
+    }
+
+    // An item with no source is one the HOST loads — see the `itemchange`
+    // contract on `playlist`. The element cannot open it, and announcing a move
+    // to the item the host is already showing would send that host navigating
+    // to where it already is. Adopt the index and say nothing.
+    if (!items[start]?.src) {
+      this._playlistIndex = start;
+      this.refreshPlaylistUi();
+      return;
+    }
+    // Otherwise open it. Not a play: whether the first item starts on its own
+    // is `autoplay`'s question, exactly as it is for a plain `src`.
+    this.loadPlaylistItem(start, false);
+  }
+
+  /**
+   * Lay out the order the queue will play in.
+   *
+   * The item playing now keeps its place at the head, so turning shuffle on
+   * never restarts what is on screen — it decides what comes AFTER. Which
+   * also means the shuffled pass runs once: it is not re-drawn when the queue
+   * wraps, because the step that wraps is also the one the Next button's
+   * tooltip asks about, and an order that changed underneath that question
+   * would name one item and play another. `reshuffle()` is there for a host
+   * that wants a fresh draw, and turning shuffle off and on again is another.
+   */
+  private rebuildPlayOrder(): void {
+    const n = this._playlist.length;
+    const order = Array.from({ length: n }, (_, i) => i);
+    if (this._shuffle && n > 1) {
+      for (let i = n - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+      }
+      const at = order.indexOf(this._playlistIndex);
+      if (at > 0) {
+        const t = order[0];
+        order[0] = order[at];
+        order[at] = t;
+      }
+    }
+    this._playOrder = order;
+  }
+
+  /**
+   * A fresh order for a new pass through a shuffled queue. Unlike
+   * {@link rebuildPlayOrder} the item just played is kept OFF the front —
+   * coming round to the top should not replay it back to back.
+   */
+  private redrawPlayOrderForNewPass(): void {
+    const n = this._playlist.length;
+    const order = Array.from({ length: n }, (_, i) => i);
+    for (let i = n - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = order[i];
+      order[i] = order[j];
+      order[j] = t;
+    }
+    if (n > 1 && order[0] === this._playlistIndex) {
+      const j = 1 + Math.floor(Math.random() * (n - 1));
+      const t = order[0];
+      order[0] = order[j];
+      order[j] = t;
+    }
+    this._playOrder = order;
+  }
+
+  /**
+   * The index `dir` away, or -1 when there is nothing that way.
+   *
+   * `commit` says this is the move itself rather than a question about it. It
+   * only matters at the wrap: a shuffled queue coming round to the top draws a
+   * NEW order there, and `hasNext` and the button tooltips ask this same
+   * question constantly — they must not shuffle the deck to answer it.
+   */
+  private resolvePlaylistStep(dir: 1 | -1, commit = false): number {
+    const n = this._playlist.length;
+    if (n < 2) return -1;
+    // Outside the queue — a host assigned its own `src`. Next starts the queue
+    // rather than resuming it from an index that no longer describes anything;
+    // Previous, with nothing behind it, is nothing.
+    if (this._playOrder.length !== n) this.rebuildPlayOrder();
+    const order = this._playOrder;
+    if (this._playlistIndex < 0) return dir > 0 ? order[0] : -1;
+    // Steps move along the ORDER, not the queue. Identical while shuffle is
+    // off, because the order is then the queue.
+    const pos = order.indexOf(this._playlistIndex);
+    if (pos < 0) return dir > 0 ? order[0] : -1;
+    const target = pos + dir;
+    if (target >= 0 && target < n) return order[target];
+    if (!this._playlistWraps) return -1;
+    // Round to the top. One permutation played over and over is not a shuffle
+    // — it is a reordered playlist — so the new pass gets a new order. Only
+    // forwards: stepping BACK off the front is a retrace, and a new order
+    // there would be a jump into a queue the listener has not heard yet.
+    if (commit && dir > 0 && this._shuffle) {
+      this.redrawPlayOrderForNewPass();
+      return this._playOrder[0];
+    }
+    return dir > 0 ? order[0] : order[n - 1];
+  }
+
+  /** What the button one step that way is about to play, for its tooltip. */
+  private neighbourItemTitle(dir: 1 | -1): string {
+    const i = this.resolvePlaylistStep(dir);
+    return i < 0 ? "" : this._playlist[i]?.title || "";
+  }
+
+  /**
+   * Move to an item.
+   *
+   * `itemchange` is announced FIRST, and it is cancelable. The move itself is
+   * settled by the time it fires — the buttons, the lock screen and
+   * `playlistIndex` all report the new item either way — but the LOAD is still
+   * the host's to take back. `preventDefault()` means "I own what plays", and
+   * the element then writes nothing at all: not the source, not the title, not
+   * the poster, not the offset.
+   *
+   * That is not an escape hatch, it is the only workable answer for two very
+   * ordinary shapes. A page whose sources are `<source>` / `<track>` children —
+   * a quality ladder, per-language audio, subtitle tracks — cannot say any of
+   * that in an item's one `src`, and writing `src` would HIDE those children
+   * (see _parseChildSources, which only reads them when there is no `src`). A
+   * page where each item is its own route has a URL, a history entry and half a
+   * page of its own to move, none of which a source swap knows about.
+   *
+   * When the load does go ahead, the order of the four writes is not cosmetic.
+   * `startat` goes in FIRST because a File source stands the player up
+   * synchronously inside the `src` setter, and an offset written after that is
+   * an offset for the item after this one. The title and the poster go in LAST
+   * because the same setter runs dispose(), which is entitled to clear both.
+   */
+  private loadPlaylistItem(index: number, autoplay: boolean): boolean {
+    const item = this._playlist[index];
+    if (!item) return false;
+    this.cancelAutoAdvance();
+    const previousIndex = this._playlistIndex;
+    this._playlistIndex = index;
+
+    const proceed = this.dispatchEvent(
+      new CustomEvent("itemchange", {
+        detail: { index, previousIndex, item: { ...item } },
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+      }),
+    );
+    if (!proceed) {
+      // The host is loading it. The ends of the queue still moved.
+      this.refreshPlaylistUi();
+      return true;
+    }
+    if (!item.src) {
+      // A src-less item that nobody claimed. Said out loud rather than left as
+      // a Next button that visibly does nothing: the queue was built for a host
+      // to drive and no host took the wheel.
+      Logger.warn(
+        TAG,
+        `playlist: item ${index} carries no src and itemchange was not prevented — nothing to load`,
+      );
+      this.refreshPlaylistUi();
+      return true;
+    }
+
+    if (item.startAt != null && Number.isFinite(item.startAt)) {
+      this._playlistOwnsStartAt = true;
+      this.setAttribute("startat", String(item.startAt));
+    } else if (this._playlistOwnsStartAt) {
+      this._playlistOwnsStartAt = false;
+      this.removeAttribute("startat");
+    }
+
+    this._playlistSwitching = true;
+    try {
+      this.src = item.src;
+    } finally {
+      this._playlistSwitching = false;
+    }
+
+    if (item.poster) {
+      this._playlistOwnsPoster = true;
+      this.setAttribute("poster", item.poster);
+    } else if (this._playlistOwnsPoster) {
+      this._playlistOwnsPoster = false;
+      this.removeAttribute("poster");
+    }
+
+    // The title is set on the field rather than through the attribute: the
+    // attribute strips itself once applied (so the browser's own tooltip never
+    // appears), which leaves nothing behind to remove when the next item has no
+    // title of its own. _titleAutoLoaded goes false with it — this title came
+    // from the host, so the next dispose() must not treat it as the container's
+    // and throw it away.
+    if (item.title != null) {
+      this._playlistOwnsTitle = true;
+      this._title = item.title;
+      this._titleAutoLoaded = false;
+      this.updateTitle();
+    } else if (this._playlistOwnsTitle) {
+      this._playlistOwnsTitle = false;
+      this._title = null;
+      this.updateTitle();
+    }
+
+    if (autoplay) {
+      // There is nothing to play yet — the load the `src` write scheduled is a
+      // microtask away — so this is the flag the load flushes when it lands.
+      // The play() beside it is for the File path, where the player already
+      // exists by the time we get here, and for the `play` event either way.
+      this._pendingPlay = true;
+      void this.play().catch(() => {});
+    }
+
+    this.refreshPlaylistUi();
+    return true;
+  }
+
+  /**
+   * An item finished. Fires `playlistend` at the end of the list whether or
+   * not auto-advance is on — a host driving the queue itself still wants to
+   * know it ran out — and only then decides whether to move.
+   */
+  private handleItemEnded(): void {
+    if (this._playlist.length < 2) return;
+    const target = this.resolvePlaylistStep(1);
+    if (target < 0) {
+      this.dispatchEvent(
+        new CustomEvent("playlistend", {
+          detail: { index: this._playlistIndex },
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return;
+    }
+    if (!this._autoAdvance) return;
+    // Through the timer even with no delay at all. This runs from inside the
+    // state change that ended the item, and the first thing the next item does
+    // is dispose() the player that is still mid-transition; a zero timeout is
+    // what keeps the switch out of its own notification.
+    this._autoAdvanceTimer = window.setTimeout(
+      () => {
+        this._autoAdvanceTimer = null;
+        // Resolved again, as the move this time — the step above was the
+        // question of whether the list had run out.
+        const moving = this.resolvePlaylistStep(1, true);
+        if (moving < 0) return;
+        this.loadPlaylistItem(moving, true);
+      },
+      Math.max(0, this._autoAdvanceDelay * 1000),
+    );
+  }
+
+  /** Drop a pending advance. Anything that replaces the source has already
+   *  decided what plays next, so the timer from the last one is stale. */
+  private cancelAutoAdvance(): void {
+    if (this._autoAdvanceTimer !== null) {
+      clearTimeout(this._autoAdvanceTimer);
+      this._autoAdvanceTimer = null;
+    }
+  }
+
+  /** A host assigned `src` itself while a queue was up. The index no longer
+   *  describes what is playing, unless the new source happens to be in the
+   *  list — in which case it describes it exactly. */
+  private notePlaylistDetached(value: string | File | null): void {
+    if (!this._playlist.length) return;
+    const found = value ? this._playlist.findIndex((i) => i.src === value) : -1;
+    if (found === this._playlistIndex) return;
+    this._playlistIndex = found;
+    this.cancelAutoAdvance();
+    this.refreshPlaylistUi();
+  }
+
+  /**
+   * Everything that reads the queue: whether the two buttons are on the bar at
+   * all, whether each of them can do anything, and the lock screen's own pair.
+   */
+  private refreshPlaylistUi(): void {
+    // One item is not a queue. The buttons stay off the bar for it — a Next
+    // that can never be pressed is a control that only takes up room.
+    this.classList.toggle("movi-has-playlist", this._playlist.length > 1);
+    this.updateShuffleUI();
+    const sr = this.shadowRoot;
+    const prev = sr?.querySelector(".movi-prev-btn") as HTMLButtonElement | null;
+    const next = sr?.querySelector(".movi-next-btn") as HTMLButtonElement | null;
+    if (prev) prev.disabled = !this.hasPrevious;
+    if (next) next.disabled = !this.hasNext;
+    // A tooltip naming the item it was about to play, still open across the
+    // switch that played it.
+    const tipped = this.controlTipFor;
+    if (tipped && (tipped === prev || tipped === next)) {
+      this.showControlTip(tipped);
+    }
+    this.updatePlaylistMediaSession();
+  }
+
+  /**
+   * The lock screen's skip pair. Set and cleared rather than registered once:
+   * a handler is what MAKES the button appear, so leaving one in place at the
+   * end of the queue offers a Next that does nothing.
+   */
+  private updatePlaylistMediaSession(): void {
+    if (!("mediaSession" in navigator)) return;
+    const ms = navigator.mediaSession;
+    const set = (
+      action: MediaSessionAction,
+      handler: MediaSessionActionHandler | null,
+    ) => {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {
+        // Same reason as setupMediaSession: a build without the action.
+      }
+    };
+    // …and off entirely where the host switched the queue off. The lock screen
+    // is the one surface a page cannot restyle its way out of.
+    const off = this.isControlDisabled("playlist");
+    set(
+      "previoustrack",
+      !off && this.hasPrevious
+        ? () => {
+            this.previous();
+          }
+        : null,
+    );
+    set(
+      "nexttrack",
+      !off && this.hasNext
+        ? () => {
+            this.next();
+          }
+        : null,
+    );
+  }
+
   /** Chapters given by the host, kept so a source/player rebuild can re-apply
    *  them — the player instance is recreated on quality switches and recovery,
    *  and a fresh one only knows about the container's own chapters. */
@@ -34653,12 +44688,24 @@ export class MoviElement extends HTMLElement {
       .filter(Boolean);
     // Anything of the shape back[-mobile][-fullscreen], in any order, with
     // ":" accepted in place of "-" — both read naturally as a scope.
-    const backToken = tokens.find((t) => /^back([-:](mobile|fullscreen|fs))*$/.test(t));
+    const backToken = tokens.find((t) =>
+      /^back([-:](mobile|fullscreen|fs|windowed|inline|normal))*$/.test(t),
+    );
     this._titleBack = !!backToken;
     this._titleBackMobileOnly = !!backToken?.includes("mobile");
     this._titleBackFullscreenOnly = !!(
       backToken &&
       (backToken.includes("fullscreen") || /[-:]fs$/.test(backToken))
+    );
+    // The mirror of `fullscreen`, and the reason it has to exist: the bar's
+    // own `windowed` placement would take the title out of fullscreen along
+    // with the arrow. This scopes the arrow alone, so "name in fullscreen, no
+    // arrow there" is one attribute. Same three words the placement takes.
+    this._titleBackWindowedOnly = !!(
+      backToken &&
+      (backToken.includes("windowed") ||
+        backToken.includes("inline") ||
+        backToken.includes("normal"))
     );
     if (tokens.includes("fullscreen") || tokens.includes("fs")) {
       this._titleMode = "fullscreen";
@@ -34695,6 +44742,64 @@ export class MoviElement extends HTMLElement {
     if (this._titleMode === "both") return true;
     const away = this.isFullscreenActive() || !!this._pipWindow;
     return this._titleMode === "fullscreen" ? away : !away;
+  }
+
+  /**
+   * Open the file dialog behind `subtitlepicker`, and load whatever comes back.
+   *
+   * The input is minted per use rather than kept in the shadow tree: a file
+   * input that has already been used keeps its value, and re-picking the same
+   * file then fires no `change` at all.
+   */
+  private openSubtitleFilePicker(): void {
+    const input = document.createElement("input");
+    input.type = "file";
+    // The external-subtitle path parses VTT, SRT and TTML. ASS/SSA is not on
+    // that list — it is only understood inside a container, where the muxed
+    // path handles it — so it is not offered here rather than accepted and
+    // failing after the pick.
+    input.accept = ".srt,.vtt,.ttml,.dfxp,text/vtt,application/x-subrip";
+    input.style.display = "none";
+    input.addEventListener("change", () => {
+      const file = input.files?.[0];
+      input.remove();
+      if (file) void this.addSubtitleFile(file);
+    });
+    this.shadowRoot?.appendChild(input);
+    input.click();
+  }
+
+  /**
+   * Add a subtitle file to the track list and show it.
+   *
+   * Public because the picker is one way in and not always the right one — a
+   * host with its own "add subtitles" button, or one that drops a file on the
+   * player, wants the same path without the element's dialog.
+   *
+   * The file never leaves the page: it becomes a `blob:` URL, which the core
+   * fetches exactly as it would a hosted file.
+   */
+  async addSubtitleFile(file: File | Blob, label?: string): Promise<boolean> {
+    if (!this.player) return false;
+    const name =
+      label ||
+      (file instanceof File ? file.name.replace(/\.[^.]+$/, "") : "Subtitle");
+    const ext = (file instanceof File ? file.name : "").toLowerCase();
+    const format: "vtt" | "srt" | "ttml" = /\.srt$/.test(ext)
+      ? "srt"
+      : /\.(ttml|dfxp)$/.test(ext)
+        ? "ttml"
+        : "vtt";
+    const url = URL.createObjectURL(file);
+    this._pickedSubtitleUrls.push(url);
+    // The lang doubles as the menu's key, so it has to be unique per add —
+    // two files named the same would otherwise replace each other.
+    const lang = `file-${this._pickedSubtitleUrls.length}`;
+    this.player.addSubtitleTrack({ url, lang, label: name, format });
+    this.updateSubtitleTrackMenu();
+    const ok = await this.player.selectSubtitleLang(lang);
+    this.updateSubtitleTrackMenu();
+    return ok;
   }
 
   private handleBackClick(): void {
@@ -34845,7 +44950,15 @@ export class MoviElement extends HTMLElement {
         if (this._title) {
           this.dispatchEvent(new CustomEvent("titlechange", { detail: { title: this._title } }));
           // Re-check resume now that title is available (resume key depends on _title)
-          if (this._resume && this.player && !this._resumeCheckedWithTitle) {
+          // Only when the title is what the key is made of. A host that named
+          // the key had its position looked up at the ordinary time, and this
+          // would be a second prompt for the same one.
+          if (
+            this._resume &&
+            this.player &&
+            !this._resumeKey &&
+            !this._resumeCheckedWithTitle
+          ) {
             this._resumeCheckedWithTitle = true;
             const savedTime = this.getResumePosition();
             if (savedTime > 2 && savedTime < this.duration - 5) {
@@ -34871,7 +44984,8 @@ export class MoviElement extends HTMLElement {
     // CSS — :fullscreen wouldn't catch the iOS pseudo or host-driven routes.
     const backHere =
       this._titleBack &&
-      (!this._titleBackFullscreenOnly || this.isFullscreenActive());
+      (!this._titleBackFullscreenOnly || this.isFullscreenActive()) &&
+      (!this._titleBackWindowedOnly || !this.isFullscreenActive());
     titleBar.classList.toggle("movi-title-with-back", backHere);
     titleBar.classList.toggle(
       "movi-title-back-mobile",
@@ -34919,7 +45033,16 @@ export class MoviElement extends HTMLElement {
       "movi-has-title",
       !!(this._showTitle && this._title && this.titleAllowedHere()),
     );
+
+    // The audio view paints the title into its canvas, so a title that
+    // resolves after the view went up (metadata, a header, the filename, or
+    // the host setting it late) needs a repaint to appear there.
+    if (this._title !== this._coverTitlePainted) {
+      this._coverTitlePainted = this._title;
+      if (this.classList.contains("movi-audio-mode")) this.updateCoverArtOverlay();
+    }
   }
+  private _coverTitlePainted: string | null = null;
 
   /**
    * Clean a video filename into a human-readable title (VLC-style).
@@ -35030,7 +45153,12 @@ export class MoviElement extends HTMLElement {
   }
 
   get paused(): boolean {
-    return this.player?.getState() === "paused" || false;
+    // Not a reading of the pipeline: a media element is paused when playback
+    // has not been asked for, so a fresh element reads true before anything
+    // has loaded, and one that is buffering or seeking mid-playback reads
+    // false. Reporting the internal state instead made a loading player look
+    // playing and a buffering one look stopped.
+    return !this._playIntent;
   }
 
   get ended(): boolean {
@@ -35048,28 +45176,49 @@ export class MoviElement extends HTMLElement {
   get readyState(): number {
     // Map MoviPlayer states to HTMLMediaElement readyState
     // 0 = HAVE_NOTHING, 1 = HAVE_METADATA, 2 = HAVE_CURRENT_DATA, 3 = HAVE_FUTURE_DATA, 4 = HAVE_ENOUGH_DATA
+    //
+    // Every state that wasn't one of four names used to answer 0 — so a video
+    // that was buffering, seeking, or had ENDED reported "nothing loaded",
+    // which is the one thing that was certainly untrue: metadata, duration and
+    // frames were all there. A host polling this to decide whether a source
+    // loaded read a mid-playback rebuffer as a failed load.
     const state = this.player?.getState();
-    if (!state || state === "idle") return 0; // HAVE_NOTHING
-    if (state === "ready" || state === "loading") return 1; // HAVE_METADATA
-    if (state === "playing" || state === "paused") return 4; // HAVE_ENOUGH_DATA
-    return 0;
+    if (!state || state === "idle" || state === "error") return 0;
+    // "loading" is the file being opened — before metadata, which is exactly
+    // what HAVE_NOTHING means. It used to claim HAVE_METADATA.
+    if (state === "loading") return 0;
+    // Data at the playhead, but not enough to keep going.
+    if (state === "buffering" || state === "seeking") return 2;
+    // ready / playing / paused / ended — metadata, a frame, and a buffer.
+    return 4;
   }
 
+  /**
+   * `width` / `height`, reflecting their attributes — what they do on
+   * `<video>`, and what code moved from one expects.
+   *
+   * These used to answer with the CANVAS's size, which is a different number
+   * entirely: a backbuffer in device pixels, sized to the display and the
+   * pixel ratio, so `player.width` on a 620px player could read 1280 and
+   * `player.width += 100` moved it somewhere nobody asked for. The attribute is
+   * the author's number, and 0 when they have not given one — again as on a
+   * media element.
+   */
   get width(): number {
-    return this.canvas.width;
+    return parseInt(this.getAttribute("width") || "", 10) || 0;
   }
 
   set width(value: number) {
-    this.setAttribute("width", value.toString());
+    this.setAttribute("width", String(value));
     this.updateCanvasSize();
   }
 
   get height(): number {
-    return this.canvas.height;
+    return parseInt(this.getAttribute("height") || "", 10) || 0;
   }
 
   set height(value: number) {
-    this.setAttribute("height", value.toString());
+    this.setAttribute("height", String(value));
     this.updateCanvasSize();
   }
 
@@ -35114,26 +45263,37 @@ export class MoviElement extends HTMLElement {
   set hdr(value: boolean) {
     const v = !!value;
     if (this._hdr === v) return;
+    this.noteStoredChoice("hdr", v);
+    // Field first, so the attribute callback this write triggers finds the
+    // value already in place and does nothing twice.
     this._hdr = v;
-    this.noteStoredChoice("hdr", this._hdr);
-    if (this._hdr) {
+    if (v) {
       this.setAttribute("hdr", "");
     } else {
       this.removeAttribute("hdr");
     }
+    this.applyHdr(v);
+    // HDR is the one boolean that is ON with its attribute absent, so turning
+    // it off on an element that never carried `hdr` writes nothing to the
+    // attribute — and `persist`, which listens to the attribute, never heard
+    // the choice. Written here as well; the attribute path writes the same.
+    if (this._persistNames().has("hdr")) this._prefWrite("hdr", v ? "1" : "0");
+    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ hdr: this._hdr });
+    this.emitSettingChange("hdrchange", { enabled: this._hdr });
+  }
 
+  /** Put an HDR on/off into effect — the UI, the gear's badge and the player —
+   *  without recording or announcing it. Shared by the setter (a choice) and
+   *  the attribute (a host's default, or the store's answer coming back). */
+  private applyHdr(v: boolean): void {
+    this._hdr = v;
     this.updateHDRUI();
     // The gear's badge carries HDR, so it has to follow the toggle rather than
     // wait for the next quality change.
     this._renderGearBadge();
-
-    // Pass to player
     if (this.player) {
       this.player.setHDREnabled(this._hdr);
     }
-
-    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ hdr: this._hdr });
-    this.emitSettingChange("hdrchange", { enabled: this._hdr });
   }
 
   /**
@@ -35346,6 +45506,13 @@ export class MoviElement extends HTMLElement {
     document.body.appendChild(host);
     this._menuPortalHost = host;
     this._menuPortalRoot = root;
+    // The menu's own nodes MOVE here, so they arrive already painted — but the
+    // panels built inside it afterwards do not, and the observer cannot watch a
+    // root that did not exist when setIcon was called.
+    if (this._iconOverrides.size) {
+      this.watchIcons();
+      this.repaintIcons(root);
+    }
     return root;
   }
 
@@ -35354,21 +45521,34 @@ export class MoviElement extends HTMLElement {
   // portal with it, or they'd stay behind and open detached from the menu.
   private _portaledSubs: Element[] = [];
 
+  /** Every panel that travels with the menu. Named once so the trip out and
+   *  the trip back cannot disagree about what counts as a submenu. */
+  private static readonly SUBMENU_SELECTOR =
+    ".movi-context-menu-submenu, .movi-context-menu-submenu-audio, .movi-context-menu-submenu-subtitle, .movi-context-menu-submenu-audiodevice";
+
   /** Move the context menu (+ its submenu panels) into the body portal and mirror theme vars. */
   private portalContextMenu(menu: HTMLElement): void {
     const root = this.ensureMenuPortal();
     if (!root) return;
-    if (menu.parentNode !== root) {
-      this._menuHome = menu.parentNode;
-      this._portaledSubs = this.shadowRoot
-        ? Array.from(
-            this.shadowRoot.querySelectorAll(
-              ".movi-context-menu-submenu, .movi-context-menu-submenu-audio, .movi-context-menu-submenu-subtitle, .movi-context-menu-submenu-audiodevice",
-            ),
-          )
-        : [];
-      root.appendChild(menu);
-      for (const sub of this._portaledSubs) root.appendChild(sub);
+    if (menu.parentNode !== root) this._menuHome = menu.parentNode;
+    // Re-taken on every open, not just the first. It used to sit inside the
+    // move-it-there branch, so a menu that was still in the portal (closed by
+    // something that skipped the unportal) opened again with the list from
+    // last time — and the close that followed had no panels to silence before
+    // moving them home. Sweep both roots: whatever is here, whatever is there.
+    const subs = new Set<Element>();
+    for (const r of [this.shadowRoot, root]) {
+      if (!r) continue;
+      for (const sub of Array.from(
+        r.querySelectorAll(MoviElement.SUBMENU_SELECTOR),
+      )) {
+        subs.add(sub);
+      }
+    }
+    this._portaledSubs = Array.from(subs);
+    if (menu.parentNode !== root) root.appendChild(menu);
+    for (const sub of this._portaledSubs) {
+      if (sub.parentNode !== root) root.appendChild(sub);
     }
     // Carry over inline theme overrides (e.g. themecolor -> --movi-primary) so
     // the portaled menu matches; the cloned styles supply the defaults.
@@ -35390,10 +45570,19 @@ export class MoviElement extends HTMLElement {
     this.syncMenuPortalAudioClasses();
   }
 
-  /** Mirror the player's audio-mode / strip classes onto the menu-portal host so
-   *  the cloned `:host(.movi-audio-mode)` rules (which hide the video-only menu
-   *  items) keep matching while the menu lives in the body portal — including
-   *  when the audio mode flips while the menu is already open. */
+  /** Attributes the cloned styles select on through `:host([…])`, which must
+   *  therefore ride along to the portal host. `theme` is the one that showed:
+   *  every light-theme rule is written `:host([theme="light"]) …`, so a menu
+   *  that portaled without it stayed dark beside a light settings panel.
+   *  `controlslist` hides menu items the same way. `hidden` is deliberately NOT
+   *  here — mirroring it would hide the portal itself. */
+  private static readonly PORTAL_HOST_ATTRS = ["theme", "controlslist"];
+
+  /** Mirror the player's audio-mode / strip classes and the host attributes the
+   *  cloned rules match on onto the menu-portal host, so `:host(.movi-audio-mode)`
+   *  (which hides the video-only menu items) and `:host([theme="light"])` keep
+   *  matching while the menu lives in the body portal — including when the audio
+   *  mode or the theme flips while the menu is already open. */
   private syncMenuPortalAudioClasses(): void {
     const host = this._menuPortalHost;
     if (!host) return;
@@ -35409,16 +45598,50 @@ export class MoviElement extends HTMLElement {
       "movi-native-video",
       this.classList.contains("movi-native-video"),
     );
+    for (const attr of MoviElement.PORTAL_HOST_ATTRS) {
+      const value = this.getAttribute(attr);
+      if (value === null) host.removeAttribute(attr);
+      else host.setAttribute(attr, value);
+    }
   }
 
   /** Return the context menu (+ submenus) from the portal to the shadow root. */
   private unportalContextMenu(menu: HTMLElement): void {
     if (!this._menuHome) return;
     if (menu.parentNode !== this._menuHome) this._menuHome.appendChild(menu);
-    for (const sub of this._portaledSubs) {
+    // What went out, PLUS anything that appeared while we were out there.
+    //
+    // _portaledSubs is a snapshot taken on the way in, and it stopped being the
+    // whole list once a control could be re-rendered mid-open: a host control
+    // with `items` that is updated while the menu is up builds its panel next
+    // to the menu, which is now the portal. Bringing back only the snapshot
+    // left that panel behind in the portal, orphaned from the menu it belongs
+    // to. Sweeping the portal costs one query and cannot miss.
+    const subs = new Set<Element>(this._portaledSubs);
+    for (const sub of Array.from(
+      this._menuPortalRoot?.querySelectorAll(MoviElement.SUBMENU_SELECTOR) || [],
+    )) {
+      subs.add(sub);
+    }
+    for (const sub of subs) {
       if (sub.parentNode !== this._menuHome) this._menuHome.appendChild(sub);
     }
     this._portaledSubs = [];
+  }
+
+  /**
+   * The tallest the right-click menu gets.
+   *
+   * Capped to the window alone, a player with many items — chapters, tracks,
+   * host entries — opened a menu the height of the whole screen, a list to
+   * read top to bottom from the point that was clicked. Three quarters of the
+   * window, and past that it scrolls. 460px (the settings panel's cap) was
+   * tried first and cut a normal menu short on a desktop window, so it is only
+   * the floor on a short one.
+   */
+  private static contextMenuMaxHeight(): number {
+    const h = window.innerHeight;
+    return Math.max(180, Math.min(h - 40, Math.max(460, Math.round(h * 0.75))));
   }
 
   private clampMenuToViewport(menu: HTMLElement): void {
@@ -35448,11 +45671,14 @@ export class MoviElement extends HTMLElement {
     const hdrContainer = this.shadowRoot?.querySelector(
       ".movi-hdr-container",
     ) as HTMLElement;
-    const hdrMenuItem = this.shadowRoot?.querySelector(
+    // Both live inside the menu, which is in the body portal while it is
+    // open — see updatePlayPauseIcon.
+    const hdrMenuRoot = this.contextMenuRoot();
+    const hdrMenuItem = hdrMenuRoot.querySelector(
       '.movi-context-menu-item[data-action="hdr-toggle"]',
     ) as HTMLElement;
 
-    const hdrDivider = this.shadowRoot?.querySelector(
+    const hdrDivider = hdrMenuRoot.querySelector(
       ".movi-hdr-divider",
     ) as HTMLElement;
 
@@ -35595,6 +45821,8 @@ export class MoviElement extends HTMLElement {
         ? ""
         : "none";
     });
+    // …and whatever capsule they left behind (see syncEmptyCapsules).
+    this.syncEmptyCapsules();
     // The panel is a promise about what the keyboard does. Arrow-seek and its
     // frame-step companion only answer when the key channel is on, and a
     // shortcut listed but dead is worse than one not listed.

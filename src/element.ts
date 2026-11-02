@@ -38,9 +38,20 @@ export type {
   DecodedAudioFrame,
   PlayerState,
   PlayerEventMap,
+  PlaybackAssessment,
+  PlaybackAssessmentOptions,
+  PlaybackQuery,
+  DecodeAudioOptions,
+  DecodedAudioChunk,
 } from './types';
 
 // Utilities
+export {
+  upgradeVideoElements,
+  playerFor,
+  type UpgradeOptions,
+  type UpgradedVideo,
+} from './upgrade';
 export { Logger, LogLevel } from './utils/Logger';
 export { Time, TIME_BASE } from './utils/Time';
 
@@ -97,7 +108,9 @@ export { MoviPlayer } from './core/MoviPlayer';
 // Main export: MoviElement (custom HTML element)
 export { MoviElement } from './render/MoviElement';
 // Host-supplied bar buttons / context-menu rows — see MoviElement.addControl.
-export type { MoviControlSpec, MoviControlItem } from './render/MoviElement';
+export type { MoviControlSpec, MoviControlItem, MoviDividerSpec } from './render/MoviElement';
+// One entry in the queue — see MoviElement.playlist.
+export type { MoviPlaylistItem } from './render/MoviElement';
 import type { MoviElement as MoviElementType } from './render/MoviElement';
 
 // Package version, baked in at build time. `import { VERSION } from
@@ -130,7 +143,22 @@ export interface MoviPlayerAttributes {
   postertime?: string;
   controls?: boolean | "";
   autoplay?: boolean | "";
-  loop?: boolean | "";
+  /**
+   * Repeat. A bare attribute repeats the ITEM, which is what it has always
+   * done; `loop="all"` repeats the QUEUE instead — the next item plays, and
+   * the last leads back to the first.
+   *
+   *   <movi-player loop>            this file, over and over
+   *   <movi-player loop="all">      the playlist, round and round
+   *   <movi-player loop="all 5">    …with five seconds between items
+   *   <movi-player loop="5">        the same — a gap can only mean the queue
+   *
+   * Aliases for the queue: `playlist`, `queue`, `wrap`. `all` implies that the
+   * queue advances at all. The number is the gap between items, which saves
+   * reaching for a second attribute to say it; `autoadvance` still wins when
+   * it names one of its own.
+   */
+  loop?: boolean | "" | "all" | "one" | string;
   muted?: boolean | "";
   /** Play inline (don't auto-fullscreen on iOS). On any touch device, touch
    *  gestures (swipe-seek / volume) are suppressed while inline so they don't
@@ -154,6 +182,8 @@ export interface MoviPlayerAttributes {
   stablevolume?: boolean | "";
   ambientmode?: boolean | "";
   resume?: boolean | "";
+  /** What the resume position is filed under. Default: the title. */
+  resumekey?: string;
   drm?: string;
   licenseurl?: string;
   /** Extra HTTP headers for the DRM license request only (JSON object string). */
@@ -184,11 +214,55 @@ export interface MoviPlayerAttributes {
    *  `both` (default) / `fullscreen` / `windowed`, and `back` — scoped with
    *  `back-mobile`, `back-fullscreen` or `back-mobile-fullscreen`. */
   titlemode?: string;
+  /** Offer "Add subtitle file…" in the subtitle menu (SRT/VTT/TTML, read
+   *  locally — the file never leaves the page). */
+  subtitlepicker?: boolean | "";
   /** Chapters from outside the media file, as a JSON array of
    *  `{ title, start, end?, image? }` (seconds). `image` is a URL the timeline
    *  tile shows instead of decoding a frame at `start`. Use the `chapters`
    *  property to pass the array directly. */
   chapters?: string;
+  /**
+   * A queue, as a JSON array of `{ src?, id?, title?, poster?, startAt? }` — or
+   * of bare source strings — or a URL to fetch that array from. Setting one
+   * loads its first item, unless `src` already names one of them. Use the
+   * `playlist` property to pass the array directly.
+   *
+   * Items may leave `src` off, for a queue the HOST loads: the element still
+   * owns the buttons, the keys and the lock-screen skip pair, and announces
+   * every move as a cancelable `itemchange`. That is the shape to use when a
+   * source is more than a URL — a `<source>` quality ladder, per-language
+   * audio, `<track>` subtitles — or when each item is its own route.
+   */
+  playlist?: string;
+  /** Which item to open on. Default 0. */
+  playlistindex?: number | string;
+  /**
+   * Let the end of one item start the next. Off by default. A number is the
+   * gap in seconds (`autoadvance="5"`), `loop` joins the ends of the queue
+   * (`autoadvance="loop"`, or `"5 loop"` for both) — though `loop="all"` on
+   * the element says the same thing more plainly, and is where to reach for
+   * it. A BARE `loop` on the element is a different thing and wins: it repeats
+   * the item, so nothing ever ends and the queue never moves.
+   */
+  autoadvance?: boolean | "" | number | string;
+  /**
+   * Play the queue in a random order. Off by default.
+   *
+   * Its own attribute rather than a `loop` token, because it is its own
+   * question: a queue can be shuffled and played through once, and it can be
+   * looped in the order it was given. They compose — `shuffle loop="all"` is
+   * the pair most people mean — but neither implies the other.
+   *
+   * The ORDER is shuffled, not the queue: `playlist` and `playlistIndex` still
+   * describe the list the host handed over, so a page's own rows keep matching,
+   * and turning it off puts the order back without reloading anything. The item
+   * playing keeps its place, so switching shuffle on never restarts it. The
+   * draw stands until the queue is replaced, shuffle is switched off and on,
+   * or `reshuffle()` is called.
+   */
+  shuffle?: boolean | "";
+
   /** Enable ±10s fast-seek. Bare = every affordance; a token list narrows it to
    *  `buttons` (the bottom-bar pair), `keys` (arrow keys) and/or `gestures`
    *  (double-tap and drag-to-seek) — e.g. `fastseek="keys gestures"`. Aliases:
@@ -202,14 +276,55 @@ export interface MoviPlayerAttributes {
   startat?: number | string;
   /** Target prefetch window, in megabytes. */
   buffersize?: number | string;
+  /**
+   * How long an interruption must last, in seconds, before the viewer is shown
+   * a loading spinner. Defaults to `"1 2"` — a stall after a second, an
+   * opening after two; `0` shows it at once. A second number gives the opening
+   * its own wait. Applies to every reason the spinner goes up — the opening
+   * load, seeking, buffering, a rendition switch, judder — so a brief stall
+   * passes in silence.
+   */
+  spinnerdelay?: number | string;
+  /**
+   * How long to wait, in milliseconds, before putting the OPENING poster up.
+   * Default 0 — paint it at once. For a host that prefetches: a load that
+   * finishes inside the wait shows no poster at all, so the picture is simply
+   * there rather than preceded by a cover that flashes.
+   */
+  posterdelay?: number | string;
+  /**
+   * Show a notice when what is loaded is not expected to play smoothly on this
+   * device at the current speed — "This video may not play smoothly", with the
+   * reason. Checked on load and on every speed change. Fires a cancelable
+   * `smoothwarning` event first.
+   */
+  smoothwarning?: boolean | "";
+  /**
+   * Keep `smoothwarning` on but never raise the link-speed notice ("This media
+   * needs about N Mbps"). For hosts serving local files over HTTP (a desktop
+   * shell or LAN server on 127.0.0.1), where the player would probe loopback
+   * and blame a connection that doesn't exist. Decode notices stay.
+   */
+  nolinkwarning?: boolean | "";
   /** Override the video frame rate (0 = use the source's own). */
   fps?: number | string;
   /** Force software decoding (FFmpeg WASM) instead of WebCodecs. `auto` (default) picks per source. */
   sw?: boolean | "auto";
   /** Enable HDR tone-mapping (Chromium + canvas renderer + HDR source). */
   hdr?: boolean | "";
-  /** Generate on-demand thumbnails for seek-bar previews. */
-  thumb?: boolean | "";
+  /**
+   * Generate on-demand thumbnails for seek-bar previews. `thumb="precise"`
+   * decodes forward from the keyframe to the frame under the pointer, rather
+   * than showing the keyframe before it — exact, at the cost of a run of
+   * frames per preview.
+   */
+  thumb?: boolean | "precise" | "";
+  /**
+   * Enter Picture-in-Picture automatically when the tab is hidden, as the
+   * attribute does on `<video>`. Only meaningful while the native element is
+   * carrying playback — a canvas has no auto-PiP of its own.
+   */
+  autopictureinpicture?: boolean | "";
 
   /** Subtitle timing offset, in seconds (positive = later, VLC/mpv sign). */
   subtitledelay?: number | string;

@@ -81,6 +81,16 @@ export class CanvasRenderer {
   // Base size of 120 provides ~2s at 60fps, ~4s at 30fps
   private static readonly MAX_FRAME_QUEUE = 120;
 
+  // Ceiling on how long the presentation anchor may be pushed into the future
+  // to wait for a high-latency audio output. See audioStartLeadMs().
+  //
+  // Set above a real Bluetooth lead (~305ms of device lead plus ~305ms of
+  // output latency) on purpose: capping BELOW it doesn't avoid the wait, it
+  // splits it — the picture starts early by the remainder and the drift
+  // correction still has to claw that back, which is the stutter this is here
+  // to remove. It is a guard against a nonsense reading, not a budget.
+  private static readonly MAX_AUDIO_START_LEAD_S = 0.7;
+
   private hdrEnabled: boolean = true;
   private isHDRSource: boolean = false;
   private isHighBitDepth: boolean = false; // 12-bit+ content needs RGBA16F texture
@@ -90,6 +100,13 @@ export class CanvasRenderer {
   // drawn frame. Lets MoviElement sample average color via a 256-pixel
   // readPixels (sync, ~microseconds) instead of an 8K canvas readback
   // (~100ms GPU stall). Created lazily when ambient mode turns on.
+  /** Frames turned down by the no-going-backwards rule since anything last
+   *  reached the screen — see selectFrameForPresentation. */
+  private _backwardsRefused = 0;
+  private _backwardsReportedAt = 0;
+  /** Only worth saying once the hold is longer than any ordinary gap. */
+  private static readonly BACKWARDS_REPORT_AFTER_MS = 250;
+  private static readonly BACKWARDS_REPORT_EVERY_MS = 2000;
   private static readonly AMBIENT_SIZE = 16;
   private ambientFbo: WebGLFramebuffer | null = null;
   private ambientTex: WebGLTexture | null = null;
@@ -99,6 +116,13 @@ export class CanvasRenderer {
   // Presentation loop
   private rafId: number | null = null;
   private isPlaying: boolean = false;
+  // A source with no picture never presents a frame, so the presentation loop
+  // below refuses to run — and the caption clock was only ever driven from
+  // inside it. See startSubtitleClock().
+  private subtitleClockTimer: ReturnType<typeof setInterval> | null = null;
+  // Data-saver: the source HAS a video track and this renderer is configured
+  // for it, but nothing is being decoded. See setPictureSuspended().
+  private pictureSuspended: boolean = false;
   // Set once configure() runs, which only happens when a real video track is
   // active. Audio-only sources (incl. cover-art "video" streams that
   // TrackManager classifies as attached-pic) never configure the renderer, so
@@ -119,6 +143,29 @@ export class CanvasRenderer {
   private _adaptDprChecked: boolean = false;
   private static readonly PAINT_SAMPLE_COUNT = 60; // ~1 second @ 60Hz
   private static readonly PAINT_THRESHOLD_MS = 8; // >50% of 16.67ms frame budget
+  /**
+   * The second rung of the same ladder, and it counts the TAIL rather than the
+   * average, because the average is not what hurts.
+   *
+   * A 12-bit source uploads RGBA16F — 3840x2160x4x2 is ~66MB a frame — and on a
+   * machine that cannot absorb that the cost does not show up as a slow mean.
+   * Measured on hevc_4k24P_rext_12bit_444_pq.mp4 over 30s, DPR already capped:
+   * mean paint 3.03ms and p90 2.5ms, both healthy, while the MAX was 126.8ms
+   * and twelve individual paints ran past 24ms. The mean-based rung above
+   * cannot see that; twelve blocks longer than the audio output buffer is what
+   * the viewer hears as crackle. The same file forced to RGBA8: max 2.5ms, and
+   * not one paint over 16.7ms.
+   *
+   * So: a handful of genuinely long paints inside one window and the 16-bit
+   * texture goes. Banding on a 12-bit HDR source is a real cost and this pays
+   * it only on hardware that has already proved it cannot hold the frame.
+   */
+  private static readonly LONG_PAINT_MS = 20;
+  private static readonly LONG_PAINT_WINDOW = 240; // ~10s at 24fps, ~4s at 60
+  private static readonly LONG_PAINT_LIMIT = 4;
+  private _longPaints = 0;
+  private _paintsSeenSinceWindow = 0;
+  private _bitDepthDowngraded = false;
 
   // Adaptive frame-rate cap — the second-stage degrade after adaptive DPR.
   // Some devices (low-end mobile on 4K60) can't hold the source rate even at
@@ -132,6 +179,10 @@ export class CanvasRenderer {
   // decoder to skip non-reference frames to cut CPU as well. One-way per
   // source, mirroring adaptive DPR — no oscillation.
   private _presentFpsCap: number = 0; // 0 = uncapped
+  // Consecutive windows that held the cap comfortably, and how many of them the
+  // next probe needs. See the lift in samplePerformance().
+  private _capHealthyWindows: number = 0;
+  private _capProbeAfterWindows: number = 10; // = PERF_CAP_PROBE_WINDOWS (declared below)
   private _perfDegradeChecked: boolean = false;
   // Latched once the decode-bound catastrophe fires: this device cannot decode
   // the current rung at all. Read by the element's frozen-video watchdog, whose
@@ -161,6 +212,22 @@ export class CanvasRenderer {
   // performance.now() when the perf detectors were (re)armed by configure().
   // The startup grace is measured from here.
   private _perfArmedAt: number = 0;
+  // Host-page contention. The presentation loop can only put up as many frames
+  // as rAF hands it callbacks, and on a page running its own heavy JS animation
+  // the main thread is busy enough that rAF fires well below the display rate.
+  // From inside the detectors below that is indistinguishable from a decoder
+  // that cannot keep up — so an animation-heavy site reads as decode-bound and
+  // gets its rung dropped, losing resolution because of the SITE's animations
+  // rather than anything about the device or the link. Three-way per window:
+  //   queue empty                      → decode really is behind (backlog latches)
+  //   queue ready, our own tick is long → OUR draw is the cost; capping helps
+  //   queue ready, our own tick is short → someone else owns the thread; excuse it
+  private _rafTicks: number = 0; // presentation-loop callbacks this window
+  private _rafSelfMs: number = 0; // wall time spent INSIDE those callbacks
+  private _rafWindowStart: number = 0; // 0 = not started
+  private _framesReadyInWindow: boolean = false; // queue was non-empty at some tick
+  private _hostContended: boolean = false; // verdict of the last completed window
+  private _hostContentionLogged: boolean = false; // log once per source
   private _onPerformanceDegrade: ((targetFps: number) => void) | null = null;
   private static readonly PERF_WINDOW_MS = 1000;
   private static readonly PERF_DEFICIT_RATIO = 0.7; // achieved < 70% of source rate = struggling
@@ -188,10 +255,35 @@ export class CanvasRenderer {
   // the decoder is hunting a keyframe to recover. A genuinely decode-bound
   // device still presents well above this.
   private static readonly PERF_MIN_ACHIEVED_FPS = 5;
+  // rAF cadence below this share of the rate we are trying to present at means
+  // the callbacks themselves are the ceiling — no decoder can beat it, so
+  // nothing the adaptive-FPS or ABR levers do would gain a single frame.
+  // A window that comes within this share of the CAPPED rate is holding the cap
+  // comfortably — the only evidence available, from inside a cap, that the
+  // device might manage more.
+  private static readonly PERF_CAP_HOLD_RATIO = 0.95;
+  // How many such windows before the cap is lifted to re-judge, and the ceiling
+  // that backoff climbs to. Ten seconds is short enough that a passing squeeze
+  // does not cost the rest of the film, and the doubling below means a device
+  // that genuinely cannot hold the full rate is probed ever more rarely instead
+  // of flapping.
+  private static readonly PERF_CAP_PROBE_WINDOWS = 10;
+  private static readonly PERF_CAP_PROBE_MAX_WINDOWS = 160;
+  private static readonly PERF_CONTENTION_RAF_RATIO = 0.7;
+  // …and if our own ticks account for less than this share of the window's wall
+  // time, the thread is being held by the host page rather than by us. A
+  // healthy 60fps draw is a few ms of each 16.7ms frame (~25%); a draw heavy
+  // enough to BE the bottleneck runs well above this, and must stay judgeable —
+  // present-capping is exactly the right answer for that one.
+  private static readonly PERF_CONTENTION_SELF_SHARE = 0.35;
 
   // Audio time provider for A/V sync
   private getAudioTime: (() => number) | null = null;
   private _isAudioHealthy: (() => boolean) | null = null;
+  // Seconds until scheduled audio is actually audible — see
+  // AudioRenderer.secondsUntilAudible(). Non-zero only on a high-latency
+  // output (Bluetooth), and only for the moment after a start or a seek.
+  private _audioStartLead: (() => number) | null = null;
   private _shouldMeasurePerf: (() => boolean) | null = null;
 
   // Presentation timing
@@ -199,6 +291,14 @@ export class CanvasRenderer {
   private presentationStartPts: number = 0;
   private lastPresentedPts: number = -1;
   private syncedToAudio: boolean = false;
+
+  // Set when the picture's anchor was dropped ON PURPOSE — a rate change, or an
+  // audio pipeline that was just rewound under it — as opposed to noticing we
+  // had drifted. The difference matters at the re-sync below: a spontaneous
+  // unsync is usually output jitter and re-anchoring on it stutters, so it is
+  // gated behind a large drift; a REQUESTED one has no old anchor worth
+  // keeping, and declining to re-anchor there is what left the offset in place.
+  private reanchorRequested: boolean = false;
   private lastKnownAudioTime: number = -1;
   private playbackRate: number = 1.0;
   private justSeeked: boolean = false; // Track if we just seeked (for post-seek frame handling)
@@ -359,6 +459,8 @@ export class CanvasRenderer {
     return this.subtitleOverlay;
   }
   private subtitleControlsPadding: number = 0; // Extra padding when controls visible
+  // Set while the viewer is dragging the caption. See setSubtitleHeld().
+  private subtitleHeld: boolean = false;
   // Subtitle delay in seconds. VLC/mpv convention: positive = subs appear
   // later, negative = earlier. Applied at the active-cue check so it works
   // uniformly for text and image subtitles and can be adjusted live without
@@ -457,7 +559,19 @@ export class CanvasRenderer {
     isHDR?: boolean,
     pixelFormat?: string,
   ): void {
+    const hadSubtitleClock = this.subtitleClockTimer !== null;
     this.isVideoConfigured = true;
+    if (hadSubtitleClock && !this.pictureSuspended) {
+      // A picture arrived mid-track (a switch off an audio-only rendition).
+      // The presentation loop owns the captions again — but the play() that
+      // started this run already called startPresentationLoop() and was turned
+      // away, so nothing else will start it.
+      this.stopSubtitleClock();
+      if (this.isPlaying && this.rafId === null) {
+        this.isPlaying = false;
+        this.startPresentationLoop();
+      }
+    }
     // Detect high bit-depth (12-bit+) content that needs RGBA16F textures
     const pf = (pixelFormat || "").toLowerCase();
     this.isHighBitDepth = pf.includes("12") || pf.includes("14") || pf.includes("16");
@@ -483,6 +597,8 @@ export class CanvasRenderer {
     // Fresh source / rendition switch: re-arm the adaptive-FPS + decode-bound
     // detectors and clear any prior cap so the new rung gets a fresh judgment.
     this._presentFpsCap = 0;
+    this._capHealthyWindows = 0;
+    this._capProbeAfterWindows = CanvasRenderer.PERF_CAP_PROBE_WINDOWS;
     this._perfDegradeChecked = false;
     this._decodeBound = false;
     this._backlogSeenStuck = false;
@@ -492,6 +608,8 @@ export class CanvasRenderer {
     this._perfStuckWindows = 0;
     this._stuckWindowStart = 0;
     this._perfArmedAt = 0; // stamped on the first sample once playback is live
+    this.resetRafCadence();
+    this._hostContentionLogged = false;
 
     // Set rotation from metadata
     if (rotation !== undefined) {
@@ -568,7 +686,7 @@ export class CanvasRenderer {
       // dim. The HDR Canvas spec's RGBA16F float buffer (drawingBufferStorage)
       // is NOT required for this — the colorspace tag is independent of the
       // buffer's bit depth. 8-bit PQ has some quantization banding but
-      // unlocks the full HDR brightness range, which Ujjwal prefers.
+      // unlocks the full HDR brightness range, which Ujjawal prefers.
       try {
         const isChromium = !!(window as any).chrome;
         const transferLc = (colorTransfer || "").toLowerCase();
@@ -635,6 +753,23 @@ export class CanvasRenderer {
                 `WebGL drawing buffer color space set to: ${applied} (requested: ${detectedColorSpace}, HDR path: ${isHDRPath})`,
               );
             }
+            this.setMacHdrCompositingGuard(applied === hdrSpace);
+          } else {
+            // …and an SDR source has to say so. The context outlives the
+            // source: play an HDR film, then load an ordinary one, and the
+            // canvas was still tagged rec2100-pq from the film — so the
+            // compositor read plain Rec.709 as PQ and the picture came out
+            // washed and grey. Only the non-srgb branch above ever assigned
+            // the tag, so nothing took it off again.
+            try {
+              // @ts-ignore
+              this.gl.drawingBufferColorSpace = "srgb";
+              // @ts-ignore
+              this.gl.unpackColorSpace = "srgb";
+            } catch (_e) {
+              /* a context that does not take the property never had one */
+            }
+            this.setMacHdrCompositingGuard(false);
           }
         }
       } catch (e) {
@@ -729,6 +864,13 @@ export class CanvasRenderer {
     // the compositor believes, so the rounding survives.
     // x = radius in drawing-buffer pixels (0 disables), yz = buffer size.
     uniform vec3 u_round;
+    // Per corner, in drawing-buffer pixels: top-left, top-right, bottom-right,
+    // bottom-left. u_round.x is the largest of them (0 disables the cut).
+    uniform vec4 u_radii;
+    float movi_cornerR(vec2 p, vec2 h) {
+      // gl_FragCoord's origin is the bottom-left corner.
+      return p.x < h.x ? (p.y >= h.y ? u_radii.x : u_radii.w) : (p.y >= h.y ? u_radii.y : u_radii.z);
+    }
     // The part of the frame to actually show, in texture coordinates
     // (x0,y0 → x1,y1). The whole frame by default; narrowed when the black bars
     // baked INTO the picture are cropped away — see setBarCropEnabled.
@@ -745,8 +887,9 @@ export class CanvasRenderer {
       outColor.a = 1.0;
       if (u_round.x > 0.0) {
         vec2 halfSize = u_round.yz * 0.5;
-        vec2 q = abs(gl_FragCoord.xy - halfSize) - (halfSize - vec2(u_round.x));
-        float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - u_round.x;
+        float rr1 = movi_cornerR(gl_FragCoord.xy, halfSize);
+        vec2 q = abs(gl_FragCoord.xy - halfSize) - (halfSize - vec2(rr1));
+        float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - rr1;
         // d is in pixels, and the centre of an edge pixel sits exactly 0.5
         // inside the shape — so the falloff has to be one pixel wide and
         // centred on the boundary. A wider band (this was -0.75..0.75) still
@@ -856,6 +999,13 @@ export class CanvasRenderer {
     // Rounded corners cut in the shader — see the passthrough program.
     // x = radius in drawing-buffer pixels (0 disables), yz = buffer size.
     uniform vec3 u_round;
+    // Per corner, in drawing-buffer pixels: top-left, top-right, bottom-right,
+    // bottom-left. u_round.x is the largest of them (0 disables the cut).
+    uniform vec4 u_radii;
+    float movi_cornerR(vec2 p, vec2 h) {
+      // gl_FragCoord's origin is the bottom-left corner.
+      return p.x < h.x ? (p.y >= h.y ? u_radii.x : u_radii.w) : (p.y >= h.y ? u_radii.y : u_radii.z);
+    }
 
     in vec2 v_texCoord;
     out vec4 outColor;
@@ -915,8 +1065,9 @@ export class CanvasRenderer {
       outColor = vec4(display, 1.0); // opaque — see the passthrough program
       if (u_round.x > 0.0) {
         vec2 halfSizeR = u_round.yz * 0.5;
-        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(u_round.x));
-        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - u_round.x;
+        float rr2 = movi_cornerR(gl_FragCoord.xy, halfSizeR);
+        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(rr2));
+        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - rr2;
         outColor *= 1.0 - smoothstep(-0.5, 0.5, dR);
       }
     }`;
@@ -1042,6 +1193,13 @@ export class CanvasRenderer {
     uniform vec3 u_colour;   // the sampled ambient colour, already held down
     uniform vec3 u_phases;   // three slowly-walking phases, in radians
     uniform vec3 u_round;    // same corner cut as the picture — see the passthrough program
+    // Per corner, in drawing-buffer pixels: top-left, top-right, bottom-right,
+    // bottom-left. u_round.x is the largest of them (0 disables the cut).
+    uniform vec4 u_radii;
+    float movi_cornerR(vec2 p, vec2 h) {
+      // gl_FragCoord's origin is the bottom-left corner.
+      return p.x < h.x ? (p.y >= h.y ? u_radii.x : u_radii.w) : (p.y >= h.y ? u_radii.y : u_radii.z);
+    }
     in vec2 v_uv;
     out vec4 outColor;
 
@@ -1104,8 +1262,9 @@ export class CanvasRenderer {
       outColor = vec4(lit, 1.0);
       if (u_round.x > 0.0) {
         vec2 halfSizeR = u_round.yz * 0.5;
-        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(u_round.x));
-        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - u_round.x;
+        float rr3 = movi_cornerR(gl_FragCoord.xy, halfSizeR);
+        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(rr3));
+        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - rr3;
         outColor *= 1.0 - smoothstep(-0.5, 0.5, dR);
       }
     }`;
@@ -1140,6 +1299,7 @@ export class CanvasRenderer {
       colour: gl.getUniformLocation(program, "u_colour"),
       phases: gl.getUniformLocation(program, "u_phases"),
       round: gl.getUniformLocation(program, "u_round"),
+      radii: gl.getUniformLocation(program, "u_radii"),
     };
     Logger.info(TAG, "Ambient wash program compiled");
     return true;
@@ -1148,7 +1308,20 @@ export class CanvasRenderer {
   /** Colour for the wash above. Null turns it off. The movement is the
    *  renderer's own — see advanceWash. */
   setAmbientWash(rgb: [number, number, number] | null): void {
+    const toggled = !rgb !== !this._washRgb;
     this._washRgb = rgb;
+    // Turning the wash on or off (entering or leaving fullscreen) on a PAUSED
+    // player: nothing draws again on its own, so the bars stayed black — or
+    // kept the colour after exit — until playback resumed. Repaint the retained
+    // frame, as setCornerRadius does. Colour changes while on need no help:
+    // the next frame carries them.
+    if (toggled && this.lastRenderedFrame) {
+      try {
+        this.drawFrame(this.lastRenderedFrame, true);
+      } catch {
+        /* the next real frame will carry it */
+      }
+    }
   }
   private _washRgb: [number, number, number] | null = null;
   /** Where the three waves currently sit, and how fast each is walking on,
@@ -1160,8 +1333,9 @@ export class CanvasRenderer {
   private washLocs: {
     colour: WebGLUniformLocation | null;
     phases: WebGLUniformLocation | null;
+    radii: WebGLUniformLocation | null;
     round: WebGLUniformLocation | null;
-  } = { colour: null, phases: null, round: null };
+  } = { colour: null, phases: null, radii: null, round: null };
 
   /**
    * Walk the waves on. The movement lives here rather than with the colour
@@ -1210,6 +1384,10 @@ export class CanvasRenderer {
         this.canvas?.height || 0,
       );
     }
+    if (this.washLocs.radii) {
+      const [tl, tr, br, bl] = this.cornerRadiiBufferPx();
+      gl.uniform4f(this.washLocs.radii, tl, tr, br, bl);
+    }
     gl.viewport(0, 0, this.width, this.height);
     // The quad has to be bound HERE. The picture's own draw binds it further
     // down, so on the way in there is no vertex array attached and a_position
@@ -1249,6 +1427,13 @@ export class CanvasRenderer {
     uniform float u_srcAspect;   // source frame width/height (keeps the disc round)
     // Rounded corners cut in the shader — see the passthrough program.
     uniform vec3 u_round;
+    // Per corner, in drawing-buffer pixels: top-left, top-right, bottom-right,
+    // bottom-left. u_round.x is the largest of them (0 disables the cut).
+    uniform vec4 u_radii;
+    float movi_cornerR(vec2 p, vec2 h) {
+      // gl_FragCoord's origin is the bottom-left corner.
+      return p.x < h.x ? (p.y >= h.y ? u_radii.x : u_radii.w) : (p.y >= h.y ? u_radii.y : u_radii.z);
+    }
     in vec2 v_ndc;
     out vec4 outColor;
 
@@ -1303,8 +1488,9 @@ export class CanvasRenderer {
       outColor.a = 1.0; // opaque — see the passthrough program
       if (u_round.x > 0.0) {
         vec2 halfSizeR = u_round.yz * 0.5;
-        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(u_round.x));
-        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - u_round.x;
+        float rr4 = movi_cornerR(gl_FragCoord.xy, halfSizeR);
+        vec2 qR = abs(gl_FragCoord.xy - halfSizeR) - (halfSizeR - vec2(rr4));
+        float dR = length(max(qR, vec2(0.0))) + min(max(qR.x, qR.y), 0.0) - rr4;
         outColor *= 1.0 - smoothstep(-0.5, 0.5, dR);
       }
     }`;
@@ -1422,8 +1608,30 @@ export class CanvasRenderer {
    * GPU-bound devices (360 raycasting is fragment-heavy at 4K).
    */
   private sampleAdaptiveDpr(paintStart: number): void {
-    if (this._adaptDprChecked || paintStart <= 0) return;
+    if (paintStart <= 0) return;
     const paintDuration = performance.now() - paintStart;
+
+    // Rung two: the long-paint tail. Runs for as long as the 16-bit texture is
+    // still in play, including long after the one-shot DPR check has closed.
+    if (this.isHighBitDepth && !this._bitDepthDowngraded) {
+      this._paintsSeenSinceWindow++;
+      if (paintDuration > CanvasRenderer.LONG_PAINT_MS) this._longPaints++;
+      if (this._longPaints >= CanvasRenderer.LONG_PAINT_LIMIT) {
+        Logger.info(
+          TAG,
+          `Adaptive bit depth: ${this._longPaints} paints over ${CanvasRenderer.LONG_PAINT_MS}ms in ${this._paintsSeenSinceWindow} frames — dropping RGBA16F to RGBA8`,
+        );
+        this.isHighBitDepth = false;
+        this._bitDepthDowngraded = true;
+      } else if (
+        this._paintsSeenSinceWindow >= CanvasRenderer.LONG_PAINT_WINDOW
+      ) {
+        this._paintsSeenSinceWindow = 0;
+        this._longPaints = 0;
+      }
+    }
+
+    if (this._adaptDprChecked) return;
     this._paintSamples.push(paintDuration);
     if (this._paintSamples.length >= CanvasRenderer.PAINT_SAMPLE_COUNT) {
       const sum = this._paintSamples.reduce((a, b) => a + b, 0);
@@ -1482,12 +1690,112 @@ export class CanvasRenderer {
    *  sustained deficit. Called once per presentation cycle, before the
    *  empty-queue bail, so a starving (decode-bound) pipeline still advances the
    *  window clock and registers its low present count. */
+  private resetRafCadence(): void {
+    this._rafWindowStart = 0;
+    this._rafTicks = 0;
+    this._rafSelfMs = 0;
+    this._framesReadyInWindow = false;
+    this._hostContended = false;
+  }
+
+  /**
+   * Drop every perf window on the floor.
+   *
+   * All three of them measure a RATE across wall-clock time, so a window that
+   * spans a stretch where the loop wasn't running measures nothing — it divides
+   * the ticks and frames of a fraction of a second by however long the player
+   * sat there. samplePerformance() has a `!isPlaying` branch for exactly this,
+   * and it can never run: startPresentationLoop() sets isPlaying BEFORE its
+   * first (synchronous) tick, so the first sample after a stop is already
+   * "playing" and reads the stale window as live.
+   *
+   * Measured on a 5.76s clip played, left on the ended screen for 31 seconds,
+   * and replayed: the replay's very first tick closed a 31-SECOND cadence
+   * window holding the last partial second of ticks from the previous run, and
+   * logged "Main thread contended by the host page: rAF fired ~1/s against a
+   * 50fps target ... 0% of the window" before a single frame of the replay had
+   * been presented. That verdict is sticky until a full window overwrites it,
+   * and while it stands samplePerformance zeroes the deficit/stuck streaks and
+   * returns — so the adaptive-FPS and decode-bound detectors were switched off
+   * across the start of the replay by a window that measured an idle player.
+   * The stuck detector's own window spans the same gap and reads ~0fps with
+   * audio flowing, which is a decode-bound downshift waiting to happen; it was
+   * only ever saved by the contention verdict returning first.
+   *
+   * So reset where the stop actually happens, and let each restart begin its
+   * windows from the moment it is genuinely running again.
+   */
+  private resetPerfWindows(): void {
+    this._perfWindowStart = 0;
+    this._stuckWindowStart = 0;
+    this._perfStuckWindows = 0;
+    this.resetRafCadence();
+  }
+
+  /**
+   * Roll the rAF-cadence window and decide whether the one that just closed was
+   * the host page's doing rather than the pipeline's.
+   *
+   * Runs once per presentation tick. The verdict is sticky between windows — it
+   * stands until the next full window overwrites it — which is what we want:
+   * the detectors it gates work on multi-second streaks, so a per-tick verdict
+   * would let a single lucky tick re-open the gate mid-streak.
+   */
+  private sampleRafCadence(now: number): void {
+    // Latch every tick, not once per window: the queue drains and refills
+    // within a window even on a healthy pipeline, so a single unlucky read
+    // would claim the decoder had nothing ready when it did — the same reason
+    // the backlog latches above are rolled this way.
+    if (this.frameQueue.length > 0) this._framesReadyInWindow = true;
+
+    if (this._rafWindowStart === 0) {
+      this._rafWindowStart = now;
+      this._rafTicks = 0;
+      this._rafSelfMs = 0;
+      return;
+    }
+    const elapsed = now - this._rafWindowStart;
+    if (elapsed < CanvasRenderer.PERF_WINDOW_MS) return;
+
+    const rafFps = this._rafTicks / (elapsed / 1000);
+    const selfShare = this._rafSelfMs / elapsed;
+    // Judge the cadence against the rate we are actually trying to hit, so an
+    // engaged present cap doesn't make a deliberately-halved rate look starved.
+    const targetFps =
+      this._presentFpsCap > 0
+        ? Math.min(this.videoFrameRate, this._presentFpsCap)
+        : this.videoFrameRate;
+
+    this._hostContended =
+      targetFps > 0 &&
+      // Frames were sitting ready and we still couldn't put them up — so the
+      // decoder is not what's short. With an empty queue this is a starved
+      // pipeline and the existing detectors own the call.
+      this._framesReadyInWindow &&
+      rafFps < targetFps * CanvasRenderer.PERF_CONTENTION_RAF_RATIO &&
+      selfShare < CanvasRenderer.PERF_CONTENTION_SELF_SHARE;
+
+    if (this._hostContended && !this._hostContentionLogged) {
+      this._hostContentionLogged = true;
+      Logger.info(
+        TAG,
+        `Main thread contended by the host page: rAF fired ~${rafFps.toFixed(0)}/s ` +
+          `against a ${targetFps}fps target with frames ready, while the presentation ` +
+          `loop itself used only ${(selfShare * 100).toFixed(0)}% of the window — ` +
+          `holding off the adaptive-FPS and decode-bound detectors`,
+      );
+    }
+
+    this._rafWindowStart = now;
+    this._rafTicks = 0;
+    this._rafSelfMs = 0;
+    this._framesReadyInWindow = false;
+  }
+
   private samplePerformance(): void {
     if (this._perfDegradeChecked) return;
     if (!this.isPlaying) {
-      this._perfWindowStart = 0;
-      this._stuckWindowStart = 0;
-      this._perfStuckWindows = 0;
+      this.resetPerfWindows();
       return;
     }
     // Skip while backgrounded (and not in PiP): the throttled rAF stalls
@@ -1499,12 +1807,29 @@ export class CanvasRenderer {
       this._perfDeficitWindows = 0;
       this._stuckWindowStart = 0;
       this._perfStuckWindows = 0;
+      this.resetRafCadence();
       return;
     }
     // Off-speed playback changes distinct-frames-per-wall-second on its own
     // (2x can't show every frame on a 60Hz panel; slow-mo shows fewer) — that's
     // not the device struggling. Only measure at normal speed.
     if (Math.abs(this.playbackRate - 1.0) > 0.05) {
+      this._perfWindowStart = 0;
+      this._stuckWindowStart = 0;
+      this.resetRafCadence();
+      return;
+    }
+
+    const nowCadence = performance.now();
+    this.sampleRafCadence(nowCadence);
+    // The host page owns the thread, so nothing measured here is about this
+    // pipeline. Drop the accumulated streaks as well as skipping the verdict —
+    // otherwise a burst of the site's own animation work half-fills the
+    // counters and the cap/downshift fires the moment it lets go, on windows
+    // that were never the decoder's fault.
+    if (this._hostContended) {
+      this._perfDeficitWindows = 0;
+      this._perfStuckWindows = 0;
       this._perfWindowStart = 0;
       this._stuckWindowStart = 0;
       return;
@@ -1627,6 +1952,50 @@ export class CanvasRenderer {
       }
     } else {
       this._perfDeficitWindows = 0;
+      // A cap has to be able to come off again.
+      //
+      // engagePresentCap() halves the presentation rate on four bad seconds,
+      // and until now the ONLY thing that ever cleared it was configure() — a
+      // new source or a rendition switch. Not a seek, not minutes of healthy
+      // playback. So one passing squeeze (a heavy stretch at 2x on an 8K60
+      // source is the one this was found on) left the picture at 30fps for the
+      // whole of the rest of the file, with nothing in the pipeline reporting a
+      // fault: audio healthy, rAF firing a full 60Hz, frames sitting queued.
+      // That is a ratchet, not an adaptation.
+      //
+      // The evidence for lifting is the only kind available from inside a cap:
+      // windows that hold the capped rate comfortably. Being wrong is cheap and
+      // self-correcting — the deficit test above re-judges against the full
+      // rate and re-engages after its usual four windows — so the cost of a bad
+      // probe is bounded at four seconds, while the cost of never probing is
+      // the rest of the film. The probe interval doubles on each lift so a
+      // device that genuinely cannot hold the full rate is asked ever less
+      // often rather than flapping between the two.
+      if (
+        this._presentFpsCap > 0 &&
+        !inGrace &&
+        audioHealthy &&
+        producing &&
+        expected > 0 &&
+        achieved >= expected * CanvasRenderer.PERF_CAP_HOLD_RATIO
+      ) {
+        if (++this._capHealthyWindows >= this._capProbeAfterWindows) {
+          Logger.info(
+            TAG,
+            `Adaptive FPS: held ${targetFps}fps for ${this._capHealthyWindows}s — ` +
+              `lifting the cap to re-judge at ${this.videoFrameRate}fps`,
+          );
+          this._presentFpsCap = 0;
+          this._capHealthyWindows = 0;
+          this._capProbeAfterWindows = Math.min(
+            CanvasRenderer.PERF_CAP_PROBE_MAX_WINDOWS,
+            this._capProbeAfterWindows * 2,
+          );
+        }
+      } else if (this._presentFpsCap > 0) {
+        // Short of the cap it is holding nothing, so it is not evidence.
+        this._capHealthyWindows = 0;
+      }
     }
     this._perfWindowStart = now;
     this._perfWindowBaseCount = this.framesPresented;
@@ -1669,6 +2038,7 @@ export class CanvasRenderer {
       // 30 but not 60 keeps its resolution instead of stepping down (which is
       // what made it flap: it never got to try the current rung at half rate).
       this._presentFpsCap = cap;
+      this._capHealthyWindows = 0;
       this._perfDeficitWindows = 0;
       this._perfWindowStart = 0;
       Logger.info(
@@ -2098,6 +2468,7 @@ export class CanvasRenderer {
             `Updated WebGL color space to ${applied} (detected: ${detectedColorSpace}, HDR path: ${isHDRPath}) following HDR toggle`,
           );
         }
+        this.setMacHdrCompositingGuard(applied === hdrSpace);
       } catch (e) {
         Logger.warn(TAG, "Failed to update drawingBufferColorSpace on the fly");
       }
@@ -2128,6 +2499,51 @@ export class CanvasRenderer {
     if (!this.isPlaying && this.lastRenderedFrame) {
       this.drawFrame(this.lastRenderedFrame, true);
     }
+  }
+
+  /**
+   * Make macOS Chromium hand this canvas to CoreAnimation as extended-range
+   * content rather than as a PQ-tagged surface.
+   *
+   * Measured 2026-09-19 (Chrome 153, macOS 26, HDR display, /tmp/hdr10.mp4,
+   * pixels read back from a screencapture of the composited display):
+   * whenever every quad in the frame qualifies, Chromium's Mac compositor
+   * gives the whole frame to CoreAnimation as CALayers
+   * (Compositing.Renderer.CALayerResult bucket 0 on a bare page and in
+   * fullscreen), and the layer holding a rec2100-pq canvas is shown
+   * tone-mapped to SDR — red bar 234,53,36, correct colours, no headroom.
+   * An RGBA16F drawing buffer changes nothing (same 234,53,36), and
+   * configureHighDynamicRange({mode:"extended"}) changes nothing;
+   * drawingBufferToneMapping is not in Chrome 153 at all. The app page only
+   * showed HDR windowed because a backdrop-filter in it failed the promotion
+   * (bucket 19) and the frame was drawn by the SkiaRenderer, whose HDR
+   * surfaces are extended-sRGB float — red 255,0,21. With
+   * --disable-features=UseCALayerContentsHeadroom (Chromium's Metal HDR
+   * copier instead of the macOS 26 contentsHeadroom attribute) the same PQ
+   * layer shows as HDR, so the loss is in that new path.
+   *
+   * Two different non-zero corner radii on the canvas make cc render it
+   * through a render pass of its own; the pass texture is viz's extended-sRGB
+   * float, and that is what the CALayer receives — promotion still succeeds
+   * (bucket 0) but the bare page, windowed and fullscreen, now composites
+   * the same pixels as the app page (255,0,16). Uniform radii would not do:
+   * they are applied on the quad itself and the PQ surface would still go
+   * to the layer. The rounding is 1px and 2px on the top corners, under the
+   * host's own clip when it is rounded and at the screen corners in
+   * fullscreen, so nothing shows. Mac + Chromium only: that is where it was
+   * measured, and elsewhere it would only cost a render pass.
+   */
+  private setMacHdrCompositingGuard(on: boolean): void {
+    if (!(this.canvas instanceof HTMLCanvasElement)) return;
+    const nav = navigator as Navigator & {
+      userAgentData?: { platform?: string };
+    };
+    const isMac =
+      nav.userAgentData?.platform === "macOS" ||
+      /^Mac/i.test(nav.platform || "");
+    const isChromium = !!(window as any).chrome;
+    if (!isMac || !isChromium) return;
+    this.canvas.style.borderRadius = on ? "1px 2px 0 0" : "";
   }
 
   /**
@@ -2303,7 +2719,10 @@ export class CanvasRenderer {
         this.subtitleOverlay.style.top = `${(height - overlayHeight) / 2}px`;
         this.subtitleOverlay.style.margin = "0";
         this.subtitleOverlay.style.padding = "0";
-        const effectivePadding = this.subtitleControlsPadding > 0 ? this.subtitleControlsPadding : bottomPadding;
+        const effectivePadding = this.subtitleEffectiveBottomPadding(
+          overlayHeight,
+          bottomPadding,
+        );
         this.subtitleOverlay.style.paddingBottom = `${effectivePadding}px`;
         this.subtitleOverlay.style.display = "flex";
         this.subtitleOverlay.style.flexDirection = "column";
@@ -2386,9 +2805,11 @@ export class CanvasRenderer {
   setAudioTimeProvider(
     getAudioTime: (() => number) | null,
     isAudioHealthy?: (() => boolean) | null,
+    audioStartLead?: (() => number) | null,
   ): void {
     this.getAudioTime = getAudioTime;
     this._isAudioHealthy = isAudioHealthy || null;
+    this._audioStartLead = audioStartLead || null;
     if (getAudioTime) {
       Logger.debug(TAG, "Audio time provider set");
     } else {
@@ -2490,7 +2911,15 @@ export class CanvasRenderer {
     // Audio-only source (no video track configured): nothing to present, and
     // running A/V sync against a non-existent video stream is meaningless. The
     // cover art, if any, is drawn separately via the overlay canvas.
-    if (!this.isVideoConfigured) return;
+    if (!this.isVideoConfigured || this.pictureSuspended) {
+      // The captions still have to run, though. Cues arrive from the decoder
+      // either way, and with no loop nothing ever compares them against the
+      // clock: an audio track's subtitles stayed empty for its whole length,
+      // and giving the source a picture back is what appeared to fix them.
+      this.isPlaying = true;
+      this.startSubtitleClock();
+      return;
+    }
     if (this.rafId !== null) return;
 
     this.isPlaying = true;
@@ -2516,13 +2945,31 @@ export class CanvasRenderer {
     } else {
       // Resuming with frames: the stream is already playing, so start the wall
       // clock now and anchor it to the last presented time to prevent a jump.
-      this.presentationStartTime = performance.now();
+      //
+      // "Now", unless the sound for this run hasn't reached the speakers yet —
+      // an ordinary unpause never waits (the audio anchor is long past, so the
+      // lead reads zero), but a resume out of the post-seek queue wait is a
+      // fresh audio run whose first buffer is still in flight. See
+      // audioStartLeadMs().
+      this.presentationStartTime = performance.now() + this.audioStartLeadMs();
       if (this.lastPresentedPts >= 0) {
         this.presentationStartPts = this.lastPresentedPts;
       } else {
         this.presentationStartPts = this.frameQueue[0].timestamp / 1_000_000;
       }
       this.syncedToAudio = false;
+      // Anchored on the frame we paused on — no jump — but that frame is NOT
+      // where the sound resumes. pause() suspends the context, it does not
+      // flush what the device already holds, so the audio clock comes back a
+      // step away from the paused picture: measured at +254ms, +11ms and
+      // -31ms across three resumes of one file. Left to the soft-sync branch
+      // every one of those steps under 400ms is accepted and kept for the
+      // rest of the run. It is the same situation a rate change creates, and
+      // it has the same answer: this unsync was caused by us, so there is no
+      // old anchor worth protecting — re-anchor on the sound the moment it is
+      // actually running. Nothing happens while the context is still coming
+      // out of suspend; the audio clock reports -1 until then.
+      this.reanchorRequested = true;
     }
 
     this.presentationLoop();
@@ -2534,6 +2981,10 @@ export class CanvasRenderer {
    */
   stopPresentationLoop(): void {
     this.isPlaying = false;
+    this.stopSubtitleClock();
+    // The perf windows are rates measured across wall-clock time, and nothing
+    // is going to tick them while the loop is stopped. See resetPerfWindows().
+    this.resetPerfWindows();
 
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
@@ -2550,10 +3001,86 @@ export class CanvasRenderer {
   }
 
   /**
+   * The caption clock for a source with no picture.
+   *
+   * updateActiveSubtitle() and renderSubtitles() live inside the presentation
+   * loop, which is where they belong while frames are being shown and exactly
+   * the wrong place for a source that has none: an audio file, or an
+   * audio-only rendition of a video one. This stands in for the loop there.
+   *
+   * An interval rather than a rAF, because neither of the reasons to use rAF
+   * applies: nothing is being painted in step with a frame, and an audio track
+   * playing behind another tab is the ordinary case, not the odd one — rAF
+   * parks there while the sound carries on. 100ms is the tolerance the cue
+   * matcher already works to.
+   */
+  private startSubtitleClock(): void {
+    if (this.subtitleClockTimer !== null) return;
+    this.subtitleClockTimer = setInterval(() => {
+      this.updateActiveSubtitle();
+      this.renderSubtitles();
+    }, 100);
+  }
+
+  private stopSubtitleClock(): void {
+    if (this.subtitleClockTimer === null) return;
+    clearInterval(this.subtitleClockTimer);
+    this.subtitleClockTimer = null;
+  }
+
+  /**
+   * Data-saver audio-only: a video track is configured and this renderer is
+   * set up for it, but not one packet of it is being decoded.
+   *
+   * Presenting is then a loop with nothing to present, and worse than idle:
+   * the perf detectors would read sixty ticks a second against zero frames
+   * with audio flowing, which is their signature for a source the machine
+   * cannot decode. So the captions move to the clock a picture-less source
+   * uses, and the loop stands down until the picture comes back.
+   */
+  setPictureSuspended(suspended: boolean): void {
+    if (this.pictureSuspended === suspended) return;
+    this.pictureSuspended = suspended;
+    if (!this.isPlaying) return;
+    if (suspended) {
+      if (this.rafId !== null) {
+        cancelAnimationFrame(this.rafId);
+        this.rafId = null;
+      }
+      // Whatever those windows measured, they measured it against a picture
+      // that is about to stop arriving. See resetPerfWindows().
+      this.resetPerfWindows();
+      this.startSubtitleClock();
+      return;
+    }
+    this.stopSubtitleClock();
+    if (this.rafId === null) {
+      this.isPlaying = false;
+      this.startPresentationLoop();
+    }
+  }
+
+  /**
+   * The presentation loop, wrapped so each tick is counted and timed. Both
+   * numbers feed sampleRafCadence(), which is what lets the perf detectors tell
+   * "the decoder is behind" apart from "the host page is holding the main
+   * thread". Everything the loop actually does lives in presentationTick().
+   */
+  private presentationLoop = (): void => {
+    const tickStart = performance.now();
+    this._rafTicks++;
+    try {
+      this.presentationTick();
+    } finally {
+      this._rafSelfMs += performance.now() - tickStart;
+    }
+  };
+
+  /**
    * RAF-based presentation loop - presents frames at VSync-aligned times
    * For true 60fps, we present exactly one frame per RAF call when available
    */
-  private presentationLoop = (): void => {
+  private presentationTick = (): void => {
     if (!this.isPlaying) {
       this.rafId = null;
       return;
@@ -2673,6 +3200,13 @@ export class CanvasRenderer {
    * This ensures smooth 60fps video playback while maintaining A/V sync
    */
   private getCurrentPlaybackTime(): number {
+    // No picture at all: the sound IS the clock. Everything below exists to
+    // hold frames in step with the audio, and there are no frames — while the
+    // last-presented-PTS fallback right under this would pin every caption to
+    // -1 for the whole track, since nothing is ever presented.
+    if (!this.isVideoConfigured || this.subtitleClockTimer !== null) {
+      return this.getAudioTime ? this.getAudioTime() : -1;
+    }
     // When the presentation loop is stopped (player paused), the
     // wall-clock formula below would advance time forever — but no one
     // is consuming frames, so updateActiveSubtitle (called from
@@ -2687,10 +3221,17 @@ export class CanvasRenderer {
       return -1;
     }
     // Always use wall clock for video timing (smooth 60fps)
+    //
+    // The anchor can sit in the FUTURE: on a high-latency output the sound for
+    // this run is not audible yet, so the anchor is placed at the moment it
+    // will be (see audioStartLeadMs). Floor the elapsed at zero exactly as the
+    // audio clock floors its own — the picture holds on the anchor frame until
+    // the sound reaches it, rather than running backwards from it.
     let videoTime = -1;
     if (this.presentationStartTime > 0) {
       const elapsed = (performance.now() - this.presentationStartTime) / 1000;
-      videoTime = this.presentationStartPts + elapsed * this.playbackRate;
+      videoTime =
+        this.presentationStartPts + Math.max(0, elapsed) * this.playbackRate;
     }
 
     // Check audio for drift correction (but don't block video)
@@ -2706,6 +3247,14 @@ export class CanvasRenderer {
       }
 
       if (audioTime >= 0 && isHealthy) {
+        // Every drift budget below is in MEDIA seconds, and what the eye
+        // judges is REAL ones. At 0.25x a 150ms media offset is 600ms of the
+        // sound arriving after the mouth — the same number that is fine at 1x
+        // is four times as wrong at quarter speed. Scale the budgets with the
+        // rate, and never past 1, so speeds above 1x keep exactly the
+        // tolerances they have today.
+        const rateScale = Math.min(this.playbackRate, 1);
+
         // First sync - initialize wall clock to match audio
         if (!this.syncedToAudio) {
           const drift = videoTime >= 0 ? Math.abs(videoTime - audioTime) : 0;
@@ -2716,8 +3265,22 @@ export class CanvasRenderer {
           // 2. Very early playback (≤3 frames) AND drift is significant (>30ms)
           //    This gives Bluetooth audio time to stabilize before hard sync
           // 3. Drift is very large (> 400ms) - critical desync recovery
-          if (videoTime < 0 || (isVeryEarlyPlayback && drift > 0.03) || drift > 0.4) {
-            this.presentationStartTime = performance.now();
+          // A drift too small for the 400ms bar below but too small for the
+          // continuous correction's own 150ms threshold has nowhere to go: the
+          // else-branch marks us synced and the offset becomes permanent. That
+          // is audible — measured on a 4K60 file, speed changes settled the
+          // picture 120-148ms off the sound and it stayed there. When the
+          // unsync was REQUESTED there is no old anchor worth protecting, so
+          // re-anchor whatever the drift is.
+          if (
+            this.reanchorRequested ||
+            videoTime < 0 ||
+            (isVeryEarlyPlayback && drift > 0.03 * rateScale) ||
+            drift > 0.4 * rateScale
+          ) {
+            this.reanchorRequested = false;
+            this.presentationStartTime =
+              performance.now() + this.audioStartLeadMs();
             this.presentationStartPts = audioTime;
             this.syncedToAudio = true;
             Logger.debug(TAG, `Initial A/V sync: audioTime=${audioTime.toFixed(3)}s, framesPresented=${this.framesPresented}, drift=${(drift * 1000).toFixed(0)}ms, early=${isVeryEarlyPlayback}`);
@@ -2726,6 +3289,7 @@ export class CanvasRenderer {
             // We're already playing, just mark as synced without resetting
             // This prevents stuttering when Bluetooth latency causes audio clock fluctuations
             this.syncedToAudio = true;
+            this.reanchorRequested = false;
             Logger.debug(TAG, `Soft A/V sync (no reset): videoTime=${videoTime.toFixed(3)}s, audioTime=${audioTime.toFixed(3)}s, framesPresented=${this.framesPresented}, drift=${(drift * 1000).toFixed(0)}ms`);
           }
         }
@@ -2734,9 +3298,35 @@ export class CanvasRenderer {
         // video racing ahead of audio due to backpressure-induced audio gaps.
         const isSlowHighFps = this.playbackRate < 0.99 && this.videoFrameRate >= 50;
 
-        if (videoTime >= 0 && this.framesPresented > 30) {
+        // …but not against a clock that has not started yet. Before the first
+        // scheduled buffer is audible the audio clock is flat at the run's
+        // starting media time by construction, so `drift` here is not drift at
+        // all — it is the lead itself, read as error. On Bluetooth that is
+        // ~600ms, far past the 150ms threshold, so this fired every frame and
+        // walked presentationStartPts backwards ~600ms over a handful of ticks:
+        // the picture stopped dead until the wall clock caught up with where
+        // the anchor had been dragged to. That is the freeze a moment after
+        // every seek that only ever showed up on Bluetooth. The anchor is
+        // already placed for the lead above; there is nothing to correct until
+        // sound is actually coming out.
+        if (
+          videoTime >= 0 &&
+          this.framesPresented > 30 &&
+          this.audioStartLeadMs() <= 0
+        ) {
           const drift = videoTime - audioTime;
-          const threshold = isSlowHighFps ? 0.05 : 0.15;
+          // Anything under this threshold is banked forever: the branch above
+          // marks us synced without moving the anchor, and this is the only
+          // thing that would have closed it. Read off a 25fps file watched at
+          // 0.25x — resume after a pause settled the picture 70ms off the
+          // sound and kept it there, because 70ms never reached the 150ms bar,
+          // and 70ms of media at quarter speed is 280ms of real lip-sync
+          // error. The deadband is wide on purpose (a tight one chases
+          // Bluetooth's own clock jitter and judders), so keep the width in
+          // REAL time and let the media-time figure follow the rate. Clamped
+          // rather than scaled so the tighter high-fps value still wins where
+          // it applies and 1x is bit-for-bit what it was.
+          const threshold = Math.min(isSlowHighFps ? 0.05 : 0.15, 0.15 * rateScale);
           const strength = isSlowHighFps ? 0.5 : 0.25;
 
           if (Math.abs(drift) > threshold) {
@@ -2745,7 +3335,9 @@ export class CanvasRenderer {
         }
 
         const elapsed = (performance.now() - this.presentationStartTime) / 1000;
-        return this.presentationStartPts + elapsed * this.playbackRate;
+        return (
+          this.presentationStartPts + Math.max(0, elapsed) * this.playbackRate
+        );
       }
     }
 
@@ -2762,6 +3354,23 @@ export class CanvasRenderer {
       return Math.min(videoTime, this.lastKnownAudioTime + 0.15);
     }
     return videoTime >= 0 ? videoTime : -1;
+  }
+
+  /**
+   * How far in the future to place a fresh presentation anchor so the picture
+   * starts moving with the sound rather than ahead of it, in ms.
+   *
+   * Zero on every ordinary output — the provider reports the real figure and it
+   * is a handful of milliseconds there. Capped so a device reporting something
+   * absurd (or a stale reading taken across a route change) can't park the
+   * picture: past a third of a second the honest thing is to start the picture
+   * and let the drift correction close the rest.
+   */
+  private audioStartLeadMs(): number {
+    if (!this._audioStartLead) return 0;
+    const lead = this._audioStartLead();
+    if (!(lead > 0)) return 0;
+    return Math.min(lead, CanvasRenderer.MAX_AUDIO_START_LEAD_S) * 1000;
   }
 
   /**
@@ -2807,8 +3416,15 @@ export class CanvasRenderer {
       this.framesPresented = 1; // First frame presented
       this._lastPresentAt = performance.now();
 
-      // Initialize presentation timing
-      this.presentationStartTime = performance.now();
+      // Initialize presentation timing.
+      //
+      // This frame goes up now — it is the picture at the seek target and the
+      // viewer should see it immediately — but the clock that walks FORWARD
+      // from it starts when the sound does. On a normal output that is the same
+      // instant; on Bluetooth the audio for this run is ~600ms from being
+      // audible, and starting the wall clock now would run the picture that far
+      // ahead of it. See audioStartLeadMs().
+      this.presentationStartTime = performance.now() + this.audioStartLeadMs();
       this.presentationStartPts = this.lastPresentedPts;
       this.syncedToAudio = false;
 
@@ -2870,6 +3486,30 @@ export class CanvasRenderer {
       const frame = this.frameQueue[i];
       const frameTime = frame.timestamp / 1_000_000;
 
+      // Never go backwards. "Due" only asked whether a frame sits at or before
+      // the clock, never whether we had already shown something LATER — and
+      // after a rate change we routinely have. The corrective seek repositions
+      // the demuxer to the playhead without clearing this queue, so the frames
+      // that arrive next start from the keyframe BEFORE that point while the
+      // picture has already run on past it. Every one of them is "due", and
+      // showing them rewinds the picture and replays it.
+      //
+      // Measured on 8K60 AV1, 2x: the renderer had presented up to 9.283s, then
+      // showed 6.267s and walked forward from there while the clock ran 9.32,
+      // 9.35, 9.45 — a three second rewind, sixty-two backward presentations in
+      // one run, which is the flicker where frames "come and then go".
+      //
+      // Skipping them leaves them for the prune below, which drops anything
+      // more than maxBehind behind the clock — it could not reach them before
+      // because it stops at the frame this loop selected. The three sites that
+      // legitimately restart the picture somewhere else (an empty queue, the
+      // stale-frame drop, clearQueue on a real seek) all reset lastPresentedPts
+      // to -1, so a genuine backward seek is untouched.
+      if (this.lastPresentedPts >= 0 && frameTime < this.lastPresentedPts - 0.0005) {
+        this._backwardsRefused++;
+        continue;
+      }
+
       // Frame is due if its timestamp is at or before currentTime (with small tolerance)
       if (frameTime <= currentTime + 0.005) {
         // 5ms tolerance
@@ -2887,8 +3527,17 @@ export class CanvasRenderer {
       const firstFrame = this.frameQueue[0];
       const firstFrameTime = firstFrame.timestamp / 1_000_000;
 
+      // Same rule as the loop above, and it has to be repeated here: this
+      // fallback reaches straight for the head of the queue, so without it the
+      // no-going-backwards test is simply stepped around — which is exactly
+      // what a first attempt at this did, leaving the count of backward
+      // presentations unchanged at sixty-odd.
+      const wouldGoBackwards =
+        this.lastPresentedPts >= 0 &&
+        firstFrameTime < this.lastPresentedPts - 0.0005;
+
       // If first frame is coming up soon (within one frame interval), present it
-      if (firstFrameTime <= currentTime + frameInterval) {
+      if (!wouldGoBackwards && firstFrameTime <= currentTime + frameInterval) {
         bestFrame = firstFrame;
         bestIndex = 0;
       }
@@ -2943,6 +3592,35 @@ export class CanvasRenderer {
     }
 
     // If we found a frame, update tracking and remove old frames
+    // Say when the picture is being held still by the rule above.
+    //
+    // It was silent, and that is why it went unexplained across three separate
+    // reports: the viewer sees the picture stop and then jump, and the log for
+    // that stretch carries nothing at all — no state change, no seek, no drop.
+    // Every other thing that can stop the picture announces itself; this did
+    // not. Rate-limited to one line an episode, and it says how long and how
+    // far, which is what tells this apart from a decoder that is merely slow.
+    if (this._backwardsRefused > 0 && !bestFrame) {
+      const heldMs = performance.now() - this._lastPresentAt;
+      if (
+        heldMs > CanvasRenderer.BACKWARDS_REPORT_AFTER_MS &&
+        performance.now() - this._backwardsReportedAt >
+          CanvasRenderer.BACKWARDS_REPORT_EVERY_MS
+      ) {
+        this._backwardsReportedAt = performance.now();
+        const head = this.frameQueue.length
+          ? this.frameQueue[0].timestamp / 1_000_000
+          : NaN;
+        Logger.warn(
+          TAG,
+          `Picture held at ${this.lastPresentedPts.toFixed(3)}s for ${heldMs.toFixed(0)}ms — ` +
+            `${this._backwardsRefused} frame(s) refused as older than what is on screen ` +
+            `(queue ${this.frameQueue.length}, head ${Number.isFinite(head) ? head.toFixed(3) + "s" : "none"}, clock ${currentTime.toFixed(3)}s)`,
+        );
+      }
+    }
+    if (bestFrame) this._backwardsRefused = 0;
+
     if (bestFrame && bestIndex >= 0) {
       // Remove all frames up to (but not including) the best one
       if (bestIndex > 0) {
@@ -3011,7 +3689,13 @@ export class CanvasRenderer {
   private drawFrame(frame: RenderSource, force: boolean = false): void {
     if (!this.gl || !this.program || !this.texture) return;
     const gl = this.gl;
-    const paintStart = this._adaptDprChecked ? 0 : performance.now();
+    // Keep timing while ANY adaptation is still available — the bit-depth rung
+    // below outlives the one-shot DPR check. Two performance.now() calls a
+    // frame cost nothing next to what they are measuring.
+    const canStillAdapt =
+      !this._adaptDprChecked ||
+      (this.isHighBitDepth && !this._bitDepthDowngraded);
+    const paintStart = canStillAdapt ? performance.now() : 0;
 
     try {
       // Update current time. A <video> source carries its own playhead;
@@ -3131,6 +3815,21 @@ export class CanvasRenderer {
 
       const scaledWidth = contentWidth * this.currentScaleX;
       const scaledHeight = contentHeight * this.currentScaleY;
+
+      // How much of the frame's height the picture fills, from the TARGET
+      // scale so a fit change is followed once rather than every lerp step.
+      // The caption's home is measured from the picture, not the frame — see
+      // subtitleBottomPadding. Only for an upright or upside-down picture:
+      // at 90/270 the overlay's height runs along the frame's width.
+      const rotNow = (((this.rotation ?? 0) % 360) + 360) % 360;
+      const pictureFrac =
+        rotNow % 180 === 0 && this.height > 0
+          ? Math.min(1, (contentHeight * targetScaleY) / this.height)
+          : 1;
+      if (Math.abs(pictureFrac - this._pictureHeightFrac) > 0.002) {
+        this._pictureHeightFrac = pictureFrac;
+        this.reapplySubtitlePadding();
+      }
 
       const x = (this.width - scaledWidth) / 2;
       const y = (this.height - scaledHeight) / 2;
@@ -3298,6 +3997,19 @@ export class CanvasRenderer {
    * Read the latest mirrored frame as a 16×16 RGBA buffer. Synchronous and
    * cheap (256-pixel readPixels). Returns null if ambient mirror isn't
    * enabled or no frame has been drawn yet.
+   *
+   * NOTE: `readPixels` is a GPU synchronisation point — it flushes the command
+   * queue and waits — so its cost is set by whatever is already queued, not by
+   * the 256 pixels. On a 4K 12-bit source (RGBA16F, ~66MB a frame) samples were
+   * measured at up to 21ms of blocked main thread here, and MoviElement's
+   * ambient loop has seen 44ms in the field.
+   *
+   * A PBO + fenceSync rewrite was tried to make that asynchronous and was
+   * MEASURABLY WORSE, on the same machine and file: p90 11.5ms -> 23.5ms, max
+   * 21.4ms -> 121.7ms, main-thread long tasks 5 -> 20 over the same 40s. In
+   * Chrome the WebGL context lives in the GPU process, so clientWaitSync and
+   * getBufferSubData are each an IPC round trip — the "asynchronous" path adds
+   * two blocking hops where the direct read had one. Don't reintroduce it.
    */
   readAmbientPixels(): Uint8Array | null {
     if (!this.ambientEnabled || !this.gl || !this.ambientFbo || !this.ambientPixels) {
@@ -3422,8 +4134,13 @@ export class CanvasRenderer {
     this.subtitleControlsPadding = padding;
     // Apply immediately if overlay exists
     if (this.subtitleOverlay) {
+      const height = this.containerHeight || 672;
+      const settled = this.subtitleEffectiveBottomPadding(
+        height,
+        this.subtitleBottomPadding(height),
+      );
       if (padding > 0) {
-        this.subtitleOverlay.style.paddingBottom = `${padding}px`;
+        this.subtitleOverlay.style.paddingBottom = `${settled}px`;
       } else {
         // containerHeight is CSS pixels; this.height is the dpr-scaled
         // backbuffer and would inflate the padding 2× on retina.
@@ -3758,7 +4475,10 @@ export class CanvasRenderer {
       // The text path has always computed its padding first, which is exactly
       // why text cues never did this.
       const bottomPaddingImg = this.subtitleBottomPadding(ovH);
-      const effectivePaddingImg = this.subtitleControlsPadding > 0 ? this.subtitleControlsPadding : bottomPaddingImg;
+      const effectivePaddingImg = this.subtitleEffectiveBottomPadding(
+        ovH,
+        bottomPaddingImg,
+      );
       this.subtitleOverlay.style.padding = "0";
       this.subtitleOverlay.style.paddingBottom = `${effectivePaddingImg}px`;
       this.subtitleOverlay.style.textAlign = "center";
@@ -3879,7 +4599,87 @@ export class CanvasRenderer {
    * this is the one that matters on the canvas path, where the overlay is
    * positioned by inline style and the CSS `bottom` never applies.
    */
+  /**
+   * How far the viewer has carried the caption UP the picture, in pixels.
+   *
+   * The element writes the drag onto this same overlay as `translate: x% y%`,
+   * an inline value on an element this renderer already owns the rest of the
+   * inline styles of — so it is read back here rather than pushed through the
+   * player, and read off the style attribute rather than the computed style,
+   * which would force a layout flush on every cue.
+   */
+  private subtitleUserLift(overlayHeight: number): number {
+    const raw = (this.subtitleOverlay as HTMLElement | null)?.style?.translate;
+    if (!raw || !Number.isFinite(overlayHeight) || overlayHeight <= 0) return 0;
+    const y = raw.trim().split(/\s+/)[1];
+    const pct = y ? /^(-?[\d.]+)%$/.exec(y) : null;
+    if (!pct) return 0;
+    return (-parseFloat(pct[1]) / 100) * overlayHeight;
+  }
+
+  /**
+   * The controls reserve is for the caption the bar would otherwise cover,
+   * and for no other caption.
+   *
+   * Where the caption sits comes out as max(home, controlsPadding) once CSS
+   * adds the viewer's own lift back on — so one sitting down by the bar rides
+   * up with it and settles back when it hides, exactly as it always has, and
+   * one carried anywhere above the bar's reach never moves for it again.
+   *
+   * Stated as a maximum rather than as a near/far test, because a test flips:
+   * the caption would jump the moment a drag crossed the line, in the middle
+   * of the gesture that crossed it.
+   */
+  private subtitleEffectiveBottomPadding(
+    overlayHeight: number,
+    bottomPadding: number,
+  ): number {
+    // While the caption is being carried there is no reserve at all: it goes
+    // where the pointer goes, pixel for pixel. Whatever reserve it was sitting
+    // on was folded into the drag when the drag began (see subtitleReservePx),
+    // so nothing moves as it is picked up either — and nothing moves as it is
+    // let go, because the reserve does not come back for a placed caption.
+    if (this.subtitleHeld) return bottomPadding;
+    const lift = this.subtitleUserLift(overlayHeight);
+    return Math.max(bottomPadding, this.subtitleControlsPadding - lift);
+  }
+
+  /**
+   * How much of where the caption sits right now is the controls reserve
+   * rather than the caption's own place — the distance it would drop if the
+   * reserve were dropped. The element folds this into the drag it is about to
+   * start, which is what lets the reserve be suspended for the drag without
+   * the caption lurching the height of the bar as it is picked up.
+   */
+  subtitleReservePx(): number {
+    const overlayHeight = (this.subtitleOverlay as HTMLElement | null)?.offsetHeight ?? 0;
+    if (!overlayHeight) return 0;
+    const bottomPadding = this.subtitleBottomPadding(overlayHeight);
+    return Math.max(
+      0,
+      this.subtitleEffectiveBottomPadding(overlayHeight, bottomPadding) -
+        bottomPadding,
+    );
+  }
+
   private subtitleBottomPadding(overlayHeight: number): number {
+    // Measured from the PICTURE, not the frame it sits in. The overlay spans
+    // the whole player, so a letterboxed picture — a 2.39:1 film in a 16:9
+    // player, a 16:9 video in a tall one — had its caption placed off the
+    // player's bottom edge: down in the black bar, or pressed against the
+    // picture's edge, and sized by a height the picture does not have. The
+    // bar below the picture is added first, then the distance the picture
+    // itself calls for. A picture that fills the frame (cover, fill, most
+    // players) has no bar, and nothing changes for it.
+    const frac = this._pictureHeightFrac;
+    const pictureHeight =
+      Number.isFinite(overlayHeight) && overlayHeight > 0
+        ? overlayHeight * frac
+        : overlayHeight;
+    const below =
+      Number.isFinite(overlayHeight) && overlayHeight > 0
+        ? (overlayHeight - pictureHeight) / 2
+        : 0;
     const raw = this.subtitleOverlay
       ? getComputedStyle(this.subtitleOverlay)
           .getPropertyValue("--movi-sub-bottom")
@@ -3887,11 +4687,29 @@ export class CanvasRenderer {
       : "";
     if (raw && Number.isFinite(overlayHeight) && overlayHeight > 0) {
       const pct = /^([\d.]+)%$/.exec(raw);
-      if (pct) return (overlayHeight * parseFloat(pct[1])) / 100;
+      if (pct) return below + (pictureHeight * parseFloat(pct[1])) / 100;
       const px = /^([\d.]+)px$/.exec(raw);
-      if (px) return parseFloat(px[1]);
+      if (px) return below + parseFloat(px[1]);
     }
-    return CanvasRenderer.computeSubtitleBottomPadding(overlayHeight);
+    return below + CanvasRenderer.computeSubtitleBottomPadding(pictureHeight);
+  }
+
+  /** How much of the frame's height the picture fills (1 when it fills it or
+   *  overflows it). Kept by drawFrame. */
+  private _pictureHeightFrac = 1;
+
+  /** Put the caption back on its home after the picture's size in the frame
+   *  changed — a new aspect, a fit-mode change, the first frame. */
+  private reapplySubtitlePadding(): void {
+    const overlay = this.subtitleOverlay as HTMLElement | null;
+    if (!overlay) return;
+    const h = parseFloat(overlay.style.height) || this.containerHeight || 0;
+    if (!(h > 0)) return;
+    overlay.style.paddingBottom = `${this.subtitleEffectiveBottomPadding(
+      h,
+      this.subtitleBottomPadding(h),
+    )}px`;
+    if (this.activeSubtitleCue) this.scheduleSubtitleRerender();
   }
 
   /**
@@ -3914,7 +4732,34 @@ export class CanvasRenderer {
   /**
    * Update active subtitle based on current time
    */
+  /**
+   * Hold the caption on the cue it is showing.
+   *
+   * For the length of a drag, and for nothing else. A caption is rewritten
+   * wholesale on every karaoke word and every cue — and between cues it is
+   * taken off the screen altogether — so the thing the viewer has hold of
+   * keeps being replaced underneath them: the block re-centres itself on the
+   * new text and slips out from under the pointer, and in a gap between cues
+   * there is suddenly nothing there at all. Pinned to one cue, the render
+   * below meets the same key every tick and leaves the DOM alone.
+   *
+   * The CUE is held, not the rendering: the overlay's box and the controls
+   * reserve go on being worked out every tick, because the reserve shrinks as
+   * the caption is carried up and away from the bar. Frozen along with the
+   * cue, all of that shrink arrived at once when the caption was let go, and
+   * dropped it the height of the bar out of the viewer's hand.
+   */
+  setSubtitleHeld(held: boolean): void {
+    if (this.subtitleHeld === held) return;
+    this.subtitleHeld = held;
+    if (!held) {
+      this.updateActiveSubtitle();
+      this.renderSubtitles();
+    }
+  }
+
   private updateActiveSubtitle(): void {
+    if (this.subtitleHeld) return;
     // Use getCurrentPlaybackTime() instead of this.currentTime to ensure accurate timing
     // this.currentTime is only updated when frames are drawn, but subtitles need real-time updates
     const currentTime = this.getCurrentPlaybackTime();
@@ -4083,7 +4928,10 @@ export class CanvasRenderer {
       this.subtitleOverlay.style.top = `${(overlayH - ovTxtH) / 2}px`;
       this.subtitleOverlay.style.margin = "0";
       this.subtitleOverlay.style.padding = "0";
-      const effectivePad = this.subtitleControlsPadding > 0 ? this.subtitleControlsPadding : bottomPadding;
+      const effectivePad = this.subtitleEffectiveBottomPadding(
+        ovTxtH,
+        bottomPadding,
+      );
       this.subtitleOverlay.style.paddingBottom = `${effectivePad}px`;
       this.subtitleOverlay.style.transformOrigin = "center center";
       this.subtitleOverlay.style.transform = rotTxt ? `rotate(${rotTxt}deg)` : "none";
@@ -4404,7 +5252,7 @@ export class CanvasRenderer {
           // wrapper now, so individual lines just hug their content (and
           // expand to the wrapper's width because they're block-level).
           const lineParts: string[] = [
-            `<div class="movi-subtitle-line">`,
+            `<div class="movi-subtitle-line" part="subtitle">`,
           ];
           if (staticHtml)
             lineParts.push(
@@ -4511,8 +5359,22 @@ export class CanvasRenderer {
       this.presentationStartPts = currentTime;
     }
 
-    // Mark as not synced so we can re-sync to audio with new rate
+    // Mark as not synced so we can re-sync to audio with new rate — and say
+    // that this one was asked for, so the re-sync actually re-anchors instead
+    // of accepting whatever offset the rate change introduced.
     this.syncedToAudio = false;
+    this.reanchorRequested = true;
+  }
+
+  /**
+   * The audio pipeline was rebuilt underneath a picture that never stopped —
+   * the rate-change rewind does exactly this. The sound now starts from a media
+   * time the video's anchor knows nothing about, so re-anchor the picture on it
+   * rather than leaving the two a fixed distance apart forever.
+   */
+  requestAudioReanchor(): void {
+    this.syncedToAudio = false;
+    this.reanchorRequested = true;
   }
 
   /**
@@ -4527,6 +5389,22 @@ export class CanvasRenderer {
    */
   hasQueuedFrames(): boolean {
     return this.frameQueue.length > 0;
+  }
+
+  /**
+   * Whether the last cadence window was the HOST PAGE starving rAF rather than
+   * the pipeline falling short — see sampleRafCadence.
+   */
+  isHostContended(): boolean {
+    return this._hostContended;
+  }
+
+  /**
+   * Media time (s) of the frame on screen, or -1 when nothing has been shown
+   * since the last seek / queue clear.
+   */
+  getLastPresentedTime(): number {
+    return this.lastPresentedPts;
   }
 
   /**
@@ -4600,8 +5478,10 @@ export class CanvasRenderer {
    * Clear frame queue (useful for seek operations)
    * Resets all presentation timing to prevent stuttering after seek
    */
-  private cornerRadiusCss = 0;
+  /** Top-left, top-right, bottom-right, bottom-left, in CSS pixels. */
+  private cornerRadiiCss: [number, number, number, number] = [0, 0, 0, 0];
   private roundLocs = new Map<WebGLProgram, WebGLUniformLocation | null>();
+  private radiiLocs = new Map<WebGLProgram, WebGLUniformLocation | null>();
 
   /**
    * Corner radius (CSS pixels) for the picture itself.
@@ -4611,11 +5491,19 @@ export class CanvasRenderer {
    * ended up with square video inside it. Pixels the shader declines to draw
    * are transparent whatever the compositor thinks, so this holds everywhere.
    * 0 turns it off.
+   *
+   * One number rounds all four corners; four (top-left, top-right,
+   * bottom-right, bottom-left — CSS order) round each on its own. A host
+   * that rounds only the top of the picture, where it sits on a caption bar,
+   * used to get all four corners cut to the first radius.
    */
-  setCornerRadius(cssPx: number): void {
-    const r = Math.max(0, cssPx || 0);
-    if (r === this.cornerRadiusCss) return;
-    this.cornerRadiusCss = r;
+  setCornerRadius(cssPx: number | number[]): void {
+    const src = Array.isArray(cssPx) ? cssPx : [cssPx, cssPx, cssPx, cssPx];
+    const r = [0, 1, 2, 3].map((i) => Math.max(0, src[i] || 0)) as [
+      number, number, number, number,
+    ];
+    if (r.every((v, i) => v === this.cornerRadiiCss[i])) return;
+    this.cornerRadiiCss = r;
     // A paused player never draws again on its own; repaint so the change shows.
     // (Same retained frame the VR camera nudges and resizes repaint from.)
     if (this.lastRenderedFrame) {
@@ -4653,13 +5541,19 @@ export class CanvasRenderer {
   }
   private _letterboxBgCss = "";
 
-  /** Radius in DRAWING-BUFFER pixels, which is what the shader measures in. */
-  private cornerRadiusBufferPx(): number {
-    if (!this.cornerRadiusCss || !this.canvas) return 0;
+  /** Per-corner radii in DRAWING-BUFFER pixels, which is what the shader
+   *  measures in. */
+  private cornerRadiiBufferPx(): [number, number, number, number] {
+    if (!this.canvas || this.cornerRadiiCss.every((v) => !v)) return [0, 0, 0, 0];
     const cssW =
       (this.canvas as HTMLCanvasElement).clientWidth || this.canvas.width;
     const scale = cssW > 0 ? this.canvas.width / cssW : 1;
-    return this.cornerRadiusCss * scale;
+    return this.cornerRadiiCss.map((v) => v * scale) as [number, number, number, number];
+  }
+
+  /** The largest of them: the shader's on/off switch (u_round.x). */
+  private cornerRadiusBufferPx(): number {
+    return Math.max(...this.cornerRadiiBufferPx());
   }
 
   // ── Bar cropping ────────────────────────────────────────
@@ -5024,6 +5918,15 @@ export class CanvasRenderer {
       this.canvas?.width || 0,
       this.canvas?.height || 0,
     );
+    let rloc = this.radiiLocs.get(program);
+    if (rloc === undefined) {
+      rloc = gl.getUniformLocation(program, "u_radii");
+      this.radiiLocs.set(program, rloc);
+    }
+    if (rloc) {
+      const [tl, tr, br, bl] = this.cornerRadiiBufferPx();
+      gl.uniform4f(rloc, tl, tr, br, bl);
+    }
   }
 
   clearQueue(): void {

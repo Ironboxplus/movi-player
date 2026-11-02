@@ -11,11 +11,15 @@
           "name": "MoviElement",
           "tagName": "movi-player",
           "customElement": true,
-          "description": "Movi Player — a WASM + WebCodecs video player custom element.\n\nPlays formats the browser cannot (MKV, HEVC, AV1, TrueHD/DTS, …) on a WebGL2 canvas, with adaptive quality, HDR, subtitles and a full built-in UI.",
+          "description": "MoviPlayer — a WASM + WebCodecs video player custom element.\n\nPlays formats the browser cannot (MKV, HEVC, AV1, TrueHD/DTS, …) on a WebGL2 canvas, with adaptive quality, HDR, subtitles and a full built-in UI.",
           "attributes": [
             {
               "name": "src",
               "description": "Specifies the video source URL or File object."
+            },
+            {
+              "name": "autopictureinpicture",
+              "description": "Enter Picture-in-Picture automatically when the tab is hidden, and leave it on"
             },
             {
               "name": "autoplay",
@@ -27,7 +31,7 @@
             },
             {
               "name": "loop",
-              "description": "Restarts playback when video ends."
+              "description": "Restarts playback when the video ends — or, with a queue, asks for the queue"
             },
             {
               "name": "muted",
@@ -199,6 +203,14 @@
               "description": "Target prefetch window in **megabytes** — how far ahead of playback the source should try to keep buffered."
             },
             {
+              "name": "spinnerdelay",
+              "description": "How long an interruption has to last, in **seconds**, before the viewer is shown a loading spinner."
+            },
+            {
+              "name": "posterdelay",
+              "description": "How long to wait, in **milliseconds**, before putting the opening poster up — the cover shown while a source loads its first frame."
+            },
+            {
               "name": "title",
               "description": "Sets the video title shown in the in-player overlay. Unlike the global HTML `title` attribute, this does **not** trigger a native browser tooltip on hover."
             },
@@ -211,12 +223,20 @@
               "description": "Decides where the title bar is allowed to appear, and whether it carries a back arrow. Space- or comma-separated tokens, in any order:"
             },
             {
+              "name": "subtitlepicker",
+              "description": "Adds an \"Add subtitle file…\" row to the subtitle menu for picking a local SRT/VTT/TTML. Read in the page, never uploaded"
+            },
+            {
               "name": "chapters",
               "description": "Chapters that aren't in the media file. The player already reads chapter atoms out of MKV/MP4 containers; this is for the sources that keep them somewhere else — YouTube in the watch page, a CMS in its own database. Each entry is `{title, start, end?, image?}`, where `image` is artwork the timeline tile shows in place of a frame decoded at `start`."
             },
             {
               "name": "resume",
               "description": "Saves playback position to localStorage and shows a resume dialog on reload."
+            },
+            {
+              "name": "resumekey",
+              "description": "Files the resume position under a name you choose instead of the title."
             },
             {
               "name": "stablevolume",
@@ -319,6 +339,30 @@
             {
               "name": "disableremoteplayback",
               "description": "Boolean. Turns off remote playback targets (AirPlay, Cast) for the element, the same"
+            },
+            {
+              "name": "playlist",
+              "description": "A queue. The bar grows Previous and Next, `Shift+P` / `Shift+N` walk it, and the"
+            },
+            {
+              "name": "playlistindex",
+              "description": "Which item to open on. Default `0`. The `playlistIndex` property reads and"
+            },
+            {
+              "name": "autoadvance",
+              "description": "Let the end of one item start the next. **Off by default** — a queue a page"
+            },
+            {
+              "name": "shuffle",
+              "description": "Play the queue in a random order. **Off by default.**"
+            },
+            {
+              "name": "smoothwarning",
+              "description": "Shows a notice when what is loaded is not expected to play smoothly on this"
+            },
+            {
+              "name": "nolinkwarning",
+              "description": "Keeps `smoothwarning` on but never raises the link-speed notice (\"This media"
             }
           ],
           "events": [
@@ -583,9 +627,9 @@
             },
             {
               "name": "qualitychange",
-              "description": "Active video quality / track switched",
+              "description": "Active video quality / track switched. The shape depends on what moved it: a pick from the track menu carries trackId (with height and auto), a ladder switch carries src and height, a switch landing carries height and auto, and a hand-picked rung that switches nothing (the one Auto was already on) still reports height with auto: false. An Auto/ABR move carries auto: true. A host persisting a deliberate choice should ignore auto === true; one prefetching the next video should read height from any of them and treat its absence as \"unchanged\"",
               "type": {
-                "text": "CustomEvent<{ trackId: number }>"
+                "text": "CustomEvent<{ trackId } or { src, height, … } or { height, auto }>"
               }
             },
             {
@@ -593,6 +637,55 @@
               "description": "Subtitle offset changed via property/attribute",
               "type": {
                 "text": "CustomEvent<{ subtitleDelay: number }>"
+              }
+            },
+            {
+              "name": "playlistchange",
+              "description": "The queue was replaced (see playlist)",
+              "type": {
+                "text": "CustomEvent<{ items: MoviPlaylistItem[] }>"
+              }
+            },
+            {
+              "name": "itemchange",
+              "description": "Cancelable — the queue moved to another item and is about to load it. preventDefault() takes back the load, not the move, so a host whose sources are <source>/<track> children (or whose items are routes) can own what plays. See Queues the host loads",
+              "type": {
+                "text": "CustomEvent<{ index, previousIndex, item }>"
+              }
+            },
+            {
+              "name": "playlistend",
+              "description": "The last item ended with nothing after it. Fires whether or not autoadvance is on",
+              "type": {
+                "text": "CustomEvent<{ index: number }>"
+              }
+            },
+            {
+              "name": "loopchange",
+              "description": "Loop switched or changed kind — mode is off, one (the item) or all (the queue); see loop",
+              "type": {
+                "text": "CustomEvent<{ enabled: boolean, mode: string }>"
+              }
+            },
+            {
+              "name": "loop",
+              "description": "The item started over on a seamless loop; count is which turn this is, from 1",
+              "type": {
+                "text": "CustomEvent<{ count: number }>"
+              }
+            },
+            {
+              "name": "shufflechange",
+              "description": "Shuffle switched on or off (see shuffle); a fresh order is already drawn",
+              "type": {
+                "text": "CustomEvent<{ enabled: boolean }>"
+              }
+            },
+            {
+              "name": "smoothwarning",
+              "description": "Cancelable — what is loaded is not expected to play smoothly at the current speed; media is video or audio, message is the notice's plain-language { title, body }. preventDefault() keeps the built-in notice down (see smoothwarning). From measurement while playing, detail carries measured: true, plus software: true and a softwareReason when the stutter is the software decoder's (e.g. hardware refused the stream mid-playback); for a link that is too slow, link: true, neededBps and measuredBps",
+              "type": {
+                "text": "CustomEvent<PlaybackAssessment & { media: string, message: object }>"
               }
             },
             {
@@ -632,9 +725,9 @@
             },
             {
               "name": "audiostripchange",
-              "description": "Audio-only strip layout entered/left",
+              "description": "Audio-only strip layout entered/left. Reports the windowed layout: a fullscreen trip (where the strip becomes a full-screen view) doesn't fire it",
               "type": {
-                "text": "CustomEvent<{ active: boolean }>"
+                "text": "CustomEvent<{ strip: boolean }>"
               }
             },
             {
@@ -659,242 +752,474 @@
               }
             }
           ],
+          "slots": [
+            {
+              "name": "error",
+              "description": "Light-DOM children with slot=\"error\" are drawn instead of the built-in one."
+            },
+            {
+              "name": "spinner",
+              "description": "Light-DOM children with slot=\"spinner\" are drawn instead of the built-in one."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "aspect-button",
+              "description": "Aspect ratio"
+            },
+            {
+              "name": "audio-button",
+              "description": "Audio track"
+            },
+            {
+              "name": "button",
+              "description": "Every button on the bar, all at once"
+            },
+            {
+              "name": "center-button",
+              "description": "The big centre play / pause"
+            },
+            {
+              "name": "controls",
+              "description": "The whole bottom chrome — bar, progress, tooltip"
+            },
+            {
+              "name": "controls-bar",
+              "description": "The bar itself, inside that container"
+            },
+            {
+              "name": "controls-divider",
+              "description": "The quiet rule in the right-hand capsule"
+            },
+            {
+              "name": "error-button",
+              "description": "Both buttons"
+            },
+            {
+              "name": "error-container",
+              "description": "The centred column"
+            },
+            {
+              "name": "error-exit-fullscreen-button",
+              "description": "\"Exit full screen\" — shown only while the player is fullscreen"
+            },
+            {
+              "name": "error-icon",
+              "description": "Icon tile (its <svg> inherits currentColor)"
+            },
+            {
+              "name": "error-message",
+              "description": "Body text"
+            },
+            {
+              "name": "error-retry-button",
+              "description": "Retry only"
+            },
+            {
+              "name": "error-screen",
+              "description": "The full-bleed backdrop"
+            },
+            {
+              "name": "error-software-button",
+              "description": "\"Try Software Decoding\" only"
+            },
+            {
+              "name": "error-text",
+              "description": "Title + message + buttons wrapper"
+            },
+            {
+              "name": "error-title",
+              "description": "Heading"
+            },
+            {
+              "name": "fullscreen-button",
+              "description": "Fullscreen"
+            },
+            {
+              "name": "hdr-button",
+              "description": "HDR toggle"
+            },
+            {
+              "name": "icon",
+              "description": "Every glyph in the player, all at once — size, colour, transform"
+            },
+            {
+              "name": "loop-button",
+              "description": "Loop"
+            },
+            {
+              "name": "more-button",
+              "description": "The mobile \"more\" tray"
+            },
+            {
+              "name": "next-button",
+              "description": "The queue's two ends"
+            },
+            {
+              "name": "osd",
+              "description": "The volume / speed / seek flash in the middle"
+            },
+            {
+              "name": "pip-button",
+              "description": "Picture-in-picture"
+            },
+            {
+              "name": "play-button",
+              "description": "Play / pause"
+            },
+            {
+              "name": "poster",
+              "description": "The poster image"
+            },
+            {
+              "name": "prev-button",
+              "description": "The queue's two ends"
+            },
+            {
+              "name": "progress",
+              "description": "The seek bar's track"
+            },
+            {
+              "name": "progress-buffer",
+              "description": "The buffered stretch"
+            },
+            {
+              "name": "progress-handle",
+              "description": "The knob"
+            },
+            {
+              "name": "progress-played",
+              "description": "The played stretch"
+            },
+            {
+              "name": "quality-button",
+              "description": "Quality"
+            },
+            {
+              "name": "seek-backward-button",
+              "description": "The ±10s pair"
+            },
+            {
+              "name": "seek-forward-button",
+              "description": "The ±10s pair"
+            },
+            {
+              "name": "settings-button",
+              "description": "The gear"
+            },
+            {
+              "name": "speed-button",
+              "description": "Playback speed"
+            },
+            {
+              "name": "spinner",
+              "description": "The loading ring's box — where it sits, not what it draws"
+            },
+            {
+              "name": "stableaudio-button",
+              "description": "Stable volume"
+            },
+            {
+              "name": "subtitle",
+              "description": "Each caption line"
+            },
+            {
+              "name": "subtitle-area",
+              "description": "The region the captions are laid out in"
+            },
+            {
+              "name": "subtitles-button",
+              "description": "Subtitles / captions"
+            },
+            {
+              "name": "time",
+              "description": "Current time / duration"
+            },
+            {
+              "name": "title-bar",
+              "description": "The title strip along the top"
+            },
+            {
+              "name": "volume-button",
+              "description": "Mute / unmute"
+            }
+          ],
           "cssProperties": [
             {
               "name": "--movi-chrome-inset",
-              "description": "Movi Player theme variable.\n\nDefault: `20px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `20px`"
             },
             {
               "name": "--movi-title-font",
-              "description": "Movi Player theme variable.\n\nDefault: `clamp(16px, 4vw, 20px)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `clamp(16px, 4vw, 20px)`"
             },
             {
               "name": "--movi-title-line",
-              "description": "Movi Player theme variable.\n\nDefault: `calc(var(--movi-title-font) * 1.4)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `calc(var(--movi-title-font) * 1.4)`"
             },
             {
               "name": "--movi-title-pad-top",
-              "description": "Movi Player theme variable.\n\nDefault: `16px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `16px`"
             },
             {
               "name": "--movi-primary",
-              "description": "Movi Player theme variable.\n\nDefault: `#8B5CF6`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `#7c75ff`"
+            },
+            {
+              "name": "--movi-brand-fill",
+              "description": "MoviPlayer theme variable.\n\nDefault: `linear-gradient(110deg, #674cff, #3c6df5)`"
             },
             {
               "name": "--movi-primary-light",
-              "description": "Movi Player theme variable.\n\nDefault: `color-mix(in srgb, var(--movi-primary) 70%, white)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `color-mix(in srgb, var(--movi-primary) 70%, white)`"
             },
             {
               "name": "--movi-primary-dark",
-              "description": "Movi Player theme variable.\n\nDefault: `color-mix(in srgb, var(--movi-primary) 70%, black)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `color-mix(in srgb, var(--movi-primary) 70%, black)`"
             },
             {
               "name": "--movi-accent",
-              "description": "Movi Player theme variable.\n\nDefault: `#06B6D4`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `#4f86ff`"
             },
             {
               "name": "--movi-accent-light",
-              "description": "Movi Player theme variable.\n\nDefault: `#22D3EE`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `color-mix(in srgb, var(--movi-accent) 70%, white)`"
             },
             {
               "name": "--movi-gradient",
-              "description": "Movi Player theme variable.\n\nDefault: `var(--movi-primary)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `var(--movi-primary)`"
             },
             {
               "name": "--movi-glass-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(0, 0, 0, 0.92)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(0, 0, 0, 0.92)`"
             },
             {
               "name": "--movi-glass-border",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.1)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.1)`"
             },
             {
               "name": "--movi-osd-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(0, 0, 0, 0.55)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(0, 0, 0, 0.55)`"
+            },
+            {
+              "name": "--movi-osd-bg-strong",
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(0, 0, 0, 0.78)`"
             },
             {
               "name": "--movi-glass-blur",
-              "description": "Movi Player theme variable.\n\nDefault: `20px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `20px`"
             },
             {
               "name": "--movi-radius-surface",
-              "description": "Movi Player theme variable.\n\nDefault: `10px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `10px`"
             },
             {
               "name": "--movi-radius-row",
-              "description": "Movi Player theme variable.\n\nDefault: `7px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `7px`"
             },
             {
               "name": "--movi-radius-panel",
-              "description": "Movi Player theme variable.\n\nDefault: `10px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `10px`"
             },
             {
               "name": "--movi-radius-control",
-              "description": "Movi Player theme variable.\n\nDefault: `8px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `8px`"
             },
             {
               "name": "--movi-radius-tile",
-              "description": "Movi Player theme variable.\n\nDefault: `6px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `6px`"
             },
             {
               "name": "--movi-radius-badge",
-              "description": "Movi Player theme variable.\n\nDefault: `4px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `4px`"
             },
             {
               "name": "--movi-radius-badge-sm",
-              "description": "Movi Player theme variable.\n\nDefault: `3px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `3px`"
             },
             {
               "name": "--movi-radius-subtitle",
-              "description": "Movi Player theme variable.\n\nDefault: `4px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `4px`"
             },
             {
               "name": "--movi-radius-scrollbar",
-              "description": "Movi Player theme variable.\n\nDefault: `3px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `3px`"
             },
             {
               "name": "--movi-radius-osd",
-              "description": "Movi Player theme variable.\n\nDefault: `var(--movi-radius-surface)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `var(--movi-radius-surface)`"
             },
             {
               "name": "--movi-preview-radius",
-              "description": "Movi Player theme variable.\n\nDefault: `var(--movi-radius-surface)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `var(--movi-radius-surface)`"
             },
             {
               "name": "--movi-preview-img-radius",
-              "description": "Movi Player theme variable.\n\nDefault: `var(--movi-radius-surface)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `var(--movi-radius-surface)`"
             },
             {
               "name": "--movi-preview-caption-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `var(--movi-osd-bg)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `var(--movi-osd-bg)`"
             },
             {
               "name": "--movi-controls-color",
-              "description": "Movi Player theme variable.\n\nDefault: `#FFFFFF`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `#FFFFFF`"
             },
             {
               "name": "--movi-chrome-fg",
-              "description": "Movi Player theme variable.\n\nDefault: `#ffffff`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `#ffffff`"
             },
             {
               "name": "--movi-controls-group-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.065)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.025)`"
             },
             {
               "name": "--movi-chrome-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(0, 0, 0, 0.92)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(0, 0, 0, 0.92)`"
             },
             {
               "name": "--movi-chrome-border",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.1)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.1)`"
             },
             {
               "name": "--movi-text-secondary",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.7)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.7)`"
             },
             {
               "name": "--movi-text-tertiary",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.5)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.5)`"
             },
             {
               "name": "--movi-bar-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `linear-gradient(to top, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0.4) 45%, transparent 100%)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `linear-gradient(to top, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0.4) 45%, transparent 100%)`"
             },
             {
               "name": "--movi-overlay-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `linear-gradient(to top, rgba(0, 0, 0, 0.35) 0%, transparent 12%)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `linear-gradient(to top, rgba(0, 0, 0, 0.35) 0%, transparent 12%)`"
             },
             {
               "name": "--movi-progress-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.15)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.15)`"
             },
             {
               "name": "--movi-controls-height",
-              "description": "Movi Player theme variable.\n\nDefault: `72px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `72px`"
             },
             {
               "name": "--movi-controls-height-mobile",
-              "description": "Movi Player theme variable.\n\nDefault: `64px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `64px`"
             },
             {
               "name": "--movi-progress-height",
-              "description": "Movi Player theme variable.\n\nDefault: `4px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `4px`"
             },
             {
               "name": "--movi-progress-height-hover",
-              "description": "Movi Player theme variable.\n\nDefault: `8px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `8px`"
             },
             {
               "name": "--movi-btn-size",
-              "description": "Movi Player theme variable.\n\nDefault: `44px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `44px`"
             },
             {
               "name": "--movi-btn-size-mobile",
-              "description": "Movi Player theme variable.\n\nDefault: `40px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `40px`"
             },
             {
               "name": "--movi-shadow-sm",
-              "description": "Movi Player theme variable.\n\nDefault: `0 2px 8px rgba(0, 0, 0, 0.3)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0 2px 8px rgba(0, 0, 0, 0.3)`"
             },
             {
               "name": "--movi-shadow-md",
-              "description": "Movi Player theme variable.\n\nDefault: `0 8px 32px rgba(0, 0, 0, 0.4)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0 8px 32px rgba(0, 0, 0, 0.4)`"
             },
             {
               "name": "--movi-shadow-lg",
-              "description": "Movi Player theme variable.\n\nDefault: `0 16px 64px rgba(0, 0, 0, 0.5)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0 16px 64px rgba(0, 0, 0, 0.5)`"
             },
             {
               "name": "--movi-shadow-glow",
-              "description": "Movi Player theme variable.\n\nDefault: `0 0 20px color-mix(in srgb, var(--movi-primary) 0.3)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0 0 20px color-mix(in srgb, var(--movi-primary) 0.3)`"
             },
             {
               "name": "--movi-transition-fast",
-              "description": "Movi Player theme variable.\n\nDefault: `0.15s cubic-bezier(0.4, 0, 0.2, 1)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0.15s cubic-bezier(0.4, 0, 0.2, 1)`"
             },
             {
               "name": "--movi-transition-normal",
-              "description": "Movi Player theme variable.\n\nDefault: `0.25s cubic-bezier(0.4, 0, 0.2, 1)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0.25s cubic-bezier(0.4, 0, 0.2, 1)`"
             },
             {
               "name": "--movi-transition-slow",
-              "description": "Movi Player theme variable.\n\nDefault: `0.4s cubic-bezier(0.4, 0, 0.2, 1)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0.4s cubic-bezier(0.4, 0, 0.2, 1)`"
             },
             {
               "name": "--movi-transition-bounce",
-              "description": "Movi Player theme variable.\n\nDefault: `0.5s cubic-bezier(0.34, 1.56, 0.64, 1)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0.5s cubic-bezier(0.34, 1.56, 0.64, 1)`"
+            },
+            {
+              "name": "--movi-motion-out",
+              "description": "MoviPlayer theme variable.\n\nDefault: `cubic-bezier(0.16, 1, 0.3, 1)`"
+            },
+            {
+              "name": "--movi-motion-spring",
+              "description": "MoviPlayer theme variable.\n\nDefault: `cubic-bezier(0.2, 0.9, 0.25, 1.18)`"
+            },
+            {
+              "name": "--movi-divider-color",
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.14)`"
+            },
+            {
+              "name": "--movi-divider-width",
+              "description": "MoviPlayer theme variable.\n\nDefault: `1px`"
+            },
+            {
+              "name": "--movi-divider-height",
+              "description": "MoviPlayer theme variable.\n\nDefault: `20px`"
+            },
+            {
+              "name": "--movi-divider-gap",
+              "description": "MoviPlayer theme variable.\n\nDefault: `4px`"
             },
             {
               "name": "--movi-controls-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `var(--movi-glass-bg)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `var(--movi-glass-bg)`"
             },
             {
               "name": "--movi-progress-color",
-              "description": "Movi Player theme variable.\n\nDefault: `var(--movi-primary)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `var(--movi-primary)`"
             },
             {
               "name": "--movi-progress-buffer-color",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.2)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.2)`"
+            },
+            {
+              "name": "--movi-progress-hover-color",
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.45)`"
             },
             {
               "name": "--movi-btn-hover-bg",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(255, 255, 255, 0.1)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(255, 255, 255, 0.1)`"
             },
             {
               "name": "--movi-menu-tx",
-              "description": "Movi Player theme variable.\n\nDefault: `0px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0px`"
             },
             {
               "name": "--movi-menu-ty",
-              "description": "Movi Player theme variable.\n\nDefault: `8px`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `8px`"
             },
             {
               "name": "--movi-menu-scale",
-              "description": "Movi Player theme variable.\n\nDefault: `0.97`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `0.97`"
             },
             {
               "name": "--movi-sub-cust-rail",
-              "description": "Movi Player theme variable.\n\nDefault: `rgba(0, 0, 0, 0.35)`"
+              "description": "MoviPlayer theme variable.\n\nDefault: `rgba(0, 0, 0, 0.35)`"
+            },
+            {
+              "name": "--movi-strip-cap-h",
+              "description": "MoviPlayer theme variable.\n\nDefault: `calc(2 * var(--movi-strip-cap-line) + 10px)`"
             }
           ]
         }

@@ -46,13 +46,32 @@ function showToast(msg) {
   toastTimer = setTimeout(() => (toast.hidden = true), 4000);
 }
 
+// The welcome screen is held down from the head script when this window was
+// opened with a file — see index.html. Once something is playing it is hidden
+// on its own; if the file never arrives, give the screen back rather than
+// leaving a black window with nothing in it.
+function revealWelcome() {
+  document.documentElement.classList.remove("opening-file");
+}
+if (window.movi.pendingOpen) {
+  setTimeout(() => {
+    if (player.hidden) revealWelcome();
+  }, 20000);
+}
+
 function prime() {
+  revealWelcome();
   welcome.style.display = "none";
   player.hidden = false;
   player.setAttribute("autoplay", "");
 }
 function loadSrc(src) {
   prime();
+  // A /_local/ source is this machine's own disk served over loopback, so the
+  // player sees a sized HTTP source and would probe it — "needs 3250 Mbps,
+  // arriving 3240", blaming a connection that doesn't exist. /_proxy/ keeps
+  // the notice: there the network is real.
+  player.toggleAttribute("nolinkwarning", String(src).includes("/_local/"));
   player.src = src;
 }
 async function loadFile(file) {
@@ -62,6 +81,8 @@ async function loadFile(file) {
   // the PiP window and lands in Recents. Fall back to a zero-copy File when the
   // path isn't available (then PiP isn't possible for that source).
   const fp = window.movi.pathForFile(file);
+  // Picked/dropped files are always this machine's disk — see loadSrc.
+  player.toggleAttribute("nolinkwarning", true);
   if (fp) {
     try { await window.movi.grant([fp]); } catch {}
     player.src = localSrc(fp);
@@ -91,12 +112,15 @@ function updatePlToggle() {
   const show = playlist.length > 1 && !panelOpen && (controlsVisible || iconHovered);
   plToggle.hidden = !show;
 }
+const PANEL_WIDTH = 320; // .playlist-panel flex-basis
 function openPanel() {
+  if (!panelOpen) window.movi.playlistPanel(true, PANEL_WIDTH);
   panelOpen = true;
   playlistPanel.classList.add("open");
   updatePlToggle();
 }
 function closePanel() {
+  if (panelOpen) window.movi.playlistPanel(false, PANEL_WIDTH);
   panelOpen = false;
   playlistPanel.classList.remove("open");
   updatePlToggle();
@@ -329,14 +353,69 @@ window.addEventListener("drop", async (e) => {
   }
 });
 
+// ---------- Window follows the video (QuickTime-style) ----------
+// Once per picture: the file's own size decides the window, and after that the
+// viewer's resizing is theirs — a PiP round trip or a repeat event for the same
+// file must not undo it.
+let fittedKey = "";
+function fitWindowToVideo() {
+  if (player.hidden) return;
+  const w = player.videoWidth || 0;
+  const h = player.videoHeight || 0;
+  if (!(w > 0 && h > 0) || player.classList.contains("movi-audio-strip")) {
+    if (player.duration > 0 && fittedKey !== "audio") {
+      fittedKey = "audio";
+      window.movi.releaseVideo();
+    }
+    return;
+  }
+  // Phone clips are stored landscape with a rotation flag, so a portrait video
+  // reads 1920×1080 here and has to open tall. The flag is on the track;
+  // getVideoRotation() is the viewer's own turn on top of it (0 until they
+  // rotate), so the track's is the one that says which way up the file is.
+  let rot = 0;
+  try {
+    rot =
+      player.player?.getVideoTracks?.()?.[0]?.rotation ||
+      player.player?.getVideoRotation?.() ||
+      0;
+  } catch {}
+  const turned = Math.abs(rot) % 180 === 90;
+  const dw = turned ? h : w;
+  const dh = turned ? w : h;
+  const key = `${player.src?.name ?? player.src}|${dw}x${dh}`;
+  if (key === fittedKey) return;
+  fittedKey = key;
+  window.movi.fitVideo(dw, dh);
+}
+player.addEventListener("resize", fitWindowToVideo);
+player.addEventListener("loadedmetadata", fitWindowToVideo);
+
 // Surface player errors instead of failing silently
 player.addEventListener("error", (e) => {
   const msg = (e && e.detail && (e.detail.message || e.detail)) || "Couldn't play that file";
   showToast(String(msg));
+  // Nothing is playing and nothing will: the welcome screen is the only thing
+  // left to show, even if this window was opened with a file.
+  if (!player.duration) {
+    revealWelcome();
+    welcome.style.display = "";
+    player.hidden = true;
+  }
 });
 
 // ---------- Wires from main ----------
 window.movi.onLoadPaths(loadPaths);
+// Closing: let the sound out rather than cutting it. Main waits the length of
+// the fade before the window actually goes.
+window.movi.onFadeOut?.((ms) => {
+  try {
+    player.fadeOutAudio?.(ms || 200);
+  } catch {
+    /* nothing playing, or an older bundle without it */
+  }
+});
+
 window.movi.onFullscreen((on) => {
   document.body.classList.toggle("osfs", on);
   // Sync the player's own fullscreen UI (icon, context-menu label, auto-hide /
@@ -359,52 +438,19 @@ player.addEventListener("movi-fullscreen-request", (e) => {
   window.movi.toggleFullscreen();
 });
 
-// ---------- Open-URL modal (works during playback; the welcome URL bar is hidden then) ----------
-function playUrl(u) {
-  u = (u || "").trim();
-  if (!/^https?:\/\//i.test(u)) {
-    showToast("Enter a full http(s):// link");
-    return false;
-  }
-  clearPlaylist();
-  loadSrc(proxySrc(u));
-  return true;
-}
-
-const urlModal = document.getElementById("url-modal");
-const modalUrlInput = document.getElementById("modal-url-input");
-
+// ---------- Open URL (menu / Cmd+L) ----------
+// The welcome screen's own URL bar is the one place a link goes in — the
+// separate modal this used to open duplicated it. While a video is showing
+// the bar is off screen, so the shortcut does nothing there.
 async function showUrlPrompt() {
-  urlModal.hidden = false;
+  if (!player.hidden) return;
   try {
     const c = ((await window.movi.readClipboard()) || "").trim();
-    if (/^https?:\/\//i.test(c)) modalUrlInput.value = c;
+    if (!urlInput.value && /^https?:\/\//i.test(c)) urlInput.value = c;
   } catch {}
-  modalUrlInput.focus();
-  modalUrlInput.select();
+  urlInput.focus();
+  urlInput.select();
 }
-function hideUrlPrompt() {
-  urlModal.hidden = true;
-  modalUrlInput.value = "";
-}
-
-document.getElementById("url-modal-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  if (playUrl(modalUrlInput.value)) hideUrlPrompt();
-});
-document.getElementById("url-modal-cancel").addEventListener("click", hideUrlPrompt);
-document.getElementById("modal-url-paste").addEventListener("click", async () => {
-  const text = ((await window.movi.readClipboard()) || "").trim();
-  if (!text) return showToast("Clipboard is empty");
-  modalUrlInput.value = text;
-  modalUrlInput.focus();
-});
-urlModal.addEventListener("mousedown", (e) => {
-  if (e.target === urlModal) hideUrlPrompt();
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !urlModal.hidden) hideUrlPrompt();
-});
 
 // Menu "Open URL…" and Cmd/Ctrl+L. The keydown is captured before the player's
 // own handler so it doesn't also toggle loop (its "l" case has no modifier guard).

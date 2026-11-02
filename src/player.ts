@@ -39,6 +39,11 @@ export type {
   DecodedAudioFrame,
   PlayerState,
   PlayerEventMap,
+  PlaybackAssessment,
+  PlaybackAssessmentOptions,
+  PlaybackQuery,
+  DecodeAudioOptions,
+  DecodedAudioChunk,
 } from './types';
 
 // Utilities

@@ -3,6 +3,26 @@
 
 <head>
   <meta charset="UTF-8" />
+    <script>
+      // The extension is offered only where it installs: desktop Chromium
+      // (Chrome, Edge, Brave, Opera, Arc…). Everything that offers it hides
+      // without this class — see app/shared.css. In the head so nothing
+      // flashes in and out.
+      (function () {
+        try {
+          var ua = navigator.userAgent;
+          var hints = navigator.userAgentData;
+          var brands = (hints && hints.brands) || [];
+          var chromium =
+            brands.some(function (b) { return /Chromium|Google Chrome|Microsoft Edge|Brave|Opera/i.test(b.brand); }) ||
+            (!!window.chrome && /Chrome|Chromium|Edg|OPR/i.test(ua) && !/Firefox|FxiOS/i.test(ua));
+          var mobile = hints && typeof hints.mobile === "boolean"
+            ? hints.mobile
+            : /Android|iPhone|iPad|iPod|Mobile|Tablet|CriOS/i.test(ua);
+          if (chromium && !mobile) document.documentElement.classList.add("ext-installable");
+        } catch (e) { /* no offer is the safe default */ }
+      })();
+    </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Movi Player for Google Drive — play your Drive videos in the browser</title>
   <meta name="description" content="Open and stream your Google Drive videos (MKV, HEVC, AV1, 4K/HDR) directly in the browser with Movi Player. No download, read-only, decoded on your device." />
@@ -17,7 +37,10 @@
     href="/dist/__BUILD_VERSION__/element.js"
     fetchpriority="high"
   />
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=__BUILD_VERSION__" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192x192.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=__BUILD_VERSION__" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico?v=__BUILD_VERSION__" />
   <meta property="og:title" content="Movi Player for Google Drive" />
   <meta property="og:description" content="Play your Google Drive videos in the browser — MKV, HEVC, AV1, 4K/HDR. Read-only, nothing uploaded." />
   <meta property="og:type" content="website" />
@@ -44,37 +67,21 @@
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="https://apis.google.com/js/api.js" async defer></script>
   <style>
+    /* This page's own names, aliased onto the shared design system in
+       app/shared.css. Custom properties resolve at use time, so these pick
+       up whatever shared.css sets — including the light theme — without
+       /drive keeping a second palette of its own. */
     :root {
-      --accent: #6c5dd3;
-      --accent-2: #00d4ff;
-      --accent-grad: linear-gradient(135deg, #6c5dd3 0%, #00d4ff 100%);
-      --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-
-      --bg: #0b0b0f;
-      --surface: rgba(255, 255, 255, 0.045);
-      --surface-2: rgba(255, 255, 255, 0.07);
-      --border: rgba(255, 255, 255, 0.09);
-      --border-strong: rgba(255, 255, 255, 0.16);
-      --text: #f4f4f7;
-      --text-dim: #9a9aae;
-      --text-faint: #6a6a7d;
-      --glow-1: rgba(108, 93, 211, 0.18);
+      --accent-grad: linear-gradient(135deg, #8a7cf2 0%, #6c5dd3 100%);
+      --bg: var(--bg-base);
+      --surface: var(--bg-surface);
+      --surface-2: var(--surface-soft);
+      --text: var(--text-primary);
+      --text-dim: var(--text-secondary);
+      --text-faint: var(--text-muted);
+      --glow-1: rgba(124, 108, 240, 0.18);
       --glow-2: rgba(0, 212, 255, 0.12);
-      --shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.7);
-      --radius: 20px;
-    }
-    [data-theme="light"] {
-      --bg: #f6f7fb;
-      --surface: rgba(255, 255, 255, 0.75);
-      --surface-2: #ffffff;
-      --border: rgba(17, 20, 45, 0.08);
-      --border-strong: rgba(17, 20, 45, 0.14);
-      --text: #14162e;
-      --text-dim: #5a5f78;
-      --text-faint: #8a8fa6;
-      --glow-1: rgba(108, 93, 211, 0.12);
-      --glow-2: rgba(0, 212, 255, 0.1);
-      --shadow: 0 24px 60px -24px rgba(60, 66, 120, 0.28);
+      --radius: var(--radius-xl);
     }
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -88,15 +95,6 @@
       flex-direction: column;
       overflow-x: hidden;
       -webkit-font-smoothing: antialiased;
-    }
-    /* Ambient background glow */
-    body::before {
-      content: "";
-      position: fixed; inset: 0; z-index: 0; pointer-events: none;
-      background:
-        radial-gradient(60% 50% at 12% 8%, var(--glow-1) 0%, transparent 60%),
-        radial-gradient(50% 50% at 90% 20%, var(--glow-2) 0%, transparent 55%),
-        radial-gradient(40% 40% at 50% 110%, var(--glow-1) 0%, transparent 60%);
     }
     #ambient-wrapper {
       position: fixed; inset: 0; z-index: 0; pointer-events: none;
@@ -200,6 +198,338 @@
       .privacy-note { display: none; }
     }
   </style>
+  <!-- Inter for prose, JetBrains Mono for anything technical (codec names,
+       timecodes, code). Both are declared in app/shared.css, so both have
+       to actually load here or the mono chips fall back to Menlo/Consolas
+       and the pages drift apart again. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <!-- Shared design system — spliced in by the worker AFTER this page's own
+       <style> so it is the authority on the site-wide chrome. -->
+  <!--__SHARED_CSS__-->
+  <!-- ════════════════════════════════════════════════════════════════
+       Landing parity — the same layer examples.html and compare.html
+       carry, adapted to this page's class and variable names. The home
+       page's tokens (neutral canvas, one accent, 2/4/6px corners, mono
+       eyebrow, no glows) applied over the page's own styles; it sits
+       after shared.css, whose marker is above, and starts every selector
+       at html so it wins. The Google sign-in button stays white, as
+       Google's branding asks; only its corners and shadow change.
+       ════════════════════════════════════════════════════════════════ -->
+  <style id="landing-parity">
+    html:root {
+      --bg-base: #0b0d11;
+      --bg-elevated: #12151a;
+      --bg-card: #12151a;
+      --bg-surface: #171b21;
+      --text-primary: #f2f4f7;
+      --text-secondary: #9aa3b0;
+      --text-muted: #7f8a99;
+      --border-subtle: #333b47;
+      --border-hover: #4a5462;
+      --accent: #6366f1;
+      --accent-hover: #818cf8;
+      --r-1: 2px;
+      --r-2: 4px;
+      --r-3: 6px;
+      /* This page's own names, pointed at the same values. */
+      --bg: var(--bg-base);
+      --surface: var(--bg-elevated);
+      --surface-2: var(--bg-surface);
+      --text: var(--text-primary);
+      --text-dim: var(--text-secondary);
+      --text-faint: var(--text-muted);
+      --border: var(--border-subtle);
+      --accent-grad: var(--accent);
+      --glow-1: transparent;
+      --glow-2: transparent;
+      --radius: var(--r-3);
+    }
+    html[data-theme="light"] {
+      --bg-base: #f4f6f8;
+      --bg-elevated: #ffffff;
+      --bg-card: #ffffff;
+      --bg-surface: #eceff3;
+      --text-primary: #0d1117;
+      --text-secondary: #4a5567;
+      --text-muted: #798393;
+      --border-subtle: #dbe0e8;
+      --border-hover: #c2cad6;
+      --accent: #4f46e5;
+      --accent-hover: #4338ca;
+    }
+
+    /* One flat canvas: no navy, no glows (shared.css pins one behind
+       every page on body::before). */
+    html body {
+      background: var(--bg-base) !important;
+      background-image: none !important;
+    }
+    html body::before,
+    html body::after { display: none !important; }
+
+    /* ── Hierarchy: mono eyebrow, heavy headline in one accent ─────── */
+    html body .hero .eyebrow {
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: none;
+      color: var(--text-muted);
+      font: 600 0.68rem/1 "DM Mono", ui-monospace, monospace;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+    html body .hero .eyebrow .dot { box-shadow: none; }
+    html body .hero h1 {
+      font-weight: 800;
+      letter-spacing: -0.035em;
+    }
+    html body .hero h1 em {
+      background: none;
+      -webkit-text-fill-color: currentColor;
+      color: var(--accent);
+    }
+
+    /* ── Surfaces and controls on the site's corners ──────────────── */
+    html body .brand-sub,
+    html body .chip { border-radius: var(--r-1) !important; }
+    html body .brand-sub { white-space: nowrap; }
+    html body .chip { background: var(--bg-elevated); border-color: var(--border-subtle); }
+    html body .btn,
+    html body .icon-btn,
+    html body .connected,
+    html body .toast { border-radius: var(--r-2) !important; }
+    html body .btn:hover { transform: none; }
+    html body .btn-primary {
+      background: var(--accent) !important;
+      box-shadow: none !important;
+    }
+    html body .btn-primary:hover { background: var(--accent-hover) !important; }
+    html body .btn-google {
+      border-radius: var(--r-2) !important;
+      box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12) !important;
+    }
+    html body .stage-card {
+      border-radius: var(--r-3) !important;
+      border-color: var(--border-subtle);
+      box-shadow: none !important;
+    }
+    html body .empty .glyph { border-radius: var(--r-3) !important; }
+    html body .connected .dot,
+    html body .now-playing.active .dot { box-shadow: none; }
+
+    /* ── The toast when it is not showing ────────────────────────────
+       It was parked 140% of its own height below its spot, which is
+       bottom:24px — so the top 6px of an empty box sat at the foot of
+       every viewport, and over the footer text on a tablet. Hidden
+       means hidden: out of view and out of the accessibility tree. */
+    html body .toast {
+      visibility: hidden;
+      opacity: 0;
+      transform: translate(-50%, calc(100% + 32px));
+      transition: transform .35s cubic-bezier(.2,.9,.2,1), opacity .2s ease, visibility 0s linear .35s;
+    }
+    html body .toast.show {
+      visibility: visible;
+      opacity: 1;
+      transform: translate(-50%, 0);
+      transition: transform .35s cubic-bezier(.2,.9,.2,1), opacity .2s ease, visibility 0s;
+    }
+
+    /* ── Three steps under the chips ──────────────────────────────── */
+    html body .hero .steps {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1.5rem;
+      width: 100%;
+      max-width: 46rem;
+      margin: 2.75rem 0 0;
+      padding: 1.5rem 0 0;
+      border-top: 1px solid var(--border-subtle);
+      list-style: none;
+      text-align: left;
+    }
+    html body .hero .steps li { display: flex; gap: 0.75rem; align-items: flex-start; }
+    html body .hero .step-n {
+      flex: none;
+      width: 1.6rem;
+      height: 1.6rem;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--r-2);
+      color: var(--accent);
+      font: 600 0.75rem/1 "DM Mono", ui-monospace, monospace;
+    }
+    html body .hero .steps strong { display: block; color: var(--text-primary); font-size: 0.9rem; font-weight: 600; }
+    html body .hero .steps small { display: block; margin-top: 0.2rem; color: var(--text-muted); font-size: 0.8rem; }
+
+
+    /* ── Before a video: a picker, not an empty player ────────────────
+       Signed in with nothing chosen, the page was a large black 16:9
+       frame with the choice pushed into its middle, the same "Pick a
+       video" button twice, and "No video selected" underneath — an
+       empty player reads as broken. Until the first pick it is a panel
+       on the page's own surface with one action, what it plays, and the
+       other way in (Drive's "Open with"). data-has-video is set by
+       playDriveFile() and cleared on sign-out. */
+    html body:not([data-has-video]) .topbar #pick-btn,
+    html body:not([data-has-video]) .meta-row { display: none !important; }
+    html body:not([data-has-video]) .stage-card {
+      background: var(--bg-elevated) !important;
+      border-color: var(--border-subtle) !important;
+    }
+    /* The page above the footer fills the screen, and the footer starts
+       where the screen ends — signing in no longer shrinks the page to a
+       box with the footer pulled up under it. The panel takes all of the
+       height under the bar. svh, so a phone's collapsing toolbar does not
+       make it jump. */
+    html body:not([data-has-video]) .app { min-height: calc(100svh - 48px); } /* 48px: the footer's own margin-top */
+    /* …and in every state, from the first paint. The page opens in
+       data-state="loading" — the player bundle and the silent Google
+       sign-in both still out — with the hero and the app both hidden, so
+       the space above the footer collapsed and the footer sat mid-screen
+       until a view arrived, then jumped down. The signed-out hero on a tall
+       tablet screen fell short the same way (886px of a 1024px screen). */
+    html body .wrap { min-height: calc(100svh - 48px); }
+    /* …and it stays that tall once a file is playing: the player takes
+       the height between the bar and the title line, and the picture is
+       letterboxed inside it (objectfit="contain"). Not on a phone, where
+       a portrait screen would put the 16:9 picture in a tall black box —
+       there it keeps its own shape. Not for the audio strip either. */
+    @media (min-width: 561px) {
+      html body[data-has-video] .app { min-height: calc(100svh - 48px); }
+      html body[data-has-video] .stage-card:not(.audio) {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+      }
+      html body[data-has-video] .stage-card:not(.audio) .player-stage:not(.is-audio-strip) {
+        flex: 1;
+        aspect-ratio: auto;
+        min-height: 0;
+      }
+      /* height:100% does not resolve against a flexed height, so the
+         player stopped at its own 16:9 inside the taller stage. */
+      html body[data-has-video] .stage-card:not(.audio) .player-stage:not(.is-audio-strip) > movi-player {
+        position: absolute;
+        inset: 0;
+        height: auto;
+        /* The element writes the source's shape inline (aspect-ratio:
+           16/9) to size itself when nothing else does; here the stage
+           gives it a box, and the picture is contained inside it. */
+        aspect-ratio: auto !important;
+      }
+    }
+    html body:not([data-has-video]) .stage-card {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+    html body:not([data-has-video]) .player-stage {
+      flex: 1;
+      aspect-ratio: auto;
+      min-height: 320px;
+      background: transparent;
+    }
+    /* Hidden and out of the flow: invisible alone still kept its 16:9
+       box, which made the panel as tall as the player would be. */
+    html body:not([data-has-video]) .player-stage movi-player {
+      position: absolute;
+      inset: 0;
+      visibility: hidden;
+    }
+    /* In the flow before a pick, so the panel is as tall as what it says
+       — absolutely placed, a phone squeezed the icon and the button to
+       fit a fixed height. */
+    html body:not([data-has-video]) .empty {
+      position: relative;
+      inset: auto;
+      width: 100%;
+    }
+    html body .empty > * { flex-shrink: 0; }
+    html body .empty {
+      background: none !important;
+      color: var(--text-secondary);
+      padding: 2.5rem 1.5rem;
+    }
+    /* Spare: a mark, a heading, one line, one button, one tip. The
+       formats line wrapped into three ragged rows and said again what
+       the landing page already says, and the icon's box was one more
+       frame inside the panel's frame. */
+    html body .empty .glyph {
+      width: auto;
+      height: auto;
+      background: none;
+      border: 0;
+      color: var(--accent);
+    }
+    html body .empty .glyph svg { width: 36px; height: 36px; opacity: 1; }
+    html body .empty p { max-width: none; }
+    html body .empty h3 {
+      color: var(--text-primary);
+      font-size: clamp(1.15rem, 2.4vw, 1.45rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    html body .empty .btn { height: 46px; padding: 0 1.4rem; }
+    html body .empty .empty-hint {
+      margin-top: 0.75rem;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      text-wrap: balance;
+    }
+    html body .empty .empty-hint strong { color: var(--text-secondary); font-weight: 600; }
+
+    /* ── Phones ───────────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      html body .hero { padding: 2.5rem 0 3rem; }
+      html body .hero .steps { grid-template-columns: 1fr; gap: 0.9rem; margin-top: 2rem; }
+    }
+    /* The full bar — brand, status, the action, two controls — needs
+       about 800px. Below that it either ran off the right edge (561–639px,
+       by up to 67px) or wrapped "Connected to Drive" inside its own chip;
+       at 560px and under it wrapped into loose rows of unlabelled squares.
+       So under 800px: the brand with the two small controls beside it,
+       the one action as a full-width button with its words, and the
+       status as a line of text. */
+    html body .connected { white-space: nowrap; }
+    @media (max-width: 800px) {
+      html body .topbar {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        align-items: center;
+        gap: 0.6rem 0.5rem;
+        padding: 0.85rem 0;
+      }
+      html body .topbar .actions { display: contents; }
+      html body .topbar .brand { grid-column: 1; grid-row: 1; min-width: 0; }
+      html body .topbar #signout-btn { grid-column: 2; grid-row: 1; }
+      html body .topbar #theme-toggle { grid-column: 3; grid-row: 1; }
+      html body .topbar .icon-btn { width: 40px; height: 40px; }
+      html body .topbar #pick-btn {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        width: 100%;
+        padding: 0 1rem;
+      }
+      html body .topbar #pick-btn .label,
+      html body .topbar .connected .label { display: inline; }
+      html body .topbar .connected {
+        grid-column: 1 / -1;
+        grid-row: 3;
+        height: auto;
+        padding: 0;
+        border: 0;
+        background: none;
+        font-size: 0.78rem;
+      }
+    }
+    @media (max-width: 560px) {
+      html body .empty { padding: 2.5rem 1rem; }
+    }
+  </style>
 </head>
 
 <body data-state="loading">
@@ -210,11 +540,7 @@
     <!-- ============ SIGNED-OUT HERO ============ -->
     <section class="hero" id="hero">
       <div class="brand">
-        <svg class="brand-logo" viewBox="0 0 100 100" aria-hidden="true">
-          <defs><linearGradient id="brand-grad-h" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#8a7cf2"/><stop offset="100%" stop-color="#6c5dd3"/></linearGradient></defs>
-          <circle cx="50" cy="50" r="46" fill="url(#brand-grad-h)"/>
-          <polygon points="40,29 40,71 73,50" fill="#ffffff"/>
-        </svg>
+        <svg class="brand-logo" viewBox="323 49 930 930" aria-hidden="true"><defs><clipPath id="drive-logo-1-0"><path clip-rule="evenodd" d="M383.55 222 C383.55 152.17 440.03 97.5 512 97.5 C543.4 97.5 559.7 101.8 590 117.5 L1100 381.5 C1174.55 414.03 1191.47 471.49 1193 512.5 C1192.29 590.19 1134.3 634.06 1100 646.5 C930.83 737.99 761.67 826.04 592.5 909 C571.47 917.98 554.22 929.25 512 930.3 C455.97 929.9 384.46 889.54 383.55 802 Z M614 360 L913 520 C686.95 641.07 614 666.34 614 669 Z"/></clipPath><linearGradient id="drive-logo-1-1" gradientUnits="userSpaceOnUse" x1="0" y1="97" x2="0" y2="360"><stop offset="0" stop-color="#737bfd"/><stop offset="0.5" stop-color="#6eb3fd"/><stop offset="1" stop-color="#81e1fe"/></linearGradient><radialGradient id="drive-logo-1-2" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(726.13 101.51) scale(218.96 701.75)"><stop offset="0" stop-color="#0c00fd"/><stop offset="0.12" stop-color="#0c00fd" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0c00fd" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0c00fd" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0c00fd" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0c00fd" stop-opacity="0.006"/><stop offset="1" stop-color="#0c00fd" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-1-3" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(255.4 225.67) scale(350.82 206.02)"><stop offset="0" stop-color="#4c00fd" stop-opacity="0.58"/><stop offset="0.12" stop-color="#4c00fd" stop-opacity="0.484"/><stop offset="0.24" stop-color="#4c00fd" stop-opacity="0.282"/><stop offset="0.36" stop-color="#4c00fd" stop-opacity="0.115"/><stop offset="0.48" stop-color="#4c00fd" stop-opacity="0.033"/><stop offset="0.64" stop-color="#4c00fd" stop-opacity="0.003"/><stop offset="1" stop-color="#4c00fd" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-1-4" gradientUnits="userSpaceOnUse" x1="0" y1="225" x2="0" y2="817"><stop offset="0" stop-color="#5143ff"/><stop offset="0.5" stop-color="#294cf6"/><stop offset="1" stop-color="#0437cc"/></linearGradient><radialGradient id="drive-logo-1-5" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(621.75 616.05) scale(192.93 939.93)"><stop offset="0" stop-color="#436eff"/><stop offset="0.12" stop-color="#436eff" stop-opacity="0.835"/><stop offset="0.24" stop-color="#436eff" stop-opacity="0.487"/><stop offset="0.36" stop-color="#436eff" stop-opacity="0.198"/><stop offset="0.48" stop-color="#436eff" stop-opacity="0.056"/><stop offset="0.64" stop-color="#436eff" stop-opacity="0.006"/><stop offset="1" stop-color="#436eff" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-1-6" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(637.74 314.49) scale(126.64 109.33)"><stop offset="0" stop-color="#0000ec"/><stop offset="0.12" stop-color="#0000ec" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0000ec" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0000ec" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0000ec" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0000ec" stop-opacity="0.006"/><stop offset="1" stop-color="#0000ec" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-1-7" gradientUnits="userSpaceOnUse" x1="0" y1="669" x2="0" y2="930"><stop offset="0" stop-color="#001fad"/><stop offset="0.5" stop-color="#2e50ff"/><stop offset="1" stop-color="#3d4eff"/></linearGradient><radialGradient id="drive-logo-1-8" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(367.66 690.91) scale(257.59 321.92)"><stop offset="0" stop-color="#0023ab"/><stop offset="0.12" stop-color="#0023ab" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0023ab" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0023ab" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0023ab" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0023ab" stop-opacity="0.006"/><stop offset="1" stop-color="#0023ab" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-1-9" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(554.73 904.5) scale(161.77 151.07)"><stop offset="0" stop-color="#564efc"/><stop offset="0.12" stop-color="#564efc" stop-opacity="0.835"/><stop offset="0.24" stop-color="#564efc" stop-opacity="0.487"/><stop offset="0.36" stop-color="#564efc" stop-opacity="0.198"/><stop offset="0.48" stop-color="#564efc" stop-opacity="0.056"/><stop offset="0.64" stop-color="#564efc" stop-opacity="0.006"/><stop offset="1" stop-color="#564efc" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-1-10" gradientUnits="userSpaceOnUse" x1="460" y1="0" x2="1185" y2="0"><stop offset="0" stop-color="#4442fc"/><stop offset="0.5" stop-color="#5800fd"/><stop offset="1" stop-color="#00c9ff"/></linearGradient><radialGradient id="drive-logo-1-11" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(918.16 679.1) scale(562.77 1104.38)"><stop offset="0" stop-color="#b3acfc" stop-opacity="0.732"/><stop offset="0.12" stop-color="#b3acfc" stop-opacity="0.611"/><stop offset="0.24" stop-color="#b3acfc" stop-opacity="0.356"/><stop offset="0.36" stop-color="#b3acfc" stop-opacity="0.145"/><stop offset="0.48" stop-color="#b3acfc" stop-opacity="0.041"/><stop offset="0.64" stop-color="#b3acfc" stop-opacity="0.004"/><stop offset="1" stop-color="#b3acfc" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-1-12" gradientUnits="userSpaceOnUse" x1="933.66" y1="4.95" x2="816.34" y2="695.05"><stop offset="0" stop-color="#ff3efc"/><stop offset=".25" stop-color="#6cb1fd"/><stop offset=".5" stop-color="#548cfd"/><stop offset=".75" stop-color="#295dfd"/><stop offset="1" stop-color="#0b07f8"/></linearGradient><radialGradient id="drive-logo-1-13" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(1255.8 459.16) rotate(22.04) scale(464.67 224.5)"><stop offset="0" stop-color="#00d4fe" stop-opacity="0.797"/><stop offset=".5" stop-color="#00d4fe" stop-opacity="0.246"/><stop offset="1" stop-color="#00d4fe" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-1-14" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(630 351) rotate(-113.37) scale(1399.91 230.15)"><stop offset="0" stop-color="#a0effd" stop-opacity="0.2"/><stop offset=".5" stop-color="#a0effd" stop-opacity="0"/><stop offset="1" stop-color="#a0effd" stop-opacity="0"/></radialGradient><path id="drive-logo-1-15" d="M350 80 H1220 V950 H350 Z"/><path id="drive-logo-1-16" d="M350 80 H614 V668.5 C394.51 759.97 395.83 810.57 384 817 H350 Z"/><path id="drive-logo-1-17" d="M384 817 C395.83 810.57 394.51 759.97 614 668.5 C601.76 795.98 495.68 900.62 460 920 L350 960 V817 Z"/><path id="drive-logo-1-18" d="M350 80 H1220 V545 L1184 558 C1091.75 639.78 1018.25 572.14 913 520 L614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/><path id="drive-logo-1-19" d="M350 80 H520 L539 100 C563.83 110.79 604.49 141.82 611.5 230 C614.03 257.11 613.18 307.14 614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/></defs><g clip-path="url(#drive-logo-1-0)"><g id="drive-logo-1-20"><use href="#drive-logo-1-15" fill="url(#drive-logo-1-10)"/><use href="#drive-logo-1-15" fill="url(#drive-logo-1-11)"/></g><g id="drive-logo-1-21"><use href="#drive-logo-1-16" fill="url(#drive-logo-1-4)"/><use href="#drive-logo-1-16" fill="url(#drive-logo-1-5)"/><use href="#drive-logo-1-16" fill="url(#drive-logo-1-6)"/></g><g id="drive-logo-1-22"><use href="#drive-logo-1-17" fill="url(#drive-logo-1-7)"/><use href="#drive-logo-1-17" fill="url(#drive-logo-1-8)"/><use href="#drive-logo-1-17" fill="url(#drive-logo-1-9)"/></g><g id="drive-logo-1-23"><use href="#drive-logo-1-18" fill="url(#drive-logo-1-12)"/><use href="#drive-logo-1-18" fill="url(#drive-logo-1-13)"/><use href="#drive-logo-1-18" fill="url(#drive-logo-1-14)"/></g><g id="drive-logo-1-24"><use href="#drive-logo-1-19" fill="url(#drive-logo-1-1)"/><use href="#drive-logo-1-19" fill="url(#drive-logo-1-2)"/><use href="#drive-logo-1-19" fill="url(#drive-logo-1-3)"/></g></g></svg>
         <span class="brand-text">MoviPlayer</span>
         <span class="brand-sub">for Drive</span>
       </div>
@@ -240,25 +566,29 @@
         <span class="chip">4K & HDR</span><span class="chip">Multi-track audio</span><span class="chip">Subtitles</span>
         <span class="chip">Instant range-streaming</span>
       </div>
+
+      <!-- What happens after the button, in the home page's step form: a
+           first-time visitor otherwise signs in not knowing what comes next. -->
+      <ol class="steps" aria-label="How it works">
+        <li><span class="step-n" aria-hidden="true">1</span><span><strong>Sign in with Google</strong><small>Read-only, the file you pick</small></span></li>
+        <li><span class="step-n" aria-hidden="true">2</span><span><strong>Pick a file from Drive</strong><small>Any size, any format</small></span></li>
+        <li><span class="step-n" aria-hidden="true">3</span><span><strong>It plays here</strong><small>Streamed, never downloaded</small></span></li>
+      </ol>
     </section>
 
     <!-- ============ APP VIEW ============ -->
     <div class="app" id="app">
       <div class="topbar">
         <div class="brand">
-          <svg class="brand-logo" viewBox="0 0 100 100" aria-hidden="true">
-            <defs><linearGradient id="brand-grad-t" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#8a7cf2"/><stop offset="100%" stop-color="#6c5dd3"/></linearGradient></defs>
-            <circle cx="50" cy="50" r="46" fill="url(#brand-grad-t)"/>
-            <polygon points="40,29 40,71 73,50" fill="#ffffff"/>
-          </svg>
+          <svg class="brand-logo" viewBox="323 49 930 930" aria-hidden="true"><defs><clipPath id="drive-logo-2-0"><path clip-rule="evenodd" d="M383.55 222 C383.55 152.17 440.03 97.5 512 97.5 C543.4 97.5 559.7 101.8 590 117.5 L1100 381.5 C1174.55 414.03 1191.47 471.49 1193 512.5 C1192.29 590.19 1134.3 634.06 1100 646.5 C930.83 737.99 761.67 826.04 592.5 909 C571.47 917.98 554.22 929.25 512 930.3 C455.97 929.9 384.46 889.54 383.55 802 Z M614 360 L913 520 C686.95 641.07 614 666.34 614 669 Z"/></clipPath><linearGradient id="drive-logo-2-1" gradientUnits="userSpaceOnUse" x1="0" y1="97" x2="0" y2="360"><stop offset="0" stop-color="#737bfd"/><stop offset="0.5" stop-color="#6eb3fd"/><stop offset="1" stop-color="#81e1fe"/></linearGradient><radialGradient id="drive-logo-2-2" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(726.13 101.51) scale(218.96 701.75)"><stop offset="0" stop-color="#0c00fd"/><stop offset="0.12" stop-color="#0c00fd" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0c00fd" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0c00fd" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0c00fd" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0c00fd" stop-opacity="0.006"/><stop offset="1" stop-color="#0c00fd" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-2-3" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(255.4 225.67) scale(350.82 206.02)"><stop offset="0" stop-color="#4c00fd" stop-opacity="0.58"/><stop offset="0.12" stop-color="#4c00fd" stop-opacity="0.484"/><stop offset="0.24" stop-color="#4c00fd" stop-opacity="0.282"/><stop offset="0.36" stop-color="#4c00fd" stop-opacity="0.115"/><stop offset="0.48" stop-color="#4c00fd" stop-opacity="0.033"/><stop offset="0.64" stop-color="#4c00fd" stop-opacity="0.003"/><stop offset="1" stop-color="#4c00fd" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-2-4" gradientUnits="userSpaceOnUse" x1="0" y1="225" x2="0" y2="817"><stop offset="0" stop-color="#5143ff"/><stop offset="0.5" stop-color="#294cf6"/><stop offset="1" stop-color="#0437cc"/></linearGradient><radialGradient id="drive-logo-2-5" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(621.75 616.05) scale(192.93 939.93)"><stop offset="0" stop-color="#436eff"/><stop offset="0.12" stop-color="#436eff" stop-opacity="0.835"/><stop offset="0.24" stop-color="#436eff" stop-opacity="0.487"/><stop offset="0.36" stop-color="#436eff" stop-opacity="0.198"/><stop offset="0.48" stop-color="#436eff" stop-opacity="0.056"/><stop offset="0.64" stop-color="#436eff" stop-opacity="0.006"/><stop offset="1" stop-color="#436eff" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-2-6" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(637.74 314.49) scale(126.64 109.33)"><stop offset="0" stop-color="#0000ec"/><stop offset="0.12" stop-color="#0000ec" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0000ec" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0000ec" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0000ec" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0000ec" stop-opacity="0.006"/><stop offset="1" stop-color="#0000ec" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-2-7" gradientUnits="userSpaceOnUse" x1="0" y1="669" x2="0" y2="930"><stop offset="0" stop-color="#001fad"/><stop offset="0.5" stop-color="#2e50ff"/><stop offset="1" stop-color="#3d4eff"/></linearGradient><radialGradient id="drive-logo-2-8" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(367.66 690.91) scale(257.59 321.92)"><stop offset="0" stop-color="#0023ab"/><stop offset="0.12" stop-color="#0023ab" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0023ab" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0023ab" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0023ab" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0023ab" stop-opacity="0.006"/><stop offset="1" stop-color="#0023ab" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-2-9" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(554.73 904.5) scale(161.77 151.07)"><stop offset="0" stop-color="#564efc"/><stop offset="0.12" stop-color="#564efc" stop-opacity="0.835"/><stop offset="0.24" stop-color="#564efc" stop-opacity="0.487"/><stop offset="0.36" stop-color="#564efc" stop-opacity="0.198"/><stop offset="0.48" stop-color="#564efc" stop-opacity="0.056"/><stop offset="0.64" stop-color="#564efc" stop-opacity="0.006"/><stop offset="1" stop-color="#564efc" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-2-10" gradientUnits="userSpaceOnUse" x1="460" y1="0" x2="1185" y2="0"><stop offset="0" stop-color="#4442fc"/><stop offset="0.5" stop-color="#5800fd"/><stop offset="1" stop-color="#00c9ff"/></linearGradient><radialGradient id="drive-logo-2-11" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(918.16 679.1) scale(562.77 1104.38)"><stop offset="0" stop-color="#b3acfc" stop-opacity="0.732"/><stop offset="0.12" stop-color="#b3acfc" stop-opacity="0.611"/><stop offset="0.24" stop-color="#b3acfc" stop-opacity="0.356"/><stop offset="0.36" stop-color="#b3acfc" stop-opacity="0.145"/><stop offset="0.48" stop-color="#b3acfc" stop-opacity="0.041"/><stop offset="0.64" stop-color="#b3acfc" stop-opacity="0.004"/><stop offset="1" stop-color="#b3acfc" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-2-12" gradientUnits="userSpaceOnUse" x1="933.66" y1="4.95" x2="816.34" y2="695.05"><stop offset="0" stop-color="#ff3efc"/><stop offset=".25" stop-color="#6cb1fd"/><stop offset=".5" stop-color="#548cfd"/><stop offset=".75" stop-color="#295dfd"/><stop offset="1" stop-color="#0b07f8"/></linearGradient><radialGradient id="drive-logo-2-13" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(1255.8 459.16) rotate(22.04) scale(464.67 224.5)"><stop offset="0" stop-color="#00d4fe" stop-opacity="0.797"/><stop offset=".5" stop-color="#00d4fe" stop-opacity="0.246"/><stop offset="1" stop-color="#00d4fe" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-2-14" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(630 351) rotate(-113.37) scale(1399.91 230.15)"><stop offset="0" stop-color="#a0effd" stop-opacity="0.2"/><stop offset=".5" stop-color="#a0effd" stop-opacity="0"/><stop offset="1" stop-color="#a0effd" stop-opacity="0"/></radialGradient><path id="drive-logo-2-15" d="M350 80 H1220 V950 H350 Z"/><path id="drive-logo-2-16" d="M350 80 H614 V668.5 C394.51 759.97 395.83 810.57 384 817 H350 Z"/><path id="drive-logo-2-17" d="M384 817 C395.83 810.57 394.51 759.97 614 668.5 C601.76 795.98 495.68 900.62 460 920 L350 960 V817 Z"/><path id="drive-logo-2-18" d="M350 80 H1220 V545 L1184 558 C1091.75 639.78 1018.25 572.14 913 520 L614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/><path id="drive-logo-2-19" d="M350 80 H520 L539 100 C563.83 110.79 604.49 141.82 611.5 230 C614.03 257.11 613.18 307.14 614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/></defs><g clip-path="url(#drive-logo-2-0)"><g id="drive-logo-2-20"><use href="#drive-logo-2-15" fill="url(#drive-logo-2-10)"/><use href="#drive-logo-2-15" fill="url(#drive-logo-2-11)"/></g><g id="drive-logo-2-21"><use href="#drive-logo-2-16" fill="url(#drive-logo-2-4)"/><use href="#drive-logo-2-16" fill="url(#drive-logo-2-5)"/><use href="#drive-logo-2-16" fill="url(#drive-logo-2-6)"/></g><g id="drive-logo-2-22"><use href="#drive-logo-2-17" fill="url(#drive-logo-2-7)"/><use href="#drive-logo-2-17" fill="url(#drive-logo-2-8)"/><use href="#drive-logo-2-17" fill="url(#drive-logo-2-9)"/></g><g id="drive-logo-2-23"><use href="#drive-logo-2-18" fill="url(#drive-logo-2-12)"/><use href="#drive-logo-2-18" fill="url(#drive-logo-2-13)"/><use href="#drive-logo-2-18" fill="url(#drive-logo-2-14)"/></g><g id="drive-logo-2-24"><use href="#drive-logo-2-19" fill="url(#drive-logo-2-1)"/><use href="#drive-logo-2-19" fill="url(#drive-logo-2-2)"/><use href="#drive-logo-2-19" fill="url(#drive-logo-2-3)"/></g></g></svg>
           <span class="brand-text">MoviPlayer</span>
           <span class="brand-sub">for Drive</span>
         </div>
         <div class="actions">
           <span class="connected" id="connected"><span class="dot"></span><span class="label">Connected to Drive</span></span>
-          <button class="btn btn-primary" id="pick-btn">
+          <button type="button" class="btn btn-primary" id="pick-btn">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-            <span class="label">Pick a video</span>
+            <span class="label">Pick a file</span>
           </button>
           <button class="icon-btn" id="signout-btn" title="Sign out" aria-label="Sign out">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -270,31 +600,53 @@
       <div class="stage-card" id="stage-card">
         <div class="player-stage" id="player-stage">
           <movi-player id="movi-player" renderer="canvas" controls objectfit="contain"
-            playsInline thumb fastseek showtitle ambientmode ambientwrapper="ambient-wrapper" stablevolume></movi-player>
+            playsInline thumb="precise" fastseek showtitle subtitlepicker ambientmode ambientwrapper="ambient-wrapper" stablevolume smoothwarning></movi-player>
 
           <div class="empty" id="empty-state">
-            <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg></span>
-            <h3>Pick a video to start</h3>
-            <p>Choose any video from your Google Drive and it plays here instantly — streamed, never downloaded.</p>
-            <button class="btn btn-primary" id="empty-pick-btn">
+            <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M10 11.5v5l4-2.5z"/></svg></span>
+            <h3>Pick a file from your Drive</h3>
+            <p>Video or audio — streamed from your Drive, never downloaded.</p>
+            <button type="button" class="btn btn-primary" id="empty-pick-btn">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              Pick a video from Drive
+              Pick a file from Drive
             </button>
+            <p class="empty-hint">Tip: in Google Drive, right-click a file → <strong>Open with</strong> → <strong>MoviPlayer</strong>.</p>
           </div>
         </div>
       </div>
 
       <div class="meta-row">
-        <span class="now-playing" id="now-playing"><span class="dot"></span><span class="txt">No video selected</span></span>
+        <span class="now-playing" id="now-playing"><span class="dot"></span><span class="txt">No file selected</span></span>
         <span class="privacy-note">Streamed read-only · decoded on your device</span>
       </div>
     </div>
 
   </div>
 
-  <div class="foot">
-    Not affiliated with Google. · <a href="/docs/privacy-policy">Privacy</a> · <a href="/docs/terms-of-service">Terms</a> · <a href="/">moviplayer.com</a>
-  </div>
+  <footer class="site-footer site-footer--app">
+    <div class="site-footer-inner">
+      <div class="site-footer-brand">
+        <a href="/" class="brand" aria-label="MoviPlayer — home">
+          <svg class="brand-logo" viewBox="323 49 930 930" aria-hidden="true"><defs><clipPath id="drive-logo-3-0"><path clip-rule="evenodd" d="M383.55 222 C383.55 152.17 440.03 97.5 512 97.5 C543.4 97.5 559.7 101.8 590 117.5 L1100 381.5 C1174.55 414.03 1191.47 471.49 1193 512.5 C1192.29 590.19 1134.3 634.06 1100 646.5 C930.83 737.99 761.67 826.04 592.5 909 C571.47 917.98 554.22 929.25 512 930.3 C455.97 929.9 384.46 889.54 383.55 802 Z M614 360 L913 520 C686.95 641.07 614 666.34 614 669 Z"/></clipPath><linearGradient id="drive-logo-3-1" gradientUnits="userSpaceOnUse" x1="0" y1="97" x2="0" y2="360"><stop offset="0" stop-color="#737bfd"/><stop offset="0.5" stop-color="#6eb3fd"/><stop offset="1" stop-color="#81e1fe"/></linearGradient><radialGradient id="drive-logo-3-2" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(726.13 101.51) scale(218.96 701.75)"><stop offset="0" stop-color="#0c00fd"/><stop offset="0.12" stop-color="#0c00fd" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0c00fd" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0c00fd" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0c00fd" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0c00fd" stop-opacity="0.006"/><stop offset="1" stop-color="#0c00fd" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-3-3" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(255.4 225.67) scale(350.82 206.02)"><stop offset="0" stop-color="#4c00fd" stop-opacity="0.58"/><stop offset="0.12" stop-color="#4c00fd" stop-opacity="0.484"/><stop offset="0.24" stop-color="#4c00fd" stop-opacity="0.282"/><stop offset="0.36" stop-color="#4c00fd" stop-opacity="0.115"/><stop offset="0.48" stop-color="#4c00fd" stop-opacity="0.033"/><stop offset="0.64" stop-color="#4c00fd" stop-opacity="0.003"/><stop offset="1" stop-color="#4c00fd" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-3-4" gradientUnits="userSpaceOnUse" x1="0" y1="225" x2="0" y2="817"><stop offset="0" stop-color="#5143ff"/><stop offset="0.5" stop-color="#294cf6"/><stop offset="1" stop-color="#0437cc"/></linearGradient><radialGradient id="drive-logo-3-5" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(621.75 616.05) scale(192.93 939.93)"><stop offset="0" stop-color="#436eff"/><stop offset="0.12" stop-color="#436eff" stop-opacity="0.835"/><stop offset="0.24" stop-color="#436eff" stop-opacity="0.487"/><stop offset="0.36" stop-color="#436eff" stop-opacity="0.198"/><stop offset="0.48" stop-color="#436eff" stop-opacity="0.056"/><stop offset="0.64" stop-color="#436eff" stop-opacity="0.006"/><stop offset="1" stop-color="#436eff" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-3-6" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(637.74 314.49) scale(126.64 109.33)"><stop offset="0" stop-color="#0000ec"/><stop offset="0.12" stop-color="#0000ec" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0000ec" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0000ec" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0000ec" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0000ec" stop-opacity="0.006"/><stop offset="1" stop-color="#0000ec" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-3-7" gradientUnits="userSpaceOnUse" x1="0" y1="669" x2="0" y2="930"><stop offset="0" stop-color="#001fad"/><stop offset="0.5" stop-color="#2e50ff"/><stop offset="1" stop-color="#3d4eff"/></linearGradient><radialGradient id="drive-logo-3-8" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(367.66 690.91) scale(257.59 321.92)"><stop offset="0" stop-color="#0023ab"/><stop offset="0.12" stop-color="#0023ab" stop-opacity="0.835"/><stop offset="0.24" stop-color="#0023ab" stop-opacity="0.487"/><stop offset="0.36" stop-color="#0023ab" stop-opacity="0.198"/><stop offset="0.48" stop-color="#0023ab" stop-opacity="0.056"/><stop offset="0.64" stop-color="#0023ab" stop-opacity="0.006"/><stop offset="1" stop-color="#0023ab" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-3-9" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(554.73 904.5) scale(161.77 151.07)"><stop offset="0" stop-color="#564efc"/><stop offset="0.12" stop-color="#564efc" stop-opacity="0.835"/><stop offset="0.24" stop-color="#564efc" stop-opacity="0.487"/><stop offset="0.36" stop-color="#564efc" stop-opacity="0.198"/><stop offset="0.48" stop-color="#564efc" stop-opacity="0.056"/><stop offset="0.64" stop-color="#564efc" stop-opacity="0.006"/><stop offset="1" stop-color="#564efc" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-3-10" gradientUnits="userSpaceOnUse" x1="460" y1="0" x2="1185" y2="0"><stop offset="0" stop-color="#4442fc"/><stop offset="0.5" stop-color="#5800fd"/><stop offset="1" stop-color="#00c9ff"/></linearGradient><radialGradient id="drive-logo-3-11" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="2.5" gradientTransform="translate(918.16 679.1) scale(562.77 1104.38)"><stop offset="0" stop-color="#b3acfc" stop-opacity="0.732"/><stop offset="0.12" stop-color="#b3acfc" stop-opacity="0.611"/><stop offset="0.24" stop-color="#b3acfc" stop-opacity="0.356"/><stop offset="0.36" stop-color="#b3acfc" stop-opacity="0.145"/><stop offset="0.48" stop-color="#b3acfc" stop-opacity="0.041"/><stop offset="0.64" stop-color="#b3acfc" stop-opacity="0.004"/><stop offset="1" stop-color="#b3acfc" stop-opacity="0"/></radialGradient><linearGradient id="drive-logo-3-12" gradientUnits="userSpaceOnUse" x1="933.66" y1="4.95" x2="816.34" y2="695.05"><stop offset="0" stop-color="#ff3efc"/><stop offset=".25" stop-color="#6cb1fd"/><stop offset=".5" stop-color="#548cfd"/><stop offset=".75" stop-color="#295dfd"/><stop offset="1" stop-color="#0b07f8"/></linearGradient><radialGradient id="drive-logo-3-13" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(1255.8 459.16) rotate(22.04) scale(464.67 224.5)"><stop offset="0" stop-color="#00d4fe" stop-opacity="0.797"/><stop offset=".5" stop-color="#00d4fe" stop-opacity="0.246"/><stop offset="1" stop-color="#00d4fe" stop-opacity="0"/></radialGradient><radialGradient id="drive-logo-3-14" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(630 351) rotate(-113.37) scale(1399.91 230.15)"><stop offset="0" stop-color="#a0effd" stop-opacity="0.2"/><stop offset=".5" stop-color="#a0effd" stop-opacity="0"/><stop offset="1" stop-color="#a0effd" stop-opacity="0"/></radialGradient><path id="drive-logo-3-15" d="M350 80 H1220 V950 H350 Z"/><path id="drive-logo-3-16" d="M350 80 H614 V668.5 C394.51 759.97 395.83 810.57 384 817 H350 Z"/><path id="drive-logo-3-17" d="M384 817 C395.83 810.57 394.51 759.97 614 668.5 C601.76 795.98 495.68 900.62 460 920 L350 960 V817 Z"/><path id="drive-logo-3-18" d="M350 80 H1220 V545 L1184 558 C1091.75 639.78 1018.25 572.14 913 520 L614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/><path id="drive-logo-3-19" d="M350 80 H520 L539 100 C563.83 110.79 604.49 141.82 611.5 230 C614.03 257.11 613.18 307.14 614 360 C551.52 322.82 391.01 278.71 384 226 L350 220 Z"/></defs><g clip-path="url(#drive-logo-3-0)"><g id="drive-logo-3-20"><use href="#drive-logo-3-15" fill="url(#drive-logo-3-10)"/><use href="#drive-logo-3-15" fill="url(#drive-logo-3-11)"/></g><g id="drive-logo-3-21"><use href="#drive-logo-3-16" fill="url(#drive-logo-3-4)"/><use href="#drive-logo-3-16" fill="url(#drive-logo-3-5)"/><use href="#drive-logo-3-16" fill="url(#drive-logo-3-6)"/></g><g id="drive-logo-3-22"><use href="#drive-logo-3-17" fill="url(#drive-logo-3-7)"/><use href="#drive-logo-3-17" fill="url(#drive-logo-3-8)"/><use href="#drive-logo-3-17" fill="url(#drive-logo-3-9)"/></g><g id="drive-logo-3-23"><use href="#drive-logo-3-18" fill="url(#drive-logo-3-12)"/><use href="#drive-logo-3-18" fill="url(#drive-logo-3-13)"/><use href="#drive-logo-3-18" fill="url(#drive-logo-3-14)"/></g><g id="drive-logo-3-24"><use href="#drive-logo-3-19" fill="url(#drive-logo-3-1)"/><use href="#drive-logo-3-19" fill="url(#drive-logo-3-2)"/><use href="#drive-logo-3-19" fill="url(#drive-logo-3-3)"/></g></g></svg>
+          <span class="brand-text">MoviPlayer</span>
+        </a>
+        <p>Not affiliated with Google. Your Drive files are streamed read-only and decoded on your device.</p>
+      </div>
+      <div class="site-footer-links">
+        <a href="/">Player</a>
+        <a href="/examples">Examples</a>
+        <a href="/compare">Compare</a>
+        <a href="/docs/" target="_blank" rel="noopener">Docs</a>
+        <a href="https://github.com/mrujjwalg/movi-player" rel="noopener" target="_blank">GitHub</a>
+        <a href="/docs/privacy-policy" target="_blank" rel="noopener">Privacy Policy</a>
+        <a href="/docs/terms-of-service" target="_blank" rel="noopener">Terms of Service</a>
+      </div>
+    </div>
+    <div class="site-footer-base">
+      <p>We only ever read the file you pick &mdash; nothing is uploaded or stored.</p>
+      <p>&copy; MoviPlayer &middot; Engineered for high-fidelity playback.</p>
+    </div>
+  </footer>
 
   <div class="toast" id="toast"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span id="toast-msg"></span></div>
 
@@ -434,8 +786,9 @@
       try { player.dispose(); } catch {}
       player.removeAttribute("src");
       player.removeAttribute("title");
-      setNow("No video selected");
+      setNow("No file selected");
       emptyState.style.display = "";
+      document.body.removeAttribute("data-has-video");
       setState("signed-out");
     }
 
@@ -450,25 +803,69 @@
       }
     }, 150);
 
+    /**
+     * Hold the page where it is while the Picker opens.
+     *
+     * The Picker appends its dialog to the end of <body> and focuses it, and a
+     * focus lands the browser's "scroll it into view" on something below the
+     * fold — so clicking "Pick a file" slid the whole page down, smoothly,
+     * because this page sets scroll-behavior: smooth. None of that is ours to
+     * configure: the dialog is Google's, inside an iframe.
+     *
+     * So put the scroll back. Once is not enough — the dialog is built over
+     * several frames and focuses late — so it is re-asserted for a short
+     * while, instantly rather than smoothly, and then left alone.
+     */
+    function holdScroll(ms = 1200) {
+      const y = window.scrollY;
+      const x = window.scrollX;
+      const stopAt = performance.now() + ms;
+      const put = () => {
+        if (window.scrollY !== y || window.scrollX !== x) {
+          window.scrollTo({ top: y, left: x, behavior: "instant" });
+        }
+        if (performance.now() < stopAt) requestAnimationFrame(put);
+      };
+      requestAnimationFrame(put);
+    }
+
     function openPicker() {
       if (!accessToken) return ensureAuth();
       if (!pickerLoaded) { showToast("Picker is still loading — try again in a moment."); return; }
       const view = new google.picker.DocsView(google.picker.ViewId.DOCS_VIDEOS)
         .setIncludeFolders(true)
         .setSelectFolderEnabled(false);
+      // The player plays audio too, and DOCS_VIDEOS lists video only, so
+      // audio gets a second tab of its own. Listed by type because the
+      // Picker takes no wildcard; the video tab above is left as it was.
+      const audioView = new google.picker.DocsView(google.picker.ViewId.DOCS)
+        .setMimeTypes([
+          "audio/mpeg", "audio/mp3", "audio/flac", "audio/x-flac",
+          "audio/mp4", "audio/x-m4a", "audio/aac", "audio/ogg", "audio/opus",
+          "audio/wav", "audio/x-wav", "audio/webm",
+        ].join(","))
+        .setIncludeFolders(true)
+        .setSelectFolderEnabled(false);
       const picker = new google.picker.PickerBuilder()
         .setOAuthToken(accessToken)
         .setDeveloperKey(API_KEY)
         .setAppId(APP_ID)
-        .setTitle("Choose a video")
+        .setTitle("Choose a file")
         .addView(view)
+        .addView(audioView)
         .setCallback((data) => {
+          // Closing hands focus back, which scrolls for the same reason.
+          if (data.action === google.picker.Action.PICKED ||
+              data.action === google.picker.Action.CANCEL) {
+            holdScroll(600);
+          }
           if (data.action === google.picker.Action.PICKED) {
             const doc = data.docs[0];
             playDriveFile(doc.id, doc.name);
           }
         })
         .build();
+      holdScroll();
       picker.setVisible(true);
     }
     $("pick-btn").addEventListener("click", openPicker);
@@ -479,6 +876,9 @@
       if (!accessToken) return ensureAuth();
       setState("app");
       emptyState.style.display = "none";
+      // Styles key off this: before the first pick the page is a picker,
+      // not an empty player (see "Before a video" in landing-parity).
+      document.body.setAttribute("data-has-video", "");
 
       // Change ONLY the src (headers were set once at sign-in) so the player
       // does a single clean (re)init per pick. movi-player shows its own

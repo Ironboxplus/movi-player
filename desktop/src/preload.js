@@ -7,6 +7,17 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 contextBridge.exposeInMainWorld("movi", {
   platform: process.platform,
 
+  // True when this window was launched with a file to play ("open with", a
+  // double-clicked file, a file argument). Read before the first paint, so it
+  // is synchronous on purpose.
+  pendingOpen: (() => {
+    try {
+      return ipcRenderer.sendSync("boot:pending-open") === true;
+    } catch {
+      return false;
+    }
+  })(),
+
   // Tell main we've wired our listeners and the player is defined; flushes
   // any files the OS asked us to open before we were ready.
   ready: () => ipcRenderer.send("renderer-ready"),
@@ -20,6 +31,10 @@ contextBridge.exposeInMainWorld("movi", {
   // Menu "Open URL…" asks the renderer to focus its URL field.
   onFocusUrl: (cb) => ipcRenderer.on("focus-url", () => cb()),
 
+  // The window is closing: take the sound down a slope first. Main holds the
+  // close open for the length of the fade and no longer — see main.js.
+  onFadeOut: (cb) => ipcRenderer.on("app:fade-out", (_e, ms) => cb(ms)),
+
   // OS window fullscreen toggled (used to drop the macOS titlebar inset AND to
   // sync the player's own fullscreen UI — see renderer).
   onFullscreen: (cb) => ipcRenderer.on("window-fullscreen", (_e, on) => cb(on)),
@@ -29,6 +44,11 @@ contextBridge.exposeInMainWorld("movi", {
   // green button, instead of a separate HTML element-fullscreen the two paths
   // would fight over.
   toggleFullscreen: () => ipcRenderer.send("window:toggle-fullscreen"),
+
+  // Size the window around the picture (QuickTime-style) — see main.js.
+  fitVideo: (width, height) => ipcRenderer.send("window:fit-video", { width, height }),
+  releaseVideo: () => ipcRenderer.send("window:release-video"),
+  playlistPanel: (open, width) => ipcRenderer.send("window:playlist-panel", { open, width }),
 
   // Recent files (path-based opens only).
   getRecents: () => ipcRenderer.invoke("recents:get"),

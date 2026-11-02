@@ -292,6 +292,21 @@ export class WasmBindings {
       }
     };
 
+    // The demuxer telling the source that the next few reads are a search, not
+    // a playhead (see HttpSource.setProbeMode). Sources that don't care about
+    // the difference simply don't implement it.
+    (this.module as any).onProbeMode = (on: number) => {
+      try {
+        (
+          self.dataSource as unknown as {
+            setProbeMode?: (v: boolean) => void;
+          } | null
+        )?.setProbeMode?.(!!on);
+      } catch {
+        /* advisory only */
+      }
+    };
+
     // Handle seek requests from WASM
     // IMPORTANT: offset may be a BigInt for files >= 2GB
     // This is especially important for large files (>= 2GB) where position tracking
@@ -421,12 +436,83 @@ export class WasmBindings {
   }
 
   /**
+   * Every Asyncify call, counted while it is suspended.
+   *
+   * A call into the WASM that reads through the data source does not run to
+   * completion: it unwinds at the first read and resumes when JS hands the
+   * bytes back. In between, this side is free to do anything — including tear
+   * the player down, which is what a reload does. destroy() would then free
+   * the packet buffer the suspended call is about to write into, and free the
+   * context out from under it; the call resumes, writes into freed memory, and
+   * the NEXT free walks an allocator whose metadata it just trampled. That is
+   * the "memory access out of bounds" inside _free, with a stack that points
+   * at readFrame's finally and tells you nothing about who freed what.
+   *
+   * So a teardown that lands mid-call is remembered rather than performed, and
+   * runs when the last call returns. The caller is told nothing: destroy()
+   * still means "this is finished with", and nothing new is routed here —
+   * activeBindings drops it immediately.
+   */
+  private inFlight = 0;
+  private teardownPending = false;
+  /**
+   * Called once the context is really gone — which, with a call still
+   * suspended in WASM, is later than destroy(). Whoever owns the module waits
+   * for this before handing it to anyone else; see Demuxer.close.
+   */
+  onTornDown: (() => void) | null = null;
+
+  private ccallAsync(
+    name: string,
+    returnType: string,
+    argTypes: string[],
+    args: unknown[],
+    // Kept so call sites read exactly as ccall's do; every call through here
+    // is an Asyncify call by definition.
+    _opts?: { async: boolean },
+  ): Promise<unknown> {
+    this.inFlight++;
+    const settle = () => {
+      this.inFlight--;
+      if (this.inFlight === 0 && this.teardownPending) {
+        this.teardownPending = false;
+        this.teardown();
+      }
+    };
+    return Promise.resolve(
+      this.module.ccall(name, returnType, argTypes, args, { async: true }),
+    ).then(
+      (value) => {
+        settle();
+        return value;
+      },
+      (error) => {
+        settle();
+        throw error;
+      },
+    );
+  }
+
+  /**
    * Destroy the demuxer context
    */
   destroy(): void {
     // Unregister this instance
     activeBindings.delete(this);
 
+    if (this.inFlight > 0) {
+      this.teardownPending = true;
+      Logger.debug(
+        TAG,
+        `Destroy deferred: ${this.inFlight} call(s) still suspended in WASM`,
+      );
+      return;
+    }
+
+    this.teardown();
+  }
+
+  private teardown(): void {
     if (this.packetBuffer) {
       this.module._free(this.packetBuffer);
       this.packetBuffer = 0;
@@ -441,6 +527,9 @@ export class WasmBindings {
     this.fileSize = 0;
 
     Logger.debug(TAG, "Context destroyed");
+    const done = this.onTornDown;
+    this.onTornDown = null;
+    done?.();
   }
 
   /**
@@ -487,7 +576,7 @@ export class WasmBindings {
     // Clear any previous error
     this.lastError = null;
 
-    const ret = (await this.module.ccall(
+    const ret = (await this.ccallAsync(
       "movi_open",
       "number",
       ["number"],
@@ -516,6 +605,26 @@ export class WasmBindings {
   getDuration(): number {
     if (!this.contextPtr) return 0;
     return this.module._movi_get_duration(this.contextPtr);
+  }
+
+  /**
+   * Recover a duration the container never stored, by demuxing to EOF and
+   * keeping the largest packet end timestamp. Only worth calling when
+   * getDuration() returned 0. Returns -1 if the scan blew its budget or found
+   * no usable timestamps — see movi_scan_duration() for why a partial result
+   * is deliberately not returned.
+   *
+   * Async: this reads the whole source through the Asyncify I/O callbacks.
+   */
+  async scanDuration(budgetMs: number): Promise<number> {
+    if (!this.contextPtr) return -1;
+    return (await this.ccallAsync(
+      "movi_scan_duration",
+      "number",
+      ["number", "number"],
+      [this.contextPtr, budgetMs],
+      { async: true },
+    )) as number;
   }
 
   /**
@@ -554,6 +663,34 @@ export class WasmBindings {
   /**
    * Get title from metadata
    */
+  /**
+   * A container tag by name — artist, album, date. The title has its own
+   * getter (above this one historically, and kept for its callers); this is
+   * for everything else a file carries, which a cover-art view wants.
+   */
+  getMetadataTag(key: string): string {
+    if (!this.contextPtr || !key) return "";
+    const bufferSize = 256;
+    const buffer = this.module._malloc(bufferSize);
+    const keyBytes = new TextEncoder().encode(key + "\0");
+    const keyPtr = this.module._malloc(keyBytes.length);
+    try {
+      this.module.HEAPU8.set(keyBytes, keyPtr);
+      const ret = this.module._movi_get_metadata_tag(
+        this.contextPtr,
+        keyPtr,
+        buffer,
+        bufferSize,
+      );
+      return ret > 0 ? this.module.UTF8ToString(buffer) : "";
+    } catch {
+      return "";
+    } finally {
+      this.module._free(buffer);
+      this.module._free(keyPtr);
+    }
+  }
+
   getMetadataTitle(): string {
     if (!this.contextPtr) return "";
 
@@ -741,7 +878,7 @@ export class WasmBindings {
     }
 
     // Use ccall with async:true for Asyncify
-    const ret = (await this.module.ccall(
+    const ret = (await this.ccallAsync(
       "movi_seek_to",
       "number",
       ["number", "number", "number", "number"],
@@ -765,7 +902,7 @@ export class WasmBindings {
     const infoPtr = this.module._malloc(PACKET_INFO_SIZE);
     try {
       // Use ccall with async:true for Asyncify
-      let ret = (await this.module.ccall(
+      let ret = (await this.ccallAsync(
         "movi_read_frame",
         "number",
         ["number", "number", "number", "number"],
@@ -1026,7 +1163,7 @@ export class WasmBindings {
       const packetDuration = duration ?? 0;
 
       // Decode subtitle using ccall with async
-      const result = (await this.module.ccall(
+      const result = (await this.ccallAsync(
         "movi_decode_subtitle",
         "number",
         ["number", "number", "number", "number", "number", "number"],
@@ -1170,7 +1307,7 @@ export class WasmBindings {
   ): Promise<{ start: number; end: number; text: string }[] | null> {
     if (!this.contextPtr) return null;
 
-    const count = (await this.module.ccall(
+    const count = (await this.ccallAsync(
       "movi_prefetch_subtitle_cues",
       "number",
       ["number", "number"],
@@ -1613,6 +1750,10 @@ export class ThumbnailBindings {
   private dataSource: DataSource | null = null;
   private isOpened: boolean = false;
   private lastPacketPts: number = 0; // Store from callback
+  /** The same packet's DECODE timestamp. Monotonic in the order packets
+   *  arrive, which PTS is not once a stream carries B-frames — see
+   *  getPacketDts. NaN until a build that reports it answers. */
+  private lastPacketDts: number = Number.NaN;
 
   constructor(module: MoviWasmModule) {
     this.module = module;
@@ -1713,7 +1854,7 @@ export class ThumbnailBindings {
     if (!this.contextPtr) return false;
 
     // Use ccall with async:true to handle Asyncify correctly
-    const result = (await this.module.ccall(
+    const result = (await this.ccallAsync(
       "movi_thumbnail_open",
       "number",
       ["number"],
@@ -1740,23 +1881,25 @@ export class ThumbnailBindings {
     // We use a shared result object to capture callback data
     let packetSize = -1;
     let packetPts = -1;
+    let packetDts = Number.NaN;
 
     // Setup callback that C will call
     (this.module as any)._pendingThumbnail = {
-      resolve: (result: { size: number; pts: number }) => {
+      resolve: (result: { size: number; pts: number; dts?: number }) => {
         Logger.debug(
           TAG,
           `JS callback received: size=${result.size}, pts=${result.pts}`,
         );
         packetSize = result.size;
         packetPts = result.pts;
+        packetDts = result.dts ?? Number.NaN;
       },
     };
 
     try {
       // Call C function using ccall with async:true
       // This ensures we wait for the entire async operation to complete
-      await this.module.ccall(
+      await this.ccallAsync(
         "movi_thumbnail_read_keyframe",
         "void",
         ["number", "number"],
@@ -1767,10 +1910,49 @@ export class ThumbnailBindings {
       // After ccall completes, the callback should have populated our variables
       if (packetSize > 0) {
         this.lastPacketPts = packetPts;
+        this.lastPacketDts = packetDts;
       }
       return packetSize;
     } catch (e) {
       Logger.error(TAG, "readKeyframe error", e);
+      return -1;
+    } finally {
+      (this.module as any)._pendingThumbnail = null;
+    }
+  }
+
+  /**
+   * The next video packet after the last one handed over — the walk forward
+   * from a keyframe to the frame the pointer is actually on. Same callback
+   * shape as readKeyframe; a negative size means EOF or a broken read.
+   */
+  async readNextPacket(): Promise<number> {
+    if (!this.contextPtr || !this.isOpened) return -1;
+    let packetSize = -1;
+    let packetPts = -1;
+    let packetDts = Number.NaN;
+    (this.module as any)._pendingThumbnail = {
+      resolve: (result: { size: number; pts: number; dts?: number }) => {
+        packetSize = result.size;
+        packetPts = result.pts;
+        packetDts = result.dts ?? Number.NaN;
+      },
+    };
+    try {
+      await this.ccallAsync(
+        "movi_thumbnail_read_next_packet",
+        "void",
+        ["number"],
+        [this.contextPtr],
+        { async: true },
+      );
+      if (packetSize > 0) {
+        this.lastPacketPts = packetPts;
+        this.lastPacketDts = packetDts;
+      }
+      return packetSize;
+    } catch (e) {
+      Logger.error(TAG, "readNextPacket error", e);
       return -1;
     } finally {
       (this.module as any)._pendingThumbnail = null;
@@ -1801,6 +1983,22 @@ export class ThumbnailBindings {
    */
   getPacketPts(): number {
     return this.lastPacketPts;
+  }
+
+  /**
+   * The last packet's DECODE timestamp, or NaN from a WASM build that does
+   * not report one.
+   *
+   * PTS is presentation order. Packets arrive in decode order, and with
+   * B-frames the two differ — a picture meant for later can be handed over
+   * before one meant for now. A reader walking forward to a hovered moment
+   * therefore cannot ask "is this pts past the pointer yet"; the answer is
+   * yes long before the frame under the pointer has been read. DTS rises with
+   * every packet in the order they arrive, so it is the one that says when
+   * the walk has gone far enough.
+   */
+  getPacketDts(): number {
+    return this.lastPacketDts;
   }
 
   /**
@@ -1964,10 +2162,57 @@ export class ThumbnailBindings {
     (this.module as any)._movi_thumbnail_clear_buffer(this.contextPtr);
   }
 
+  /** Counted while suspended, and a teardown that lands mid-call is deferred —
+   *  the same race the demuxer's guard explains, reached here by a scrub that
+   *  is still reading when the source changes under it. */
+  private inFlight = 0;
+  private teardownPending = false;
+
+  private ccallAsync(
+    name: string,
+    returnType: string,
+    argTypes: string[],
+    args: unknown[],
+    _opts?: { async: boolean },
+  ): Promise<unknown> {
+    this.inFlight++;
+    const settle = () => {
+      this.inFlight--;
+      if (this.inFlight === 0 && this.teardownPending) {
+        this.teardownPending = false;
+        this.teardown();
+      }
+    };
+    return Promise.resolve(
+      this.module.ccall(name, returnType, argTypes, args, { async: true }),
+    ).then(
+      (value) => {
+        settle();
+        return value;
+      },
+      (error) => {
+        settle();
+        throw error;
+      },
+    );
+  }
+
   /**
    * Destroy thumbnail context
    */
   destroy(): void {
+    if (this.inFlight > 0) {
+      this.teardownPending = true;
+      Logger.debug(
+        TAG,
+        `Thumbnail destroy deferred: ${this.inFlight} call(s) still suspended in WASM`,
+      );
+      return;
+    }
+    this.teardown();
+  }
+
+  private teardown(): void {
     if (this.contextPtr) {
       this.module._movi_thumbnail_destroy(this.contextPtr);
       this.contextPtr = 0;

@@ -5,7 +5,7 @@
       "name": "movi-player",
       "description": {
         "kind": "markdown",
-        "value": "Movi Player — a WASM + WebCodecs video player custom element.\n\nPlays formats the browser cannot (MKV, HEVC, AV1, TrueHD/DTS, …) on a WebGL2 canvas, with adaptive quality, HDR, subtitles and a full built-in UI."
+        "value": "MoviPlayer — a WASM + WebCodecs video player custom element.\n\nPlays formats the browser cannot (MKV, HEVC, AV1, TrueHD/DTS, …) on a WebGL2 canvas, with adaptive quality, HDR, subtitles and a full built-in UI."
       },
       "attributes": [
         {
@@ -18,6 +18,19 @@
             {
               "name": "Documentation",
               "url": "https://moviplayer.com/docs/api/element#src"
+            }
+          ]
+        },
+        {
+          "name": "autopictureinpicture",
+          "description": {
+            "kind": "markdown",
+            "value": "Enter Picture-in-Picture automatically when the tab is hidden, and leave it on"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#autopictureinpicture"
             }
           ]
         },
@@ -51,7 +64,7 @@
           "name": "loop",
           "description": {
             "kind": "markdown",
-            "value": "Restarts playback when video ends."
+            "value": "Restarts playback when the video ends — or, with a queue, asks for the queue"
           },
           "references": [
             {
@@ -667,6 +680,32 @@
           ]
         },
         {
+          "name": "spinnerdelay",
+          "description": {
+            "kind": "markdown",
+            "value": "How long an interruption has to last, in **seconds**, before the viewer is shown a loading spinner."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#spinnerdelay"
+            }
+          ]
+        },
+        {
+          "name": "posterdelay",
+          "description": {
+            "kind": "markdown",
+            "value": "How long to wait, in **milliseconds**, before putting the opening poster up — the cover shown while a source loads its first frame."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#posterdelay"
+            }
+          ]
+        },
+        {
           "name": "title",
           "description": {
             "kind": "markdown",
@@ -706,6 +745,19 @@
           ]
         },
         {
+          "name": "subtitlepicker",
+          "description": {
+            "kind": "markdown",
+            "value": "Adds an \"Add subtitle file…\" row to the subtitle menu for picking a local SRT/VTT/TTML. Read in the page, never uploaded"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#subtitlepicker"
+            }
+          ]
+        },
+        {
           "name": "chapters",
           "description": {
             "kind": "markdown",
@@ -728,6 +780,19 @@
             {
               "name": "Documentation",
               "url": "https://moviplayer.com/docs/api/element#resume"
+            }
+          ]
+        },
+        {
+          "name": "resumekey",
+          "description": {
+            "kind": "markdown",
+            "value": "Files the resume position under a name you choose instead of the title."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#resumekey"
             }
           ]
         },
@@ -1086,6 +1151,84 @@
             {
               "name": "Documentation",
               "url": "https://moviplayer.com/docs/api/element#disableremoteplayback"
+            }
+          ]
+        },
+        {
+          "name": "playlist",
+          "description": {
+            "kind": "markdown",
+            "value": "A queue. The bar grows Previous and Next, `Shift+P` / `Shift+N` walk it, and the"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#playlist"
+            }
+          ]
+        },
+        {
+          "name": "playlistindex",
+          "description": {
+            "kind": "markdown",
+            "value": "Which item to open on. Default `0`. The `playlistIndex` property reads and"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#playlistindex"
+            }
+          ]
+        },
+        {
+          "name": "autoadvance",
+          "description": {
+            "kind": "markdown",
+            "value": "Let the end of one item start the next. **Off by default** — a queue a page"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#autoadvance"
+            }
+          ]
+        },
+        {
+          "name": "shuffle",
+          "description": {
+            "kind": "markdown",
+            "value": "Play the queue in a random order. **Off by default.**"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#shuffle"
+            }
+          ]
+        },
+        {
+          "name": "smoothwarning",
+          "description": {
+            "kind": "markdown",
+            "value": "Shows a notice when what is loaded is not expected to play smoothly on this"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#smoothwarning"
+            }
+          ]
+        },
+        {
+          "name": "nolinkwarning",
+          "description": {
+            "kind": "markdown",
+            "value": "Keeps `smoothwarning` on but never raises the link-speed notice (\"This media"
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#nolinkwarning"
             }
           ]
         }

@@ -31,6 +31,62 @@ let sharedAudioContext: AudioContext | null = null;
 // wakes it during init(), before autoplay's block-check runs. Stays false until
 // the first real gesture so a brand-new page's poster-seek can't leak audio.
 let sharedContextActivated = false;
+
+/**
+ * Whether this session's output has ever been handed a buffer.
+ *
+ * Deliberately NOT part of the per-run counters: a seek resets those (the run
+ * starts over) but the DEVICE does not forget it has been playing. The full
+ * start cushion is for an output that has never been fed; asking a warm one
+ * for it again only holds the picture longer. Module-level for the same reason
+ * sharedContextActivated is — the context is shared across videos.
+ */
+let outputEverFed = false;
+
+/**
+ * How long play() waits on an AudioContext.resume() before carrying on
+ * without it.
+ *
+ * Long enough for a genuine wake-up (measured at tens of ms, and ~100ms on
+ * Gecko), short enough that a resume the browser has silently declined does
+ * not hold playback hostage. Safari's declined resume never settles at all —
+ * see the race in play().
+ */
+const RESUME_GRACE_MS = 1200;
+/**
+ * The same wait, when the browser has as good as said no — see
+ * audioStartRefused(). Not zero: Chromium also lets a site with a high media
+ * engagement score start audio without a gesture, and that resume lands in
+ * tens of milliseconds.
+ */
+const REFUSED_RESUME_GRACE_MS = 150;
+
+/**
+ * Will the browser refuse to start audio right now?
+ *
+ * The full grace is for a context that might still wake. One that cannot —
+ * nothing has been unlocked this session and the page has never had a
+ * gesture — held an upgraded `<video autoplay>` on its first frame for 1.2s
+ * under a centre play button, and only then did the muted fallback start it.
+ * Gecko says so outright (getAutoplayPolicy); Chromium has no such call, but
+ * a page with no activation ever is exactly what its policy refuses.
+ */
+function audioStartRefused(): boolean {
+  if (sharedContextActivated) return false;
+  if (typeof navigator === "undefined") return false;
+  const nav = navigator as Navigator & {
+    getAutoplayPolicy?: (type: string) => string;
+    userActivation?: { hasBeenActive: boolean };
+  };
+  try {
+    const policy = nav.getAutoplayPolicy?.("audiocontext");
+    if (policy === "disallowed") return true;
+    if (policy === "allowed") return false;
+  } catch {
+    /* an engine that does not know the type */
+  }
+  return !!nav.userActivation && !nav.userActivation.hasBeenActive;
+}
 /**
  * "Somebody suspended this context on purpose."
  *
@@ -55,6 +111,11 @@ export class AudioRenderer {
   // separate from the volume node lets us reorder the compressor/gain chain
   // (stable-audio toggle) without re-touching the live sources.
   private inputNode: GainNode | null = null;
+  /** A tap for drawing the sound, not for hearing it — see getLevels. Built
+   *  only when something asks, and hung off the gain node in parallel, so it
+   *  never sits between the audio and the speakers. */
+  private _analyser: AnalyserNode | null = null;
+  private _analyserBins: Uint8Array<ArrayBuffer> | null = null;
   private gainNode: GainNode | null = null;
   private compressorNode: DynamicsCompressorNode | null = null;
   private scheduledTime: number = 0;
@@ -62,7 +123,24 @@ export class AudioRenderer {
   private volume: number = 1.0;
   private _playbackRate: number = 1.0;
   private activeSources: AudioBufferSourceNode[] = [];
+  /**
+   * What each live source was made from, and when it is due.
+   *
+   * A scheduled source is a finished thing — post-stretch PCM with a start time
+   * the audio thread already owns — and there is no reading back out of it. A
+   * rate change needs to do exactly that: everything scheduled ahead of the
+   * playhead is at the old rate and has to go, and up to SCHEDULE_LOOKAHEAD
+   * seconds of media goes with it unless the buffer it was made from can be put
+   * back. Keyed weakly so a source that has played out is collectable with its
+   * entry.
+   */
+  private sourceOrigin = new WeakMap<
+    AudioBufferSourceNode,
+    { buffer: AudioBuffer; audioTime: number; when: number; endsAt: number }
+  >();
   private _muted: boolean = false;
+  // Small software-decoder frames (TrueHD/MLP/DTS: ~40 samples each) are
+  // coalesced into ~20ms buffers before they are scheduled — see appendPendingPCM.
   private pendingPCMFlushTimerId: ReturnType<typeof setTimeout> | null = null;
   private nextPCMExpectedTimestamp: number | null = null;
   private pendingPCM: {
@@ -80,29 +158,45 @@ export class AudioRenderer {
 
   // Audio clock tracking for A/V sync
   private firstBufferScheduledAt: number = 0;
+  /**
+   * The context time this RUN of sound starts at — the moment the picture has
+   * to wait out before the first of it reaches the speakers. See
+   * secondsUntilAudible().
+   *
+   * Not the same thing as firstBufferScheduledAt, which is the anchor the
+   * media clock's arithmetic hangs off and is RE-BASED whenever that
+   * arithmetic needs it to be — most importantly by a speed change, which
+   * moves it to "now" so the old rate's elapsed time is not read at the new
+   * one. Nothing about the sound restarts there; it is playing, and has been.
+   * Reading that re-based anchor as a run start answers "how long until it is
+   * audible" with the device's whole output latency, which on Bluetooth is a
+   * quarter of a second of picture parked at every speed change.
+   */
+  private soundRunStartedAt: number = 0;
   private firstBufferMediaTime: number = 0;
   private hasFirstBuffer: boolean = false;
   // performance.now() of the last buffer underrun (a hole we patched with
   // silence). Sustained underruns mean packets aren't reaching the renderer in
   // realtime — see isUnderrunning().
-  private lastUnderrunAt: number = 0;
-  // True while the input is faded out to cover a run of underruns — EITHER
-  // duckForUnderrun's own trigger OR silenceForResync's. The two share this
-  // one flag (rather than each tracking its own) so forceUnduck(),
-  // releaseResyncSilence() and releaseUnderrunDuckIfClean() all agree on
-  // whether the gain is actually held down; two independent flags is exactly
-  // how forceUnduck() ends up a no-op while duckForUnderrun() is holding the
-  // input at 0. Stitched output across underruns is audibly broken — clicks
-  // and chopped syllables — and chopped audio reads as "this player is
-  // broken" where silence just reads as "it's loading". So we fade out for
-  // the whole stuttery stretch and fade back in only once packets have
-  // flowed cleanly again. The player's buffering spinner covers the same
-  // window, so the silence is explained on screen.
+  private _lastUnderrunAt: number = 0;
+  // True while the input is faded out to cover a run of underruns. Stitched
+  // output across underruns is audibly broken — clicks and chopped syllables —
+  // and chopped audio reads as "this player is broken" where silence just reads
+  // as "it's loading". So we fade out for the whole stuttery stretch and fade
+  // back in only once packets have flowed cleanly again. The player's buffering
+  // spinner covers the same window, so the silence is explained on screen.
   private _ducked: boolean = false;
   /** Output held silent across the unmute re-read — see silenceForResync. */
   private _resyncSilenced: boolean = false;
   private static readonly DUCK_FADE_OUT = 0.01; // 10ms: beats the glitch, still too slow to click
   private static readonly DUCK_FADE_IN = 0.04; // 40ms: audibly smooth on the way back
+  // Hold the silence until this long without a fresh underrun. Must stay well
+  // clear of the gap cadence during a bad stretch, or we'd fade in and out
+  // between holes and turn a dropout into tremolo.
+  private static readonly DUCK_CLEAR_MS = 300;
+  /** How often the duck re-asks whether it can lift — see duckForUnderrun. */
+  private static readonly DUCK_POLL_MS = 100;
+  private _duckReleaseTimer: number | null = null;
   // performance.now() before which ducking is suppressed. The player sets this
   // around a background→foreground recovery: the recovery flushes the video
   // decoder and re-seeks, which briefly starves audio — a transient underrun,
@@ -111,6 +205,82 @@ export class AudioRenderer {
   private _suppressDuckUntil: number = 0;
   private currentMediaTime: number = 0;
   private maxScheduledMediaTime: number = 0; // Track the furthest media time we've scheduled
+
+  /**
+   * The sound is over, and no more of it is coming.
+   *
+   * getAudioClock() clamps to maxScheduledMediaTime so a runaway clock cannot
+   * outrun what has been scheduled. That is right while more audio is on its
+   * way and wrong once there is none: an audio track SHORTER than the picture
+   * leaves the clock parked at the last sample for good, and everything that
+   * follows it — the master clock and the renderer's own presentation timing
+   * both read this — stops with it. Measured on a 4K AV1 MKV whose Opus track
+   * ends at 193.4s against a picture running to 243.8s: playback stopped dead
+   * at 3:13 with fifty seconds of video left.
+   *
+   * Once the player says the stream has ended AND the head has reached it,
+   * report no clock at all. Both readers already treat a negative time as
+   * "time this yourself", which is exactly right: there is no sound left to
+   * sync to, and the picture should play out on its own.
+   */
+  private _streamEnded: boolean = false;
+
+  /**
+   * A media-time origin that takes effect at a CONTEXT time still in the
+   * future — how a gapless loop turns the corner.
+   *
+   * The audio clock is `firstBufferMediaTime + elapsed-since-the-anchor`, so
+   * moving the origin back to zero for the next pass cannot be done when that
+   * pass is SCHEDULED: its samples are queued a cushion ahead of the ones
+   * being heard, and re-anchoring then would drop the clock to zero while the
+   * end of the previous pass is still coming out of the speakers.
+   *
+   * So the new origin is armed with the context time its first sample begins
+   * at, and getAudioClock()/getCurrentTime() adopt it once the output has
+   * actually reached that point. Before the seam they read the old pass, after
+   * it the new one, and the samples themselves were never interrupted.
+   */
+  private _pendingAnchor: { atContextTime: number; mediaOrigin: number } | null =
+    null;
+
+  /**
+   * A loop pass the player has started reading, whose first buffer has not
+   * arrived yet.
+   *
+   * The seam used to be armed at `scheduledTime` the moment the pass began.
+   * That is only where the old pass ends when nothing of it is still waiting —
+   * and buffers DO wait: they sit in `_pending` as data until they come within
+   * the lookahead, so on a file with a soundtrack a second of the old pass was
+   * still to be scheduled behind that point, and the clock wrapped to zero a
+   * second before the sound did.
+   *
+   * So the seam is found in the audio itself. The first buffer whose timestamp
+   * jumps back is where the new pass begins; it is marked on the way in, and
+   * the anchor is armed with the context time it is actually started at.
+   */
+  private _loopArm: { lastAudioTime: number; found: boolean } | null = null;
+  /**
+   * The furthest media time scheduled for the NEXT pass while the old one is
+   * still being heard. Kept apart because the clock clamps to
+   * maxScheduledMediaTime, and letting the new pass's small numbers in early
+   * would pin the old pass's clock at them.
+   */
+  private _nextPassMaxMediaTime = 0;
+
+  /** Called by the player when the demuxer has no more audio to give. */
+  endOfStream(): void {
+    this._streamEnded = true;
+  }
+
+  /** Has the sound already been let go for this run? */
+  isStreamEnded(): boolean {
+    return this._streamEnded;
+  }
+
+  /** Fresh audio is coming (a seek, a new source): the sound is not over. */
+  clearEndOfStream(): void {
+    this._streamEnded = false;
+  }
 
   // Buffer health monitoring
   private lastDecodeTime: number = 0;
@@ -127,8 +297,8 @@ export class AudioRenderer {
   private signalsmith: SignalsmithStretcher | null = null;
   private signalsmithLoading: boolean = false;
   private signalsmithSampleRate: number = 0;
-
-  // Stable audio: master toggle (off by default, opt-in via element attribute)
+  /** Pending background build of the stretcher — see warmStretcherSoon(). */
+  private stretcherWarmTimer: number | null = null;
   // Sample rate of the most recently decoded audio buffer. The stretcher is
   // fixed-rate per instance and MUST be built at this rate — not the
   // AudioContext's, which can differ (e.g. 48kHz media in a 44.1kHz context).
@@ -137,6 +307,7 @@ export class AudioRenderer {
   // rebuilding on the first chunk (the ~1-2s opening-silence gap).
   private _decodedSampleRate: number = 0;
 
+  // Stable audio: master toggle (off by default, opt-in via element attribute)
   private _stableAudio: boolean = false;
   /** The state the GRAPH is actually wired for, so a repeated request for the
    *  state we are already in doesn't tear the chain apart to rebuild it
@@ -150,16 +321,14 @@ export class AudioRenderer {
 
   // Stable audio: gain ramp duration for smooth transitions (prevents clicks/pops)
   private static readonly GAIN_RAMP_TIME = 0.015; // 15ms ramp
+  /** …and how slowly a level nobody asked for is walked back, which wants to
+   *  be gentle rather than quick: it is a correction to a mistake, not a
+   *  response to the viewer, and it must not read as a jump. */
+  private static readonly GAIN_RESTORE_TIME = 0.25;
   private static readonly FADE_OUT_TIME = 0.03; // 30ms fade-out before seek/reset
   private static readonly PCM_COALESCE_MIN_DURATION = 0.02; // 20ms
   private static readonly PCM_COALESCE_MAX_DELAY_MS = 25;
   private static readonly PCM_COALESCE_GAP_TOLERANCE_US = 20000;
-  private static readonly UNDERRUN_DUCK_OUT_SECONDS = 0.01;
-  private static readonly UNDERRUN_DUCK_IN_SECONDS = 0.04;
-  // Hold the silence until this long without a fresh underrun. Must stay well
-  // clear of the gap cadence during a bad stretch, or we'd fade in and out
-  // between holes and turn a dropout into tremolo.
-  private static readonly UNDERRUN_CLEAR_MS = 300;
 
   // Stable audio: AudioContext state monitoring & auto-recovery
   private contextStateHandler: (() => void) | null = null;
@@ -269,9 +438,33 @@ export class AudioRenderer {
   async init(): Promise<boolean> {
     try {
       // Reuse the session-wide context so a resumed (unmuted) state survives
-      // source/video switches — see sharedAudioContext above. Only mint a new
-      // one on first use or if a prior one somehow ended up closed.
-      if (!sharedAudioContext || sharedAudioContext.state === "closed") {
+      // source/video switches — see sharedAudioContext above. Mint a new one on
+      // first use, if a prior one somehow ended up closed, or if the one we
+      // inherited runs at the wrong rate for this source.
+      //
+      // That last case is what the sharing costs. The context is opened at the
+      // FIRST source's rate and then kept for the life of the page, so the
+      // second source at a different rate has every one of its buffers
+      // resampled per node — the "pit pit" described below, the very thing
+      // opening at the source rate was meant to cure. Reproduced directly: play
+      // a 44.1kHz source, then a 48kHz one, and all ten of the second source's
+      // scheduled nodes come back bufSr=48000 against ctxSr=44100. Playing the
+      // 48kHz source alone gives zero mismatches, which is why this only ever
+      // shows up partway through a session and clears on a reload.
+      //
+      // Re-minting is only free once the session has been activated by a
+      // gesture: from then on a fresh context can be resumed without one, which
+      // is the entire reason the sharing exists (see sharedContextActivated).
+      // Before that first gesture the mismatch stays — a resampled seam is a
+      // smaller price than sound that will not start at all.
+      const inheritedRateWrong =
+        !!sharedAudioContext &&
+        sharedAudioContext.state !== "closed" &&
+        this._sourceSampleRate > 0 &&
+        sharedAudioContext.sampleRate !== this._sourceSampleRate;
+      const remintForRate = inheritedRateWrong && sharedContextActivated;
+      const retiringContext = remintForRate ? sharedAudioContext : null;
+      if (!sharedAudioContext || sharedAudioContext.state === "closed" || remintForRate) {
         // Open at the SOURCE's sample rate when we know it. Every decoded
         // packet becomes its own AudioBufferSourceNode, and a buffer whose rate
         // differs from the context's is resampled PER NODE — each one resampled
@@ -301,16 +494,27 @@ export class AudioRenderer {
         }
       }
       this.audioContext = sharedAudioContext;
-      // A shared context minted for an earlier source keeps its rate. Worth
-      // knowing when a "pit pit" report comes back: this line says the
-      // per-buffer resampling is still in play for this source.
+      if (retiringContext && retiringContext !== sharedAudioContext) {
+        Logger.info(
+          TAG,
+          `Retired the ${retiringContext.sampleRate}Hz context for a ${this.audioContext.sampleRate}Hz one to match this ${this._sourceSampleRate}Hz source`,
+        );
+        // Only after the replacement is in hand, so there is never a moment
+        // without a context. Best-effort: a context another player still holds
+        // will simply refuse, and the worst that costs is one idle device
+        // stream.
+        retiringContext.close().catch(() => {});
+      }
+      // A shared context we could NOT re-mint (audio not unlocked yet) keeps
+      // its rate, and this says so at a level someone chasing a "pit pit"
+      // report will actually see: the per-buffer resampling is still in play.
       if (
         this._sourceSampleRate > 0 &&
         this.audioContext.sampleRate !== this._sourceSampleRate
       ) {
-        Logger.debug(
+        Logger.warn(
           TAG,
-          `Context runs at ${this.audioContext.sampleRate}Hz, source is ${this._sourceSampleRate}Hz — buffers will be resampled per node`,
+          `Context runs at ${this.audioContext.sampleRate}Hz, source is ${this._sourceSampleRate}Hz — buffers will be resampled per node (clicking at buffer seams). Kept because audio has not been unlocked by a gesture yet.`,
         );
       }
       // Inheriting an already-running shared context (a prior player kept it
@@ -365,6 +569,11 @@ export class AudioRenderer {
 
       // Apply muted state if set before initialization
       this.gainNode.gain.value = this._muted ? 0 : this.perceptualGain(this.volume);
+      // A tap built before this point would have been wired to the old graph.
+      if (this._analyser) {
+        this._analyser = null;
+        this._analyserBins = null;
+      }
 
       // Re-apply the chosen output device to the freshly-created context.
       // Non-blocking: a stale/removed deviceId just falls back to default.
@@ -462,6 +671,24 @@ export class AudioRenderer {
    */
   /** Decoded source sample rate, from configure(). 0 until the decoder reports. */
   private _sourceSampleRate = 0;
+  /**
+   * Until when a ramp we asked for owns the master gain (performance.now()).
+   *
+   * The drift check must not police a gain that is deliberately on its way
+   * somewhere: a seek fades to zero and back, and a check landing inside that
+   * window sees "far from target", cancels the fade and hauls the level up
+   * mid-flight — which is the pumping a seek started doing the moment the
+   * check was added.
+   */
+  private _gainHoldUntil = 0;
+  /** Consecutive health ticks that have seen the gain wrong. Restoring takes
+   *  two, so nothing transient is ever touched. */
+  private _gainDriftStrikes = 0;
+
+  /** Channels in the last buffer actually scheduled. A track that starts
+   *  arriving as mono, or downmixed, is one of the ways "it went quiet" is
+   *  true — see the health line. */
+  private _lastChannels = 0;
 
   configure(sampleRate: number, channels: number): void {
     // Remembered for init(): opening the context at the SOURCE's rate is what
@@ -556,6 +783,7 @@ export class AudioRenderer {
     try {
       const numberOfFrames = audioData.numberOfFrames;
       const numberOfChannels = audioData.numberOfChannels;
+    this._lastChannels = numberOfChannels;
       const sampleRate = audioData.sampleRate;
       const audioTime = audioData.timestamp / 1_000_000; // Convert to seconds
 
@@ -595,10 +823,6 @@ export class AudioRenderer {
       this.discardPendingPCM();
       return;
     }
-    // isDroppingAudio() (not a bare _muted+suspended check): an intentional
-    // suspend — a prime/buffering hold — must NOT be treated as a drop, only
-    // the autoplay-blocked case where nothing will resume the context on its
-    // own. See isDroppingAudio()'s doc comment.
     if (this.isDroppingAudio()) {
       this.discardPendingPCM();
       this.droppedWhileSuspended = true;
@@ -606,6 +830,7 @@ export class AudioRenderer {
     }
 
     try {
+      this._lastChannels = frame.numberOfChannels;
       const frameDuration = frame.numberOfFrames / frame.sampleRate;
       if (frameDuration < AudioRenderer.PCM_COALESCE_MIN_DURATION) {
         this.appendPendingPCM(frame);
@@ -773,6 +998,7 @@ export class AudioRenderer {
     this.scheduleAudioBuffer(audioBuffer, frameTimestamp / 1_000_000);
   }
 
+
   /**
    * Schedule a populated AudioBuffer through the stretcher + A/V sync
    * pipeline. Shared by render() and renderPCM().
@@ -797,7 +1023,21 @@ export class AudioRenderer {
    * decode headroom the deep buffer was for is still there.
    */
   private scheduleAudioBuffer(audioBuffer: AudioBuffer, audioTime: number): void {
-    this._pending.push({ buffer: audioBuffer, audioTime });
+    // The first buffer of the next loop pass: its timestamp goes BACK. Anything
+    // short of a clear step back is the old pass (or ordinary PTS jitter).
+    let loopStart = false;
+    const arm = this._loopArm;
+    if (arm && !arm.found) {
+      // Stays armed (found) until that buffer is STARTED — it can wait a
+      // second in _pending, and the seam must read as pending all that time.
+      if (arm.lastAudioTime >= 0 && audioTime < arm.lastAudioTime - 0.25) {
+        loopStart = true;
+        arm.found = true;
+      } else {
+        arm.lastAudioTime = Math.max(arm.lastAudioTime, audioTime);
+      }
+    }
+    this._pending.push({ buffer: audioBuffer, audioTime, loopStart });
     this._pendingDuration += audioBuffer.duration;
     this.pumpSchedule();
   }
@@ -823,7 +1063,7 @@ export class AudioRenderer {
         0,
         this._pendingDuration - next.buffer.duration,
       );
-      this.commitAudioBuffer(next.buffer, next.audioTime);
+      this.commitAudioBuffer(next.buffer, next.audioTime, next.loopStart);
     }
     if (this._pending.length > 0) {
       if (this._pumpTimer === null) {
@@ -838,7 +1078,11 @@ export class AudioRenderer {
     }
   }
 
-  private commitAudioBuffer(audioBuffer: AudioBuffer, audioTime: number): void {
+  private commitAudioBuffer(
+    audioBuffer: AudioBuffer,
+    audioTime: number,
+    loopStart = false,
+  ): void {
     if (!this.audioContext || !this.gainNode) return;
 
     // Track when we receive decoded audio
@@ -854,6 +1098,9 @@ export class AudioRenderer {
     const numberOfChannels = audioBuffer.numberOfChannels;
     const sampleRate = audioBuffer.sampleRate;
     this._decodedSampleRate = sampleRate;
+    // Now that the decoded rate is known, get the stretcher built while nobody
+    // is waiting on it.
+    this.warmStretcherSoon(sampleRate);
 
     // Clear rebuffering flag as soon as audio data arrives (decoder is producing).
     // Don't wait for successful scheduling — the stretcher may swallow a few
@@ -918,17 +1165,41 @@ export class AudioRenderer {
       outputLatency?: number;
       baseLatency?: number;
     };
+    // …and that reasoning is about a device that has never been fed. The
+    // starvation it describes is the first buffer of a SESSION, where nothing
+    // has primed the output at all.
+    //
+    // A seek restarts a run on a device that has been playing for minutes: the
+    // flush cleared our scheduling, not the device's own pipeline, and the
+    // decoder already has packets queued so the buffers behind this one land
+    // within a frame or two. Paying the full lead there costs the viewer real
+    // time — the picture is held for exactly this figure plus the output
+    // latency (see expectedStartLead), which on Bluetooth is why the frames
+    // pause for the better part of a second after every seek.
+    //
+    // So the full cushion for a cold start, a small one once warm.
+    const latency = ctx.outputLatency ?? ctx.baseLatency ?? 0;
+    const warmOutput = outputEverFed;
     const deviceLead = this.hasFirstBuffer
       ? 0
-      : Math.min(0.5, ctx.outputLatency ?? ctx.baseLatency ?? 0);
+      : Math.min(warmOutput ? 0.12 : 0.5, latency);
     const minTime = now + 0.005 + deviceLead;
 
     // Detect buffer underrun
     if (this.scheduledTime < now) {
+      // Record it: a run of these means the decode pipeline is behind realtime
+      // and playback is audibly broken. The player watches this to show its
+      // buffering state instead of pretending to play while we quietly patch
+      // holes with silence. (Only counts once we're actually playing out —
+      // before the first buffer there's nothing to under-run.)
       if (this.hasFirstBuffer) {
-        this.lastUnderrunAt = performance.now();
+        this._lastUnderrunAt = performance.now();
+        // Silence the output for this stretch. The gap fill below stops the
+        // pops at the seams, but what plays between the holes is still chopped
+        // — better not heard at all.
         this.duckForUnderrun();
       }
+
       // Stable audio: fill the gap with a short silence buffer to prevent pops
       if (this._stableAudio && this.hasFirstBuffer && this.audioContext) {
         const gapDuration = now - this.scheduledTime;
@@ -958,10 +1229,14 @@ export class AudioRenderer {
         // Pivot global clock if we underrun (resync)
         this.firstBufferScheduledAt = minTime;
         this.firstBufferMediaTime = audioTime;
+        // The sound ran out and begins again here, so this one IS a run start.
+        this.soundRunStartedAt = minTime;
       }
     }
 
-    this.releaseUnderrunDuckIfClean();
+    // Packets are flowing again if this buffer arrived without a hole; fade
+    // back in once that's held for DUCK_CLEAR_MS. No-op unless ducked.
+    this.unduckIfClean();
 
     // Where this buffer should start.
     //
@@ -1020,9 +1295,23 @@ export class AudioRenderer {
     }
     source.start(when);
 
+    // The next loop pass starts sounding at `when` — that is the seam, exact
+    // at any rate, and the clock takes the new origin once output reaches it.
+    if (loopStart && this.hasFirstBuffer) {
+      this._loopArm = null;
+      this._pendingAnchor = { atContextTime: when, mediaOrigin: audioTime };
+      this._nextPassMaxMediaTime = 0;
+      Logger.debug(
+        TAG,
+        `Loop seam at context ${when.toFixed(3)}s → media ${audioTime.toFixed(3)}s`,
+      );
+    }
+
     if (!this.hasFirstBuffer) {
       this.firstBufferScheduledAt = when;
       this.firstBufferMediaTime = audioTime;
+      // A genuine start: nothing is coming out of the speakers yet.
+      this.soundRunStartedAt = when;
       this.hasFirstBuffer = true;
       Logger.debug(
         TAG,
@@ -1034,6 +1323,16 @@ export class AudioRenderer {
     this.scheduledTime = when + (usedStretcher
       ? processedBuffer.duration
       : audioBuffer.duration / this._playbackRate);
+    // The buffer this was made from, kept so a rate change can hand back the
+    // part nobody has heard yet — see setPlaybackRate. The ORIGINAL, not the
+    // stretched one: the stretched copy is at the rate being left behind, and
+    // re-stretching it would apply the tempo shift twice.
+    this.sourceOrigin.set(source, {
+      buffer: audioBuffer,
+      audioTime,
+      when,
+      endsAt: this.scheduledTime,
+    });
 
     // Once a second, what the output actually has in hand.
     //
@@ -1045,6 +1344,12 @@ export class AudioRenderer {
     // thinks its own latency is. A cushion collapsing towards zero, a source
     // count that climbs across a track change, or an output latency that moves
     // are three different bugs, and this tells them apart.
+    //
+    // …and what the output is being multiplied BY, which none of the four
+    // said. "It went quiet after a seek" is a report these lines could not
+    // answer: the master gain, the underrun duck and the channel count are
+    // three separate ways for the same complaint to be true, and a log with
+    // none of them in it leaves guessing as the only move.
     if (
       this.audioContext &&
       now - this._lastHealthLogAt > 1
@@ -1054,11 +1359,18 @@ export class AudioRenderer {
         outputLatency?: number;
         baseLatency?: number;
       };
+      this.policeMasterGain();
+
       Logger.debug(
         TAG,
         `Output: cushion=${((this.scheduledTime - now) * 1000).toFixed(0)}ms ` +
           `queued=${(this._pendingDuration * 1000).toFixed(0)}ms ` +
           `sources=${this.activeSources.length} state=${ctx.state} ` +
+          `gain=${this.gainNode ? this.gainNode.gain.value.toFixed(3) : "-"}` +
+          `/${this.perceptualGain(this.volume).toFixed(3)} ` +
+          (this._ducked ? "DUCKED " : "") +
+          (this._muted ? "MUTED " : "") +
+          `ch=${this._lastChannels} ` +
           (this._stableAudio && this.compressorNode
             ? `gr=${this.compressorNode.reduction.toFixed(1)}dB `
             : "") +
@@ -1068,9 +1380,14 @@ export class AudioRenderer {
     }
     this.currentMediaTime = audioTime;
     this.scheduledCount++;
+    outputEverFed = true;
 
     const endMediaTime = audioTime + audioBuffer.duration;
-    if (endMediaTime > this.maxScheduledMediaTime) {
+    if (this._pendingAnchor) {
+      if (endMediaTime > this._nextPassMaxMediaTime) {
+        this._nextPassMaxMediaTime = endMediaTime;
+      }
+    } else if (endMediaTime > this.maxScheduledMediaTime) {
       this.maxScheduledMediaTime = endMediaTime;
     }
 
@@ -1185,12 +1502,36 @@ export class AudioRenderer {
       (!this._muted || contextSuspendIntent)
     ) {
       try {
-        await this.audioContext.resume();
+        const resuming = this.audioContext.resume();
         // Remember that this session's shared context is unlocked, so future
         // auto-advanced / switched videos can wake it without a fresh gesture.
-        if ((this.audioContext.state as string) === "running") {
-          sharedContextActivated = true;
-        }
+        // Hung off the promise itself rather than read after the race below:
+        // a resume that lands late still counts.
+        void resuming
+          .then(() => {
+            if ((this.audioContext?.state as string) === "running") {
+              sharedContextActivated = true;
+            }
+          })
+          .catch(() => {});
+        // Bounded, because a resume the browser will not grant does not always
+        // REJECT. Safari leaves it pending until a gesture arrives, and every
+        // caller awaiting it stops there — which took the whole player down
+        // with it: the buffering→resume path awaited this and so never reached
+        // clock.start() or the "playing" state. Read off a session's log, the
+        // video sat on its poster with no error, no autoplay fallback and no
+        // "Tap to unmute" pill, and the viewer had to press play by hand.
+        //
+        // Past the grace, playback starts without sound. That is the same
+        // bargain the muted-autoplay fallback makes, and the element raises
+        // the pill for it once the picture is moving.
+        const grace = audioStartRefused()
+          ? REFUSED_RESUME_GRACE_MS
+          : RESUME_GRACE_MS;
+        await Promise.race([
+          resuming,
+          new Promise<void>((r) => setTimeout(r, grace)),
+        ]);
       } catch (err) {
         Logger.warn(
           TAG,
@@ -1217,10 +1558,8 @@ export class AudioRenderer {
     // Reset last decode time to prevent false unhealthy buffer detection after long pause
     this.lastDecodeTime = performance.now();
 
-    // isPlaying is already set synchronously at the top of play() so no decoded
-    // frames are dropped during the async resume window. (The fork's companion
-    // `intentionalSuspend` flag is gone — isDroppingAudio() answers the same
-    // question, and answers it for the browser's own suspends too.)
+    // isPlaying / intentionalSuspend already set synchronously at the top of
+    // play() so no decoded frames are dropped during the async resume window.
 
     // NOTE: We do NOT reset scheduledTime or sync anchors here.
     // If we are resuming from pause (suspend), the buffer is preserved
@@ -1238,6 +1577,36 @@ export class AudioRenderer {
    * The movi WASM module is shared with FFmpeg, so this is fast once the
    * player has loaded — just an instance allocation.
    */
+  /**
+   * Build the pitch-preserving stretcher in the background, before anyone asks
+   * for a speed change.
+   *
+   * It used to be built when the speed actually changed, and the speed changing
+   * is the worst moment to start: the build is an async WASM load, and until it
+   * lands every chunk is deliberately scheduled as silence rather than as
+   * pitch-shifted audio (see commitAudioBuffer). That choice is right — a
+   * chipmunk blip is worse than a gap — but it means the whole load time is
+   * heard as a hole, which is the second of silence on the first speed change.
+   * Nothing about that load needs the speed change to have happened.
+   *
+   * So it is built once playback is settled, at the DECODED sample rate, which
+   * is only known after some audio has come through (the stretcher is
+   * fixed-rate per instance, and building at the context rate instead means
+   * destroying it and rebuilding at the real rate on the first chunk — the same
+   * silence, just moved). One instance per session, off the startup path.
+   */
+  private warmStretcherSoon(sampleRate: number): void {
+    if (!this.preservePitch) return;
+    if (this.signalsmith || this.signalsmithLoading) return;
+    if (this.stretcherWarmTimer !== null) return;
+    this.stretcherWarmTimer = setTimeout(() => {
+      this.stretcherWarmTimer = null;
+      // Late enough that starting a video does not compete with it, early
+      // enough that nobody has reached the speed menu yet.
+      this.maybeInitSignalsmith(this._decodedSampleRate || sampleRate);
+    }, AudioRenderer.STRETCHER_WARM_DELAY_MS) as unknown as number;
+  }
+
   private maybeInitSignalsmith(sampleRate: number): void {
     if (this.signalsmith || this.signalsmithLoading) return;
     this.signalsmithLoading = true;
@@ -1454,7 +1823,7 @@ export class AudioRenderer {
   setVolume(volume: number): void {
     // 0–2: values above 1 boost up to 200% (VLC-style).
     this.volume = Math.max(0, Math.min(2, volume));
-    if (this.gainNode && !this._muted) {
+    if (this.gainNode && !this._muted && !this._fadingOut) {
       const g = this.perceptualGain(this.volume);
       if (this._stableAudio) {
         this.rampGain(g);
@@ -1511,16 +1880,34 @@ export class AudioRenderer {
       );
     }
 
-    // Re-anchor the audio→media clock at the CURRENT play position, then drop
-    // the stale old-rate audio that's still scheduled ahead of `now` so the
-    // rate change is heard immediately instead of after a multi-second tail.
+    // Re-anchor the audio→media clock at the CURRENT play position, then take
+    // back the stale old-rate audio scheduled ahead of `now` so the rate change
+    // is heard immediately instead of after a multi-second tail.
     //
-    // The scheduled read-ahead (each chunk queued at `scheduledTime`, which
-    // runs up to ~maxAudioBuffered seconds past `now`) is all old-rate audio.
-    // If we leave it playing (the old "do nothing" path) the audible rate
-    // change lags video by that whole span. So we stop the active sources and
-    // pull scheduledTime back to `now` — the next decoded chunk then plays at
-    // `now` at the new rate.
+    // TAKE BACK, not throw away — that distinction is the whole second of
+    // silence this used to cost.
+    //
+    // Everything scheduled ahead is old-rate and cannot stay. It used to be
+    // stopped and forgotten, with scheduledTime pulled to `now` on the reasoning
+    // that the next decoded chunk would then play immediately. It does not: that
+    // chunk's media time is a full SCHEDULE_LOOKAHEAD past the playhead, because
+    // that is precisely the span just discarded, and the scheduler honours the
+    // media timeline — it puts the chunk where its PTS says it belongs and fills
+    // the space in front with silence. One second of scheduled audio dropped is
+    // therefore one second of hole, and the picture, which follows the audio
+    // clock, stops with it. That is the interruption on every speed change.
+    //
+    // Nothing about that audio was wrong except its rate, and the buffers it was
+    // built from are still to hand (see sourceOrigin). So the sources that have
+    // not begun are stopped and their ORIGINAL buffers pushed back onto the
+    // pending queue, in order, to be stretched again at the new rate and
+    // rescheduled behind whatever is playing right now. No media is skipped, so
+    // there is no hole to fill; the seam is a buffer boundary that was never
+    // heard.
+    //
+    // The one source already playing is left alone. It finishes at the old rate
+    // — a chunk, tens of milliseconds — and is the bridge across the change
+    // rather than a click to be faded over.
     //
     // Crucially we do NOT clear firstBufferMediaTime / hasFirstBuffer the way
     // reset() does. Keeping the anchor (mapped through the OLD rate up to now)
@@ -1528,9 +1915,23 @@ export class AudioRenderer {
     // playhead — so the audio clock does NOT leap to the demuxer's read-ahead
     // mediaTime, and the video does not hard-snap forward. That leap was the
     // "jumps 1–3s ahead on rate change" regression.
+    //
+    // None of this may be skipped while the context is SUSPENDED, which is
+    // what pause() leaves behind — and requiring "running" here skipped all of
+    // it, so a rate change made from a paused player re-anchored nothing.
+    // getAudioClock() maps the whole span since the anchor through the
+    // CURRENT rate, so on resume the entire pre-change history was re-scaled:
+    // anchored at media 108.716, played 6.82s at 1x to a pause at 115.532,
+    // then 1x → 0.25x gave 108.716 + 6.82 * 0.25 = 110.42 — the clock reported
+    // 110.427 and the picture, which may not go back over frames it has
+    // already shown, froze for the 5.1s hole. At 0.25x that is 20 seconds of
+    // still image. A suspended context is the ideal place to do this work:
+    // currentTime is frozen at the instant of the pause, so `now` IS the
+    // paused position and the same arithmetic that is right while running is
+    // right here. Only a closed context has nothing to re-anchor.
     if (
       this.audioContext &&
-      this.audioContext.state === "running" &&
+      this.audioContext.state !== "closed" &&
       this.hasFirstBuffer
     ) {
       const now = this.audioContext.currentTime;
@@ -1540,52 +1941,59 @@ export class AudioRenderer {
       this.firstBufferScheduledAt = now;
       this.firstBufferMediaTime = currentMediaTime;
 
-      // Stop the stale old-rate sources scheduled ahead of now. Fade the gain
-      // briefly first (stable audio) to avoid a click at the cut.
-      if (this._stableAudio && this.gainNode && this.activeSources.length > 0) {
-        try {
-          this.gainNode.gain.cancelScheduledValues(now);
-          this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
-          this.gainNode.gain.linearRampToValueAtTime(
-            0,
-            now + AudioRenderer.FADE_OUT_TIME,
-          );
-        } catch {
-          /* ignore ramp errors */
+      // A hair of slack on "has it begun": a source due within a few
+      // milliseconds is already the audio thread's, and stopping it is a cut in
+      // sound that is on its way out of the speaker.
+      const started = now + 0.005;
+      const reclaimed: { buffer: AudioBuffer; audioTime: number }[] = [];
+      // The context time the retained audio runs out at, which is where the
+      // new-rate audio has to begin. `now` when nothing is playing.
+      let seam = now;
+      // Over a copy: stop() fires onended, which splices activeSources.
+      for (const source of [...this.activeSources]) {
+        const origin = this.sourceOrigin.get(source);
+        // Playing right now: leave it, and start the new rate where it ends.
+        if (origin && origin.when <= started) {
+          seam = Math.max(seam, origin.endsAt);
+          continue;
         }
-      }
-      for (const source of this.activeSources) {
+        // Everything else goes. With an origin it comes back below; without one
+        // it can only be dropped — but it still has to be stopped, or old-rate
+        // audio would play over what is scheduled in its place.
         try {
           source.stop();
           source.disconnect();
         } catch {
           /* ignore */
         }
-      }
-      this.activeSources = [];
-      // Next chunk schedules from now (its expectedTime, via the preserved
-      // anchor, lands just after now — the small forward gap is the buffered
-      // span we just discarded, not a clock leap). Stretcher ring already
-      // cleared above.
-      this.scheduledTime = now;
-
-      // Restore gain after the fade-out for the new-rate sources.
-      if (this._stableAudio && this.gainNode) {
-        try {
-          const restoreTime = now + AudioRenderer.FADE_OUT_TIME + 0.005;
-          this.gainNode.gain.linearRampToValueAtTime(
-            this._muted ? 0 : this.perceptualGain(this.volume),
-            restoreTime,
-          );
-        } catch {
-          this.gainNode.gain.value = this._muted
-            ? 0
-            : this.perceptualGain(this.volume);
+        const idx = this.activeSources.indexOf(source);
+        if (idx !== -1) this.activeSources.splice(idx, 1);
+        if (origin) {
+          reclaimed.push({ buffer: origin.buffer, audioTime: origin.audioTime });
         }
       }
+
+      // Back at the FRONT of the queue and in schedule order: this is the media
+      // immediately after what is playing, and everything already waiting comes
+      // after it.
+      if (reclaimed.length > 0) {
+        this._pending.unshift(...reclaimed);
+        for (const r of reclaimed) this._pendingDuration += r.buffer.duration;
+      }
+
+      // Where the new rate starts: the end of the audio still in flight, so the
+      // two meet without a gap and without playing over each other. Stretcher
+      // ring already cleared above.
+      this.scheduledTime = seam;
     }
 
     this._playbackRate = newRate;
+    // Refill now, at the new rate. The queue drains on arriving audio or on its
+    // own timer, and neither is due: the player parks its audio loop once the
+    // buffer is deep, and the timer only runs while something was left waiting.
+    // Without this the reclaimed audio would sit there until the retained chunk
+    // had run out — which is the hole again, just a smaller one.
+    this.pumpSchedule();
   }
 
   /**
@@ -1644,7 +2052,7 @@ export class AudioRenderer {
       await this.init();
     }
 
-    if (this.gainNode) {
+    if (this.gainNode && !this._fadingOut) {
       const g = this.perceptualGain(this.volume);
       if (this._stableAudio) {
         this.rampGain(g);
@@ -1689,6 +2097,13 @@ export class AudioRenderer {
   reset(): void {
     this.discardPendingPCM();
 
+    // A seek or a new source means fresh audio is on its way, so the sound is
+    // no longer over — see _streamEnded.
+    this._streamEnded = false;
+    // Whatever loop seam was armed belonged to the run being thrown away.
+    this._pendingAnchor = null;
+    this._loopArm = null;
+    this._nextPassMaxMediaTime = 0;
     // Silence first, always — not only under stable audio.
     //
     // Stopping a source ends it mid-waveform, which is a click, and it does
@@ -1702,16 +2117,19 @@ export class AudioRenderer {
     // not yet rendered, which is most of that stretch. Over a few
     // milliseconds rather than instantly, because a hard cut to zero is its
     // own click.
-    if (this.audioContext && this.gainNode && this.activeSources.length > 0) {
+    if (this.audioContext && this.inputNode && this.activeSources.length > 0) {
       try {
         const now = this.audioContext.currentTime;
         // Stable audio was already doing this and getting the quiet handover
         // for free; everyone else got the tail and the click. The fade is
         // longer there because that path is also covering compressor release.
         const fade = this._stableAudio ? AudioRenderer.FADE_OUT_TIME : 0.008;
-        this.gainNode.gain.cancelScheduledValues(now);
-        this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
-        this.gainNode.gain.linearRampToValueAtTime(0, now + fade);
+        // The fade down and the restore at the end of reset() are one
+        // movement; keep the drift check off the input for the whole of it.
+        this._gainHoldUntil = performance.now() + 1000;
+        this.inputNode.gain.cancelScheduledValues(now);
+        this.inputNode.gain.setValueAtTime(this.inputNode.gain.value, now);
+        this.inputNode.gain.linearRampToValueAtTime(0, now + fade);
       } catch {
         // Ignore ramp errors
       }
@@ -1721,6 +2139,7 @@ export class AudioRenderer {
     // a seek would play the old position's audio a moment later.
     this._pending = [];
     this._pendingDuration = 0;
+    this.stopDuckPolling();
     if (this._pumpTimer !== null) {
       clearInterval(this._pumpTimer);
       this._pumpTimer = null;
@@ -1752,21 +2171,20 @@ export class AudioRenderer {
     this.activeSources = [];
     this.scheduledTime = this.audioContext?.currentTime ?? 0;
 
+    // Drop the underrun duck. A seek/flush retires the stretch that caused it,
+    // and unduckIfClean() only runs from the scheduling path — so leaving this
+    // set would keep a freshly-seeked, perfectly healthy player silent.
+    // The flag only. Putting the gain back to 1 HERE used to be the whole of
+    // it, and that now lands between the fade-out above and the restore below
+    // — cancelling the fade a seek needs. The restore at the end of this
+    // function is the one place the input comes back, ducked or not.
     this._ducked = false;
-    this.lastUnderrunAt = 0;
-    if (this.inputNode && this.audioContext) {
-      try {
-        const now = this.audioContext.currentTime;
-        this.inputNode.gain.cancelScheduledValues(now);
-        this.inputNode.gain.setValueAtTime(1, now);
-      } catch {
-        // The context may be closing during teardown.
-      }
-    }
+    this._lastUnderrunAt = 0;
 
     // Reset clock tracking
     this.hasFirstBuffer = false;
     this.firstBufferScheduledAt = 0;
+    this.soundRunStartedAt = 0;
     this.firstBufferMediaTime = 0;
     this.scheduledCount = 0;
     this.maxScheduledMediaTime = 0;
@@ -1778,20 +2196,35 @@ export class AudioRenderer {
     // Clear stretcher state
     if (this.signalsmith) this.signalsmith.clear();
 
-    // Bring the gain back, on the same terms the fade went out on. Guarding
+    // Bring the input back, on the same terms the fade went out on. Guarding
     // this on stable audio while the fade above is unconditional would leave
     // every other setup silent from the first seek onwards.
-    if (this.gainNode && this.audioContext) {
+    if (this.inputNode && this.audioContext) {
       try {
+        const param = this.inputNode.gain;
+        const now = this.audioContext.currentTime;
         const fade = this._stableAudio ? AudioRenderer.FADE_OUT_TIME : 0.008;
-        const restoreTime = this.audioContext.currentTime + fade + 0.005;
-        this.gainNode.gain.linearRampToValueAtTime(
-          this._muted ? 0 : this.perceptualGain(this.volume),
-          restoreTime
-        );
+        this._gainHoldUntil = performance.now() + 1000;
+        // Anchored, and on a cleared timeline — not a bare ramp trusting
+        // whatever came before it.
+        //
+        // A bare one is what shipped, and it left the input parked below 1
+        // twice in one session (0.5292 and 0.0026, caught by the net). The
+        // race: this ramp is scheduled, then an underrun during the same seek
+        // fires duck(), which does cancelScheduledValues and takes the input
+        // to zero — the restore is gone. The next seek then clears the duck
+        // FLAG without putting the gain back and stops the duck's release
+        // timer, so nothing is left that would ever raise it again.
+        //
+        // Cancelling first, anchoring at wherever the value actually is, and
+        // ramping from there makes this the last word on the param whatever
+        // happened before it, which is what a reset should be.
+        param.cancelScheduledValues(now);
+        param.setValueAtTime(param.value, now);
+        param.linearRampToValueAtTime(1, now + fade + 0.005);
       } catch {
         // Fallback: set directly
-        this.gainNode.gain.value = this._muted ? 0 : this.perceptualGain(this.volume);
+        this.inputNode.gain.value = 1;
       }
     }
   }
@@ -1807,6 +2240,7 @@ export class AudioRenderer {
       this.audioContext.state === "running" &&
       this.hasFirstBuffer
     ) {
+      this.adoptPendingAnchor();
       const elapsed =
         this.audioContext.currentTime - this.firstBufferScheduledAt;
       let computedTime =
@@ -1828,12 +2262,193 @@ export class AudioRenderer {
   }
 
   /**
+   * How long from now until the audio we have scheduled is actually HEARD —
+   * i.e. how long getAudioClock() will keep returning firstBufferMediaTime
+   * unchanged before it starts advancing. Zero once sound is playing out, and
+   * on every device whose latency is small enough not to matter.
+   *
+   * Two separate delays stack up at the start of every playback run, and both
+   * are deliberate:
+   *
+   *  - the first buffer is placed one output-latency ahead (`deviceLead`, see
+   *    render()) so the scheduler has a window to queue the buffers behind it
+   *    instead of handing a deep device a single buffer and starving it;
+   *  - and what is scheduled at context time T is heard at T + outputLatency,
+   *    which getAudioClock() subtracts so video syncs to what is HEARD.
+   *
+   * On a wired or built-in output that is ~5-25ms twice over and nobody can
+   * tell. On Bluetooth it is ~305ms twice over: for the first ~600ms after a
+   * seek there is no sound yet, and the audio clock is flat by construction.
+   *
+   * The video side has to know that, because its own clock is wall-clock based
+   * and would otherwise start advancing immediately from an anchor taken off
+   * that flat value — running ~600ms ahead of the sound, until the drift
+   * correction notices and yanks the presentation anchor backwards, which is
+   * seen as the picture freezing a moment after every seek. Bluetooth only,
+   * because on anything else the number is too small to cross the threshold.
+   */
+  /**
+   * What secondsUntilAudible() will report once the next run's first buffer is
+   * scheduled — the deviceLead render() is about to apply, plus the latency it
+   * will then take to be heard.
+   *
+   * Callers that have to decide whether to hold playback need the figure BEFORE
+   * any buffer exists: right after a seek the flush has cleared hasFirstBuffer,
+   * so secondsUntilAudible() honestly reports zero and would talk them out of a
+   * wait that is coming regardless.
+   */
+  expectedStartLead(): number {
+    if (!this.audioContext) return 0;
+    const ctx = this.audioContext as AudioContext & {
+      outputLatency?: number;
+      baseLatency?: number;
+    };
+    const latency = ctx.outputLatency || ctx.baseLatency || 0;
+    // Mirrors render()'s deviceLead, warm case included — this figure is what
+    // the video side holds for, so a prediction bigger than the real delay is
+    // a picture parked for nothing.
+    const warmOutput = outputEverFed;
+    return Math.min(warmOutput ? 0.12 : 0.5, latency) + latency;
+  }
+
+  /**
+   * How long until sound is actually coming out — measured once there is a
+   * buffer to measure, predicted before there is.
+   *
+   * The two halves answer the same question at different moments and must not
+   * be mixed up: after a seek's flush there is no scheduled buffer, so the
+   * measurement honestly reports zero, and a caller that acts on it starts the
+   * picture with no lead at all. Past the first buffer the prediction is
+   * stale — the live figure counts down to zero as the sound approaches, and
+   * must be allowed to reach it, or the drift correction it gates never runs.
+   */
+  startLead(): number {
+    if (!this.audioContext) return 0;
+    return this.hasFirstBuffer
+      ? this.secondsUntilAudible()
+      : this.expectedStartLead();
+  }
+
+  secondsUntilAudible(): number {
+    if (!this.audioContext || !this.hasFirstBuffer) return 0;
+    if (this.audioContext.state !== "running") return 0;
+    const ctx = this.audioContext as AudioContext & {
+      outputLatency?: number;
+      baseLatency?: number;
+    };
+    const latency = ctx.outputLatency || ctx.baseLatency || 0;
+    return Math.max(
+      0,
+      this.soundRunStartedAt + latency - ctx.currentTime,
+    );
+  }
+
+  /**
+   * Can a speed change be carried on the audio this renderer already holds?
+   *
+   * setPlaybackRate() does not throw the scheduled audio away any more — it
+   * stops the sources that have not begun and pushes their ORIGINAL buffers
+   * back onto the pending queue to be re-stretched at the new tempo and
+   * rescheduled behind whatever is playing. Nothing is skipped and no hole is
+   * opened, so the media from the playhead forward is still in hand and the
+   * source does not have to be re-read to get it back.
+   *
+   * This reports whether that reclaim is actually available: the branch's own
+   * preconditions (a running context past its first buffer) plus a material
+   * amount of audio to reclaim. Read it BEFORE setPlaybackRate() — afterwards
+   * the sources have already been taken back into the queue.
+   */
+  canCarryRateChange(minSeconds = 0.3): boolean {
+    if (!this.audioContext || this.audioContext.state !== "running") {
+      return false;
+    }
+    if (!this.isPlaying || !this.hasFirstBuffer) return false;
+    return this.getBufferedDuration() >= minSeconds;
+  }
+
+  /**
    * Get the audio clock - THE MASTER TIME SOURCE FOR A/V SYNC
    * Returns accurate time based on when audio actually started playing
    * Returns -1 if audio hasn't started yet
    * Clamps to maxScheduledMediaTime when audio has ended
    */
+
+  /**
+   * Take up an armed origin once the output has actually reached it. Called
+   * from both clock readers rather than on a timer: the only moment that
+   * matters is the one being asked about.
+   */
+  private adoptPendingAnchor(): void {
+    const p = this._pendingAnchor;
+    if (!p || !this.audioContext) return;
+    if (this.audioContext.currentTime < p.atContextTime) return;
+    this.firstBufferScheduledAt = p.atContextTime;
+    this.firstBufferMediaTime = p.mediaOrigin;
+    this._pendingAnchor = null;
+    // The clamp's horizon now belongs to the pass being heard.
+    this.maxScheduledMediaTime = this._nextPassMaxMediaTime;
+    this._nextPassMaxMediaTime = 0;
+    Logger.debug(
+      TAG,
+      `Loop seam reached — media clock now counts from ${p.mediaOrigin.toFixed(3)}s`,
+    );
+  }
+
+  /**
+   * The next pass of a looping file starts here.
+   *
+   * Everything about the sound carries on untouched — the scheduler keeps
+   * placing buffers at `scheduledTime`, so the first sample of the new pass
+   * abuts the last sample of the old one and there is no seam to hear. What
+   * changes is only the BOOKKEEPING: the media time those samples are labelled
+   * with wraps back to the start of the file, and the clock has to wrap with
+   * them, but not until they are heard.
+   *
+   * Call BEFORE the new pass is read. Its first buffer is recognised by its
+   * timestamp stepping back (see _loopArm) and the seam is armed when that
+   * buffer is started.
+   */
+  beginLoopPass(): void {
+    const last = this._pending[this._pending.length - 1];
+    this._loopArm = {
+      found: false,
+      lastAudioTime: last ? last.audioTime : this.hasFirstBuffer ? this.currentMediaTime : -1,
+    };
+    this._pendingAnchor = null;
+    this._nextPassMaxMediaTime = 0;
+    // Fresh audio is on its way, so the sound is not over — the same reason
+    // reset() clears this, without any of reset()'s teardown.
+    this._streamEnded = false;
+    Logger.debug(TAG, "Loop pass armed — waiting for its first buffer");
+  }
+
+  /**
+   * True from beginLoopPass until the output has reached the new pass. The
+   * player turns the picture over when this goes false, so both halves of the
+   * loop share one boundary.
+   */
+  isLoopSeamPending(): boolean {
+    this.adoptPendingAnchor();
+    return this._loopArm !== null || this._pendingAnchor !== null;
+  }
+
+  /** Drop an armed loop seam that is not going to happen after all. */
+  cancelLoopPass(): void {
+    if (this._pendingAnchor || this._loopArm) {
+      this._pendingAnchor = null;
+      this._loopArm = null;
+      for (const p of this._pending) p.loopStart = false;
+      if (this._nextPassMaxMediaTime > this.maxScheduledMediaTime) {
+        this.maxScheduledMediaTime = this._nextPassMaxMediaTime;
+      }
+      this._nextPassMaxMediaTime = 0;
+      Logger.debug(TAG, "Loop pass cancelled");
+    }
+  }
+
+  /** Where the media clock is anchored; -1 until the first buffer is placed. */
   getAnchorMediaTime(): number {
+    this.adoptPendingAnchor();
     return this.hasFirstBuffer ? this.firstBufferMediaTime : -1;
   }
 
@@ -1843,6 +2458,7 @@ export class AudioRenderer {
       this.audioContext.state === "running" &&
       this.hasFirstBuffer
     ) {
+      this.adoptPendingAnchor();
       const elapsed =
         this.audioContext.currentTime - this.firstBufferScheduledAt;
       let computedTime =
@@ -1865,6 +2481,15 @@ export class AudioRenderer {
 
       // Clamp to the maximum scheduled media time to prevent clock runaway
       if (this.maxScheduledMediaTime > 0) {
+        // …unless there is no more sound coming and the head has reached the
+        // end of it. Then the clamp is not holding back a runaway, it is
+        // holding back the picture — see _streamEnded.
+        if (
+          this._streamEnded &&
+          computedTime >= this.maxScheduledMediaTime - 0.01
+        ) {
+          return -1;
+        }
         return Math.min(computedTime, this.maxScheduledMediaTime);
       }
       return computedTime;
@@ -1901,6 +2526,11 @@ export class AudioRenderer {
    */
   wasEverActivated(): boolean {
     return sharedContextActivated;
+  }
+
+  /** See audioStartRefused(). */
+  isStartRefused(): boolean {
+    return audioStartRefused();
   }
 
   /**
@@ -1994,14 +2624,28 @@ export class AudioRenderer {
     );
   }
 
-  /** True while decoded audio has recently arrived too late for its slot. */
+  /**
+   * True if we patched a hole with silence within `withinMs`. A run of these
+   * means the decode pipeline has fallen behind realtime — the audio the user
+   * hears is already broken, so the player surfaces its buffering state rather
+   * than claiming to play. High packet-rate codecs (TrueHD/MLP/DTS) are what
+   * hit this: they read far more often than AAC, so anything that adds latency
+   * per read shows up here first — the same file decodes clean from a local
+   * file and stutters over HTTP.
+   */
   isUnderrunning(withinMs: number = 500): boolean {
     return (
-      this.lastUnderrunAt > 0 &&
-      performance.now() - this.lastUnderrunAt < withinMs
+      this._lastUnderrunAt > 0 &&
+      performance.now() - this._lastUnderrunAt < withinMs
     );
   }
 
+  /**
+   * Fade the input out to cover a run of underruns.
+   * Rides on inputNode, never gainNode: gainNode carries the user's volume and
+   * boost, and stomping it here would fight setVolume() and leave the ducked
+   * level behind as the user's own setting.
+   */
   /**
    * Suppress ducking for the next `ms` and release any current duck. Called by
    * the player around a background→foreground recovery, whose decoder flush +
@@ -2014,6 +2658,7 @@ export class AudioRenderer {
 
   /** Immediately restore the input gain and clear the duck (no fade). */
   private forceUnduck(): void {
+    this.stopDuckPolling();
     if (!this._ducked || !this.inputNode || !this.audioContext) return;
     this._ducked = false;
     try {
@@ -2073,7 +2718,12 @@ export class AudioRenderer {
 
   /** Decoded audio waiting for its turn to become a node — see
    *  scheduleAudioBuffer. Plain data; costs nothing until committed. */
-  private _pending: Array<{ buffer: AudioBuffer; audioTime: number }> = [];
+  private _pending: Array<{
+    buffer: AudioBuffer;
+    audioTime: number;
+    /** First buffer of the next loop pass — see _loopArm. */
+    loopStart?: boolean;
+  }> = [];
   private _pendingDuration = 0;
   private _pumpTimer: number | null = null;
   /** How far ahead of the output a buffer may be turned into a node. Wide
@@ -2082,37 +2732,70 @@ export class AudioRenderer {
   private static readonly SCHEDULE_LOOKAHEAD = 1.0;
   /** How often the queue drains itself while no audio is arriving. */
   private static readonly PUMP_INTERVAL_MS = 50;
-
   /**
-   * Fade the input out to cover a run of underruns.
-   * Rides on inputNode, never gainNode: gainNode carries the user's volume and
-   * boost, and stomping it here would fight setVolume() and leave the ducked
-   * level behind as the user's own setting.
+   * How long after audio starts flowing the stretcher is built.
+   *
+   * Long enough to stay off the opening of a video, where the decode, the fetch
+   * and the first frames are already competing; far shorter than it takes
+   * anyone to open the speed menu.
    */
+  private static readonly STRETCHER_WARM_DELAY_MS = 1500;
+
   private duckForUnderrun(): void {
-    if (
-      this._ducked ||
-      !this.inputNode ||
-      !this.audioContext ||
-      performance.now() < this._suppressDuckUntil
-    ) {
+    // Suppressed right after a foreground recovery: the recovery's own
+    // decoder flush/seek causes a one-off underrun that must not mute audio.
+    if (performance.now() < this._suppressDuckUntil) {
+      this.forceUnduck();
       return;
     }
+    // Never duck in the background. The duck exists to mute glitchy audio while
+    // a spinner shows — but there's no spinner when hidden, and the decode loop
+    // is throttled there so underruns are constant. Muting on them would
+    // silence background audio playback entirely (music stops the moment the
+    // tab hides). If we were already ducked when the tab hid, release it so the
+    // audio isn't left muted.
+    if (typeof document !== "undefined" && document.hidden) {
+      this.forceUnduck();
+      return;
+    }
+    if (this._ducked || !this.inputNode || !this.audioContext) return;
     this._ducked = true;
+    // Its own way back up.
+    //
+    // The release used to ride on the next committed buffer, and a buffer is
+    // committed only when one ARRIVES — so on a link that stalls, the duck
+    // engaged on the underrun at the resume and then sat there for the whole
+    // play stretch, because the cushion it resumed with was already scheduled
+    // and nothing new needed committing before the next stall. Measured on a
+    // 1.4GB file over a throttled link: state "playing", the clock running
+    // 79.86s to 82.19s, and the input gain flat at 0 the entire time. Video
+    // playing to no sound, which is the report.
+    //
+    // The duck is about the audio being broken, so its end is a question of
+    // time, not of traffic: check on a timer and lift as soon as no underrun
+    // has landed for DUCK_CLEAR_MS.
+    if (this._duckReleaseTimer === null) {
+      this._duckReleaseTimer = setInterval(
+        () => this.unduckIfClean(),
+        AudioRenderer.DUCK_POLL_MS,
+      ) as unknown as number;
+    }
     try {
+      const param = this.inputNode.gain;
       const now = this.audioContext.currentTime;
-      const gain = this.inputNode.gain;
-      gain.cancelScheduledValues(now);
-      gain.setValueAtTime(gain.value, now);
-      gain.linearRampToValueAtTime(
-        0,
-        now + AudioRenderer.UNDERRUN_DUCK_OUT_SECONDS,
-      );
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(0, now + AudioRenderer.DUCK_FADE_OUT);
+      Logger.debug(TAG, `Duck: engaged (underrun)`);
     } catch {
-      // Ignore a context shutdown race.
+      // Ignore ramp errors
     }
   }
 
+  /**
+   * Fade back in, but only once no underrun has landed for DUCK_CLEAR_MS.
+   * Called on every scheduled buffer, so recovery needs no external signal.
+   */
   /**
    * Hold the output silent WITHOUT touching the mute flag.
    *
@@ -2122,8 +2805,8 @@ export class AudioRenderer {
    * viewer heard a second of the wrong moment, then a seek, then the right one.
    * Resuming stays on the tap; this keeps it inaudible until the re-read lands.
    *
-   * Same gain node the underrun duck uses, and the same _ducked flag — see
-   * releaseUnderrunDuckIfClean, which won't lift it while this is held.
+   * Same gain node the underrun duck uses, its own flag, and the duck can't
+   * lift it — see unduckIfClean.
    */
   silenceForResync(): void {
     if (this._resyncSilenced || !this.inputNode || !this.audioContext) return;
@@ -2137,6 +2820,13 @@ export class AudioRenderer {
       Logger.debug(TAG, "Silenced for resync");
     } catch {
       /* ignore ramp errors */
+    }
+  }
+
+  private stopDuckPolling(): void {
+    if (this._duckReleaseTimer !== null) {
+      clearInterval(this._duckReleaseTimer);
+      this._duckReleaseTimer = null;
     }
   }
 
@@ -2159,35 +2849,23 @@ export class AudioRenderer {
     }
   }
 
-  /**
-   * Fade back in, but only once no underrun has landed for UNDERRUN_CLEAR_MS.
-   * Called on every scheduled buffer, so recovery needs no external signal.
-   * The resync hold outranks this: letting the gain ramp back to 1 while a
-   * resync silence is active would make the pre-seek audio audible, which is
-   * the whole thing silenceForResync exists to avoid.
-   */
-  private releaseUnderrunDuckIfClean(): void {
-    if (
-      !this._ducked ||
-      this._resyncSilenced ||
-      !this.inputNode ||
-      !this.audioContext ||
-      this.isUnderrunning(AudioRenderer.UNDERRUN_CLEAR_MS)
-    ) {
-      return;
-    }
+  private unduckIfClean(): void {
+    // The resync hold outranks the duck: letting this ramp back to 1 would
+    // make the pre-seek audio audible, which is the whole thing being avoided.
+    if (this._resyncSilenced) return;
+    if (!this._ducked || !this.inputNode || !this.audioContext) return;
+    if (this.isUnderrunning(AudioRenderer.DUCK_CLEAR_MS)) return;
     this._ducked = false;
+    this.stopDuckPolling();
     try {
+      const param = this.inputNode.gain;
       const now = this.audioContext.currentTime;
-      const gain = this.inputNode.gain;
-      gain.cancelScheduledValues(now);
-      gain.setValueAtTime(gain.value, now);
-      gain.linearRampToValueAtTime(
-        1,
-        now + AudioRenderer.UNDERRUN_DUCK_IN_SECONDS,
-      );
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(1, now + AudioRenderer.DUCK_FADE_IN);
+      Logger.debug(TAG, `Duck: released (clean)`);
     } catch {
-      // Ignore a context shutdown race.
+      // Ignore ramp errors
     }
   }
 
@@ -2236,6 +2914,59 @@ export class AudioRenderer {
     } catch {
       Logger.warn(TAG, "Failed to (re)wire audio chain");
     }
+  }
+
+  /**
+   * The sound as levels, for drawing.
+   *
+   * `bars` bands from the spectrum, each 0..1, weighted so the low end does
+   * not swamp everything (music has most of its energy there and a plain
+   * average leaves every bar but the first two flat). Returns null when there
+   * is nothing to read — no context, no sound running — and the caller can
+   * draw its resting state.
+   */
+  getLevels(bars: number): Float32Array | null {
+    const ctx = this.audioContext;
+    if (!ctx || ctx.state !== "running" || !this.gainNode || bars <= 0) {
+      return null;
+    }
+    if (!this._analyser) {
+      try {
+        this._analyser = ctx.createAnalyser();
+        this._analyser.fftSize = 512;
+        this._analyser.smoothingTimeConstant = 0.72;
+        // In parallel with the output, not in series: an analyser passes audio
+        // through, but hanging it off the gain node keeps the path to the
+        // speakers exactly as it was.
+        this.gainNode.connect(this._analyser);
+        this._analyserBins = new Uint8Array(
+          new ArrayBuffer(this._analyser.frequencyBinCount),
+        );
+      } catch {
+        this._analyser = null;
+        return null;
+      }
+    }
+    const analyser = this._analyser;
+    const bins = this._analyserBins;
+    if (!analyser || !bins) return null;
+    analyser.getByteFrequencyData(bins);
+    const out = new Float32Array(bars);
+    // Logarithmic bands: the ear hears pitch that way, and it spreads a song
+    // across the whole row instead of the first handful of bars.
+    const top = Math.floor(bins.length * 0.72); // above this is mostly hiss
+    for (let i = 0; i < bars; i++) {
+      const from = Math.floor(Math.pow(i / bars, 1.7) * top);
+      const to = Math.max(from + 1, Math.floor(Math.pow((i + 1) / bars, 1.7) * top));
+      let sum = 0;
+      for (let b = from; b < to && b < bins.length; b++) sum += bins[b];
+      const avg = sum / Math.max(1, to - from) / 255;
+      // Lift the top end, which is quieter in almost every recording — gently.
+      // At 1.6 most of the row pinned at 1.0 on anything loud, and a meter
+      // where every band reads full is a straight line, not a meter.
+      out[i] = Math.min(1, avg * (1 + (i / bars) * 0.8));
+    }
+    return out;
   }
 
   /**
@@ -2295,12 +3026,131 @@ export class AudioRenderer {
     return (Math.exp(k * v) - 1) / (Math.exp(k) - 1);
   }
 
+  /**
+   * Put the master gain back if it has been wrong for long enough that
+   * nothing legitimate can explain it.
+   *
+   * While playing, unmuted and unducked, the gain IS perceptualGain(volume).
+   * It was found parked at 0.001 against a target of 0.436 and still there
+   * twelve seconds later — the "it went quiet after a seek" report — with no
+   * way back for the viewer except reloading. The cause of that is still
+   * open; this does not need it.
+   *
+   * What it does need is to never fight. Every deliberate move of this param
+   * — a seek's fade down and back, a volume change, a mute — is short, and
+   * while one is in flight the level is MEANT to be somewhere other than the
+   * target. Correcting it there is the fault this net was supposed to prevent,
+   * turned upside down: the first version of it hauled the gain up mid-fade
+   * and made a seek pump audibly. So it stands down for the length of any ramp
+   * we asked for, forgets what it saw while standing down, waits for three
+   * consecutive seconds of a wrong level, and then moves slowly enough that
+   * being wrong about it is inaudible.
+   */
+  private policeMasterGain(): void {
+    if (
+      !this.gainNode ||
+      !this.audioContext ||
+      !this.isPlaying ||
+      this._muted ||
+      this._ducked ||
+      this.audioContext.state !== "running"
+    ) {
+      return;
+    }
+    // A ramp of ours owns the gain — and a strike counted before it started
+    // describes a level that no longer exists, so that goes too.
+    if (performance.now() < this._gainHoldUntil) {
+      this._gainDriftStrikes = 0;
+      return;
+    }
+    // Two params can silence the output and only one of them is the viewer's.
+    // The volume node is written by setVolume and setMuted and nothing else
+    // now; the input node carries the transients — the duck, and the fade a
+    // seek makes. Either being wrong for long enough is the same fault.
+    const want = this.perceptualGain(this.volume);
+    const have = this.gainNode.gain.value;
+    const inputWrong =
+      !!this.inputNode && Math.abs(this.inputNode.gain.value - 1) > 0.05;
+    if (
+      Math.abs(have - want) <= Math.max(0.01, want * 0.05) &&
+      !inputWrong
+    ) {
+      this._gainDriftStrikes = 0;
+      return;
+    }
+    // This net is for a level that is STUCK, and stuck levels stay stuck.
+    if (++this._gainDriftStrikes < 3) return;
+    this._gainDriftStrikes = 0;
+    Logger.warn(
+      TAG,
+      `Audio stuck quiet — volume ${have.toFixed(4)} of ${want.toFixed(4)}` +
+        (inputWrong ? `, input ${this.inputNode!.gain.value.toFixed(4)} of 1` : "") +
+        " — restoring",
+    );
+    try {
+      const now = this.audioContext.currentTime;
+      this._gainHoldUntil =
+        performance.now() + AudioRenderer.GAIN_RESTORE_TIME * 1000 + 100;
+      if (inputWrong && this.inputNode) {
+        this.inputNode.gain.cancelScheduledValues(now);
+        this.inputNode.gain.setValueAtTime(this.inputNode.gain.value, now);
+        this.inputNode.gain.linearRampToValueAtTime(
+          1,
+          now + AudioRenderer.GAIN_RESTORE_TIME,
+        );
+      }
+      this.gainNode.gain.cancelScheduledValues(now);
+      this.gainNode.gain.setValueAtTime(have, now);
+      this.gainNode.gain.linearRampToValueAtTime(
+        want,
+        now + AudioRenderer.GAIN_RESTORE_TIME,
+      );
+    } catch {
+      this.gainNode.gain.value = want;
+      if (this.inputNode) this.inputNode.gain.value = 1;
+    }
+  }
+
+  /**
+   * Take the sound down a slope and leave it there.
+   *
+   * For a player that is going away — the desktop window closing, a page
+   * unloading — where the alternative is the sound stopping dead on whatever
+   * sample it was on. That cliff is what makes closing an app feel like
+   * pulling a plug out; a fifth of a second of slope is all it takes to feel
+   * like a door closing instead.
+   *
+   * Nothing raises it again on the way down: the drift net restores a gain
+   * that is wrong, and this one is wrong on purpose. There is no fade back —
+   * whatever asked for this is not expecting to play again.
+   */
+  fadeOut(durationMs: number = 200): void {
+    if (!this.gainNode || !this.audioContext) return;
+    this._fadingOut = true;
+    const seconds = Math.max(0.02, durationMs / 1000);
+    this._gainHoldUntil = performance.now() + durationMs + 2000;
+    try {
+      const now = this.audioContext.currentTime;
+      this.gainNode.gain.cancelScheduledValues(now);
+      this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
+      this.gainNode.gain.linearRampToValueAtTime(0, now + seconds);
+    } catch {
+      this.gainNode.gain.value = 0;
+    }
+    Logger.debug(TAG, `Fading out over ${durationMs}ms`);
+  }
+
+  /** Set once fadeOut has run: the level is on its way to zero and stays there. */
+  private _fadingOut: boolean = false;
+
   private rampGain(targetValue: number): void {
-    if (!this.gainNode || !this.audioContext) {
+    if (!this.gainNode || !this.audioContext || this._fadingOut) {
       return;
     }
     try {
       const now = this.audioContext.currentTime;
+      this._gainHoldUntil =
+        performance.now() + AudioRenderer.GAIN_RAMP_TIME * 1000 + 50;
       this.gainNode.gain.cancelScheduledValues(now);
       this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
       this.gainNode.gain.linearRampToValueAtTime(
@@ -2522,6 +3372,10 @@ export class AudioRenderer {
     this.inputNode = null;
     this.gainNode = null;
     this.compressorNode = null;
+    if (this.stretcherWarmTimer !== null) {
+      clearTimeout(this.stretcherWarmTimer);
+      this.stretcherWarmTimer = null;
+    }
     if (this.signalsmith) {
       this.signalsmith.destroy();
       this.signalsmith = null;

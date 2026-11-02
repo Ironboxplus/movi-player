@@ -1,36 +1,50 @@
 {
   "name": "movi-player",
-  "version": "0.4.0-openlist.1",
+  "version": "0.4.1-openlist.1",
   "description": "Play MKV, HEVC, AV1, HDR videos in the browser. WebCodecs + FFmpeg WASM player with encrypted playback, chapters, subtitles, multi-audio tracks. No server transcoding needed.",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
+  "jsdelivr": "dist/element.global.js",
+  "unpkg": "dist/element.global.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.cjs",
-      "types": "./dist/index.d.ts"
+      "require": "./dist/index.cjs"
     },
     "./demuxer": {
+      "types": "./dist/demuxer.d.ts",
       "import": "./dist/demuxer.js",
-      "require": "./dist/demuxer.cjs",
-      "types": "./dist/demuxer.d.ts"
+      "require": "./dist/demuxer.cjs"
     },
     "./player": {
+      "types": "./dist/player.d.ts",
       "import": "./dist/player.js",
-      "require": "./dist/player.cjs",
-      "types": "./dist/player.d.ts"
+      "require": "./dist/player.cjs"
     },
     "./element": {
+      "types": "./dist/element.d.ts",
       "import": "./dist/element.js",
-      "require": "./dist/element.cjs",
-      "types": "./dist/element.d.ts"
+      "require": "./dist/element.cjs"
     },
     "./element/slim": {
+      "types": "./dist/element.d.ts",
       "import": "./dist/element.slim.js",
-      "require": "./dist/element.slim.cjs",
-      "types": "./dist/element.d.ts"
+      "require": "./dist/element.slim.cjs"
+    },
+    "./element/global": {
+      "types": "./dist/element.d.ts",
+      "import": "./dist/element.global.js",
+      "require": "./dist/element.global.js",
+      "default": "./dist/element.global.js"
+    },
+    "./element/slim/global": {
+      "types": "./dist/element.d.ts",
+      "import": "./dist/element.slim.global.js",
+      "require": "./dist/element.slim.global.js",
+      "default": "./dist/element.slim.global.js"
     },
     "./movi.wasm": "./dist/movi.wasm",
     "./react": {
@@ -106,11 +120,12 @@
   "scripts": {
     "build": "npm run build:wasm && npm run build:ts",
     "build:ts": "node scripts/check-wasm.js && tsc && node scripts/build-standalone.js && node scripts/build-wrappers.mjs && node scripts/build-custom-data.mjs",
+    "build:ts:fast": "node scripts/check-wasm.js && tsc --emitDeclarationOnly && MOVI_ENTRY=element,element.slim MOVI_FORMAT=es MOVI_TERSER_PASSES=2 node scripts/build-standalone.js && node scripts/build-wrappers.mjs && node scripts/build-custom-data.mjs",
     "release": "node scripts/release.mjs",
     "sync:element": "node scripts/sync-element.mjs",
     "build:wasm": "mkdir -p dist/wasm && docker compose run --rm build",
     "build:wasm:force": "mkdir -p dist/wasm && docker compose run --rm -e FORCE_FFMPEG=true -e FORCE_DAV1D=true build",
-    "dev": "vite --open /dev/",
+    "dev": "vite --host --open /dev/",
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
@@ -127,10 +142,11 @@
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",
     "docs:deploy": "npm run docs:build && npx gh-pages -d docs/.vitepress/dist",
-    "app:dev": "cd app && npx wrangler dev",
+    "app:dev": "cd app && npx wrangler dev --var LOCAL_DEV:true",
     "app:deploy": "cd app && cp worker.js worker.js.bak && sed -i '' \"s|\\\"__BUILD_VERSION__\\\"|\\\"$(date +%s)\\\"|\" worker.js && npx wrangler deploy; mv worker.js.bak worker.js",
     "app:harden": "node scripts/harden-element.js",
     "app:upload": "npm run app:harden && wrangler r2 object put movi-assets/element.js --file dist/element.js --remote && wrangler r2 object put movi-assets/element.slim.js --file dist/element.slim.js --remote && wrangler r2 object put movi-assets/movi.wasm --file dist/movi.wasm --content-type application/wasm --remote",
+    "app:upload:icons": "node scripts/upload-app-icons.mjs",
     "app:upload:local": "wrangler r2 object put movi-assets/element.js --file dist/element.js --local --persist-to app/.wrangler/state",
     "app:release": "npm run build:ts && npm run app:upload && npm run app:deploy"
   },

@@ -20,9 +20,93 @@ routes = [
 DRIVE_CLIENT_ID = "1051579256106-k6kn9uavacv1g7rjj8805976t25131se.apps.googleusercontent.com"
 DRIVE_APP_ID = "1051579256106"
 
+# Hosts /proxy will refuse to relay, comma-separated. This is the lever the
+# takedown process in the terms of service promises: add a host here and it
+# stops resolving immediately, including for signatures already issued and
+# for redirects that try to reach it. Subdomains are covered — "example.com"
+# also blocks "cdn.example.com".
+#
+# Editable without a redeploy:
+#   wrangler secret put PROXY_BLOCKED_HOSTS   (or edit here and deploy)
+PROXY_BLOCKED_HOSTS = ""
+
+# Turnstile site key — public, safe to commit. The worker substitutes it into
+# the page at request time; the matching secret never lives here and goes in
+# with `wrangler secret put TURNSTILE_SECRET_KEY`.
+#
+# Leaving this empty disables the bot gate everywhere it is used — the comments
+# form, /api/token and /api/proxy-sign all fall open with a console warning.
+# Set BOTH halves or neither: a secret without a site key leaves the server
+# demanding a challenge the page has no way to solve.
+#
+# Local dev test key that always passes: 1x00000000000000000000AA
+TURNSTILE_SITE_KEY = "0x4AAAAAAEU9gOLpQnS9mR0D"
+
+# Watch party rooms. One object per room code — `idFromName(code)` means the
+# code two people agree on IS the address, so there is no room registry to
+# keep and nothing to clean up when they leave. See app/watch-party.js.
+#
+# Hosting is gated on a key in D1 (party_host_keys, seeded from the
+# PARTY_HOST_KEYS secret); joining needs only the code.
+[[durable_objects.bindings]]
+name = "PARTY"
+class_name = "WatchParty"
+
+# SQLite-backed class, which is what a new Durable Object namespace has to be.
+# The object keeps no storage of its own — a room lives only as long as its
+# sockets — but the migration is still how the class is registered.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WatchParty"]
+
 [[r2_buckets]]
 binding = "ASSETS"
 bucket_name = "movi-assets"
+
+# ─── Which sites load a player bundle from this origin (/dist/…) ───────
+# The documented embed points at jsdelivr, so this deliberately does not see
+# most adoption. It answers one question: of the loads that DO come here,
+# whose page were they on. The referring HOST is the whole record — see
+# recordDistHit() in worker.js for what is and is not kept.
+#
+# OPTIONAL for forks: with no binding the worker skips it entirely.
+#
+# Query it (no dashboard page for this dataset — it is the SQL API):
+#   curl "https://api.cloudflare.com/client/v4/accounts/<account_id>/analytics_engine/sql" \
+#     -H "Authorization: Bearer <token>" --data @-
+#
+# Which sites, and how many hits each — the whole point of the dataset:
+#   SELECT blob1 AS site, SUM(_sample_interval) AS hits
+#   FROM movi_dist_hits
+#   WHERE timestamp > NOW() - INTERVAL '30' DAY
+#   GROUP BY blob1
+#   ORDER BY SUM(_sample_interval) DESC
+#
+# …broken down by version and file as well:
+#   SELECT blob1 AS site, blob2 AS version, blob3 AS file,
+#          SUM(_sample_interval) AS hits
+#   FROM movi_dist_hits
+#   WHERE timestamp > NOW() - INTERVAL '30' DAY
+#   GROUP BY blob1, blob2, blob3
+#   ORDER BY SUM(_sample_interval) DESC
+#
+# …and everyone but you, which is usually the question being asked:
+#   … WHERE timestamp > NOW() - INTERVAL '30' DAY AND blob1 != 'moviplayer.com'
+#
+# GROUP BY and ORDER BY name the raw column and repeat the aggregate rather
+# than reusing the SELECT alias: aliases are documented for the SELECT list,
+# and the reference's own grouping example is `GROUP BY index1`, so this is
+# the shape the docs actually show working.
+#
+# `SUM(_sample_interval)`, not COUNT(*): Analytics Engine samples under load
+# and that column is the weight each stored row stands for.
+#
+# No migration and no setup command — Cloudflare creates the table on the first
+# writeDataPoint. `SHOW TABLES` through the same SQL API lists it once it
+# exists. Data is kept for three months.
+[[analytics_engine_datasets]]
+binding = "DIST_HITS"
+dataset = "movi_dist_hits"
 
 # ─── Visitor feedback wall (/api/comments) ─────────────────────────────
 # D1 backs the comment list under the FAQ on the landing page. Comments go
@@ -63,7 +147,7 @@ database_id = "ea838cee-312d-46ea-b2f5-94efb870bcd3"   # replace with the id fro
 # server enforces but client has no site key to solve the challenge):
 #
 #   wrangler secret put TURNSTILE_SECRET_KEY   # from Cloudflare dashboard
-#   # TURNSTILE_SITE_KEY goes in the [vars] block below or the dashboard
+#   # TURNSTILE_SITE_KEY goes in the [vars] block at the top of this file
 #
 # Get keys: https://dash.cloudflare.com → Turnstile → Add site.
 # Test keys for local dev (always pass, no network call):
@@ -91,12 +175,29 @@ database_id = "ea838cee-312d-46ea-b2f5-94efb870bcd3"   # replace with the id fro
 # class_name = "WrapKeyStore"
 #
 # [[migrations]]
-# tag = "v1"
+# tag = "v2"
 # new_classes = ["NonceTracker", "WrapKeyStore"]
+#
+# NOTE: this said tag = "v1" while nothing was applied. The watch party's
+# migration is v1 now and has been applied, so re-using that tag here would be
+# rejected — hence v2. These two are still `new_classes`, which is the
+# KV-backed kind and paid-only; the watch party's class is `new_sqlite_classes`,
+# which is the kind the free plan does allow.
 
 [[rules]]
 type = "Text"
-globs = ["**/*.html", "**/*.xml", "**/*.txt"]
+globs = ["**/*.html", "**/*.xml", "**/*.txt", "**/*.css"]
+# This replaces wrangler's built-in Text rule rather than adding to it, and
+# without saying so wrangler warns that the default is being shadowed. The
+# only glob the default carries that this one does not is **/*.sql, and
+# nothing here imports one — app/schema.sql is applied to D1 by hand, not
+# bundled. So: replace it, deliberately, and say so.
+fallthrough = false
+
+[[rules]]
+type = "Data"
+globs = ["**/*.webp"]
+fallthrough = false
 
 # ─── Rate limits (manual setup in Cloudflare dashboard) ────────────────
 # Workers doesn't expose per-route rate limiting in wrangler.toml — it

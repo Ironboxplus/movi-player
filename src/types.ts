@@ -13,6 +13,14 @@ export interface Track {
   type: "video" | "audio" | "subtitle";
   codec: string;
   codecId?: number;
+  /**
+   * This stream's own duration in seconds, as the container declares it —
+   * NOT the file's. They differ on a file whose streams don't end together:
+   * a 161s recording whose camera stopped at 80s has a video track of 80s
+   * and an audio track of 161s. Falls back to the container duration when the
+   * stream doesn't carry one, and is 0 when neither does.
+   */
+  duration?: number;
   codecString?: string;
   extradata?: Uint8Array;
   profile?: number;
@@ -163,6 +171,22 @@ export interface PlayerConfig {
    */
   forceStreamEngine?: "dashjs" | "hlsjs";
   /**
+   * Treat this URL as an adaptive manifest whatever its path looks like.
+   *
+   * Which of the two a URL is — a manifest or a media file — is normally read
+   * off the URL, and that holds only while a manifest ends in .m3u8 or .mpd.
+   * Plenty do not: a signed endpoint like
+   * "/share/streaming?type=M3U8_FLV_264_480" serves a playlist and says so in
+   * its Content-Type, while nothing in its path says anything at all. Such a
+   * URL is handed to the demuxer, which is given a text playlist where it
+   * expected a container, and the open fails.
+   *
+   * Set by the caller that has since found out — see the retry in MoviElement,
+   * which asks the source what the server called it once an open has already
+   * failed. Not a probe: nothing is fetched to answer this.
+   */
+  forceStream?: "hls" | "dash";
+  /**
    * When force-demuxing a DASH source, use this specific video Representation
    * file instead of the best one — set when the user picks a quality in the
    * demuxer-mode quality menu, so the re-load lands on the chosen rendition.
@@ -206,6 +230,95 @@ export interface Chapter {
    * `chapters` attribute/property.
    */
   image?: string;
+}
+
+/**
+ * A video to ask about without a file: what `canPlaySmoothly()` needs when the
+ * page already knows the shape of what it is going to play (a ladder rung, an
+ * upload's metadata) and has no reason to open it.
+ */
+export interface PlaybackQuery {
+  /** A WebCodecs string ("av01.0.13M.10", "avc1.640028") or a bare family
+   *  ("av1", "hevc", "h264", "vp9"), which is filled in with a representative
+   *  profile. */
+  codec: string;
+  width: number;
+  height: number;
+  /** Frames per second. Defaults to 30. */
+  fps?: number;
+  /** Bits per second, when known — only the browser's own estimate uses it. */
+  bitrate?: number;
+}
+
+export interface PlaybackAssessmentOptions {
+  /** Playback speed to judge at. Decode work scales with it: 2x is twice the
+   *  frames per second of wall time. Defaults to 1. */
+  rate?: number;
+}
+
+/** What `canPlaySmoothly()` concluded, and why. */
+export interface PlaybackAssessment {
+  /** Something here can decode it at all. */
+  playable: boolean;
+  /** Expected to play without dropping frames, at `rate`. */
+  smooth: boolean;
+  /** Decoded on dedicated hardware, which is what keeps a laptop cool and a
+   *  phone's battery alive. False does not mean it stutters. */
+  powerEfficient: boolean;
+  /** The speed this was judged at. */
+  rate: number;
+  video: {
+    /** The codec string the question was asked with. */
+    codec: string;
+    width: number;
+    height: number;
+    fps: number;
+    /**
+     * Which decoder would carry it: "hardware" — the GPU's; "software" — the
+     * browser's own software decoder; "wasm" — this player's built-in FFmpeg,
+     * used when the browser has no decoder for it at all.
+     */
+    decoder: "hardware" | "software" | "wasm";
+    smooth: boolean;
+    powerEfficient: boolean;
+    /**
+     * Software decode work relative to what this class of device can carry
+     * (1 = exactly at the limit). Only decides anything when there is no
+     * hardware path; a hardware decoder is not bound by it.
+     */
+    load: number;
+  } | null;
+  audio: {
+    codec: string;
+    channels: number;
+    sampleRate: number;
+    decoder: "webcodecs" | "wasm";
+  } | null;
+  /** Plain-language reasons for anything short of smooth. Empty when smooth. */
+  reasons: string[];
+}
+
+/** Options for decodeAudio(). */
+export interface DecodeAudioOptions {
+  /** Output sample rate. Defaults to 16000 — what speech models expect. */
+  sampleRate?: number;
+  /** Where to start, in seconds of media time. Defaults to 0. */
+  from?: number;
+  /** Length of each chunk handed back, in seconds. Defaults to 30. */
+  chunkSeconds?: number;
+  /** Stops decoding (and releases the file) when aborted. */
+  signal?: AbortSignal;
+}
+
+/** One stretch of decoded audio from decodeAudio(): mono, resampled. */
+export interface DecodedAudioChunk {
+  /** Media time of the first sample, in seconds. */
+  start: number;
+  /** Media time just past the last sample, in seconds. */
+  end: number;
+  sampleRate: number;
+  /** Mono samples in [-1, 1]. */
+  samples: Float32Array;
 }
 
 export interface MediaInfo {
@@ -385,10 +498,37 @@ export interface PlayerEventMap {
    * moved to, for a UI that wants to say so.
    */
   renditionSwitch: { active: boolean; label?: string };
+  /**
+   * The viewer chose Auto and the rung the link carries could not be switched
+   * to in place — its seamless prime ran out of time, which on a heavy rung
+   * means the in-place hard swap would leave the picture behind the sound.
+   * The element answers by reloading at that rung from the current position,
+   * the way a fresh open reaches it.
+   */
+  autoSnapNeedsReload: { url: string };
   seeking: number;
   seeked: number;
+  /**
+   * A seek finished — INCLUDING the ones the player performs for itself, which
+   * `seeked` deliberately stays quiet about (rendering a poster frame, the
+   * first-play realignment). Internal to the element's own bookkeeping: a host
+   * wants `seeked`, which answers for what it asked for.
+   */
+  seekcomplete: number;
   bufferUpdate: { start: number; end: number }[];
   ended: void;
+  /**
+   * A looping file started over.
+   *
+   * There is no such event on a native media element — a looping one reports
+   * only `seeking` and `seeked`, and a page that wants to COUNT the turns has
+   * to infer them from a seek nobody asked for. This says it outright.
+   *
+   * `count` is how many times this source has come back round, from 1, and
+   * resets when the source does. Fires on both routes: the gapless turn, and
+   * the restart a file with a soundtrack still takes.
+   */
+  loop: { count: number };
   preloadcomplete: void;
   /**
    * Embedded cover art extracted from the source (ID3v2 APIC, FLAC PICTURE,

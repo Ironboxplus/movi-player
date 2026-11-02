@@ -17,6 +17,11 @@ import type {
   SubtitleCue,
   SubtitleRenderer,
   Packet,
+  PlaybackAssessment,
+  PlaybackAssessmentOptions,
+  PlaybackQuery,
+  DecodeAudioOptions,
+  DecodedAudioChunk,
 } from "../types";
 import { EventEmitter } from "../events/EventEmitter";
 import {
@@ -38,11 +43,18 @@ import { Demuxer } from "../demux";
 import { TrackManager } from "./TrackManager";
 import { Clock } from "./Clock";
 import { PlayerStateManager } from "./PlayerState";
+import { loadPersistedLinkBps, lowerLinkBps, raiseLinkBps } from "../utils/LinkRate";
 import { Logger, LogLevel } from "../utils/Logger";
+import {
+  Storyboard,
+  type StoryboardSpec,
+  type StoryboardTile,
+} from "../utils/Storyboard";
 import { probeLinkBandwidth } from "../utils/bandwidthProbe";
 import { MoviVideoDecoder } from "../decode/VideoDecoder";
 import { MoviAudioDecoder } from "../decode/AudioDecoder";
 import type { PCMFrame } from "../decode/SoftwareAudioDecoder";
+import { CodecParser } from "../decode/CodecParser";
 import { SubtitleDecoder } from "../decode/SubtitleDecoder";
 import {
   CanvasRenderer,
@@ -50,7 +62,7 @@ import {
   type RenderSource,
 } from "../render/CanvasRenderer";
 import { AudioRenderer } from "../render/AudioRenderer";
-import { updateAllBindingsLogLevel, ThumbnailBindings } from "../wasm/bindings";
+import { updateAllBindingsLogLevel, ThumbnailBindings, WasmBindings } from "../wasm/bindings";
 import { loadWasmModuleNew, resetWasmModule } from "../wasm/FFmpegLoader";
 import { ShakaPlayerWrapper } from "../render/ShakaPlayerWrapper";
 import { HLSPlayerWrapper } from "../render/HLSPlayerWrapper";
@@ -70,6 +82,22 @@ type StreamWrapper =
 
 const TAG = "MoviPlayer";
 
+/**
+ * Whether a stream engine turned a source down for want of a LICENCE, rather
+ * than for any of the other reasons it turns sources down.
+ *
+ * Both engines say so plainly — Shaka's wrapper produces "This video is
+ * protected and can't be played here", dash.js produces "DRM: No license server
+ * URL specified!" — and the difference matters: a licence refusal is the one
+ * failure where the demuxer tier below already knows it has nothing to gain.
+ */
+function looksLikeDrmFailure(e: unknown): boolean {
+  const msg = String((e as Error)?.message ?? e ?? "");
+  return /protected|licen[cs]e|key[ _-]?system|\bdrm\b|widevine|playready|fairplay/i.test(
+    msg,
+  );
+}
+
 // Module-level device decode-capability cache — survives player/element
 // recreates for the whole page session, so a fresh MoviPlayer (per video, or
 // after a recovery) doesn't re-learn the same limit and re-stutter. Keyed by
@@ -78,11 +106,18 @@ const TAG = "MoviPlayer";
 // renderer tries an FPS cap first, means "can't sustain even at half rate": a
 // device limit, not a transient. Cleared only on a full page reload.
 const deviceDecodeBoundHeights = new Set<string>();
-// …and the same lesson, kept across reloads. A device that cannot sustain 8K
-// today cannot sustain it after F5 either, but the in-memory set above is
-// cleared by the reload, so every fresh visit paid the same stutter to
-// re-learn it. Small and self-correcting: the ceiling only ever rises to what
-// the machine has actually failed at, and clearing site data resets it.
+// …and the same lesson, kept across reloads — of this TAB, and no further.
+// The in-memory set above is cleared by a reload, so a fresh visit paid the
+// same stutter to re-learn a limit it had just found; carrying it in session
+// storage saves that without the verdict outliving the run it was made in.
+//
+// Which matters, because the verdict is made from one machine on one evening:
+// a laptop on battery, a GPU busy behind another tab, a browser mid-update.
+// None of those is a property of the device, and all of them were being
+// written down forever. The ceiling only ever rises — nothing lowers it — so
+// a bad evening barred a rung on that device for good, on every video, with
+// nothing in the interface to say why 4K was never chosen again. A session is
+// the longest any of it can honestly claim to be true for.
 // The thumbnail pipeline's WASM module, kept for the whole page session.
 //
 // It used to be built fresh per video — a second emscripten instance, its own
@@ -190,15 +225,80 @@ function webCodecsUnavailable(): boolean {
  */
 const DECODE_CEILING_KEY = "movi:decode-ceiling:v2";
 
+/**
+ * The store is session storage: the ceiling belongs to this tab's run of the
+ * player and goes when the tab does. See deviceDecodeBoundHeights.
+ */
+function decodeCeilingStore(): Storage | null {
+  try {
+    return typeof sessionStorage !== "undefined" ? sessionStorage : null;
+  } catch {
+    // Blocked storage (a sandboxed frame, a privacy mode): the in-memory set
+    // still holds for the life of the page.
+    return null;
+  }
+}
+
+/**
+ * Resolve `p`, or TIMED_OUT once `ms` have passed.
+ *
+ * The losing promise is NOT cancelled — it cannot be — so every caller must
+ * tear its demuxer down straight after, which is exactly what abandonPrep and
+ * primeRendition's discard path do. Used only where an await has no bound of
+ * its own and the thing being waited on is holding the link.
+ */
+const TIMED_OUT = Symbol("timed-out");
+async function withDeadline<T>(
+  p: Promise<T>,
+  ms: number,
+): Promise<T | typeof TIMED_OUT> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<typeof TIMED_OUT>((r) => {
+    t = setTimeout(() => r(TIMED_OUT), Math.max(0, ms));
+  });
+  try {
+    return await Promise.race([p, timer]);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /** `av01@2160` — what actually failed, not just how tall it was. */
 function decodeBoundKey(codec: string, height: number): string {
   const family = (codec || "").split(".")[0].toLowerCase() || "unknown";
   return `${family}@${height}`;
 }
 
+/**
+ * `av01.0.17m.08@4320` — the exact rung SHAPE, for a bar that gets written
+ * down.
+ *
+ * The family key above collapses everything a codec string carries: profile,
+ * level and BIT DEPTH. That is right for the reactive bar, which comes from
+ * this device visibly failing to play something and is a statement about the
+ * machine right now. It is wrong for a persisted capability verdict, because
+ * "8K AV1" is not one thing — a GPU can decode 8-bit and refuse 10-bit, and
+ * two videos' 8K rungs are routinely different profiles. Keyed by family, one
+ * refusal retired every 8K AV1 rung on that device for good, including the
+ * ones it could have played.
+ *
+ * Empty for a bare family ("av01"), which has no shape to be exact about.
+ */
+function decodeBoundExactKey(codec: string, height: number): string {
+  if (!codec.includes(".")) return "";
+  return `${codec.toLowerCase()}@${height}`;
+}
+
 function loadPersistedDecodeCeiling(): void {
   try {
-    const raw = localStorage.getItem(DECODE_CEILING_KEY);
+    // Whatever earlier versions wrote down for ever: drop it on sight. A
+    // ceiling from another day is the thing this stopped keeping.
+    localStorage.removeItem(DECODE_CEILING_KEY);
+  } catch {
+    /* nothing there to clear, or nowhere to clear it from */
+  }
+  try {
+    const raw = decodeCeilingStore()?.getItem(DECODE_CEILING_KEY);
     if (!raw) return;
     for (const k of JSON.parse(raw) as string[]) {
       if (typeof k === "string" && k.includes("@")) deviceDecodeBoundHeights.add(k);
@@ -219,7 +319,7 @@ const sessionOnlyDecodeBoundHeights = new Set<string>();
 
 function persistDecodeCeiling(): void {
   try {
-    localStorage.setItem(
+    decodeCeilingStore()?.setItem(
       DECODE_CEILING_KEY,
       JSON.stringify(
         [...deviceDecodeBoundHeights].filter(
@@ -278,7 +378,61 @@ function softwareDecodeCost(
  * Two constants, one place to tune.
  */
 const SOFTWARE_DECODE_BUDGET_MOBILE = 100_000_000;
-const SOFTWARE_DECODE_BUDGET_DESKTOP = 400_000_000;
+// Measured, where the mobile figure above was measured and the old desktop
+// one (400M) was only "several times" it: Chrome's software H.264 on an M4
+// decoded 124 fps of 3840x2160 (~1.03G px/s) at 2x and kept exact pace with
+// the clock — but only just: it held for one pass and then stuttered in
+// bursts, holds of up to 384ms. That is the edge, not headroom, so the budget
+// sits below it: ~1G per 10 threads at the edge, 600M per 8 is what carries
+// without stutter (1.5x of that file, not 2x). A machine that falls short is
+// caught by what playback actually did — see the stutter hint.
+const SOFTWARE_DECODE_BUDGET_DESKTOP = 600_000_000;
+
+/**
+ * The budget above, scaled by the cores this machine actually has.
+ *
+ * The browser's software decoders are threaded, so what they carry grows with
+ * the core count — and a flat number judged every desktop as the same one. On
+ * an M4 (10 cores) a 4K60 H.264 4:2:2 file, which has no hardware path, came
+ * out 1.24x over the flat budget and raised "may not play smoothly" over
+ * playback that then presented 60 of 60 frames every second. The constants are
+ * read as an 8-thread machine; the scale is bounded both ways so a misreported
+ * count can't turn the screen off or bar everything.
+ */
+function softwareDecodeBudget(mobile: boolean): number {
+  const base = mobile
+    ? SOFTWARE_DECODE_BUDGET_MOBILE
+    : SOFTWARE_DECODE_BUDGET_DESKTOP;
+  const cores =
+    typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 0 : 0;
+  if (!(cores > 0)) return base;
+  return base * Math.min(2, Math.max(0.5, cores / 8));
+}
+
+/**
+ * The most a HARDWARE decoder is built to carry, in pixels per second: 8K at
+ * 60fps. That is the top of AV1 level 6.1 and HEVC level 6.1, which is where
+ * the decoders in laptops, phones and consumer GPUs stop — a device advertising
+ * "8K AV1" means 8K60, and nothing past it.
+ *
+ * It exists because nothing else here will say no. Asked about 8K at 120fps,
+ * WebCodecs configured a hardware decoder and MediaCapabilities answered
+ * smooth and power-efficient — its "smooth" comes from past playback of that
+ * configuration, and with no history it is optimistic by default. Only a speed
+ * setting reaches this in practice (8K60 at 2x is 8K120), which is exactly the
+ * question canPlaySmoothly is asked with a rate for.
+ */
+const HARDWARE_DECODE_CEILING = 7680 * 4320 * 60;
+/**
+ * How far past realtime a decoder that already carries a stream is assumed to
+ * go. Speed does not scale hardware decoding the way it scales the software
+ * budget: a decoder has headroom above realtime — that is what makes fast
+ * playback possible at all — and above 1x the player stops asking it for every
+ * frame anyway (the adaptive frame cap, and the skip-ahead path). Two is what
+ * an 8K60 file demonstrates: it plays at 2x while the old rule, which simply
+ * multiplied the pixel rate by the speed, called it beyond hardware at 1.5x.
+ */
+const HARDWARE_RATE_HEADROOM = 2;
 
 async function screenLadderForDecode(
   rungs: {
@@ -312,7 +466,7 @@ async function screenLadderForDecode(
       if (h <= 0) continue;
       // Skip only a rung ALREADY judged for this codec — a different codec at
       // the same height is a different question.
-      if (deviceDecodeBoundHeights.has(decodeBoundKey(r.codec || "", h))) continue;
+      if (MoviPlayer.isDecodeBound(r.codec, h)) continue;
       // The rung's real frame. Only fall back to a 16:9 guess when the ladder
       // didn't declare a width — asking decodingInfo about dimensions the
       // content doesn't have gets an answer about a video nobody is playing.
@@ -353,11 +507,7 @@ async function screenLadderForDecode(
       // barring would cost quality for nothing. A hard `unsupported` still
       // counts at any size; that one isn't a judgement call.
       const cost = softwareDecodeCost(w, h, rungFps, codec);
-      const overBudget =
-        cost >
-        (mobile
-          ? SOFTWARE_DECODE_BUDGET_MOBILE
-          : SOFTWARE_DECODE_BUDGET_DESKTOP);
+      const overBudget = cost > softwareDecodeBudget(mobile);
       const key = `${codec}@${w}x${h}@${Math.round(rungFps)}`;
       if (screened.has(key)) continue;
       screened.add(key);
@@ -391,6 +541,34 @@ async function screenLadderForDecode(
                   ? "software-decoded"
                   : "";
 
+        // …and "unsupported" is decodingInfo's word too, so the decoder gets
+        // the last say on it. WebKit's decodingInfo ties AV1 level to frame
+        // rate more tightly than its decoder does: it answers supported:false
+        // for 2560x1440@60 at av01.0.12M.08 and for 1920x1080@60 at
+        // av01.0.08M.08, while VideoDecoder.isConfigSupported answers true for
+        // both with prefer-hardware — and YouTube labels its 1440p60 rung
+        // exactly 12M. That false "unsupported" is a fact that gets written
+        // down, so every 1440p AV1 rung on Safari was barred the moment the
+        // ladder was screened.
+        if (verdict === "unsupported" && typeof VideoDecoder !== "undefined") {
+          try {
+            const any = await VideoDecoder.isConfigSupported({
+              codec,
+              codedWidth: w,
+              codedHeight: h,
+            });
+            if (any?.supported) {
+              Logger.debug(
+                TAG,
+                `decodingInfo calls ${w}x${h}@${Math.round(rungFps)} ${codec} unsupported, VideoDecoder does not — not barring it`,
+              );
+              verdict = "";
+            }
+          } catch {
+            /* the query itself is unsupported here — decodingInfo's answer stands */
+          }
+        }
+
         // Ask the API that actually DECIDES. decodingInfo is an advisory
         // second opinion, and Safari disagrees with itself: it answered
         // "supported" for 3840x2026 AV1 that VideoDecoder.isConfigSupported
@@ -414,7 +592,14 @@ async function screenLadderForDecode(
           }
         }
         if (verdict) {
-          const key = decodeBoundKey(codec, h);
+          // A verdict that gets WRITTEN DOWN is keyed by the exact rung shape,
+          // so it retires that rung and not the whole family at that height —
+          // see decodeBoundExactKey. A session-scoped one keeps the broad key:
+          // it expires with the tab anyway, and while it lasts "this machine is
+          // not comfortable at this size" is the useful reading of it.
+          const isFact = verdict === "unsupported" || verdict === "no hardware path";
+          const key =
+            (isFact && decodeBoundExactKey(codec, h)) || decodeBoundKey(codec, h);
           deviceDecodeBoundHeights.add(key);
           // Facts are written down; judgements are not.
           //
@@ -429,7 +614,6 @@ async function screenLadderForDecode(
           // never be tried again to find out whether the opinion was right.
           // Session-scoped, the next load gets to ask again, and if it really
           // can't hold it the reactive path pulls it down in a few seconds.
-          const isFact = verdict === "unsupported" || verdict === "no hardware path";
           if (isFact) {
             persistDecodeCeiling();
           } else {
@@ -486,7 +670,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private audioAnimationFrameId: number | null = null;
   private audioDemuxInFlight: boolean = false;
   private _splitAudioTrackId: number = -1;
+  /** How long a split-audio track may fail every read before the player says
+   *  so. Long enough to step over a bad patch, short enough that nobody sits
+   *  through a silent film wondering. */
+  private static readonly SPLIT_AUDIO_GIVE_UP_MS = 4000;
+
   private _splitAudioEof: boolean = false;
+  // A split-audio track that has stopped answering. See pumpSplitAudio.
+  private _splitAudioDead: boolean = false;
+  private _splitAudioErrorSince: number = 0;
   // Bounded automatic recovery from a decoder that started rejecting every
   // packet (see recoverBrokenAudio). Counted per source, so a genuinely
   // undecodable stream ends in silence instead of a seek loop.
@@ -549,6 +741,62 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private _subtitleTracks: SubtitleSourceEntry[] = [];
   // DASH-fallback video Representations (best-first) + the one currently playing,
   // for the demuxer-mode quality menu. Populated only in the force-demux path.
+  /**
+   * The demuxer-path source came from a manifest that declares encryption. It
+   * plays for as long as the packager's clear lead lasts, then stops for good;
+   * this is what turns that stop into "needs a licence" rather than a decoder
+   * fault. Set when the fallback plan is taken, cleared on every load.
+   */
+  private _sourceIsEncrypted: boolean = false;
+
+  /**
+   * Halt further reading without tearing the source down — the buffered part is
+   * still good to seek around in, and only what comes next is unusable.
+   */
+  private stopSourceStreaming(): void {
+    try {
+      (this.source as unknown as { haltStreaming?: () => void })?.haltStreaming?.();
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  /** Reported once; either decoder may be the one that hits the wall first. */
+  private _encryptedGaveUp: boolean = false;
+  /** Audio already given up on for this source — say it once, not per packet. */
+  private _encryptedAudioSilenced: boolean = false;
+
+  /**
+   * The clear lead of an encrypted source has run out. Whichever decoder
+   * noticed, the answer is the same and there is no recovery to attempt.
+   *
+   * Stopping matters as much as reporting. Left running, the pipeline keeps
+   * asking for frames it can never get, and the machinery built to rescue a
+   * struggling stream turns on itself: audio empties, video is bound to it, the
+   * stall detector fires, the element nudges a seek, and that repeats for as
+   * long as anyone watches. Pausing ends that; halting the source stops pulling
+   * bytes that cannot be used; the error names the cause.
+   */
+  private encryptedSourceGaveUp(): void {
+    if (this._encryptedGaveUp) return;
+    this._encryptedGaveUp = true;
+    Logger.warn(
+      TAG,
+      "Encrypted source: the clear lead has ended — no licence, so playback stops here",
+    );
+    this.stopSourceStreaming();
+    try {
+      this.pause();
+    } catch {
+      /* already stopped */
+    }
+    this.stateManager.setState("error");
+    this.emit(
+      "error",
+      new Error("This video is protected and needs a licence to play here."),
+    );
+  }
+
   private _dashRenditions: {
     url: string;
     label: string;
@@ -572,7 +820,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   /**
    * Resolutions this device has been shown not to sustain — learned from a
-   * decode-bound stall or from MediaCapabilities, and kept across reloads.
+   * decode-bound stall or from MediaCapabilities, and kept for this tab's
+   * session (see deviceDecodeBoundHeights).
    * Public because the pick happens BEFORE any player exists: the element's
    * pre-play speed test chooses the opening rung off a bandwidth measurement
    * alone, so without this a machine that cannot decode 8K still opened on it
@@ -585,7 +834,557 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   /** Has THIS codec at THIS height been shown not to decode here? */
   static isDecodeBound(codec: string | undefined, height: number): boolean {
     if (!(height > 0)) return false;
+    const exact = decodeBoundExactKey(codec || "", height);
+    if (exact && deviceDecodeBoundHeights.has(exact)) return true;
     return deviceDecodeBoundHeights.has(decodeBoundKey(codec || "", height));
+  }
+
+  /**
+   * Will this play smoothly HERE — on this device, in this browser, at this
+   * speed — before committing to playing it?
+   *
+   * Answered with the same judgement the player itself acts on when it picks a
+   * rendition (screenLadderForDecode), not a second opinion that could
+   * disagree with it:
+   *
+   *  1. Is there a HARDWARE decoder for this exact configuration? Asked of
+   *     WebCodecs with `prefer-hardware`, because that is the API that decides
+   *     — MediaCapabilities is advisory, and Safari has been caught answering
+   *     "supported" for 4K AV1 that isConfigSupported then refused.
+   *  2. Failing that, is there a browser SOFTWARE decoder? Failing that, the
+   *     player's own FFmpeg (WASM) takes it — which is why `playable` is true
+   *     for nearly anything with a video track.
+   *  3. Without hardware, it comes down to cost: width × height × fps × the
+   *     codec's work factor × playback rate, against the budget for this class
+   *     of device — the same two constants the player's ABR uses, calibrated on
+   *     a phone that could not produce a frame of 1440p AV1 and the 1080p H.264
+   *     it plays without complaint.
+   *  4. MediaCapabilities gets a veto over "smooth": when the browser says a
+   *     configuration will not be smooth, that is believed.
+   *
+   * Audio is reported but never decides it. Every audio track goes through the
+   * software decoder already, and audio decode is a rounding error next to
+   * video's.
+   *
+   * @param input A URL or File to open and read (an isolated WASM instance, so
+   *   a player already playing is not disturbed), the tracks of something
+   *   already open, or a {@link PlaybackQuery} when there is nothing to open.
+   */
+  static async assessPlayback(
+    input: string | File | Blob | Track[] | PlaybackQuery,
+    options: PlaybackAssessmentOptions = {},
+  ): Promise<PlaybackAssessment> {
+    const rate =
+      typeof options.rate === "number" && options.rate > 0 ? options.rate : 1;
+    const reasons: string[] = [];
+
+    // ── What are we looking at ────────────────────────────────────────────
+    let tracks: Track[];
+    let fromQuery: PlaybackQuery | null = null;
+    if (Array.isArray(input)) {
+      tracks = input;
+    } else if (typeof input === "string" || input instanceof Blob) {
+      try {
+        tracks = await MoviPlayer.probeTracks(input);
+      } catch (e) {
+        // A source that cannot be opened is a verdict, not an exception: the
+        // caller asked "will this play", and "it could not be read" answers it.
+        // Adaptive manifests land here too — open one with the player instead,
+        // and ask the element once it has loaded.
+        return {
+          playable: false,
+          smooth: false,
+          powerEfficient: false,
+          rate,
+          video: null,
+          audio: null,
+          reasons: [
+            `The source could not be read: ${e instanceof Error ? e.message : String(e)}`,
+          ],
+        };
+      }
+    } else {
+      fromQuery = input;
+      tracks = [
+        {
+          id: 0,
+          type: "video",
+          codec: input.codec,
+          width: input.width,
+          height: input.height,
+          frameRate: input.fps && input.fps > 0 ? input.fps : 30,
+          bitRate: input.bitrate,
+        } as VideoTrack,
+      ];
+    }
+
+    const video = tracks.find(
+      (t): t is VideoTrack =>
+        t.type === "video" && !(t as VideoTrack).isAttachedPic,
+    );
+    const audioTrack = tracks.find((t): t is AudioTrack => t.type === "audio");
+
+    const audio: PlaybackAssessment["audio"] = audioTrack
+      ? {
+          codec: audioTrack.codec,
+          channels: audioTrack.channels,
+          sampleRate: audioTrack.sampleRate,
+          decoder: MoviAudioDecoder.needsSoftwareDecoding(audioTrack.codec)
+            ? "wasm"
+            : "webcodecs",
+        }
+      : null;
+
+    if (!video) {
+      // Sound only: nothing here is expensive enough to stutter.
+      return {
+        playable: !!audioTrack,
+        smooth: !!audioTrack,
+        powerEfficient: !!audioTrack,
+        rate,
+        video: null,
+        audio,
+        reasons: audioTrack ? [] : ["No video or audio track was found."],
+      };
+    }
+
+    // ── The codec string to ask with ──────────────────────────────────────
+    // A full WebCodecs string when the stream's own extradata can build one;
+    // otherwise the representative profile for its family, the same fill-in
+    // the ladder screen uses. A query that already names a full string is
+    // taken at its word.
+    const family = (video.codec || "").split(".")[0].toLowerCase();
+    const parsedCodec =
+      (fromQuery && fromQuery.codec.includes(".") ? fromQuery.codec : null) ||
+      (!fromQuery ? MoviPlayer.codecStringFor(video) : null) ||
+      REPRESENTATIVE_CODECS[family] ||
+      "";
+    let codec = parsedCodec;
+
+    const width = video.width || 0;
+    const height = video.height || 0;
+    const fps = video.frameRate && video.frameRate > 0 ? video.frameRate : 30;
+    const budget = softwareDecodeBudget(MoviPlayer._isMobileDevice);
+    const load =
+      softwareDecodeCost(width, height, fps * rate, codec || family) / budget;
+
+    // ── Which decoder would carry it ──────────────────────────────────────
+    //
+    // Asked the way the decoder will actually be configured, or the answer is
+    // about a decoder nobody builds. Two things the playback path does and this
+    // did not, both on every MPEG-TS file:
+    //  - Its extradata is Annex B (start codes, not an avcC/hvcC record). The
+    //    decoder drops it and reads the inline parameter sets; handed over as
+    //    `description` it makes the browser refuse the config outright.
+    //  - The parser reads that Annex B as if it were a record and builds a
+    //    string like "avc1.000001". The decoder falls back to a mapped string
+    //    when its first one is refused, so this falls back too.
+    // Without both, a 4K HEVC .ts that plays in hardware was judged WASM-only,
+    // 3.7× over the software budget, and warned about as not smooth.
+    const extradata = video.extradata;
+    const annexB =
+      !!extradata &&
+      extradata.length > 4 &&
+      extradata[0] === 0 &&
+      extradata[1] === 0 &&
+      (extradata[2] === 1 || (extradata[2] === 0 && extradata[3] === 1));
+    const ask = async (
+      codecString: string,
+      hardwareAcceleration?: "prefer-hardware",
+    ): Promise<boolean> => {
+      if (!codecString || typeof VideoDecoder === "undefined") return false;
+      try {
+        const config: VideoDecoderConfig = {
+          codec: codecString,
+          codedWidth: width,
+          codedHeight: height,
+        };
+        if (hardwareAcceleration) config.hardwareAcceleration = hardwareAcceleration;
+        if (extradata && extradata.length > 0 && !annexB) {
+          config.description = extradata;
+        }
+        const r = await VideoDecoder.isConfigSupported(config);
+        return r?.supported === true;
+      } catch {
+        return false;
+      }
+    };
+    const candidates = [parsedCodec, REPRESENTATIVE_CODECS[family] || ""].filter(
+      (c, i, all) => !!c && all.indexOf(c) === i,
+    );
+    let hardware = false;
+    let software = false;
+    for (const candidate of candidates) {
+      hardware = await ask(candidate, "prefer-hardware");
+      software = hardware ? true : await ask(candidate);
+      if (software) {
+        codec = candidate;
+        break;
+      }
+    }
+    const decoder: "hardware" | "software" | "wasm" = hardware
+      ? "hardware"
+      : software
+        ? "software"
+        : "wasm";
+
+    // ── The browser's own estimate ────────────────────────────────────────
+    let browserSmooth: boolean | undefined;
+    let browserEfficient: boolean | undefined;
+    const caps = (
+      navigator as unknown as {
+        mediaCapabilities?: {
+          decodingInfo?: (c: unknown) => Promise<{
+            supported?: boolean;
+            smooth?: boolean;
+            powerEfficient?: boolean;
+          }>;
+        };
+      }
+    ).mediaCapabilities;
+    if (codec && caps?.decodingInfo && width > 0 && height > 0) {
+      try {
+        const container = /^(vp0?[89]|vp8)/i.test(codec)
+          ? "video/webm"
+          : "video/mp4";
+        const info = await caps.decodingInfo({
+          type: "file",
+          video: {
+            contentType: `${container}; codecs="${codec}"`,
+            width,
+            height,
+            bitrate: video.bitRate || 0,
+            framerate: fps * rate,
+          },
+        });
+        // Only an answer about a configuration the browser recognised counts.
+        if (info?.supported) {
+          browserSmooth = info.smooth;
+          browserEfficient = info.powerEfficient;
+        }
+      } catch {
+        /* the query itself was rejected — no opinion */
+      }
+    }
+
+    // ── Verdict ───────────────────────────────────────────────────────────
+    const dims = `${width}×${height} @ ${Math.round(fps)}fps${rate !== 1 ? ` × ${rate}x` : ""}`;
+    let smooth: boolean;
+    if (decoder === "hardware") {
+      // Hardware is not bound by the software budget — but it is bound by what
+      // hardware decoders are built for, and the browser saying otherwise.
+      //
+      // Two questions, not one: can a decoder of this class carry the STREAM,
+      // and can it carry it at this SPEED. The second gets the headroom above
+      // realtime that hardware has — see HARDWARE_RATE_HEADROOM — because the
+      // old rule folded the speed into the pixel rate and so declared an 8K60
+      // file beyond hardware the moment the viewer pressed 1.5x, while it went
+      // on playing. If the headroom turns out not to be there, the stutter
+      // hint says so from what actually happened.
+      const pixelRate = width * height * fps;
+      const beyondStream = pixelRate > HARDWARE_DECODE_CEILING;
+      const beyondSpeed =
+        pixelRate * rate > HARDWARE_DECODE_CEILING * HARDWARE_RATE_HEADROOM;
+      const beyondHardware = beyondStream || beyondSpeed;
+      smooth = !beyondHardware && browserSmooth !== false;
+      if (beyondStream) {
+        reasons.push(
+          `${dims} is beyond what hardware video decoders are built for (8K at 60fps).`,
+        );
+      } else if (beyondSpeed) {
+        reasons.push(
+          `${dims} is more than a hardware decoder for ${width}×${height} @ ${Math.round(fps)}fps can be expected to keep up with.`,
+        );
+      }
+    } else {
+      const overBudget = load > 1;
+      smooth = !overBudget && browserSmooth !== false;
+      reasons.push(
+        decoder === "software"
+          ? `No hardware decoder for ${codec || family} at ${width}×${height} — the browser decodes it in software.`
+          : `The browser cannot decode ${codec || family} — the player's built-in decoder (WASM) takes it.`,
+      );
+      if (overBudget) {
+        reasons.push(
+          `Software decoding ${dims} needs about ${load.toFixed(1)}× what this ${MoviPlayer._isMobileDevice ? "mobile" : "desktop"} device can sustain.`,
+        );
+      }
+    }
+    if (browserSmooth === false) {
+      reasons.push(`The browser reports ${dims} as not smooth on this device.`);
+    }
+    const powerEfficient =
+      decoder === "hardware" && browserEfficient !== false;
+
+    return {
+      playable: true,
+      smooth,
+      powerEfficient,
+      rate,
+      video: {
+        codec: codec || video.codec,
+        width,
+        height,
+        fps,
+        decoder,
+        smooth,
+        powerEfficient,
+        load: Math.round(load * 100) / 100,
+      },
+      audio,
+      // "Smooth" with a note about software decode is still smooth — the note
+      // is information, not a problem, so a smooth verdict carries no reasons.
+      reasons: smooth ? [] : reasons,
+    };
+  }
+
+  /**
+   * The audio track of a URL or File, decoded to mono PCM and handed back in
+   * chunks — without playing it, and alongside anything that IS playing.
+   *
+   *   for await (const chunk of MoviPlayer.decodeAudio(file, { from: 60 })) {
+   *     // chunk.samples: Float32Array @ 16 kHz, chunk.start / chunk.end in seconds
+   *   }
+   *
+   * Built for work that needs the sound ahead of the playhead — speech
+   * recognition for captions is the case it was written for. It decodes with
+   * this player's own demuxer and audio decoder, so anything the player can
+   * play it can read: MKV, Opus, TrueHD, DTS — not just what the browser's
+   * decodeAudioData happens to understand, and never the whole file into
+   * memory at once.
+   *
+   * Runs on its own WASM instance, like assessPlayback, so a player that is
+   * playing is not disturbed, and yields to the event loop as it goes. Resampled
+   * with an OfflineAudioContext, which band-limits properly — a speech model
+   * fed aliased audio hears noise that is not in the file.
+   *
+   * Uses the first audio track. Stops, and releases everything, when the
+   * signal aborts or the loop is broken out of.
+   */
+  static async *decodeAudio(
+    input: string | File | Blob,
+    options: DecodeAudioOptions = {},
+  ): AsyncGenerator<DecodedAudioChunk> {
+    const outRate =
+      options.sampleRate && options.sampleRate > 0 ? options.sampleRate : 16000;
+    const chunkSeconds =
+      options.chunkSeconds && options.chunkSeconds > 0 ? options.chunkSeconds : 30;
+    const from = Math.max(0, options.from ?? 0);
+    const signal = options.signal;
+
+    const source: SourceAdapter =
+      typeof input === "string"
+        ? new HttpSource(input)
+        : new FileSource(input instanceof File ? input : new File([input], "media"));
+    const demuxer = new Demuxer(source, undefined, true);
+    const decoder = new MoviAudioDecoder();
+
+    // Decoded blocks, already mixed to mono, waiting to be gathered.
+    const pending: { time: number; samples: Float32Array; rate: number }[] = [];
+    const toMono = (planes: Float32Array[], frames: number): Float32Array => {
+      if (planes.length === 1) return planes[0].slice(0, frames);
+      const out = new Float32Array(frames);
+      for (const plane of planes) {
+        for (let i = 0; i < frames; i++) out[i] += plane[i];
+      }
+      const k = 1 / planes.length;
+      for (let i = 0; i < frames; i++) out[i] *= k;
+      return out;
+    };
+
+    try {
+      const info = await demuxer.open();
+      const track = info.tracks.find((t): t is AudioTrack => t.type === "audio");
+      if (!track) return;
+
+      const bindings = demuxer.getBindings();
+      if (bindings) decoder.setBindings(bindings);
+      // Stereo out of the software decoder, whatever the source layout; the mix
+      // to one channel happens here, where it is a plain average.
+      decoder.setDownmix(true);
+      decoder.setOnPCM((frame) => {
+        pending.push({
+          time: frame.timestamp / 1e6,
+          samples: toMono(frame.planes, frame.numberOfFrames),
+          rate: frame.sampleRate,
+        });
+      });
+      decoder.setOnData((data) => {
+        try {
+          const planes: Float32Array[] = [];
+          for (let c = 0; c < data.numberOfChannels; c++) {
+            const plane = new Float32Array(data.numberOfFrames);
+            data.copyTo(plane, { planeIndex: c, format: "f32-planar" });
+            planes.push(plane);
+          }
+          pending.push({
+            time: data.timestamp / 1e6,
+            samples: toMono(planes, data.numberOfFrames),
+            rate: data.sampleRate,
+          });
+        } finally {
+          data.close();
+        }
+      });
+      const configured = await decoder.configure(
+        track,
+        demuxer.getExtradata(track.id) ?? undefined,
+      );
+      if (!configured) {
+        throw new Error(`Cannot decode the ${track.codec} audio track`);
+      }
+      if (from > 0) await demuxer.seek(from);
+
+      // Gathered mono samples at the source rate, not yet handed back.
+      let parts: Float32Array[] = [];
+      let length = 0;
+      let startTime = -1;
+      let rate = track.sampleRate || 48000;
+
+      const resample = async (mono: Float32Array): Promise<Float32Array> => {
+        if (rate === outRate) return mono;
+        if (typeof OfflineAudioContext === "undefined") {
+          // No audio graph (a worker): nearest-lower sample. Crude, but only
+          // reached where the good path cannot run at all.
+          const n = Math.floor((mono.length * outRate) / rate);
+          const out = new Float32Array(n);
+          const step = rate / outRate;
+          for (let i = 0; i < n; i++) out[i] = mono[Math.floor(i * step)];
+          return out;
+        }
+        const n = Math.max(1, Math.round((mono.length * outRate) / rate));
+        const ctx = new OfflineAudioContext(1, n, outRate);
+        const buffer = ctx.createBuffer(1, mono.length, rate);
+        buffer.copyToChannel(mono as Float32Array<ArrayBuffer>, 0);
+        const node = ctx.createBufferSource();
+        node.buffer = buffer;
+        node.connect(ctx.destination);
+        node.start();
+        const rendered = await ctx.startRendering();
+        return rendered.getChannelData(0).slice();
+      };
+
+      const takeChunk = async (samplesWanted: number): Promise<DecodedAudioChunk> => {
+        const joined = new Float32Array(length);
+        let o = 0;
+        for (const p of parts) {
+          joined.set(p, o);
+          o += p.length;
+        }
+        const head = joined.subarray(0, samplesWanted);
+        const rest = joined.slice(samplesWanted);
+        const chunkStart = startTime;
+        parts = rest.length ? [rest] : [];
+        length = rest.length;
+        startTime = chunkStart + samplesWanted / rate;
+        return {
+          start: chunkStart,
+          end: chunkStart + samplesWanted / rate,
+          sampleRate: outRate,
+          samples: await resample(head.slice()),
+        };
+      };
+
+      const gather = () => {
+        while (pending.length) {
+          const block = pending.shift()!;
+          // Pre-roll decoded ahead of a seek target is not part of the answer.
+          let samples = block.samples;
+          let time = block.time;
+          if (time < from) {
+            const skip = Math.floor((from - time) * block.rate);
+            if (skip >= samples.length) continue;
+            samples = samples.subarray(skip);
+            time = from;
+          }
+          if (startTime < 0) startTime = time;
+          rate = block.rate;
+          parts.push(samples);
+          length += samples.length;
+        }
+      };
+
+      let packets = 0;
+      for (;;) {
+        if (signal?.aborted) return;
+        const packet = await demuxer.readPacket();
+        if (!packet) break;
+        if (packet.streamIndex !== track.id) continue;
+        decoder.decode(packet.data, packet.timestamp, packet.keyframe);
+        gather();
+        const chunkSamples = Math.round(chunkSeconds * rate);
+        while (length >= chunkSamples && startTime >= 0) {
+          yield await takeChunk(chunkSamples);
+          if (signal?.aborted) return;
+        }
+        // Keep the page responsive: this can be minutes of audio.
+        if (++packets % 48 === 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+      }
+      await decoder.flush().catch(() => {});
+      gather();
+      if (length > 0 && startTime >= 0 && !signal?.aborted) {
+        yield await takeChunk(length);
+      }
+    } finally {
+      try {
+        decoder.close();
+      } catch {
+        /* already gone */
+      }
+      try {
+        demuxer.close();
+      } catch {
+        /* already gone */
+      }
+      try {
+        source.close();
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  /** The stream's own codec string, or null — never a throw on odd extradata. */
+  private static codecStringFor(video: VideoTrack): string | null {
+    try {
+      return CodecParser.getCodecString(
+        video.codec,
+        video.extradata,
+        video.width,
+        video.height,
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /** Open a URL or File just long enough to read its tracks. */
+  private static async probeTracks(input: string | Blob): Promise<Track[]> {
+    const source: SourceAdapter =
+      typeof input === "string"
+        ? new HttpSource(input)
+        : new FileSource(
+            input instanceof File ? input : new File([input], "media"),
+          );
+    // An isolated WASM instance: the shared one belongs to whatever is playing.
+    const demuxer = new Demuxer(source, undefined, true);
+    try {
+      const info = await demuxer.open();
+      return info.tracks;
+    } finally {
+      try {
+        demuxer.close();
+      } catch {
+        /* already gone */
+      }
+      try {
+        source.close();
+      } catch {
+        /* already gone */
+      }
+    }
   }
 
   /**
@@ -699,6 +1498,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  runway — enough that the new decoder is never the thing being waited on
    *  at the seam. */
   private static readonly SEAMLESS_PRIME_LEAD_S = 0.25;
+  // A rung switch's opening read — see switchVideoRenditionInPlace.
+  private static readonly SWITCH_FIRST_RANGE_BYTES = 512 * 1024;
+  // No ABR decision this soon after a seek — see abrDecide.
+  private static readonly ABR_POST_SEEK_HOLD_MS = 3000;
   /** …and the most it may prime, however much the outgoing queue holds. Whole
    *  decoded frames are expensive at 4K and outrageous at 8K. */
   private static readonly SEAMLESS_PRIME_MAX_AHEAD_S = 0.6;
@@ -707,6 +1510,37 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  which cannot be made seamless falls back before the reason for switching
    *  gets worse. */
   private static readonly SEAMLESS_PRIME_BUDGET_MS = 5000;
+  /**
+   * Whole-prep bound for an in-place switch — open, seek and prime together.
+   *
+   * Every await in the prep was unbounded, and the one that hurts is the rung
+   * that cannot be fed: an 8K AV1 rung is a 1.2GB file at 38.7Mbps, and on a
+   * link that measures about the same the open alone can hang for as long as
+   * it likes. Nothing rescues that, because `_abrSwitchInProgress` is held for
+   * the whole call and it gates abrDecide, the decode downshift AND
+   * abrEmergencyDownshift — so the ladder cannot step back down while the
+   * stream it is stuck on saturates the link the player is starving for.
+   *
+   * Generous on purpose. A DOWNSHIFT comes through here too, and that is the
+   * one switch a struggling player must always be able to finish; its target
+   * is a smaller rung, so it is nowhere near this. What this cuts off is a
+   * climb into a rung the link cannot carry, which is the only case that ever
+   * runs this long.
+   */
+  private static readonly SWITCH_PREP_BUDGET_MS = 12_000;
+  /**
+   * The same bound for a step DOWN, which the note above assumed would never
+   * come near 12s. It does, on exactly the link that asks for one: at 0.2 MB/s
+   * the 480p rung's header, index and the GOP behind the swap point are ~2MB,
+   * ten seconds before anything else waits. The downshift was abandoned at the
+   * budget, decided again, abandoned again — four times, until the element
+   * gave up on a video the lower rung would have carried. Abandoning a
+   * downshift buys nothing: the rung being left has already run dry, and the
+   * outgoing source is held for the prep (suspendNetwork), so there is no
+   * picture to go back to. What still needs an end is a rung the link cannot
+   * feed at all, and this is that end.
+   */
+  private static readonly SWITCH_DOWN_PREP_BUDGET_MS = 30_000;
   // bandwidth → consecutive "couldn't sustain this rung" strikes + when the last
   // one hit. Each strike doubles the re-climb penalty (30s → 1m → 2m … capped),
   // so a rung the link keeps failing to hold is backed off harder and harder
@@ -732,8 +1566,19 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private _blackFrameWatchdog: ReturnType<typeof setTimeout> | null = null;
   private _blackRecoverySeeks: number = 0;
   private static readonly MAX_BLACK_RECOVERY_SEEKS = 3;
+
   private _activeSubtitleLang: string = "";
   private _externalSubCues: SubtitleCue[] = [];
+  /**
+   * Subtitle tracks whose cues were handed to us rather than fetched — see
+   * appendSubtitleCues. Keyed by lang, each list kept sorted by start. The
+   * array IS what the external renderer reads when that lang is active, so an
+   * append shows up on the next tick without a reload.
+   */
+  private _generatedSubCues = new Map<string, SubtitleCue[]>();
+  /** Generated tracks still waiting for their first cue — listed with a
+   *  working indicator rather than as an empty track that does nothing. */
+  private _pendingSubLangs = new Set<string>();
   private _externalSubTimer: number | null = null;
   public trackManager: TrackManager;
   private clock: Clock;
@@ -757,6 +1602,506 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Turning previews back on clears the "gave up" latch so a prior failed
     // init (or a never-attempted one) can retry on the next hover.
     if (enabled) this.previewInitGaveUp = false;
+  }
+
+  /**
+   * The longest edge a preview JPEG is worth encoding at.
+   *
+   * The card is about 160px wide. Encoding the frame at its own size — 1920,
+   * or 3840 on a 4K source — spends the time on pixels the browser then throws
+   * away scaling it down: measured at 519KB and ~45ms a frame on 4K60, per
+   * hovered position, on a fast desktop. Downscaling first costs one draw.
+   */
+  private static readonly PREVIEW_MAX_EDGE = 480;
+
+  /**
+   * How big a frame the SOFTWARE preview decoder may be asked for.
+   *
+   * Only reached when WebCodecs refuses the source outright — 8K H.264 is
+   * refused by every browser tested. The cost is the decode, which is the
+   * source's own size whatever the scaler is then asked for: measured in WASM
+   * on this machine, ~250-330ms of blocked main thread per 8K frame, and over
+   * a second for the first. 4K UHD (8.3MP) sits just under the line and stays.
+   */
+  private static readonly PREVIEW_SOFTWARE_MAX_PIXELS = 9_000_000;
+
+  /**
+   * Is the source too big to preview in software?
+   *
+   * Asked in two places, because a browser can refuse the source at
+   * configure() — Chrome does, for 8K H.264 — or accept it and then fail to
+   * produce a frame, which is what a decoder that cannot really do this size
+   * looks like from here. Both end at the same software decoder, and at that
+   * size it stalls the page either way.
+   */
+  private previewSoftwareTooBig(): boolean {
+    const track = this.trackManager.getActiveVideoTrack();
+    if (!track?.width || !track?.height) return false;
+    return track.width * track.height > MoviPlayer.PREVIEW_SOFTWARE_MAX_PIXELS;
+  }
+
+  /**
+   * The source's shape, shrunk to the size a preview is actually shown at.
+   *
+   * Everything on the preview path used to work at the source's own
+   * resolution and shrink at the very end, one step before the JPEG. On an 8K
+   * source that means a 7680x4320 RGBA buffer — 132MB — scaled by the decoder,
+   * copied out of WASM, uploaded as a texture and drawn, per hover, for a
+   * picture that is then thrown away and redrawn at 480px. Measured on 8K
+   * H.264: 1.7-2.4s per preview with the main thread stalled for up to 2.1s of
+   * it, which is the seek bar hanging the player while the keyboard seeks fine.
+   *
+   * The scaler has to resize the frame either way, so asking it for the size
+   * the picture is wanted at costs nothing and saves all of the above.
+   */
+  private static previewShape(
+    width: number,
+    height: number,
+  ): { width: number; height: number } {
+    const longest = Math.max(width, height);
+    if (!(longest > MoviPlayer.PREVIEW_MAX_EDGE) || !(width > 0) || !(height > 0)) {
+      return { width, height };
+    }
+    const scale = MoviPlayer.PREVIEW_MAX_EDGE / longest;
+    return {
+      width: Math.max(2, Math.round(width * scale)),
+      height: Math.max(2, Math.round(height * scale)),
+    };
+  }
+  private previewScaleCanvas: OffscreenCanvas | HTMLCanvasElement | null = null;
+
+  /**
+   * Frames already made, kept by the second they belong to.
+   *
+   * Scrubbing asks for a new time every few pixels of pointer travel, and the
+   * pipeline is one decoder: each request seeks, decodes and encodes from
+   * scratch, so a viewer moving back and forth over the same stretch paid for
+   * the same frames again and again — and the card sat on its loading state
+   * every time. A second is finer than the strip can show, so quantising to it
+   * costs nothing and makes the second pass over any stretch instant.
+   *
+   * Bounded and insertion-ordered: the oldest entry goes when it is full, which
+   * for scrubbing is the part of the timeline the pointer has left behind.
+   */
+  // Counted in cache steps, not seconds — see PREVIEW_CACHE_STEP_S. Raised
+  // with the step so the window of scrubbing a viewer can go back over
+  // without re-decoding stays about the same length of film.
+  private static readonly PREVIEW_CACHE_MAX = 200;
+  private previewCache = new Map<number, Blob>();
+
+  /**
+   * The same frames again, filed under the keyframe they actually came from.
+   *
+   * Outside precise mode a preview IS the keyframe at or before the hovered
+   * time, so every position inside one GOP is the same picture — and on a
+   * long-GOP source that is seconds of timeline. The time-keyed cache above
+   * cannot know that: it files by where the pointer was, so a scrub across a
+   * single GOP missed on every step of it and paid a full decode and JPEG
+   * encode (~11ms of the ~16ms a preview costs) to arrive at pixels it already
+   * had.
+   *
+   * This map is consulted AFTER the seek, because the seek is what says which
+   * keyframe the time belongs to — 4ms rather than 16, with no guess about
+   * where the GOP boundaries are and so no risk of showing the wrong frame.
+   */
+  private previewByKeyframe = new Map<number, Blob>();
+
+  /**
+   * How finely the preview cache tells one moment from another.
+   *
+   * It was a whole second — Math.round(time) — and a whole second is also how
+   * often the picture could then change. Every hover inside it was answered
+   * with the same remembered frame, so a scrub across ten seconds of a film
+   * showed ten pictures however carefully the frame under the pointer had been
+   * decoded. The precision the decode paid for never reached the screen.
+   *
+   * A fifth of a second is fine enough to read as continuous while dragging,
+   * and still coarse enough that a pointer trembling on one spot is answered
+   * from memory rather than re-decoded.
+   */
+  private static readonly PREVIEW_CACHE_STEP_S = 0.2;
+
+  /** The cache key for a time, or null when the frame can't be reused. */
+  private previewKey(time: number, view?: VRView | null): number | null {
+    // A 360 preview is reprojected to wherever the viewer is looking, so the
+    // same second is a different picture from one moment to the next.
+    if (view) return null;
+    if (!Number.isFinite(time)) return null;
+    return Math.round(time / MoviPlayer.PREVIEW_CACHE_STEP_S);
+  }
+
+  /**
+   * Is this position's picture already in hand?
+   *
+   * Asked BEFORE a preview is dispatched, by the pacer that otherwise waits
+   * for the pointer to settle. That wait exists to stop a scrub spending a
+   * 2MB range fetch at every position it crosses — but a frame that is
+   * already remembered costs nothing to produce, so waiting for it buys
+   * nothing and is simply 180ms of delay. Synchronous on purpose: a pacer
+   * that had to await this could not decide in the same tick as the move.
+   */
+  hasPreviewFor(time: number, view?: VRView | null): boolean {
+    const key = this.previewKey(time, view);
+    return key !== null && this.previewCache.has(key);
+  }
+
+  private rememberPreview(key: number, blob: Blob): void {
+    this.previewCache.set(key, blob);
+    while (this.previewCache.size > MoviPlayer.PREVIEW_CACHE_MAX) {
+      const oldest = this.previewCache.keys().next();
+      if (oldest.done) break;
+      this.previewCache.delete(oldest.value);
+    }
+  }
+
+  /** The keyframe map's key for a decoded packet's pts, or null if unusable. */
+  /**
+   * The thumbnail demuxer's current packet, in the same time base as everything
+   * that asks it questions.
+   *
+   * It reports the packet's RAW pts — `pkt->pts * time_base`, with no
+   * `start_time` taken off — while every hover, target and duration on this
+   * side of the WASM boundary is media time from zero. On a source whose
+   * stream starts at zero those are the same number and nothing shows; on one
+   * that does not, they are apart by exactly that offset, and three separate
+   * things quietly read the wrong answer.
+   *
+   * Measured on a 47.7s 4K HEVC MPEG-TS whose stream starts at 1.050044s
+   * (LG-Daylight-4K): a hover at 12.5s took the keyframe at raw 11.878 —
+   * 10.827 in media time, and the file's own keyframe list confirms 11.877522
+   * is a real raw pts, so the value is raw beyond doubt. The walk then stopped
+   * at raw 12.545 because it breaks on `pts >= time`, which is media 11.495:
+   * a preview one full second before the pointer, every time, sixty frames out
+   * at this file's 59.94fps. Where the keyframe happened to land within the
+   * offset of the hover, `timestamp < time` was false and the walk did not run
+   * at all — precise mode falling back to the plain keyframe with nothing said.
+   * And the renderer picks the frame nearest `targetSec`, which is media time,
+   * against chunk timestamps that were raw — the same offset a third time.
+   *
+   * The C seek does normalise (it adds `start_time` to its target), so the
+   * frame fetched was always the right one; only the arithmetic about it was
+   * wrong. Correcting it here rather than in the WASM keeps the fix on the
+   * side that owns the media-time convention, and needs no rebuild.
+   */
+  private previewPacketPts(): number {
+    const raw = this.thumbnailBindings?.getPacketPts() ?? 0;
+    if (!Number.isFinite(raw)) return raw;
+    return raw - this.startTime;
+  }
+
+  private keyframeKey(pts: number): number | null {
+    if (!Number.isFinite(pts)) return null;
+    // Milliseconds: fine enough that two different keyframes never collide,
+    // coarse enough that the same one always hashes the same way.
+    return Math.round(pts * 1000);
+  }
+
+  private rememberKeyframePreview(pts: number, blob: Blob): void {
+    const kfKey = this.keyframeKey(pts);
+    if (kfKey === null) return;
+    this.previewByKeyframe.set(kfKey, blob);
+    while (this.previewByKeyframe.size > MoviPlayer.PREVIEW_CACHE_MAX) {
+      const oldest = this.previewByKeyframe.keys().next();
+      if (oldest.done) break;
+      this.previewByKeyframe.delete(oldest.value);
+    }
+  }
+
+  /** Drop remembered frames — the pictures behind them are no longer the file. */
+  private clearPreviewCache(): void {
+    this.previewCache.clear();
+    this.previewByKeyframe.clear();
+  }
+
+  /**
+   * Pictures the source brought with it (see utils/Storyboard).
+   *
+   * When a source has a storyboard, a preview costs a crop out of an image the
+   * browser already has, instead of a seek, a decode and an encode — and the
+   * second WASM module the decode path needs is never opened at all. Set from
+   * the element's `storyboard` attribute or property; a URL is a WebVTT
+   * thumbnail track, an object is a tile spec.
+   */
+  private storyboardSource: string | StoryboardSpec | null = null;
+  private storyboard: Storyboard | null = null;
+  private storyboardLoad: Promise<Storyboard | null> | null = null;
+  /** Mosaics already fetched, by URL — one image serves dozens of previews. */
+  private storyboardImages = new Map<string, Promise<ImageBitmap | null>>();
+  private storyboardCanvas: OffscreenCanvas | HTMLCanvasElement | null = null;
+
+  setStoryboard(source: string | StoryboardSpec | null): void {
+    if (source === this.storyboardSource) return;
+    this.storyboardSource = source;
+    this.storyboard = null;
+    this.storyboardLoad = null;
+    this.storyboardImages.clear();
+    this.clearPreviewCache();
+    // Load the BOARD now rather than on the first hover. It is a few KB of
+    // text (or nothing at all, for a spec), and waiting until the pointer
+    // arrives means the one hover that matters most — the first — is the one
+    // that has to wait for it.
+    //
+    // The mosaics it names are a different matter: those are real pictures,
+    // and pulling one here put a fetch of hundreds of KB alongside the opening
+    // buffer, which is bandwidth the video needs more than a hover nobody has
+    // made yet. They are warmed once playback is running instead — by the
+    // element, which paints them and knows when that moment arrives (see
+    // MoviElement.flushStoryboardWarm). Nothing is lost if there is no element:
+    // cropStoryboardTile fetches the sheet it needs on demand, as it always
+    // did.
+    if (source) void this.ensureStoryboard();
+  }
+
+  /** The board's mosaics in order, for a caller that paints them itself. */
+  getStoryboardSheets(): string[] {
+    return this.storyboard?.sheets() ?? [];
+  }
+
+  /**
+   * The same list, but once the board has actually been parsed — for a caller
+   * that wants to pull the pictures in before anybody hovers.
+   *
+   * getStoryboardSheets answers from what is in hand, so at load time (the one
+   * moment worth warming at) it answers with nothing: a VTT track is still in
+   * flight. Resolves to an empty list when there is no board, or when it turns
+   * out not to have one — never rejects, because a storyboard is an
+   * optimisation and its absence is not an error.
+   */
+  whenStoryboardReady(): Promise<string[]> {
+    if (!this.storyboardSource) return Promise.resolve([]);
+    return this.ensureStoryboard().then((board) => board?.sheets() ?? []);
+  }
+
+  /** True while a storyboard is standing in for the decode path. */
+  hasStoryboard(): boolean {
+    return this.storyboardSource !== null;
+  }
+
+  /**
+   * The tile for a moment, RIGHT NOW — no promise, no crop, no encode.
+   *
+   * Cropping a tile into a blob costs a canvas draw, a JPEG encode and an
+   * image decode on the other side, and the caller has to await all of it. A
+   * caller that can paint the mosaic itself (the seek card, with a background
+   * offset) needs none of that: it needs the rectangle, and it needs it in the
+   * same frame the pointer moved. Returns null until the board is parsed —
+   * asking starts that, so the next move is answered.
+   */
+  getStoryboardTileSync(time: number): StoryboardTile | null {
+    if (!this.storyboardSource) return null;
+    if (!this.storyboard) {
+      void this.ensureStoryboard();
+      return null;
+    }
+    return this.storyboard.tileAt(time);
+  }
+
+  private ensureStoryboard(): Promise<Storyboard | null> {
+    if (this.storyboard) return Promise.resolve(this.storyboard);
+    if (this.storyboardLoad) return this.storyboardLoad;
+    const source = this.storyboardSource;
+    if (!source) return Promise.resolve(null);
+
+    // A spec needs no fetch — and, in the sprite form, needs the video's length,
+    // which may not be known yet. Answer it here rather than inside the cached
+    // promise below: caching a "not yet" would make it the answer forever.
+    if (typeof source !== "string") {
+      const board = Storyboard.fromSpec(source, this.getDuration());
+      if (!board) return Promise.resolve(null);
+      this.storyboard = board;
+      Logger.info(
+        TAG,
+        `Storyboard ready: ${board.coverage.toFixed(0)}s covered`,
+      );
+      return Promise.resolve(board);
+    }
+
+    this.storyboardLoad = (async () => {
+      try {
+        if (typeof source === "string") {
+          const res = await fetch(source, {
+            signal: this.lifetimeSignal,
+            ...(this.config.headers ? { headers: this.config.headers } : {}),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const url = res.url || source;
+          this.storyboard = Storyboard.parseVtt(await res.text(), url);
+        }
+        if (!this.storyboard) {
+          Logger.warn(TAG, "Storyboard had no usable cues — falling back to decoding previews");
+        } else {
+          Logger.info(
+            TAG,
+            `Storyboard ready: ${this.storyboard.coverage.toFixed(0)}s covered`,
+          );
+        }
+      } catch (e) {
+        // A storyboard is an optimisation, never a requirement: losing it costs
+        // speed, and the decode path answers exactly as it did before.
+        Logger.warn(TAG, `Storyboard load failed: ${(e as Error)?.message ?? e}`);
+        this.storyboard = null;
+        this.storyboardSource = null;
+      }
+      return this.storyboard;
+    })();
+    return this.storyboardLoad;
+  }
+
+  private loadStoryboardImage(url: string): Promise<ImageBitmap | null> {
+    const existing = this.storyboardImages.get(url);
+    if (existing) return existing;
+    const pending = (async () => {
+      try {
+        const res = await fetch(url, {
+          signal: this.lifetimeSignal,
+          ...(this.config.headers ? { headers: this.config.headers } : {}),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await createImageBitmap(await res.blob());
+      } catch (e) {
+        Logger.warn(TAG, `Storyboard mosaic failed: ${(e as Error)?.message ?? e}`);
+        return null;
+      }
+    })();
+    this.storyboardImages.set(url, pending);
+    return pending;
+  }
+
+  /** Cut one tile out of its mosaic and hand it over as a preview. */
+  private async cropStoryboardTile(
+    tile: StoryboardTile,
+  ): Promise<Blob | null> {
+    const image = await this.loadStoryboardImage(tile.url);
+    if (!image) return null;
+    const w = tile.width > 0 ? tile.width : image.width;
+    const h = tile.height > 0 ? tile.height : image.height;
+    if (
+      !this.storyboardCanvas ||
+      this.storyboardCanvas.width !== w ||
+      this.storyboardCanvas.height !== h
+    ) {
+      if (typeof OffscreenCanvas !== "undefined") {
+        this.storyboardCanvas = new OffscreenCanvas(w, h);
+      } else {
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        this.storyboardCanvas = c;
+      }
+    }
+    const ctx = (this.storyboardCanvas as HTMLCanvasElement).getContext("2d") as
+      | CanvasRenderingContext2D
+      | OffscreenCanvasRenderingContext2D
+      | null;
+    if (!ctx) return null;
+    ctx.drawImage(image, tile.x, tile.y, w, h, 0, 0, w, h);
+    return this.encodePreviewBlob(this.storyboardCanvas);
+  }
+
+  /**
+   * Encode what has been rendered into `src` as a preview JPEG, shrinking it
+   * first when it is bigger than a preview needs to be.
+   */
+  private encodePreviewBlob(
+    src: OffscreenCanvas | HTMLCanvasElement,
+  ): Promise<Blob | null> {
+    const w = src.width;
+    const h = src.height;
+    const longest = Math.max(w, h);
+    let out: OffscreenCanvas | HTMLCanvasElement = src;
+    if (longest > MoviPlayer.PREVIEW_MAX_EDGE && w > 0 && h > 0) {
+      const scale = MoviPlayer.PREVIEW_MAX_EDGE / longest;
+      const dw = Math.max(1, Math.round(w * scale));
+      const dh = Math.max(1, Math.round(h * scale));
+      if (
+        !this.previewScaleCanvas ||
+        this.previewScaleCanvas.width !== dw ||
+        this.previewScaleCanvas.height !== dh
+      ) {
+        if (typeof OffscreenCanvas !== "undefined") {
+          this.previewScaleCanvas = new OffscreenCanvas(dw, dh);
+        } else {
+          const c = document.createElement("canvas");
+          c.width = dw;
+          c.height = dh;
+          this.previewScaleCanvas = c;
+        }
+      }
+      const ctx = (
+        this.previewScaleCanvas as HTMLCanvasElement
+      ).getContext("2d") as
+        | CanvasRenderingContext2D
+        | OffscreenCanvasRenderingContext2D
+        | null;
+      if (ctx) {
+        ctx.drawImage(src as CanvasImageSource, 0, 0, dw, dh);
+        out = this.previewScaleCanvas;
+      }
+    }
+    if (typeof OffscreenCanvas !== "undefined" && out instanceof OffscreenCanvas) {
+      return out.convertToBlob({ type: "image/jpeg", quality: 0.7 });
+    }
+    return new Promise<Blob | null>((resolve) => {
+      (out as HTMLCanvasElement).toBlob(
+        (blob) => resolve(blob),
+        "image/jpeg",
+        0.7,
+      );
+    });
+  }
+
+  /**
+   * Walk forward from the keyframe to the frame the pointer is actually on.
+   *
+   * A preview is normally the keyframe at or before the hovered time, because
+   * that is the one frame a seek can hand over for free. On a long-GOP source
+   * — a WEB-DL with 5-10s between keyframes — that is a picture from seconds
+   * away from where the viewer is pointing. Precise mode decodes the frames in
+   * between and shows the one that belongs to the hovered second instead.
+   *
+   * Off by default: it is the same decode the player does for playback, on the
+   * hover path, so it costs a run of frames per preview rather than one — and
+   * the run is as long as the source's GOP, since a walk that gives up part
+   * way is a keyframe preview wearing this mode's name.
+   */
+  private precisePreviews = false;
+
+  setPrecisePreviews(enabled: boolean): void {
+    this.precisePreviews = enabled;
+  }
+
+  /**
+   * Can a preview still cost a network read, or is every frame it will be
+   * asked for already in hand?
+   *
+   * The seek bar asks before it decides how hard to push: a preview made from
+   * bytes the machine already holds can be asked for as fast as the pointer
+   * moves, but one that has to fetch cannot. The thumbnail reader pulls a 2MB
+   * window per position, and a scrub is a run of positions — so asking for
+   * every one of them puts the fetch for the frame the viewer actually stopped
+   * on at the BACK of a queue of fetches for frames they only passed over. The
+   * bar answers that by waiting for the pointer to settle first; this is how it
+   * knows to.
+   *
+   * False for a local file (nothing to fetch, ever) and for an HTTP source
+   * whose bytes are all in memory — a small file that has finished downloading
+   * scrubs like a local one and must not be slowed down to match a link it is
+   * no longer using. True for an adaptive stream, whose thumbnail tiles are
+   * fetched per position by the wrapper.
+   *
+   * A source adapter from outside this file answers neither test and so counts
+   * as fetching, which is the right way round to be wrong: a custom adapter is
+   * a remote one until shown otherwise, and the cost of pacing one that turns
+   * out to be local is a fraction of a second of settle, against a queue of
+   * whole fetches the other way.
+   */
+  previewsMayFetch(): boolean {
+    if (this.streamWrapper) return true;
+    if (!this.source) return false;
+    if (this.source instanceof FileSource) return false;
+    return !(
+      this.source as { isFullyCached?: () => boolean }
+    ).isFullyCached?.();
   }
 
   private previewsAllowed(): boolean {
@@ -844,6 +2189,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // from competing with the main decode during the startup grace.
   private _previewWarmTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly PREVIEW_WARM_DELAY_MS = 12000;
+  // How long to wait before re-asking when the warm-up came due while playback
+  // was still young, or while the pipeline was busy seeking/rebuffering.
+  private static readonly PREVIEW_WARM_RETRY_MS = 2000;
+  // Idle wait before the preview reader's 2MB fetch window is released.
+  private _thumbBufferIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly THUMB_BUFFER_IDLE_MS = 8000;
+  // Background recovery of a duration the container never stored. One attempt
+  // per source; see rescanDurationInBackground.
+  private _durationRescanTimer: ReturnType<typeof setTimeout> | null = null;
+  private _durationRescanDone: boolean = false;
+  private static readonly DURATION_RESCAN_DELAY_MS = 3000;
   private previewInitGaveUp: boolean = false; // Stop retrying once init has failed too often
 
   // Debug flag to disable audio processing
@@ -881,6 +2237,30 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * spinner.
    */
   private _bindAV: boolean = true;
+
+  /**
+   * Does this source actually have a picture to wait for?
+   *
+   * Canvas mode builds a CanvasRenderer for EVERY source, audio-only included —
+   * the strip a music file plays behind is that same renderer. So
+   * `!!this.videoRenderer` says "we could draw", never "there is anything to
+   * draw", and every place that read it as the latter was asking a video-less
+   * file to produce a frame. Its queue is empty forever, which is
+   * indistinguishable from a video source whose queue has just run dry.
+   *
+   * Measured on a FLAC-only .mka: the stall detector's `videoEmpty` was
+   * permanently true and `_bindAV` defaults to true, so `videoStalled` held
+   * from the first tick — and `bufferingForVideo`, also gated on the renderer
+   * merely existing, lifted the audio ceiling for the whole of the buffering
+   * that followed. The file played 0.51s, stalled, swallowed 141 SECONDS of
+   * audio in one uninterrupted read, sat in buffering for 5.5s, resumed, and
+   * did it again: five cycles in 5.6s of media.
+   *
+   * The honest question is whether the SOURCE carries video, so ask that.
+   */
+  private get hasPicture(): boolean {
+    return !!this.videoRenderer && !!this.trackManager?.getActiveVideoTrack();
+  }
   private wasPlayingBeforeRebuffer: boolean = false; // Track if we were playing before entering rebuffering state
   // Starting playback crosses async browser boundaries (AudioContext/media
   // element resume). A user play request can race the automatic
@@ -915,9 +2295,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private _bufferingSelfInflicted: boolean = false;
   private _lastRateChangeAt: number = 0;
   private _lastSeekResumeAt: number = 0;
+
+  /**
+   * How little must be buffered ahead for a stall to be about the LINK. A link
+   * that cannot carry the rung starves the buffer to nothing; anything above
+   * this and the bytes were already there.
+   */
+  private static readonly ABR_STALL_STARVED_S = 5;
   /** How long after a rate change or a seek's resume an audio stall is still
    *  attributable to the flush/re-anchor that operation performed itself. */
   private static readonly SELF_INFLICTED_STALL_WINDOW_MS = 1500;
+  /**
+   * The picture running behind the sound, and staying there.
+   *
+   * Frame selection normally makes this self-healing: the presentation loop
+   * takes the LATEST due frame, so a hitch is absorbed the moment fresh frames
+   * arrive. What it cannot absorb is a decoder that lost ground and only ever
+   * decodes forward at ~1x — after a GC pause or a few starved seconds on a
+   * small-memory device, every frame that arrives is already late by the same
+   * amount, each one is dutifully presented, and the offset becomes permanent.
+   *
+   * Nothing else catches it. The frozen-picture watchdog reads advancing
+   * frames as healthy, and the desync check further down only looks the other
+   * way (audio behind video), so the only fix was the viewer seeking by hand.
+   */
+  /** Set per seek() call: true while a seek nobody asked for is in flight. */
+  private _seekIsInternal = false;
   /**
    * How much media every active stream must hold ahead of the playhead before
    * a stall lets go — mpv's `cache_pause_wait` (playloop.c), one second. It
@@ -942,6 +2345,28 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    *  unnoticed; short enough that a catch-up going nowhere cannot run away. */
   private static readonly RESYNC_HOLD_MS = 1200;
   private _playStartTime: number = 0; // When play() was called — grace period for stall detection
+
+  /**
+   * Can the picture simply carry on from where the clock is, with what has
+   * already been decoded?
+   *
+   * The flag above says the demuxer's cursor is past the clock. That is true
+   * the moment ANY seek settles paused — including the one a click on the seek
+   * bar issues, because the bar pauses for the drag. But a click is followed by
+   * play() within a few tens of milliseconds, while the frames that seek just
+   * decoded are still queued: playback runs straight out of them and the cursor
+   * being ahead never costs anything. Rewinding there is pure harm — it throws
+   * away those frames, leaves the PREVIOUS position's picture on screen while
+   * it re-seeks and re-decodes, and restarts the audio a second time. Measured:
+   * a click seeking to 162.45s showed the old frame at 286.28s for ~240ms
+   * before snapping, against a clean -0.04s landing without the rewind.
+   *
+   * What made the paused-scrub-then-play case different is that by the time
+   * play arrived those frames were gone — the queue measured empty — so
+   * decoding resumed from the cursor and skipped everything between. So the
+   * question is not whether the cursor is ahead; it is whether the frames that
+   * cover the gap still exist. This asks that directly.
+   */
   /** performance.now() of the last buffering→playing resume (0 = never). */
   private _stallResumeAt: number = 0;
   private _primingAudio = false; // true while the first-play buffer is filling its startup cushion
@@ -1166,6 +2591,26 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // We need to decode but not display/play packets before the target time
   private seekTargetTime: number = -1;
   /**
+   * The position a completed seek still owes the screen a picture for, or -1.
+   *
+   * A seek that finishes WITHOUT a frame — the forced completion, when the
+   * demuxer ran out or the deadline fired before the walk reached the target —
+   * leaves the player paused (or ended) with nothing new on the canvas. The
+   * frames it was waiting for usually arrive a moment later, out of a decoder
+   * that was still working, and the state gate below drops every one of them
+   * because by then the state is "paused" and waitingForVideoSync is false.
+   * Nothing else ever puts them up: the presentation loop is stopped while
+   * paused, so the picture that was asked for is simply lost.
+   *
+   * Reported on a 1.33s single-GOP transport-stream segment (seg.ts, 40 frames,
+   * one keyframe at 0). Every paused seek there decoded all 40 frames and
+   * presented none: the file is short enough that EOF arrives before the
+   * decoder has emitted the frames past the target, so the forced completion
+   * always won the race. Playing the same file works, because "playing" holds
+   * the gate open.
+   */
+  private _pictureOwedFrom: number = -1;
+  /**
    * A video-only resume point, for when the picture has to catch up to sound
    * that never stopped (see resyncVideoToAudio).
    *
@@ -1257,16 +2702,42 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // Use canvas with WebCodecs (or WASM software if forced)
         this.videoDecoder = new MoviVideoDecoder(forceSoftware);
         this.videoRenderer = new CanvasRenderer(config.canvas);
+        // A source that OPENS in data-saver (the adaptive path reloads into
+        // exactly that) has a configured video track and no picture. Say so
+        // now, or the renderer spends the track believing one is coming.
+        this.videoRenderer.setPictureSuspended(this._audioOnly);
 
         // Connect video renderer to audio clock for A/V sync (skip if audio disabled)
         if (!this.disableAudio) {
           this.videoRenderer.setAudioTimeProvider(
             () => this.audioRenderer.getAudioClock(),
             () => this.audioRenderer.hasHealthyBuffer(),
+            // Measured once there is a buffer, predicted before there is —
+            // see AudioRenderer.startLead().
+            //
+            // The renderer places its post-seek anchor at the one moment the
+            // measurement cannot work: the flush has cleared the scheduled
+            // buffers, so it answers zero, no lead is applied, and the picture
+            // starts immediately. On a high-latency output the sound then
+            // arrives a few hundred ms later, the first A/V sync finds the
+            // video that far ahead and re-anchors it backwards, and the
+            // picture stops until the wall clock catches up — the hitch a beat
+            // after every seek on Bluetooth.
+            //
+            // …and there has to BE sound. With no audio track the lead is
+            // still predicted — no first buffer has ever been scheduled, so
+            // the honest answer to "how long until it is audible" is the
+            // cold-start guess, min(0.5, latency) + latency. Measured at
+            // 560ms, and the picture held for every one of them at each loop
+            // turn of a video-only file: anchored 560ms into the future,
+            // getVideoTime clamps the negative elapsed to zero, so media time
+            // sat at 0.033s with 63 decoded frames queued behind it. The
+            // picture then ran that far behind the clock for the whole pass.
+            () => (this.hasAudioThatCanPlay() ? this.audioRenderer.startLead() : 0),
           );
         } else {
           // When audio is disabled, video runs independently without A/V sync overhead
-          this.videoRenderer.setAudioTimeProvider(null, null);
+          this.videoRenderer.setAudioTimeProvider(null, null, null);
           Logger.info(
             TAG,
             "Video renderer running independently (audio disabled)",
@@ -1295,8 +2766,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // Lets the perf detectors tell a slow decoder from a starved one — see
         // setVideoBacklogProvider. Read live rather than cached: the queue
         // drains and refills between windows.
-        this.videoRenderer.setVideoBacklogProvider(
-          () => this.videoDecoder?.queueSize ?? 0,
+        // …and "the decoder has work" is not true of a decoder waiting for a
+        // keyframe, or of one whose next bytes are still on the wire. Counted
+        // as backlog, a picture frozen by a window that had lost its keyframe
+        // (a catch-up seek, then the wait for the GOP to arrive) read as
+        // "0/60fps with healthy audio" and capped 8K for the session on a
+        // machine that had been decoding it at full rate.
+        this.videoRenderer.setVideoBacklogProvider(() =>
+          this._videoHoldingForKeyframe || this.deliveryStarved()
+            ? 0
+            : (this.videoDecoder?.queueSize ?? 0),
         );
 
         Logger.info(
@@ -1483,6 +2962,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       throw new Error("Player must be idle to load");
     }
 
+    // …and its own previews: the frames remembered for the last one are not
+    // this one's picture at those times.
+    this.clearPreviewCache();
+
+
+    // A verdict about the previous source's encryption says nothing about this
+    // one; the fallback sets it again if this source earns it.
+    this._sourceIsEncrypted = false;
+    this._encryptedGaveUp = false;
+    this._encryptedAudioSilenced = false;
+
     if (sourceConfig) {
       this.config.source = sourceConfig;
       // New source on a reused instance: re-arm the startup grace so its first
@@ -1500,6 +2990,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.emit("loadStart", undefined);
     this.lastBufferedTime = 0;
     this.bufferedRangeStart = 0;
+    this._loopCount = 0;
 
     // Drop the previous source's cover art so a soft-reload on the same
     // instance (no destroy) doesn't keep showing stale artwork when the
@@ -1509,6 +3000,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     // Clean up any existing preview pipeline
     this.destroyPreviewPipeline();
+
+    // The new source gets its own shot at a missing duration.
+    if (this._durationRescanTimer) {
+      clearTimeout(this._durationRescanTimer);
+      this._durationRescanTimer = null;
+    }
+    this._durationRescanDone = false;
 
     // Adaptive streaming — only when the caller used SourceConfig (a custom
     // SourceAdapter bypasses URL detection entirely). HLS (.m3u8) and DASH
@@ -1530,16 +3028,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const lowerUrl = streamUrl?.toLowerCase() ?? "";
     // HLS (.m3u8), DASH (.mpd), and Smooth Streaming (.ism/.isml) all go
     // through Shaka. `.ism` also matches `.isml/manifest`.
+    // `forceStream` is the same question answered by the server rather than by
+    // the URL — a manifest whose path says nothing (see the option's note).
+    const forced = this.config.forceStream;
     const isStream =
       !!streamUrl &&
       (lowerUrl.includes(".m3u8") ||
         lowerUrl.includes(".mpd") ||
-        lowerUrl.includes(".ism"));
+        lowerUrl.includes(".ism") ||
+        !!forced);
 
     if (isStream) {
-      const isHls = lowerUrl.includes(".m3u8");
-      const isDash = lowerUrl.includes(".mpd");
-      const kind = isHls ? "HLS" : lowerUrl.includes(".ism") ? "Smooth Streaming" : "DASH";
+      const isHls = lowerUrl.includes(".m3u8") || forced === "hls";
+      const isDash = lowerUrl.includes(".mpd") || forced === "dash";
+      const kind = isHls
+        ? "HLS"
+        : lowerUrl.includes(".ism")
+          ? "Smooth Streaming"
+          : "DASH";
 
       // Forward track selections from the main TrackManager to whichever stream
       // wrapper is currently active (added once; resolves the live field).
@@ -1564,6 +3070,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         try {
           const plan = await analyzeDashFallback(streamUrl!, src?.headers, this.lifetimeSignal);
           if (plan) {
+            this._sourceIsEncrypted = !!plan.encrypted;
+            // Nothing here can recover, so don't spend fifty failed packets
+            // discovering it — see AudioDecoder.setFailFast.
+            if (plan.encrypted) this.audioDecoder.setFailFast(true);
             Logger.info(
               TAG,
               "forceStreamDemux: MSE failed at runtime — routing this DASH source through the FFmpeg demuxer",
@@ -1635,6 +3145,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
             this.lifetimeSignal,
           );
           if (plan) {
+            this._sourceIsEncrypted = !!plan.encrypted;
+            // Nothing here can recover, so don't spend fifty failed packets
+            // discovering it — see AudioDecoder.setFailFast.
+            if (plan.encrypted) this.audioDecoder.setFailFast(true);
             Logger.info(
               TAG,
               `forceStreamDemux: routing HLS through the FFmpeg demuxer (${plan.segments.length} video segments)`,
@@ -1754,6 +3268,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         try { this.streamWrapper?.destroy(); } catch {}
         this.streamWrapper = null;
 
+        // Did the engines turn this down for want of a LICENCE, as opposed to
+        // any of the other reasons they turn a stream down? It decides what the
+        // demuxer tier below is allowed to do with encrypted media — see the
+        // note where it is read.
+        let drmRefused = looksLikeDrmFailure(eShaka);
+
         // --- Tier 2: hls.js / dash.js. Their MSE engines play streams Shaka
         // rejects (e.g. under-specified single-file DASH the browser demuxer
         // handles but Shaka/FFmpeg won't). ---
@@ -1771,6 +3291,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
             return;
           } catch (eFallback) {
             Logger.warn(TAG, `${isHls ? "hls.js" : "dash.js"} fallback also failed`, eFallback);
+            drmRefused = drmRefused || looksLikeDrmFailure(eFallback);
             try { this.streamWrapper?.destroy(); } catch {}
             this.streamWrapper = null;
           }
@@ -1784,7 +3305,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         if (isDash) {
           try {
             const plan = await analyzeDashFallback(streamUrl!, src?.headers, this.lifetimeSignal);
+            // Encrypted, and we are only here because a licence was refused: the
+            // answer is already known, so don't spend the viewer's attention
+            // discovering it. A packager's clear lead exists to cover the wait
+            // for a licence, not to be watched on its own — playing it would put
+            // a few seconds of video up and then stop, which reads as the player
+            // breaking rather than as content that was never going to play.
+            //
+            // Only when the licence is the reason. Arriving here for any other
+            // reason (a forced engine, an MSE runtime failure) leaves the
+            // encrypted flag to the decode-time path, which still plays whatever
+            // is clear — the escape hatch for a manifest that declares
+            // ContentProtection over media that turns out not to need it.
+            if (plan?.encrypted && drmRefused) {
+              Logger.info(
+                TAG,
+                "Encrypted manifest and the licence was refused — not opening it in the demuxer",
+              );
+              throw new Error(
+                "This video is protected and needs a licence to play here.",
+              );
+            }
             if (plan) {
+              this._sourceIsEncrypted = !!plan.encrypted;
+              // Nothing here can recover, so don't spend fifty failed packets
+              // discovering it — see AudioDecoder.setFailFast.
+              if (plan.encrypted) this.audioDecoder.setFailFast(true);
               Logger.info(TAG, "Falling back to the FFmpeg demuxer");
               this.source = await this.createSource({
                 type: "url",
@@ -1954,18 +3500,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // then, the seek path lazy-inits it on demand (initPreviewPipeline is
       // idempotent), so previews still work — they just don't steal decode
       // headroom from a struggling startup.
-      if (this.previewsAllowed()) {
-        this._previewWarmTimer = setTimeout(() => {
-          this._previewWarmTimer = null;
-          if (this._destroyed || this.previewInitPromise || this.thumbnailBindings) {
-            return;
-          }
-          this.previewInitPromise = this.initPreviewPipeline().catch((e) => {
-            Logger.warn(TAG, "Preview pipeline init failed (non-critical)", e);
-            this.previewInitPromise = null;
-          });
-        }, MoviPlayer.PREVIEW_WARM_DELAY_MS);
-      }
+      this.schedulePreviewWarm(MoviPlayer.PREVIEW_WARM_DELAY_MS);
+
+      // A container that never wrote its duration down gets one more chance,
+      // off the load path this time — see rescanDurationInBackground.
+      if (!(this.mediaInfo.duration > 0)) this.scheduleDurationRescan();
 
       Logger.info(
         TAG,
@@ -2102,7 +3641,29 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.videoRenderer?.stopPresentationLoop();
       }
     };
+    // A step DOWN is a rescue on a link that is already short, and the rung
+    // being left keeps downloading through the whole prep — measured at
+    // 0.12 MB/s, the 2160p stream took a fresh 4MB range in the middle of a
+    // switch to 240p, so the rung we were escaping to got half of a link that
+    // could not feed either. Hold the outgoing source's download while the
+    // lower rung opens; every exit lets it go (endSwitch), and on success the
+    // old source is closed anyway.
+    const targetBwEarly =
+      this._dashRenditions.find((r) => r.url === newRenditionUrl)?.bandwidth ?? 0;
+    const activeBwEarly =
+      this._dashRenditions.find((r) => r.url === this._activeDashRendition)
+        ?.bandwidth ?? 0;
+    const stepDown =
+      targetBwEarly > 0 && activeBwEarly > 0 && targetBwEarly < activeBwEarly;
+    const heldSource = stepDown
+      ? (this.source as {
+          suspendNetwork?: () => void;
+          resumeNetwork?: () => void;
+        } | null)
+      : null;
+    heldSource?.suspendNetwork?.();
     const endSwitch = <T,>(result: T): T => {
+      heldSource?.resumeNetwork?.();
       if (indicatorOn && myIndicator === this._switchIndicatorGen) {
         indicatorOn = false;
         this.emit("renditionSwitch", { active: false, label: switchLabel });
@@ -2115,6 +3676,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // --- PREP (old keeps playing): build + open the new demuxer on an isolated
     // WASM module and seek it to the current position. Any failure here bails
     // out cleanly, leaving the old rendition untouched. ---
+    // …and any HANG here bails out too. See SWITCH_PREP_BUDGET_MS: the prep is
+    // several unbounded network waits held under a flag that disables every
+    // path that could rescue playback, so it needs an end.
+    const prepBudgetMs = stepDown
+      ? MoviPlayer.SWITCH_DOWN_PREP_BUDGET_MS
+      : MoviPlayer.SWITCH_PREP_BUDGET_MS;
+    const prepDeadline = performance.now() + prepBudgetMs;
+    // Which seek the prep was started against — see the last exit below.
+    const seekAtPrep = this._lastSeekAt;
+    const prepLeft = () => prepDeadline - performance.now();
     let newSource: SourceAdapter;
     try {
       if (isHls) {
@@ -2132,6 +3703,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           url: newRenditionUrl,
           headers,
         });
+        // Open the rung on a small first read. The 4MB opening is sized for a
+        // video's FIRST open — hosts prefetch against it — and a rung switch
+        // is not that: all it needs is the header, and the seek that follows
+        // starts its own stream at the landing point. At 0.12 MB/s a 4MB
+        // opening is 33s against a 12s prep budget, so every downshift to
+        // 240p (a 6.5MB file) timed out and left playback stuck on 2160p.
+        (
+          newSource as unknown as { setFirstRangeBytes?: (n: number) => void }
+        ).setFirstRangeBytes?.(MoviPlayer.SWITCH_FIRST_RANGE_BYTES);
       }
     } catch (e) {
       Logger.warn(TAG, "in-place switch: new source build failed", e);
@@ -2162,7 +3742,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     };
     let newInfo: MediaInfo;
     try {
-      newInfo = await newDemuxer.open();
+      const opened = await withDeadline(newDemuxer.open(), prepLeft());
+      if (opened === TIMED_OUT) {
+        // The moov never arrived in the budget. On the rung that does this —
+        // the one whose bitrate is at or above what the link can carry — the
+        // read is not slow, it is losing a race with the stream that is still
+        // playing. Abandon, which closes the source and hands the link back.
+        return abandonPrep(
+          `new demuxer open exceeded ${prepBudgetMs}ms — the link can't feed this rung`,
+        );
+      }
+      newInfo = opened;
     } catch (e) {
       return abandonPrep("new demuxer open failed", e);
     }
@@ -2209,6 +3799,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // hide — and only when both renditions count time from the same origin,
     // since the splice compares their frames by raw timestamp.
     let primed: { decoder: MoviVideoDecoder; frames: VideoFrame[] } | null = null;
+    // Set when the prime ran out of clock rather than bailing for a structural
+    // reason (no shared origin, a paused player, a software-backed decoder).
+    // That distinction is what the abandon below turns on.
+    const primeStatus: { exhausted: boolean; readInFlight?: Promise<unknown> } = {
+      exhausted: false,
+    };
     const sameOrigin = Math.abs(newStartTime - this.startTime) < 0.001;
     if (
       sameOrigin &&
@@ -2223,8 +3819,22 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // decoded only to be thrown away — at the resolution that most needs
         // the switch to be cheap.
         seekedTo = this.getCurrentTime();
-        await newDemuxer.seek(seekedTo + newStartTime);
-        primed = await this.primeRendition(newDemuxer, newVideoTrack, newStartTime);
+        const sought = await withDeadline(
+          newDemuxer.seek(seekedTo + newStartTime),
+          prepLeft(),
+        );
+        if (sought === TIMED_OUT) {
+          return abandonPrep(
+            "seek for the seamless prime exceeded the prep budget",
+          );
+        }
+        primed = await this.primeRendition(
+          newDemuxer,
+          newVideoTrack,
+          newStartTime,
+          prepDeadline,
+          primeStatus,
+        );
       } catch (e) {
         Logger.debug(TAG, `Seamless prime unavailable: ${e}`);
         primed = null;
@@ -2236,10 +3846,100 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // prime that ran for seconds and then gave up would otherwise seek to a
       // point that far behind the playhead ON TOP of the lookback, and the swap
       // would have to decode the whole deficit before showing anything.
+      // A prep that has already spent its whole budget has said what it needed
+      // to: this rung is not being fed. Falling through would commit the swap
+      // regardless — the unprimed path is a HARD switch, so the picture stops,
+      // the indicator goes up, and the player then waits on the very stream
+      // that could not prime. Abandon instead and let the next tick decide
+      // again, with the old rendition still playing throughout.
+      if (prepLeft() <= 0) {
+        return abandonPrep(
+          "prep budget spent before the swap — leaving the current rung in place",
+        );
+      }
+      // A prime that ran out of clock has already measured the thing this path
+      // is about to bet on, and the answer was no.
+      //
+      // The hard swap aims RENDITION_SWAP_LOOKBACK_S behind the playhead on
+      // purpose, so the incoming rendition starts on a frame the clock has
+      // passed — and that is only cheap because "those frames decode far
+      // faster than real time". On the rungs that fail to prime, they do not.
+      // Measured on an 8K60 AV1 rung: the prime spent its whole budget without
+      // staging a usable frame, the swap then seeked 4s back, the keyframe
+      // before that put the first frame 6.2s behind the audio, and the picture
+      // never closed the gap — three catch-up seeks each landed on an earlier
+      // keyframe and lost more ground (3.6s → 4.5s → 6.1s behind) until the
+      // resync cap ran out and the picture simply stopped under running sound.
+      //
+      // The prime is the cheapest possible test of exactly that capability and
+      // we have already paid for it. Failing it means this rung cannot chew a
+      // swap backlog either, so don't create one: leave the current rendition
+      // playing and let the next tick decide again.
+      //
+      // Only for an EXHAUSTED prime. The structural bails — no shared origin, a
+      // paused player, a prime that came up software-backed — say nothing about
+      // decode headroom, and those swaps go through as before.
+      // …and only when CLIMBING. A downshift is the switch a struggling player
+      // must always be allowed to finish — refusing it because the link was too
+      // slow to prime would strand the picture on the very rung it is trying to
+      // escape, which is the opposite of the rescue. Backlog is affordable
+      // there anyway: the target is the cheaper rung.
+      const targetBw =
+        this._dashRenditions.find((r) => r.url === newRenditionUrl)?.bandwidth ?? 0;
+      const activeBw =
+        this._dashRenditions.find((r) => r.url === this._activeDashRendition)
+          ?.bandwidth ?? 0;
+      if (primeStatus.exhausted && targetBw > activeBw) {
+        // Remember it, so the ladder aims below it for a while — see the cap
+        // in abrDecide. Escalates 30s, 60s, 120s for a rung that keeps failing.
+        const nowRefused = performance.now();
+        const prev = this._primeRefusals.get(newRenditionUrl);
+        const count =
+          (prev && nowRefused - prev.until < MoviPlayer.PRIME_REFUSAL_MAX_MS ? prev.count : 0) + 1;
+        this._primeRefusals.set(newRenditionUrl, {
+          count,
+          until:
+            nowRefused +
+            Math.min(
+              MoviPlayer.PRIME_REFUSAL_MS * 2 ** (count - 1),
+              MoviPlayer.PRIME_REFUSAL_MAX_MS,
+            ),
+        });
+        return abandonPrep(
+          "the incoming rung could not be primed inside its budget — it will not chew the swap backlog either",
+        );
+      }
+      // The prime can give up on a read that has not come back — it cannot be
+      // cancelled, only outwaited. Seeking the same demuxer over it hands the
+      // seek the read's pending slot: the read's bytes then land on "No pending
+      // read to fulfill" and the demuxer the swap is about to play from is
+      // wedged. That is why AUTO switches stuck on the heavy rungs and manual
+      // ones did not: an ABR downshift fires on a low buffer over a saturated
+      // link, where a 4K/8K read outlasts the prime's budget, while a manual
+      // pick lands on a healthy one and primes to a seamless handover. Measured
+      // on a 2160p → 1440p downshift: the warning 7ms after the swap, then the
+      // picture held while the sound ran on.
+      if (primeStatus.readInFlight) {
+        const landed = await withDeadline(
+          primeStatus.readInFlight,
+          Math.max(prepLeft(), 0),
+        );
+        if (landed === TIMED_OUT) {
+          return abandonPrep(
+            "the prime's last read never landed — the new demuxer cannot be reused",
+          );
+        }
+      }
       swapTime = lookbackFromNow();
       seekedTo = swapTime;
       try {
-        await newDemuxer.seek(swapTime + newStartTime);
+        const sought = await withDeadline(
+          newDemuxer.seek(swapTime + newStartTime),
+          prepLeft(),
+        );
+        if (sought === TIMED_OUT) {
+          return abandonPrep("new demuxer seek exceeded the prep budget");
+        }
       } catch (e) {
         return abandonPrep("new demuxer seek failed", e);
       }
@@ -2254,6 +3954,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         try { f.close(); } catch {}
       }
       return abandonPrep();
+    }
+    // …nor one the viewer has seeked past. The prep opened the new rung at the
+    // position it was started from, and the swap below takes the seek session:
+    // committed over a seek in flight, it put the picture back where the prep
+    // began (1476s, with the viewer at 1530s) and resolved the seek it had
+    // superseded as PAUSED — holding the right-arrow key stopped playback, and
+    // the rung it had climbed to then fell to 480p on the refill. An AUTO
+    // switch is only an opinion about the link; the viewer's seek wins, and
+    // the ladder decides again once they stop. A switch the viewer asked for
+    // is theirs and goes ahead.
+    if (this._abrSwitchInProgress && this._lastSeekAt !== seekAtPrep) {
+      try { primed?.decoder.close(); } catch {}
+      for (const f of primed?.frames ?? []) {
+        try { f.close(); } catch {}
+      }
+      return abandonPrep(
+        "the viewer seeked while the rung was being prepared — deciding again once they settle",
+      );
     }
 
     // --- ATOMIC SWAP: stop the video loop (audio + clock keep running), swap
@@ -2336,6 +4054,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // buffer bar freezes after a quality switch.
     this.lastBufferedTime = 0;
     this.bufferedRangeStart = seekedTo;
+    // Whatever the loop decided about the end of the file was a verdict on the
+    // OUTGOING demuxer's cursor, and the incoming one starts at seekedTo. A
+    // rung left mid-read can call a failed read EOF on its way out (see the
+    // held read in HttpSource), and carried across the swap that verdict
+    // stopped the loop reading the new rung at all: fully downloaded, under a
+    // spinner, until a seek happened to clear it.
+    this.eofReached = false;
+    this.eofSince = 0;
 
     // The video decoder's software path reads through the demuxer's WASM module.
     const bindings = newDemuxer.getBindings();
@@ -2482,14 +4208,27 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * switch. When on, a timer estimates download throughput and switches to the
    * best rendition it can sustain — in-place, so it's smooth. Off pins the
    * current rendition.
+   *
+   * `snap` is for the viewer choosing Auto from a fixed quality: go to the rung
+   * the link carries now, the way the opening pick does, instead of starting
+   * the ordinary climb from wherever the fixed pick left it. See
+   * abrSnapToLink. The per-video re-apply of a remembered Auto preference does
+   * not snap — the opening pick has already made that decision.
    */
-  setAutoQuality(enabled: boolean): void {
+  setAutoQuality(enabled: boolean, opts?: { snap?: boolean }): void {
     if (this._autoQuality === enabled) return;
     this._autoQuality = enabled;
     if (enabled) {
       this._abrPrimed = false; // first upshift jumps without the 2-tick wait
       this._abrPenalizedBandwidth = 0; // fresh Auto session — no stale penalty
       this._abrPenaltyUntil = 0;
+      if (opts?.snap) {
+        void this.abrSnapToLink();
+        if (!this._abrTimer) {
+          this._abrTimer = setInterval(() => this.abrTick(), 4000);
+        }
+        return;
+      }
       // Kick off a quick startup speed test so Auto can ramp to the right rung
       // in a couple of seconds instead of climbing rung-by-rung off passive
       // measurement — the "good link but started ugly-low" case. Non-blocking:
@@ -2504,6 +4243,90 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     } else if (this._abrTimer) {
       clearInterval(this._abrTimer);
       this._abrTimer = null;
+    }
+  }
+
+  /**
+   * Put Auto on the rung the link carries, now — the opening pick, re-run.
+   *
+   * Choosing Auto from a fixed quality used to hand the ladder to the ordinary
+   * tick, which climbs one step and a cooldown at a time from wherever the
+   * fixed pick left it: a viewer on 360p over a 40Mbps line picked Auto and
+   * watched it walk up for a minute, when a fresh load of the same video opens
+   * on the right rung before the first frame. So do what the fresh load does:
+   * the same 55% of the best link reading we hold, the same device ceilings,
+   * then read the chosen rung's own stream and re-pick from that — up or down,
+   * twice at most — and switch once. A fixed pick above what the link carries
+   * comes down the same way.
+   *
+   * Runs under the tick lock, so no ordinary decision races it.
+   */
+  private async abrSnapToLink(): Promise<void> {
+    if (this._abrTickInFlight) return;
+    this._abrTickInFlight = true;
+    try {
+      if (
+        this._destroyed ||
+        !this._autoQuality ||
+        this._abrSwitchInProgress ||
+        !this.source
+      ) {
+        return;
+      }
+      const rungs = this._dashRenditions
+        .filter((r) => (r.bandwidth || 0) > 0)
+        .sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
+      if (rungs.length < 2) return;
+      const onCpu = this.decodingOnCpu();
+      const ceilingH = onCpu
+        ? softwareDecodeCeiling(!!this.videoDecoder && !this.videoDecoder.isSoftware)
+        : Number.POSITIVE_INFINITY;
+      const allowed = rungs.filter(
+        (r) =>
+          !(r.height != null && MoviPlayer.isDecodeBound(r.codec, r.height)) &&
+          !((r.height ?? 0) > ceilingH && this.softwareCeilingApplies(r.codec)),
+      );
+      if (allowed.length === 0) return;
+      const pickFor = (bits: number) =>
+        allowed.find((r) => (r.bandwidth || 0) <= bits * 0.55) ??
+        allowed[allowed.length - 1];
+
+      const linkBits = Math.max(
+        loadPersistedLinkBps(),
+        this._lastThroughputBps * 8,
+      );
+      if (!(linkBits > 0)) {
+        // Nothing measured at all: the ordinary tick and the startup speed
+        // test are what find out, as they always did.
+        void this.runStartupSpeedTest();
+        return;
+      }
+      let pick = pickFor(linkBits);
+      let basis = `${(linkBits / 1e6).toFixed(1)}Mbps known`;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const bits = await this.probeRungThroughput(pick.url);
+        if (this._destroyed || !this._autoQuality) return;
+        if (bits <= 0) break; // unmeasurable says nothing — keep the pick
+        this._rungProbeBits.set(pick.url, { bits, at: performance.now() });
+        // A floor, not a verdict on the link: the playing stream shared the
+        // line while this was read.
+        raiseLinkBps(bits);
+        const next = pickFor(bits);
+        basis = `${(bits / 1e6).toFixed(1)}Mbps on ${pick.label || pick.height + "p"}'s own stream`;
+        if (next.url === pick.url) break;
+        pick = next;
+      }
+      if (pick.url === this._activeDashRendition) {
+        Logger.info(TAG, `Auto: already on ${pick.label || pick.height + "p"} (${basis})`);
+        return;
+      }
+      Logger.info(
+        TAG,
+        `Auto selected — going straight to ${pick.label || pick.height + "p"} (${basis})`,
+      );
+      await this.abrCommit(pick.url, performance.now());
+    } finally {
+      this._abrTickInFlight = false;
     }
   }
 
@@ -2542,6 +4365,17 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       TAG,
       `Startup speed test: ${(bits / 1e6).toFixed(1)}Mbps sustained (past the proxy burst)`,
     );
+    // Keep it for the next open. Only the element's pre-play probe was writing
+    // this store, so a session whose probe came up empty — a proxy that bursts
+    // before it paces, which is exactly where the probe struggles — measured a
+    // perfectly good link here and then threw the number away, and the next
+    // open started from "no link measurement yet" on the smallest rung again.
+    // raise, not persist: a reading taken mid-playback is a floor (the stream
+    // is paced to its own bitrate), so it may lift a stored estimate but must
+    // never drag a better one down. Same rule the Shaka and DASH wrappers use.
+    // Bits: the store is bits/s (see persistLinkBps), and a bytes/s value
+    // here was eight times too small ever to raise it.
+    raiseLinkBps(bits);
     if (this._autoQuality) void this.abrTick();
   }
 
@@ -2581,6 +4415,42 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // against the old one can be told apart from a genuine failure.
   private _demuxerGeneration = 0;
 
+  /**
+   * A rung the link just failed: stop the remembered rate claiming it, and
+   * hold the ladder below it for an escalating while — see _abrDrainStrikes.
+   */
+  private penalizeLeavingRung(leavingBw: number, now: number): void {
+    lowerLinkBps(leavingBw);
+    const prevStrike = this._abrDrainStrikes.get(leavingBw);
+    const strikes =
+      (prevStrike && now - prevStrike.at < MoviPlayer.ABR_STRIKE_DECAY_MS
+        ? prevStrike.count
+        : 0) + 1;
+    this._abrDrainStrikes.set(leavingBw, { count: strikes, at: now });
+    this._abrPenalizedBandwidth = leavingBw;
+    this._abrPenaltyUntil = Math.max(
+      this._abrPenaltyUntil,
+      now +
+        Math.min(
+          MoviPlayer.ABR_PENALTY_MS * 2 ** (strikes - 1),
+          MoviPlayer.ABR_PENALTY_MAX_MS,
+        ),
+    );
+  }
+
+  /** Deepest the buffer has been since playback last settled on this rung —
+   *  the reference the early downshift measures "half used" against. */
+  private _abrBufferPeak = 0;
+  /** When the early downshift last asked and chose to stay. */
+  private _abrEarlyCheckAt = Number.NEGATIVE_INFINITY;
+  /** Below this share of its peak, a buffer the link is not refilling is
+   *  worth a question about the rung — see the early downshift. */
+  private static readonly ABR_EARLY_DOWN_AT = 0.5;
+  /** A peak shallower than this has no half worth protecting: the reactive
+   *  downshift's own thresholds (4-6s) are already that close. */
+  private static readonly ABR_EARLY_MIN_PEAK_S = 10;
+  private static readonly ABR_EARLY_RECHECK_MS = 20_000;
+
   /** One ABR decision. Always through abrTick(), never called directly. */
   private async abrDecide(): Promise<void> {
     if (
@@ -2604,7 +4474,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // demuxer reading bytes at the wrong offset — surfacing as "corrupt data
       // stream" plus a large A/V desync. Wait for the seek to settle first.
       this.stateManager.is("seeking") ||
-      this.waitingForVideoSync
+      this.waitingForVideoSync ||
+      // …nor in the moments BETWEEN seeks. Holding an arrow key is a seek every
+      // ~100ms with a brief "playing" in between, and a decision made in one of
+      // those gaps prepares its rung while the next seeks arrive (see the last
+      // exit in switchVideoRenditionInPlace). Nothing about the link is learned
+      // from a playhead that is jumping; wait for it to settle.
+      performance.now() - this._lastSeekAt < MoviPlayer.ABR_POST_SEEK_HOLD_MS
     ) {
       if (this._audioOnly) this._lastBufferAhead = 0;
       return;
@@ -2623,6 +4499,23 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this._lastBufferAhead = 0;
       this._abrUpCandidate = "";
       this._abrUpConfirms = 0;
+      return;
+    }
+    // A source the server is refusing: no decision, and no verdict on the link.
+    //
+    // A 403 empties the buffer exactly the way a slow link does, and every
+    // rung of a split stream shares the one audio URL, so no downshift can
+    // answer it. Measured on a YouTube video whose URLs stop serving about a
+    // minute in (every itag, fresh or re-resolved): the audio range past that
+    // point was refused, the buffer read 0.4s, and the ABR walked 2160p to 480p
+    // to 360p to 240p through switches that could never prime — and on the way
+    // lowered the REMEMBERED link rate from 56.7 to 12 Mbps, so the next video,
+    // on a link that was fine, opened low as well. The refusal is the element's
+    // to surface; the quality stays where it is.
+    const refusing = (s: unknown) =>
+      !!(s as { isRefusing?: () => boolean } | null)?.isRefusing?.();
+    if (refusing(this.source) || refusing(this.audioSource)) {
+      this._lastBufferAhead = 0;
       return;
     }
 
@@ -2759,8 +4652,19 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // 480p → 360p → 240p on a link carrying 25.9s of buffer, each downshift
     // clearing the frame queue the hold was waiting to see fill — the ladder
     // collapse and the wait sustaining each other.
+    // …and only when the link is what ran out. Playback can stall with seconds
+    // of the rung already ON THE MACHINE — the frame queue empties while the
+    // decoder re-primes, or the picture is catching up — and a downshift is a
+    // bandwidth remedy for a problem that is not bandwidth. Measured on a 4K60
+    // rung: three stalls with 7.1s, 9.5s and 67.2s buffered ahead, each read as
+    // the rung failing, walking 2160p → 1440p → 1080p → 720p while the bytes
+    // for 2160p sat in hand. A rung the DEVICE cannot decode still drops, via
+    // the decode-bound branch that owns that case.
+    const linkStarved = bufferAhead < MoviPlayer.ABR_STALL_STARVED_S;
     const stalling =
-      this.stateManager.is("buffering") && !this._bufferingSelfInflicted;
+      this.stateManager.is("buffering") &&
+      !this._bufferingSelfInflicted &&
+      linkStarved;
     // An in-place quality switch resets the buffered range to ~0 at the current
     // playhead, so bufferAhead reads low for the first several seconds while the
     // new rendition re-primes — that's a REFILL, not the network failing to
@@ -2808,6 +4712,92 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       !videoRecovering &&
       !nothingLeftToFetch &&
       ((draining && bufferAhead < 6) || (bufferAhead < 4 && settledSinceSwitch));
+
+    // EARLY DOWNSHIFT — decide at half the buffer, not at its last second.
+    //
+    // The reactive path below fires on a buffer that is nearly gone (4-6s, or
+    // a stall), and a switch made there is a hard one: the new rung has to open,
+    // seek and prime in whatever is left, and on 8K over a link that carries
+    // neither 8K nor quite 4K that is not enough — the picture stops while the
+    // lower rung loads, and sometimes stops again when it proves too heavy as
+    // well. Asked at half the buffer, the same switch has seconds to prime
+    // under a picture that is still playing, which is what makes it seamless.
+    //
+    // Asked only when the buffer is falling for the link's reasons: the stream
+    // is downloading right now (not parked on a full window, which also lets
+    // the buffer fall) and what it has delivered is short of the rung. Then one
+    // short read of the rung's own stream, with the playing download held so
+    // the reading is the link's and not a share of it, decides: carried, stay
+    // and ask again later; not carried, go now to the highest rung it carries.
+    const earlySettled =
+      !postSeekSettling &&
+      !postBackgroundSettling &&
+      !videoRecovering &&
+      !nothingLeftToFetch &&
+      sinceSwitch > 5000 &&
+      activeIdx >= 0;
+    if (!earlySettled) {
+      this._abrBufferPeak = 0;
+    } else if (bufferAhead > this._abrBufferPeak) {
+      this._abrBufferPeak = bufferAhead;
+    }
+    if (
+      earlySettled &&
+      !stalling &&
+      !bufferLow &&
+      activeIdx < rungs.length - 1 &&
+      this._abrBufferPeak >= MoviPlayer.ABR_EARLY_MIN_PEAK_S &&
+      bufferAhead <= this._abrBufferPeak * MoviPlayer.ABR_EARLY_DOWN_AT &&
+      now - this._abrEarlyCheckAt > MoviPlayer.ABR_EARLY_RECHECK_MS &&
+      !this._abrProbeInFlight
+    ) {
+      const active = rungs[activeIdx];
+      const activeBits = active.bandwidth || 0;
+      const ns = (
+        this.source as { getNetworkStats?: () => { currentSpeed: number } } | null
+      )?.getNetworkStats?.();
+      const downloading = (ns?.currentSpeed || 0) > 0;
+      const delivered = this.sustainedDeliveryBps();
+      if (downloading && delivered > 0 && delivered < activeBits) {
+        this._abrEarlyCheckAt = now;
+        const held = this.source as {
+          suspendNetwork?: () => void;
+          resumeNetwork?: () => void;
+        } | null;
+        held?.suspendNetwork?.();
+        let probed = -1;
+        try {
+          probed = await this.probeRungThroughput(active.url);
+        } finally {
+          held?.resumeNetwork?.();
+        }
+        if (this._destroyed || !this._autoQuality) return;
+        const reading = probed > 0 ? probed : delivered;
+        const basis = `${(reading / 1e6).toFixed(1)}Mbps ${probed > 0 ? "on its own stream" : "delivered"}`;
+        if (reading * 0.85 >= activeBits) {
+          Logger.info(
+            TAG,
+            `ABR early check at ${bufferAhead.toFixed(1)}s of a ${this._abrBufferPeak.toFixed(1)}s buffer: ${active.label || activeBits} still carried (${basis}) — staying`,
+          );
+        } else {
+          let target = rungs[rungs.length - 1];
+          for (let i = activeIdx + 1; i < rungs.length; i++) {
+            if ((rungs[i].bandwidth || 0) <= reading * 0.85) {
+              target = rungs[i];
+              break;
+            }
+          }
+          this.penalizeLeavingRung(activeBits, now);
+          Logger.info(
+            TAG,
+            `ABR downshift ${active.label || activeBits} → ${target.label || target.bandwidth}: reason=early, bufferAhead=${bufferAhead.toFixed(1)}s of ${this._abrBufferPeak.toFixed(1)}s, ${basis}, delivered ${(delivered / 1e6).toFixed(1)}Mbps`,
+          );
+          this._abrBufferPeak = 0;
+          await this.abrCommit(target.url, now);
+        }
+        return;
+      }
+    }
     if (
       (stalling || bufferLow) &&
       // Nothing left to fetch means the whole rung is already in hand, and a
@@ -2870,21 +4860,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // the lower one instead of ping-ponging every ~40s. Strikes decay after a
       // clean spell so an improved link still gets another shot.
       const leavingBw = rungs[activeIdx].bandwidth || 0;
-      const prevStrike = this._abrDrainStrikes.get(leavingBw);
-      const strikes =
-        (prevStrike && now - prevStrike.at < MoviPlayer.ABR_STRIKE_DECAY_MS
-          ? prevStrike.count
-          : 0) + 1;
-      this._abrDrainStrikes.set(leavingBw, { count: strikes, at: now });
-      this._abrPenalizedBandwidth = leavingBw;
-      this._abrPenaltyUntil = Math.max(
-        this._abrPenaltyUntil,
-        now +
-          Math.min(
-            MoviPlayer.ABR_PENALTY_MS * 2 ** (strikes - 1),
-            MoviPlayer.ABR_PENALTY_MAX_MS,
-          ),
-      );
+      // The link just failed this rung, so the stored rate that opens the next
+      // load must stop claiming it can carry it — see lowerLinkBps.
+      this.penalizeLeavingRung(leavingBw, now);
       Logger.info(
         TAG,
         `ABR downshift ${rungs[activeIdx].label || rungs[activeIdx].bandwidth} → ${target.label || target.bandwidth}: reason=${stalling ? "stall" : "bufferLow"}, bufferAhead=${bufferAhead.toFixed(1)}s, draining=${draining}, sinceSwitch=${(sinceSwitch / 1000).toFixed(0)}s`,
@@ -2982,6 +4960,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       sizingBits = Math.max(sizingBits, this._lastProbeBits);
     }
     let affordableBits = sizingBits * 0.85;
+    // Everything below is a CEILING that holds whatever the link says (the
+    // device, the CPU, a rung that just failed) — kept apart so the stable-link
+    // jump further down can be held to the same limits.
+    let capBits = Number.POSITIVE_INFINITY;
     // Never climb into a resolution this device has proven (twice) it can't
     // decode. The cap lives at module level (survives player recreates), so it
     // holds across every video this session — convert the capped heights to a
@@ -2999,7 +4981,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         }
       }
       if (swCapBits < Number.POSITIVE_INFINITY) {
-        affordableBits = Math.min(affordableBits, swCapBits - 1);
+        capBits = Math.min(capBits, swCapBits - 1);
       }
     }
 
@@ -3014,18 +4996,35 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         }
       }
       if (heightCapBits < Number.POSITIVE_INFINITY) {
-        affordableBits = Math.min(affordableBits, heightCapBits - 1);
+        capBits = Math.min(capBits, heightCapBits - 1);
       }
     }
     // Honour an active penalty: a rung that recently drained is off-limits (and
     // so is anything above it) until the hold window passes, so a bursty spike
     // can't re-upshift into the same rung that just failed. Cleared once expired.
     if (now < this._abrPenaltyUntil && this._abrPenalizedBandwidth > 0) {
-      affordableBits = Math.min(affordableBits, this._abrPenalizedBandwidth - 1);
+      capBits = Math.min(capBits, this._abrPenalizedBandwidth - 1);
     } else if (this._abrPenaltyUntil !== 0 && now >= this._abrPenaltyUntil) {
       this._abrPenaltyUntil = 0;
       this._abrPenalizedBandwidth = 0;
     }
+    // A rung whose in-place switch just failed to prime is off the table for
+    // a while, and so is everything above it. Without this the climb aimed at
+    // the same rung on every tick: on Safari, 720p → 4320p was probed and
+    // abandoned ten times in a row ("could not be primed inside its budget"),
+    // each probe a burst reading of 86-103Mbps, and the picture stayed on 720p
+    // the whole time while 2160p — which the link carries — was never asked.
+    // Capping just under it lets the next tick aim one rung lower.
+    //
+    // Settled: the owner confirmed this is the right approach (2026-09-26).
+    // Do not rework it or remove it.
+    for (const r of rungs) {
+      const refused = this._primeRefusals.get(r.url);
+      if (refused && now < refused.until && (r.bandwidth || 0) > 0) {
+        capBits = Math.min(capBits, (r.bandwidth || 0) - 1);
+      }
+    }
+    affordableBits = Math.min(affordableBits, capBits);
     let up = rungs[rungs.length - 1];
     for (const r of rungs) {
       if ((r.bandwidth || 0) <= affordableBits) {
@@ -3055,7 +5054,43 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // presses play on a rung several steps below what their connection has
     // already demonstrated. The target probe below still has the final say.
     const paused = this.stateManager.getState() === "paused";
-    if (!paused && upIdx < activeIdx - 1) {
+    // …and so is a PACED link, where the number that sizes the jump is not
+    // the rung's at all. The step rule guards against an estimate taken off
+    // the rung being played; on a deep, steady buffer the target is sized off
+    // the LINK instead — the remembered measurement and the probes — and then
+    // the target itself is probed before it is entered, so what decides a
+    // climb is a reading of the stream being climbed into.
+    //
+    // Probing only the next rung up made that reading useless as a guide to
+    // anything further: one stream through the host's proxy fed 16-22Mbps on
+    // a 40-45Mbps line, 3.9 and 7.2 when it shared the link with the playing
+    // stream, and every climb was one rung and a cooldown — 480p to 1440p in
+    // three switches on a link that carried 1440p from the start. So aim at
+    // the highest rung the link is known to carry, and let each refusal bring
+    // the aim down to what that rung's own stream actually delivered.
+    const jumping = paced && !paused && this._autoQuality;
+    if (jumping) {
+      const linkBits = Math.max(sizingBits, loadPersistedLinkBps());
+      let aimBits = Math.min(linkBits * 0.85, capBits);
+      for (const r of rungs) {
+        const reading = this._rungProbeBits.get(r.url);
+        if (
+          reading &&
+          now - reading.at < MoviPlayer.ABR_PROBE_FRESH_MS &&
+          reading.bits * 0.85 < (r.bandwidth || 0)
+        ) {
+          aimBits = Math.min(aimBits, reading.bits * 0.85);
+        }
+      }
+      const aimIdx = rungs.findIndex((r) => (r.bandwidth || 0) <= aimBits);
+      if (aimIdx >= 0 && aimIdx < activeIdx) {
+        upIdx = aimIdx;
+        up = rungs[upIdx];
+      } else if (upIdx < activeIdx - 1) {
+        upIdx = activeIdx - 1;
+        up = rungs[upIdx];
+      }
+    } else if (!paused && upIdx < activeIdx - 1) {
       upIdx = activeIdx - 1;
       up = rungs[upIdx];
     }
@@ -3068,7 +5103,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
       // First upshift after enabling Auto commits at once (need 1); later ones
       // wait for 2 consecutive ticks so a lone spike can't bounce quality up.
-      const need = this._abrPrimed ? 2 : 1;
+      // Not a paced aim: the spike that rule is for is in the sustained
+      // estimate, and a paced climb is decided by probes of the target, which
+      // for a jump of more than one rung must agree twice (below).
+      const need = this._abrPrimed && !jumping ? 2 : 1;
       if (this._abrUpConfirms >= need) {
         // Confirm the upshift with a fresh probe of the TARGET rung — but the
         // probe can only make the decision MORE conservative, never less. Take
@@ -3119,7 +5157,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           );
           return;
         }
+        // A rung whose last probes measured nothing is not probed again on
+        // the next tick. Each is up to 2MB, and a probe that came back empty
+        // will usually come back empty again for the same reason — nothing
+        // limited that, so it ran every four seconds for as long as the
+        // candidate stood. Backs off 10s, 20s, 40s, capped at a minute, and a
+        // reading clears it.
+        const miss = this._rungProbeMisses.get(up.url);
+        if (
+          miss &&
+          now - miss.at <
+            Math.min(
+              MoviPlayer.ABR_PROBE_MIN_GAP_MS * 2 ** (miss.count - 1),
+              60_000,
+            )
+        ) {
+          return;
+        }
         const rawProbeBits = await this.probeRungThroughput(up.url);
+        if (rawProbeBits > 0) {
+          this._rungProbeMisses.delete(up.url);
+        } else {
+          this._rungProbeMisses.set(up.url, {
+            count: (miss?.count ?? 0) + 1,
+            at: now,
+          });
+        }
         // A rung gets probed again every time it comes up as a candidate, and
         // committing on the first reading that clears the bar is choosing the
         // best of N tries — which, with a variable link, is a near-certainty
@@ -3155,6 +5218,30 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           probeBits = priorFresh.bits;
         } else {
           probeBits = rawProbeBits; // nothing known — the sustained estimate decides
+        }
+        // …except when the link is PACED, where "the sustained estimate" is not
+        // an estimate of this rung at all.
+        //
+        // The branch above already refuses to let a don't-know become a yes
+        // when there is an earlier reading to fall back on. With NO reading it
+        // fell through to throughputBits, which is measured on the rung being
+        // LEFT — and on a CDN that paces each stream to its own bitrate that is
+        // a fact about a different file. Captured on an 8K ladder: the target
+        // probe was thrown out as a cache hit ("1953KB in 18ms — cache or short
+        // read, not the link"), and 72.9Mbps measured on the 2160p stream
+        // authorised the climb into 4320p. Nothing had measured the 8K stream.
+        //
+        // Only in the paced case. Draining or on a thin buffer, throughputBits
+        // is a real ceiling taken off a stream that is genuinely being pulled
+        // as hard as it can be, so it still means something as a limit.
+        if (paced && probeBits <= 0) {
+          this._abrUpCandidate = "";
+          this._abrUpConfirms = 0;
+          Logger.info(
+            TAG,
+            `ABR upshift to ${up.label || up.bandwidth} held — nothing has measured that rung, and the ${(throughputBits / 1e6).toFixed(1)}Mbps we have is about the one we are on`,
+          );
+          return;
         }
         // MIN normally: with a shallow buffer the sustained number is a real
         // ceiling and the probe must not talk the estimate up past it.
@@ -3219,6 +5306,19 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
             return;
           }
         }
+        // A jump of more than one rung rests on two readings of the target,
+        // not one. A single probe that clears the bar is the best of however
+        // many tries it took, and on a variable link that is a matter of time;
+        // the next tick reads it again and the lower of the two decides (see
+        // priorFresh above). One rung up keeps the single reading — it is the
+        // cheap experiment the step rule was always content with.
+        if (jumping && activeIdx - upIdx >= 2 && !priorFresh && rawProbeBits > 0) {
+          Logger.info(
+            TAG,
+            `ABR upshift to ${up.label || up.bandwidth} held for a second reading — ${(rawProbeBits / 1e6).toFixed(1)}Mbps on its own stream, rung needs ${((up.bandwidth || 0) / 1e6).toFixed(1)}Mbps`,
+          );
+          return;
+        }
         Logger.info(
           TAG,
           `ABR upshift ${rungs[activeIdx].label || rungs[activeIdx].bandwidth} → ${up.label || up.bandwidth}: ${(effectiveBits / 1e6).toFixed(1)}Mbps ${probeBits <= 0 ? "sustained" : rawProbeBits <= 0 ? "last reading of the target rung" : paced ? "probed on the target rung" : "sustained∧probed"}, bufferAhead=${bufferAhead.toFixed(1)}s`,
@@ -3254,6 +5354,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   /** Last probe reading per rung URL — the second opinion an upshift needs
    *  before the ladder moves into that rung. See the vote in abrTick. */
   private _rungProbeBits = new Map<string, { bits: number; at: number }>();
+  /** Rungs whose in-place climb could not be primed, and until when the
+   *  ladder aims below them. See the cap in abrDecide. */
+  private _primeRefusals = new Map<string, { count: number; until: number }>();
+  private static readonly PRIME_REFUSAL_MS = 30_000;
+  private static readonly PRIME_REFUSAL_MAX_MS = 120_000;
+  /** Probes of a rung that came back with no reading, and when the last one
+   *  did — the backoff before asking that rung again. */
+  private _rungProbeMisses = new Map<string, { count: number; at: number }>();
   /** How long a probe reading stays fresh enough to size a candidate from. */
   private static readonly ABR_PROBE_FRESH_MS = 60_000;
   /** How long a rung's own refusal stands before it is worth spending another
@@ -3296,6 +5404,21 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const startedAt = performance.now();
       const res = await fetch(url, {
         headers: { Range: `bytes=0-${PROBE_BYTES - 1}`, ...(this.config.headers || {}) },
+        // Ask the LINK, not the cache — the probe exists to measure the one and
+        // the other cannot answer for it.
+        //
+        // Every probe reads the same opening range, so the first one put those
+        // bytes in the HTTP cache and every probe after it was served from
+        // there. The reading is then correctly thrown out ("cache or short
+        // read, not the link"), which leaves the rung unmeasured, which is
+        // exactly the state the paced guard below refuses to climb out of — so
+        // it never climbs again. Seen on a 480p → 720p hold: "1953KB in 6ms"
+        // thirteen times in a row, on a link that had probed at 79.5Mbps and a
+        // buffer 349s deep. A ladder that can only ever step up once.
+        //
+        // `reload` bypasses the cache on the way out and still writes the
+        // response back, so the bytes are there for the switch that follows.
+        cache: "reload",
         signal: ctl.signal,
       });
       if ((!res.ok && res.status !== 206) || !res.body) {
@@ -3351,6 +5474,18 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
       const timedSecs = (performance.now() - timingStart) / 1000;
       if (timedSecs < 0.05) {
+        // Too fast to time is an answer, not a failure: the whole slice came
+        // in faster than the timing window can open, which a slow link cannot
+        // do. Returning nothing made a fast link the one thing the ABR could
+        // not measure — on a line that read 150Mbps, 30 probes in a row came
+        // back "too short to time", each a 2MB download, and the paced guard
+        // held every climb for want of a number. The whole slice, round trip
+        // included, is a floor on what the link carries, and a floor is all a
+        // climb needs.
+        if (totalSecs >= 0.15) {
+          Logger.debug(TAG, `Rung probe: past the burst in ${(timedSecs * 1000) | 0}ms — using the whole slice as a floor`);
+          return (total / totalSecs) * 8;
+        }
         Logger.debug(TAG, `Rung probe: only ${(timedSecs * 1000) | 0}ms past the burst — too short to time`);
         return -1;
       }
@@ -3465,11 +5600,22 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const failH = failing.height ?? 0;
     const capped = failH > 0;
     if (capped) {
-      const failKey = decodeBoundKey(
-        this.videoDecoder?.configuredCodec || failing.codec || "",
-        failH,
-      );
+      const failCodec =
+        this.videoDecoder?.configuredCodec || failing.codec || "";
+      const failKey = decodeBoundKey(failCodec, failH);
       deviceDecodeBoundHeights.add(failKey);
+      // What gets written down is the exact rung SHAPE, not the family at this
+      // height — "8K AV1" is not one thing, and a machine that cannot hold a
+      // 10-bit 8K rung may well hold an 8-bit one. The broad key still bars the
+      // whole height for THIS SESSION, which is what stops the re-climb loop;
+      // it just doesn't follow the device around forever. With no codec string
+      // to be exact about there is nothing finer to say, so the broad key is
+      // what persists, as before.
+      const failExact = decodeBoundExactKey(failCodec, failH);
+      if (failExact) {
+        deviceDecodeBoundHeights.add(failExact);
+        sessionOnlyDecodeBoundHeights.add(failKey);
+      }
       // …but only WRITE IT DOWN if the hardware path was the one that failed.
       // A software-decoding session cannot hold 720p on a phone and says
       // nothing about what the GPU can do — yet this was persisted all the
@@ -3482,6 +5628,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         persistDecodeCeiling();
       } else {
         sessionOnlyDecodeBoundHeights.add(failKey);
+        if (failExact) sessionOnlyDecodeBoundHeights.add(failExact);
         Logger.info(
           TAG,
           `ABR: ${failH}p barred for this session only — software decode failing says nothing about the hardware path`,
@@ -3940,6 +6087,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     // Stop pause-time buffering — we're resuming active playback
     this.stopPauseBuffering();
+    // …and let the window slide with the reader again, once the first read
+    // of this play has landed (the realignment below re-reads a keyframe).
+    if (this.source instanceof HttpSource) this.source.releaseWindowAfterNextRead();
 
     // Fallback stamp for callers that drive playback without going through
     // load() — normally load() sets this. Lets ABR tell "the buffer hasn't
@@ -3974,6 +6124,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // seek completion transitions straight to "playing".
     if (wasEnded && this.demuxer) {
       Logger.debug(TAG, "Replaying from beginning after ended state");
+      // This branch serves a manual replay too — pressing play on a finished
+      // file. Only a looping one is a loop.
+      if (this._loopEnabled) this.noteLoopTurn();
       this.requestWakeLock();
       // Set the resume intent BEFORE awaiting seek(0). Replay data is always
       // already buffered, so notifySeekCompletion can fire synchronously
@@ -4040,7 +6193,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const uiTarget = 0;
       this.wasPlayingBeforeSeek = true;
       try {
-        await this.seek(uiTarget, { suppressSpinner: true });
+        // Realigning the demuxer after the poster seek is housekeeping, not a
+        // seek anybody asked for: pressing play on a fresh element reports no
+        // seeking/seeked at all, and this one used to make it look as though
+        // the viewer had scrubbed before playback began. (The replay-from-ended
+        // seek above stays audible — an element genuinely does report that
+        // one.)
+        await this.seek(uiTarget, { suppressSpinner: true, internal: true });
         this._playStartTime = performance.now();
       } catch (error) {
         this.suppressSeekSpinner = false;
@@ -4052,6 +6211,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     if (this._playStartTime === 0 && this.demuxer) {
       const targetTime = this.clock.getTime();
+      // Said out loud, because its absence is invisible: when this does NOT run
+      // the only symptom is a picture that holds still for as long as the gap,
+      // with nothing else in the log to explain it.
+      Logger.info(
+        TAG,
+        `Realigning the demuxer to the clock at ${targetTime.toFixed(3)}s before first play`,
+      );
 
       // Flush the decode pipeline before re-seeking the demuxer. The
       // poster seek's processLoop reads ahead, racing the demuxer cursor
@@ -4081,7 +6247,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       try {
         await this.demuxer.seek(targetTime, 1, this.getSeekStreamIndex());
       } catch (error) {
-        Logger.error(TAG, "Demuxer seek on first play failed", error);
+        Logger.error(TAG, "Demuxer realignment seek on play failed", error);
         this.wasPlayingBeforeSeek = false;
         this.suppressSeekSpinner = false;
         this.stateManager.setState("error");
@@ -4110,7 +6276,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.eofReached = false;
       this.eofSince = 0;
     } else {
-      // Resume from pause — just resume AudioContext
       if (!this.disableAudio) {
         await this.audioRenderer.play();
       } else {
@@ -4151,7 +6316,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.clock.pause();
         return;
       }
-    } else {
+    } else if (stateForPlay !== "playing") {
       Logger.error(
         TAG,
         `Cannot transition to playing from state: ${stateForPlay}`,
@@ -4159,6 +6324,22 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.clock.pause();
       return;
     }
+    // Already playing is not a failure — it is this call's own goal, reached
+    // by something else while we were awaiting above.
+    //
+    // play() is async and everything between the entry check and here can
+    // yield: resuming the AudioContext, a first-play re-seek, a decoder flush.
+    // A seek completing in that window resumes playback itself, so this call
+    // comes back to a state it was on its way to setting. canPlay() bars
+    // "playing" at the door, so this can only ever be that race.
+    //
+    // It used to fall into the branch above, which logs an error and PAUSES
+    // THE CLOCK — undoing the playback that had just started. Read off a
+    // Safari session's unmute, where the tap runs an audio resync seek and a
+    // play() together: "Cannot transition to playing from state: playing",
+    // then "Clock: Paused at 0.00026s", and the only reason it survived is
+    // that the unmute re-seeks immediately afterwards and starts it again.
+    // Nothing to transition, nothing to undo: fall through to the loops.
 
     // Start demux loop
     // Cancel any existing animation frame to prevent duplicates
@@ -4210,6 +6391,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.streamWrapper.pause();
       return;
     }
+
+    // A pause ends whatever a seek was still working through, including the
+    // spinner suppression its own re-prime buffering holds (see
+    // notifySeekCompletion). Left latched, a genuine stall much later would
+    // show no spinner at all.
+    this.suppressSeekSpinner = false;
 
     if (!this.stateManager.canPause()) {
       Logger.warn(TAG, "Cannot pause in current state");
@@ -4286,6 +6473,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private demuxInFlight = false;
   private demuxInFlightStartTime: number = 0;
   private static readonly DEMUX_TIMEOUT = 35000; // 35 seconds timeout (slightly more than HTTP timeout of 30s)
+  // Loop is the element's: handleEnded() fires `ended`, the element replays.
+  // The player only keeps the flag and counts the turns (see noteLoopTurn).
+  private _loopEnabled = false;
+  /** Turns this source has come back round, from 1. Reset when the source is. */
+  private _loopCount = 0;
+
   private eofReached = false;
   // Wall-clock time (performance.now) when eofReached first flipped true.
   // Used as a watchdog: if the normal drained-and-played-out conditions
@@ -4381,6 +6574,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this._audioStartAlign = false;
     this._audioSwitching = false;
     return false;
+  }
+
+  /**
+   * Is there sound that could carry playback on its own right now? A track that
+   * exists, isn't switched off, and isn't being dropped because the browser
+   * won't start the context. (Split audio lives in its own demuxer, outside the
+   * track manager, so it is counted separately.)
+   */
+  private hasAudioThatCanPlay(): boolean {
+    if (this.disableAudio) return false;
+    if (!this.trackManager.getActiveAudioTrack() && !this.audioDemuxer) {
+      return false;
+    }
+    return !this.audioRenderer.isDroppingAudio();
   }
 
   /**
@@ -4493,12 +6700,47 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return;
     }
 
+    // "The seek is done" is a different statement from "playback has resumed",
+    // and only the first one is what `seeked` means.
+    //
+    // This used to be announced at the very end of this function — which the
+    // branches below never reach when playback was rolling: a seek made while
+    // playing lands in one of the "buffer until the cushion fills" paths and
+    // returns from there. So a scrub during playback fired `seeking` and then
+    // nothing, and any page waiting for `seeked` waited for good. A media
+    // element says seeked as soon as the new position is available and then,
+    // if it has to refill, waiting — in that order.
+    let seekedAnnounced = false;
+    const announceSeeked = () => {
+      if (seekedAnnounced) return;
+      seekedAnnounced = true;
+      // Media time back to UI time.
+      const at = Math.max(0, time - this.startTime);
+      // The pipeline's own completion, which fires for EVERY seek. `seeked` is
+      // the page's event and stays quiet for the ones nobody asked for; the
+      // element still has to know when its poster frame has landed, and
+      // borrowing the public event for that meant suppressing the event
+      // silently broke the poster: the clock was never reset off the poster
+      // timestamp, so playback began there and the readout — held at zero for
+      // the length of the poster seek — was held there for good.
+      this.emit("seekcomplete", at);
+      if (this._seekIsInternal) return;
+      this.emit("seeked", at);
+    };
+
     // A genuine frame-driven completion (forced=false) means a real picture
     // decoded — cancel any pending black-frame watchdog and refill its budget so
     // a later, unrelated black event gets fresh recovery attempts.
     if (!forced) {
       this.cancelBlackFrameWatchdog();
       this._blackRecoverySeeks = 0;
+    } else {
+      // …and a forced one means the opposite: this seek is finishing with
+      // nothing on the canvas. Note what it still owes so the frames the
+      // decoder is about to hand over — the ones this gave up waiting for —
+      // are not dropped by the state gate the moment we leave "seeking".
+      // Settled by the first frame that reaches the renderer.
+      this._pictureOwedFrom = time;
     }
 
     // Forced completion (safety timeout) with no decoded video frame yet: the
@@ -4508,8 +6750,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // the seek bookkeeping but resume into "buffering" with the play intent
     // latched, so the normal buffering→resume path flips to "playing" the
     // moment the first frame is actually decoded — no user interaction needed.
+    // Only a source that HAS a picture can be waiting for one — see hasPicture.
     const noVideoFrameYet =
-      !!this.videoRenderer && this.videoRenderer.getQueueSize() === 0;
+      this.hasPicture && this.videoRenderer!.getQueueSize() === 0;
     // …but NOT while the tab is hidden, where there is no picture to wait for.
     // Video decode is skipped there on purpose, so "resume into buffering until
     // a frame decodes" is a wait that cannot end: the next video after a
@@ -4578,6 +6821,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.seekingToKeyframe = false; // Also clear keyframe skip flag
     // First-play/replay seek has produced its first frame — drop spinner
     // suppression so any later genuine rebuffer shows the loading UI.
+    //
     this.suppressSeekSpinner = false;
 
     // How far past the requested target did the first frame actually land?
@@ -4673,7 +6917,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // a split source: video resumed at 10.552s against a 10.000s target while
       // audio started at 9.47s — 616ms of frozen picture. Hand the same cutoff
       // to the split loop so it drops the stale head too.
-      if (this.audioDemuxer) this._splitAudioSkipBefore = cutoff;
+      if (this.audioDemuxer) {
+      // An exact cutoff: nothing provisional about it.
+      this._splitAudioSkipBefore = cutoff;
+    }
     }
 
     // Transition to final state.
@@ -4721,8 +6968,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.clock.pause();
         if (this.videoRenderer) this.videoRenderer.stopPresentationLoop();
         Logger.info(TAG, "Audio cold-prime: buffering until cushion");
+        announceSeeked();
         return;
       }
+
 
       Logger.info(TAG, "Resuming playback after seek");
       // Playback is starting; if the tab is hidden this is the only thing that
@@ -4766,9 +7015,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.startPauseBuffering();
     }
 
-    // Emit seeked event now that we are actually ready
-    // Convert back from media time to UI time
-    this.emit("seeked", Math.max(0, time - this.startTime));
+    // Ready — and if a branch above already said so, this is a no-op.
+    announceSeeked();
   }
 
   /**
@@ -4975,6 +7223,23 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * 0.1s default before resuming.
    */
   private beginAudioPrime(): void {
+    this.holdAudioForBuffering();
+    this._primingAudio = true;
+  }
+
+  /**
+   * The mechanical half of a prime, without the 2s cushion demand: hold the
+   * context suspended and hand the stashed post-seek packets to the decoder so
+   * the buffer fills against a frozen clock.
+   *
+   * Any seek-completion branch that holds the picture back has to do this. The
+   * packets are stashed precisely BECAUSE the renderer isn't playing yet
+   * (render() drops AudioData while isPlaying is false), so a branch that
+   * returns without calling this leaves the audio buffer at zero — and the
+   * resume gate it just handed control to reads that as "audio not ready" and
+   * waits out its escape every single time.
+   */
+  private holdAudioForBuffering(): void {
     this.audioRenderer.primeForBuffering();
     this._primingAudio = true;
   }
@@ -6415,6 +8680,40 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
   }
 
+  /** Turn the loop on or off. Looping itself is the element's `ended` handler. */
+  setLoop(on: boolean): void {
+    if (this._loopEnabled === on) return;
+    this._loopEnabled = on;
+    Logger.debug(TAG, `Loop ${on ? "enabled" : "disabled"}`);
+  }
+
+  isLoopEnabled(): boolean {
+    return this._loopEnabled;
+  }
+
+  /**
+   * The sound as levels, for drawing — `bars` bands, each 0..1, or null when
+   * there is nothing playing to read. Used by the cover-art view's dotted
+   * meter; any host can draw its own from the same numbers.
+   */
+  getAudioLevels(bars: number): Float32Array | null {
+    if (this.disableAudio) return null;
+    return this.audioRenderer?.getLevels?.(bars) ?? null;
+  }
+
+  /** How many times this source has looped, from 0. */
+  getLoopCount(): number {
+    return this._loopCount;
+  }
+
+  /** Counted once per replay-from-ended, whether the viewer pressed play or the
+   *  element looped; a page watching `loop` should not have to care which. */
+  private noteLoopTurn(): void {
+    this._loopCount++;
+    this.emit("loop", { count: this._loopCount });
+    Logger.debug(TAG, `Loop: pass ${this._loopCount}`);
+  }
+
   /**
    * Handle playback ended
    */
@@ -6521,6 +8820,28 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
+   * What the server called this source, from a request it had already made.
+   *
+   * Asked after an open has failed, to tell the one case the URL cannot: a
+   * manifest served from a path with no extension. Empty for a source that
+   * never saw an HTTP header — a file, an adapter, a stream already playing.
+   */
+  getSourceContentType(): string {
+    return (
+      (this.source as { getContentType?: () => string } | null)
+        ?.getContentType?.() ?? ""
+    );
+  }
+
+  /** The same question for a separately-fetched audio rendition, which has a
+   *  source of its own and therefore an expiry of its own. A split stream's
+   *  two URLs are signed together and die together, but the audio is the one
+   *  read on a tick of its own — see pumpSplitAudio. */
+  getSplitAudioFailure(): Error | null {
+    return this.audioSource?.getFatalError?.() ?? null;
+  }
+
+  /**
    * End playback on a failure nothing downstream can recover from.
    *
    * Pausing without this leaves the state machine in "buffering", which the
@@ -6537,8 +8858,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   async seek(
     seconds: number,
-    opts?: { suppressSpinner?: boolean; preservePlaying?: boolean },
+    opts?: {
+      suppressSpinner?: boolean;
+      preservePlaying?: boolean;
+      /**
+       * Machinery, not a request: rendering the first frame, priming a poster,
+       * re-anchoring after a context loss. `seeking`/`seeked` stay quiet for
+       * these — a media element repositioning itself internally says nothing
+       * either, because those events answer for what a page asked for.
+       */
+      internal?: boolean;
+    },
   ): Promise<void> {
+    this._seekIsInternal = opts?.internal ?? false;
+
     if (this.streamWrapper) {
       return this.streamWrapper.seek(seconds);
     }
@@ -6594,6 +8927,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           this.stateManager.setState("playing");
         }
         this.clock.start();
+        // Split audio-only runs playback entirely from here — play()'s body,
+        // and with it the one call that starts the renderer, is never reached.
+        // Nothing is being presented either way; what this starts is the
+        // caption clock, without which subtitles turned on in audio-only sit
+        // there for the whole track (see setPictureSuspended).
+        this.videoRenderer?.startPresentationLoop();
         // Resume the (auto-suspended) context so audio is audible. Fire-and-
         // forget like the video path — the shared context was already unlocked
         // by the previous track, so this wakes it without a fresh gesture.
@@ -6602,9 +8941,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         }
         this.startAudioLoop();
       }
-      this.emit("seeking", t);
+      if (!this._seekIsInternal) this.emit("seeking", t);
       this.emit("timeUpdate", t);
-      this.emit("seeked", t);
+      this.emit("seekcomplete", t);
+      if (!this._seekIsInternal) this.emit("seeked", t);
       return;
     }
 
@@ -6666,6 +9006,19 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.wasPlayingBeforeSeek = currentState === "playing" || (currentState === "buffering" && this.wasPlayingBeforeRebuffer);
     }
 
+    // A seek that lands paused keeps the whole window (see holdWindow): the
+    // decode from its keyframe to the target reads well past bytes the play
+    // that follows will want again. A seek that plays on holds only its
+    // keyframe. By intent, not by state, so a run of arrow-key seeks while
+    // paused — each arriving in "seeking" — keeps holding too.
+    if (this.source instanceof HttpSource) {
+      if (!this.wasPlayingBeforeSeek) {
+        this.source.holdWindow();
+      } else {
+        this.source.releaseWindowAfterNextRead();
+      }
+    }
+
     // Pause clock so UI time doesn't advance during seek while in loading state
     this.clock.pause();
 
@@ -6692,7 +9045,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // the same thing for the same reason.
     this._lastBufferAhead = 0;
     this.stateManager.setState("seeking");
-    this.emit("seeking", seconds);
+    if (!this._seekIsInternal) this.emit("seeking", seconds);
 
     // Re-anchor the buffer bar's START to the target NOW, not after the
     // (blocking, potentially multi-second) demuxer.seek below. The scrubber
@@ -6743,8 +9096,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // Flush decoders
       Logger.info(TAG, `seek: flushing video decoder...`);
       await this.videoDecoder.flush({ discard: true });
+      // Let go the instant the await returns: a flush is not quick, and a second
+      // seek arriving inside that window would otherwise run its own teardown
+      // while this one is still parked (the only session check used to be after
+      // all of it, so both seeks performed the whole teardown, interleaved).
+      if (this.seekSessionId !== mySessionId)
+        return this.abandonSupersededSeek(mySessionId);
       Logger.info(TAG, `seek: flushing audio decoder...`);
       await this.audioDecoder.flush();
+      if (this.seekSessionId !== mySessionId)
+        return this.abandonSupersededSeek(mySessionId);
       // Drop the host subtitle renderer's pending state — its cues are for the
       // position we're leaving; fresh packets stream in after the seek.
       if (this._customSubtitleRenderer) {
@@ -6826,8 +9187,21 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this._audioRecoveries = 0;
 
       // Buffered region restarts from the new position; drop the
-      // monotonic clamp and anchor the visible range at the seek target.
-      this.lastBufferedTime = 0;
+      // monotonic clamp so the bar can shrink to reflect the new range,
+      // and re-anchor the range's START to the seek target so the bar grows
+      // forward from where the user clicked instead of being painted from 0.
+      //
+      // …unless the seek landed INSIDE what was already buffered. Those bytes
+      // are still in the window, and re-deriving the end from the new
+      // playhead is a linear byte-to-time guess: on a VBR file (8K AV1 is
+      // very VBR) the heavier stretch between the old playhead and the new
+      // one makes the guess come out short, and a click near the end of the
+      // buffer pulled the bar's end BACK toward the handle. The clamp keeps
+      // the end where it was; getBufferedTime still drops it the moment the
+      // window itself moves back (see _bufferedLatchBytes).
+      const landedInsideBuffer =
+        this.lastBufferedTime > 0 && seconds < this.lastBufferedTime;
+      if (!landedInsideBuffer) this.lastBufferedTime = 0;
       this.bufferedRangeStart = seconds;
 
       // Mark that we need to skip to keyframe after seek
@@ -7133,6 +9507,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // cheaper than the FFmpeg path, which can't byte-range-seek a stream.
     if (this.streamWrapper) return (this.streamWrapper as any).getThumbnailBlob?.(time) ?? null;
     if (this.previewInitGaveUp) return null; // Init failed repeatedly — stop retrying (and re-loading WASM)
+    // Already made this one (see previewCache). Answered before the in-flight
+    // lock below, so a pointer moving back over ground it has already covered
+    // gets its frame at once — even while another one is being decoded, which
+    // during a scrub is most of the time.
+    const key = this.previewKey(time, view);
+    if (key !== null) {
+      const cached = this.previewCache.get(key);
+      if (cached) return cached;
+    }
+    // Pictures the source came with beat pictures we have to make: a crop out
+    // of a mosaic the browser has already fetched, with no seek, no decode and
+    // no second WASM module behind it. Answered before the in-flight lock too,
+    // because nothing here is in flight — a storyboard has no single decoder
+    // to queue behind. A 360 view is the exception: those frames are
+    // reprojected per angle, which a flat tile cannot be.
+    if (this.storyboardSource && !view) {
+      const board = await this.ensureStoryboard();
+      const tile = board?.tileAt(time) ?? null;
+      if (tile) {
+        const blob = await this.cropStoryboardTile(tile);
+        if (blob) {
+          if (key !== null) this.rememberPreview(key, blob);
+          return blob;
+        }
+      }
+    }
     if (this.isPreviewGenerating) {
       if (!queue) return null; // Busy — the hover path would rather have nothing
       // Wait it out, then take our turn. Re-entered rather than looped: by the
@@ -7216,7 +9616,24 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         return null;
       }
 
-      const timestamp = this.thumbnailBindings.getPacketPts();
+      const timestamp = this.previewPacketPts();
+
+      // The seek has just named the keyframe this position belongs to. If that
+      // keyframe has already been decoded, this hover's picture is that
+      // picture — no decode, no encode, and no guess about GOP length.
+      //
+      // Only outside precise mode and outside 360: both of those make the
+      // frame depend on more than which keyframe it is (the walk forward to
+      // the hovered moment, and the angle it is reprojected to).
+      if (!this.precisePreviews && !view) {
+        const kfKey = this.keyframeKey(timestamp);
+        const seen = kfKey === null ? null : this.previewByKeyframe.get(kfKey);
+        if (seen) {
+          if (key !== null) this.rememberPreview(key, seen);
+          return seen;
+        }
+      }
+
       const dataPtr = this.thumbnailBindings.getPacketData();
 
       Logger.debug(
@@ -7239,13 +9656,91 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // 1. Try WebCodecs (Hardware) through Renderer
       let rendered = false;
 
+      // Precise mode walks from the keyframe to the frame the pointer is
+      // actually on. The packets are collected FIRST and decoded as one run,
+      // because the decoder has to be flushed to get a frame out and a flush
+      // ends the run: Chrome answers the next delta with "A key frame is
+      // required after configure() or flush()".
+      //
+      // Unbounded, on purpose. It used to stop at 120 frames or 900ms and
+      // keep whatever it had reached, which on the long-GOP sources this mode
+      // exists for is the keyframe again — precise previews that quietly
+      // stopped being precise exactly where the imprecision was worst. In
+      // this mode the answer is the frame under the pointer; the walk ends
+      // when it gets there, at EOF, or on a read that fails.
+      const run: Array<{ data: Uint8Array; pts: number; key: boolean }> = [
+        { data: packetData, pts: timestamp, key: true },
+      ];
+      if (this.precisePreviews && timestamp < time - 0.02) {
+        // Packets arrive in DECODE order, and with B-frames that is not
+        // presentation order: a packet whose pts is past the pointer can
+        // arrive while the frames AT the pointer are still to come. Measured
+        // on a 1080p25 H.264 file with a B-pyramid, four packets in:
+        //
+        //   pts 0.000  0.040  0.080  0.200  0.120  0.160  0.320  0.240
+        //
+        // Stopping at the first `pts >= time` therefore stopped at 0.200 for
+        // a hover at 0.160 — before 0.120 and 0.160 had been read at all —
+        // and the card showed whatever the run happened to contain, which is
+        // not the frame the seek then lands on. It is exactly this file's
+        // "the preview and the frame disagree", and only this file's, because
+        // most encodes deliver pts in order.
+        //
+        // The reader answers that with the packet's DECODE timestamp, which
+        // rises with every packet in the order they arrive. The frame the
+        // pointer is on has dts <= its own pts, so reading until dts reaches
+        // the pointer is guaranteed to have read it — and everything it
+        // references, whose dts is earlier still.
+        //
+        // A WASM build that predates this reports no dts (NaN). There the
+        // walk keeps going for a short window past the first pts that passes
+        // the pointer instead: the reorder depth is small (2–4 in practice,
+        // this file included) and the frames are small, so a dozen is
+        // generous and costs a few milliseconds.
+        const REORDER_TAIL = 12;
+        let tail = -1;
+        for (;;) {
+          const size = await this.thumbnailBindings.readNextPacket();
+          if (size <= 0) break; // EOF, or a read that went wrong
+          const pts = this.previewPacketPts();
+          const rawDts = this.thumbnailBindings.getPacketDts?.() ?? Number.NaN;
+          const dts = Number.isFinite(rawDts) ? rawDts - this.startTime : Number.NaN;
+          const data = this.thumbnailBindings.getPacketDataCopy(size);
+          if (!data) break;
+          run.push({ data, pts, key: false });
+          if (Number.isFinite(dts)) {
+            if (dts >= time) break;
+          } else {
+            if (pts >= time && tail < 0) tail = 0;
+            if (tail >= 0 && ++tail > REORDER_TAIL) break;
+          }
+        }
+      }
+
       try {
-        rendered = await this.thumbnailRenderer!.decodeAndRender(
-          packetData,
-          timestamp,
-        );
+        rendered = await this.thumbnailRenderer!.decodeSequenceAndRender(run, time);
+        if (run.length > 1) {
+          Logger.debug(
+            TAG,
+            `Precise preview: decoded ${run.length} frames from the keyframe at ` +
+              `${timestamp.toFixed(2)}s up to ${time.toFixed(2)}s`,
+          );
+        }
       } catch (e) {
         Logger.warn(TAG, "Thumbnail WebCodecs decode failed", e);
+      }
+
+      // The walk left the demuxer holding the LAST packet it read, and the
+      // software path below decodes whatever the context is holding. A delta
+      // on its own decodes to nothing, so put the keyframe back before handing
+      // over — the software fallback then shows the keyframe, which is what it
+      // showed before this mode existed.
+      if (!rendered && run.length > 1) {
+        try {
+          await this.thumbnailBindings.readKeyframe(time);
+        } catch {
+          /* the fallback reports its own failure */
+        }
       }
 
       /* REMOVED OLD LOGIC START
@@ -7519,17 +10014,29 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       REMOVED OLD LOGIC END */
 
       // 2. Fallback to Software Decoding
+      if (!rendered && this.previewSoftwareTooBig()) {
+        this.previewInitGaveUp = true;
+        Logger.warn(
+          TAG,
+          "The hardware preview decoder gave up on a frame too big to decode in " +
+            "software without stalling the page — previews off for this source",
+        );
+        // Not here: this call still holds the bindings, and the finally below
+        // reaches for them again. See the WASM use-after-destroy this pipeline
+        // has already been bitten by.
+        setTimeout(() => this.destroyPreviewPipeline(), 0);
+        return null;
+      }
       if (!rendered) {
         try {
-          // Get width/height from active video track
+          // The size the preview is SHOWN at, not the size the source is in.
+          // See previewShape — this is where the 8K hang was.
           const videoTrack = this.trackManager.getActiveVideoTrack();
-          let width = 320; // Default small
-          let height = 180;
-
-          if (videoTrack) {
-            width = videoTrack.width;
-            height = videoTrack.height;
-          }
+          const shrunk = videoTrack
+            ? MoviPlayer.previewShape(videoTrack.width, videoTrack.height)
+            : { width: 320, height: 180 };
+          const width = shrunk.width;
+          const height = shrunk.height;
 
           const rgba = this.thumbnailBindings!.decodeCurrentPacket(
             width,
@@ -7548,21 +10055,21 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
 
       if (rendered) {
-        const canvas = this.thumbnailRenderer!.getCanvas();
-        if ("toBlob" in canvas) {
-          return new Promise<Blob | null>((resolve) => {
-            // @ts-ignore
-            canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.7);
-          });
+        const blob = await this.encodePreviewBlob(
+          this.thumbnailRenderer!.getCanvas() as
+            | OffscreenCanvas
+            | HTMLCanvasElement,
+        );
+        if (blob) {
+          if (key !== null) this.rememberPreview(key, blob);
+          // File it under its keyframe too, so the rest of this GOP is free.
+          // Precise mode's frames are NOT their keyframe, and a 360 preview is
+          // one angle of it, so neither may be reused this way.
+          if (!this.precisePreviews && !view) {
+            this.rememberKeyframePreview(timestamp, blob);
+          }
         }
-        // If OffscreenCanvas (unlikely here but possible if strict types used)
-        if ("convertToBlob" in canvas) {
-          // @ts-ignore
-          return await canvas.convertToBlob({
-            type: "image/jpeg",
-            quality: 0.7,
-          });
-        }
+        return blob;
       }
 
       return null;
@@ -7573,11 +10080,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.isPreviewGenerating = false;
       this.previewInFlight = null;
       releaseInFlight();
-      // Clear ThumbnailHttpSource buffer to free memory (512KB)
-      // This clears the buffer after each thumbnail generation
-      if (this.thumbnailSource && "clearBuffer" in this.thumbnailSource) {
-        (this.thumbnailSource as any).clearBuffer();
-      }
+      // Let the ThumbnailHttpSource keep its 2MB window for a while yet.
+      //
+      // Dropping it here — after every single frame — threw away the block the
+      // fetch had just paid for, and a scrub is a run of hovers a fraction of
+      // a second apart that land INSIDE that same block: measured on a 1.5MB/s
+      // link, hovers at 100.8s and 101.6s of an un-downloaded stretch both sat
+      // inside 114.9-117.0MB, and the second one re-fetched all 2MB of it
+      // (1.65s) because the first one's copy had already been discarded.
+      // Clear it once the scrub is over instead.
+      this.scheduleThumbBufferClear();
     }
   }
 
@@ -7656,7 +10168,127 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     return pick;
   }
 
-  private async initPreviewPipeline() {
+  /**
+   * Arm the deferred preview warm-up, and keep re-arming it until playback has
+   * actually settled.
+   *
+   * The delay exists to keep the second WASM module + WebCodecs decoder out of
+   * the first seconds of PLAYBACK. It used to be a single timer started when
+   * load() finished, which quietly assumes play() follows immediately — and on
+   * a local file it does not. A FileSource preload reads 20×2MB before play()
+   * is even reachable, so on an 11 GB MKV the 12s grace was already spent by
+   * the time the first frame went up: the warm-up landed ~4.5s into playback,
+   * stood a second isolated WASM instance up, re-opened the same 11 GB file
+   * through the same main-thread Asyncify reads, and the audio cushion the
+   * (all-software) decoder was holding collapsed into a stall that then made
+   * no progress at all for six seconds, until MoviElement's stuck watchdog
+   * seeked out of it.
+   *
+   * So measure the grace against playback, not load, and never start the
+   * warm-up while the pipeline is already struggling — buffering and seeking
+   * are precisely when the competing decode is least affordable. A source that
+   * is simply sitting paused is not competing with anything, so it still warms
+   * on schedule; if the user scrubs before any of that, the seek path lazy-inits
+   * on demand (initPreviewPipeline is idempotent).
+   */
+  private schedulePreviewWarm(delayMs: number): void {
+    if (this._previewWarmTimer) return;
+    if (!this.previewsAllowed()) return;
+    // A source with a storyboard has no use for the decode pipeline, and that
+    // pipeline is the expensive half of previews: a second WASM module and its
+    // own FFmpeg context, warmed in the background for previews that will be
+    // crops out of a JPEG. The lazy path is still there if the board turns out
+    // not to cover a position.
+    if (this.storyboardSource) return;
+    this._previewWarmTimer = setTimeout(() => {
+      this._previewWarmTimer = null;
+      if (this._destroyed || this.previewInitPromise || this.thumbnailBindings) {
+        return;
+      }
+      const state = this.stateManager.getState();
+      const busy =
+        state === "loading" || state === "seeking" || state === "buffering";
+      const playbackYoung =
+        this._playStartTime > 0 &&
+        performance.now() - this._playStartTime <
+          MoviPlayer.PREVIEW_WARM_DELAY_MS;
+      if (busy || playbackYoung) {
+        this.schedulePreviewWarm(MoviPlayer.PREVIEW_WARM_RETRY_MS);
+        return;
+      }
+      this.previewInitPromise = this.initPreviewPipeline().catch((e) => {
+        Logger.warn(TAG, "Preview pipeline init failed (non-critical)", e);
+        this.previewInitPromise = null;
+      });
+    }, delayMs);
+  }
+
+  /** Goes at the preview rung before previews are drawn from the picture's own
+   *  file instead — see initPreviewPipeline. */
+  private static readonly PREVIEW_RUNG_TRIES = 2;
+  private _previewRungFailures = 0;
+
+  /**
+   * Build the preview pipeline — off the small rung when there is one, and off
+   * the rendition being played when that rung will not open.
+   *
+   * The rung is a separate file, and a separate file can fail where the one
+   * playing does not: another host (a ladder's small rungs are often on a
+   * second CDN), a header that host never sends, a link that has expired. The
+   * rung was the only thing ever tried, so every retry — three, from the hover
+   * path — went at the same failing file, and then previews were switched off
+   * for the rest of the video while the picture itself played on fine. So: the
+   * rung twice, and then the file already on screen, which is known to open.
+   */
+  private async initPreviewPipeline(): Promise<void> {
+    const gen = this._previewGeneration;
+    const rung =
+      this._previewRungFailures < MoviPlayer.PREVIEW_RUNG_TRIES
+        ? this.pickPreviewRendition()
+        : null;
+    try {
+      await this.buildPreviewPipeline(rung);
+    } catch (e) {
+      if (!rung) throw e;
+      this.abandonPreviewBuild();
+      const failures = ++this._previewRungFailures;
+      Logger.warn(
+        TAG,
+        `Preview rung ${rung.label || rung.height + "p"} did not open (${failures}/${MoviPlayer.PREVIEW_RUNG_TRIES})` +
+          (failures >= MoviPlayer.PREVIEW_RUNG_TRIES ? " — previews come from the playing rendition" : ""),
+        e,
+      );
+      if (this._destroyed || gen !== this._previewGeneration) return;
+      await this.initPreviewPipeline();
+    }
+  }
+
+  /** What a build that threw left half-made: nothing of it is published. */
+  private abandonPreviewBuild(): void {
+    if (this.thumbnailBindingsPending) {
+      try {
+        this.thumbnailBindingsPending.destroy();
+      } catch {}
+      this.thumbnailBindingsPending = null;
+    }
+    if (this.thumbnailRenderer && !this.thumbnailBindings) {
+      try {
+        this.thumbnailRenderer.destroy();
+      } catch {}
+      this.thumbnailRenderer = null;
+    }
+    if (this.thumbnailSource && this.thumbnailSource !== this.source) {
+      try {
+        this.thumbnailSource.close();
+      } catch {}
+    }
+    this.thumbnailSource = null;
+    this.releaseSharedThumbModule();
+  }
+
+  private async buildPreviewPipeline(
+    previewRung: { url: string; label: string; height?: number } | null,
+  ) {
     if (this.thumbnailBindings) return; // Already initialized
     // Everything below allocates — an isolated WASM module and FFmpeg context,
     // a WebCodecs decoder, a WebGL context — and it does so across long awaits
@@ -7705,7 +10337,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     const isEncrypted = sourceConfig
       && typeof sourceConfig !== "string"
       && (sourceConfig as any).type === "encrypted";
-    const previewRung = this.pickPreviewRendition();
+    // The rung would not open, so this is the fallback — and on a ladder the
+    // file on screen is the ACTIVE rendition, not config.source: an in-place
+    // switch changes the first and never the second. No borrow either way,
+    // for the same reason as the rung branch below.
+    const playingRendition =
+      !previewRung && this._previewRungFailures >= MoviPlayer.PREVIEW_RUNG_TRIES
+        ? this._activeDashRendition
+        : "";
     // HLS demuxer fallback: the media is a concatenated segment stream, not the
     // .m3u8 playlist in config.source — opening that URL as media would fail.
     // Reuse the SegmentStreamSource: its read() is offset-explicit (safe to
@@ -7720,6 +10359,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.thumbnailSource = this.source;
     } else if (isEncrypted && this.source) {
       this.thumbnailSource = this.source;
+    } else if (playingRendition) {
+      Logger.debug(TAG, "Thumbnail source: the playing rendition (preview rung failed)");
+      this.thumbnailSource = new ThumbnailHttpSource(
+        playingRendition,
+        (sourceConfig && typeof sourceConfig !== "string" && "headers" in sourceConfig
+          ? sourceConfig.headers
+          : undefined) || {},
+        null,
+      );
     } else if (previewRung) {
       // A ladder is available, so preview off a SMALL rung instead of whatever
       // the player is streaming. A hover thumbnail is ~160 CSS px wide; pulling
@@ -7892,9 +10540,14 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     if (shape) {
       // Initialize renderer dimensions and HDR settings
+      // The canvas is a preview surface, so it is preview-sized: a WebGL
+      // surface at 8K is 132MB to allocate and to read back, for a picture
+      // that is 480px wide. The draw scales the frame on the GPU on its way
+      // in, which is cheaper than doing it afterwards as well.
+      const canvasShape = MoviPlayer.previewShape(shape.width, shape.height);
       this.thumbnailRenderer.initialize({
-        width: shape.width,
-        height: shape.height,
+        width: canvasShape.width,
+        height: canvasShape.height,
         rotation: shape.rotation,
         colorPrimaries: shape.colorPrimaries,
         colorTransfer: shape.colorTransfer,
@@ -7918,6 +10571,27 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       );
 
       if (!configured) {
+        // The software fallback decodes the frame WHOLE, in WASM, on this
+        // thread — the scaler can hand back a small picture but the decode
+        // itself is the source's own size. At 8K that is most of a second per
+        // hover with everything else stopped, which is the seek bar hanging
+        // the player while the keyboard seeks fine. Past the budget there is
+        // no version of this worth having: no preview is better than a frozen
+        // bar, and the bar still seeks.
+        if (shape.width * shape.height > MoviPlayer.PREVIEW_SOFTWARE_MAX_PIXELS) {
+          this.previewInitGaveUp = true;
+          Logger.warn(
+            TAG,
+            `No hardware path for ${shape.codec} at ${shape.width}x${shape.height}, ` +
+              "and software decode at that size would stall the page — previews off for this source",
+          );
+          // Everything this got as far as building — the second WASM context,
+          // its own reader, the WebGL surface — is for a pipeline that is not
+          // going to be used. It is never published, so teardown is the only
+          // thing that can still reach it.
+          this.destroyPreviewPipeline();
+          return;
+        }
         Logger.warn(
           TAG,
           "Failed to configure thumbnail VideoDecoder, will use software fallback",
@@ -7952,8 +10626,172 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
   }
 
+  /**
+   * Is the source playing without a duration anybody could find?
+   *
+   * True only once the media is actually open — during a load the duration is
+   * legitimately unknown and the UI should stay blank, not pretend the file is
+   * endless. Drives the seek bar's live-edge rendering and hides the 0:00 that
+   * would otherwise sit where a total ought to be.
+   */
+  hasUnknownDuration(): boolean {
+    if (!this.mediaInfo) return false;
+    if (this.mediaInfo.duration > 0) return false;
+    const state = this.stateManager.getState();
+    return state !== "idle" && state !== "loading" && state !== "error";
+  }
+
+  /**
+   * Try once more for a missing duration, with playback already running.
+   *
+   * The scan inside open() has a load waiting on it, so it is capped in the
+   * single seconds and gives up having read a few percent of anything but a
+   * small file — a 291MB Matroska got 14MB in before its second was up. Off
+   * the load path there is nothing to hold up, so the same pass can be given
+   * the time it actually needs.
+   *
+   * It cannot run on the playing context: movi_scan_duration reads that
+   * context to EOF and then seeks it back, which would take every packet out
+   * of the demuxer's mouth. So it opens its own, over its own reader, exactly
+   * as the preview pipeline does — and for the same reason.
+   */
+  private scheduleDurationRescan(): void {
+    if (this._durationRescanDone || this._durationRescanTimer) return;
+    if (this._destroyed || this.streamWrapper) return;
+    // No SourceConfig means a caller-supplied adapter: we don't know how to
+    // build a second reader for it, and sharing the one playback is using
+    // would interleave a whole-file sweep into its reads.
+    if (!this.config.source) return;
+
+    this._durationRescanTimer = setTimeout(() => {
+      this._durationRescanTimer = null;
+      void this.rescanDurationInBackground();
+    }, MoviPlayer.DURATION_RESCAN_DELAY_MS);
+  }
+
+  private async rescanDurationInBackground(): Promise<void> {
+    if (this._durationRescanDone || this._destroyed) return;
+    this._durationRescanDone = true; // one attempt per source, win or lose
+
+    const sourceConfig = this.config.source;
+    if (!sourceConfig || !this.source) return;
+
+    const budgetMs = Demuxer.durationRescanBudgetMs(
+      this.source.getKey(),
+      this.fileSize,
+    );
+    if (budgetMs === null) {
+      Logger.debug(TAG, "Duration rescan: source isn't worth a full pass");
+      return;
+    }
+
+    // The generation this attempt belongs to. Everything below is a long await
+    // over a reader we own, and a load() of a new source (or destroy()) can
+    // land inside any of them — the result would then be the OLD file's
+    // duration, published over the new one's.
+    const gen = this._previewGeneration;
+    const superseded = () => this._destroyed || gen !== this._previewGeneration;
+
+    let scanSource: SourceAdapter | null = null;
+    let bindings: WasmBindings | null = null;
+    try {
+      const cfg =
+        typeof sourceConfig === "string"
+          ? ({ type: "url", url: sourceConfig } as SourceConfig)
+          : sourceConfig;
+      scanSource = await this.createSource(cfg);
+      // A second reader over the same File: no preload sweep of its own, and
+      // no cache-clearing on close. See FileSource.markSecondary.
+      if (scanSource instanceof FileSource) scanSource.markSecondary();
+      if (superseded()) return;
+
+      const module = await loadWasmModuleNew({
+        wasmBinary: this.config.wasmBinary,
+      });
+      if (superseded()) return;
+
+      bindings = new WasmBindings(module);
+      if (!bindings.create()) throw new Error("Failed to create scan context");
+      bindings.setDataSource({
+        read: async (offset: number, size: number): Promise<Uint8Array> =>
+          new Uint8Array(await scanSource!.read(offset, size)),
+        getSize: async (): Promise<number> => scanSource!.getSize(),
+      });
+      await bindings.open();
+      if (superseded()) return;
+
+      Logger.info(
+        TAG,
+        `Duration rescan: scanning in the background (budget ${Math.round(budgetMs / 1000)}s)`,
+      );
+      const started = performance.now();
+      const scanned = await bindings.scanDuration(budgetMs);
+      const elapsed = Math.round(performance.now() - started);
+      if (superseded()) return;
+
+      if (!(scanned > 0)) {
+        Logger.warn(TAG, `Duration rescan found nothing usable (${elapsed}ms)`);
+        return;
+      }
+      if (!this.mediaInfo || this.mediaInfo.duration > 0) return;
+
+      Logger.info(TAG, `Duration rescan recovered ${scanned}s (${elapsed}ms)`);
+      this.mediaInfo.duration = scanned;
+      this.clock.setDuration(scanned + this.startTime);
+      this.emit("durationChange", scanned);
+    } catch (e) {
+      Logger.warn(TAG, "Duration rescan failed (non-critical)", e);
+    } finally {
+      try {
+        bindings?.destroy();
+      } catch {}
+      try {
+        scanSource?.close();
+      } catch {}
+    }
+  }
+
+  /**
+   * Drop the preview reader's fetch window once hovering has stopped, so the
+   * 2MB it holds isn't kept for the rest of the session — but not between two
+   * hovers of the same scrub, which is what it exists for.
+   */
+  private scheduleThumbBufferClear(): void {
+    if (this._thumbBufferIdleTimer) clearTimeout(this._thumbBufferIdleTimer);
+    this._thumbBufferIdleTimer = setTimeout(() => {
+      this._thumbBufferIdleTimer = null;
+      const src = this.thumbnailSource as { clearBuffer?: () => void } | null;
+      if (src && typeof src.clearBuffer === "function") src.clearBuffer();
+    }, MoviPlayer.THUMB_BUFFER_IDLE_MS);
+  }
+
+  /**
+   * The seek bar is done asking: stop downloading the rest of the preview
+   * reader's fetch window, keeping the bytes that have arrived.
+   *
+   * The window keeps streaming after its frame is made so a scrub's next hover
+   * finds its bytes already here — worth it only while the pointer is still
+   * travelling. The caller is the one that knows: the player sees requests, and
+   * on a fetching source the seek bar deliberately holds those back for up to
+   * 1.5s mid-drag, so a quiet spell here is not a pointer at rest. Ignored
+   * while a frame is being made; its own reads need the window.
+   */
+  stopPreviewFill(): void {
+    if (this.isPreviewGenerating) return;
+    const src = this.thumbnailSource as { stopFill?: () => void } | null;
+    src?.stopFill?.();
+  }
+
   private destroyPreviewPipeline() {
     this._previewGeneration++;
+    if (this._durationRescanTimer) {
+      clearTimeout(this._durationRescanTimer);
+      this._durationRescanTimer = null;
+    }
+    if (this._thumbBufferIdleTimer) {
+      clearTimeout(this._thumbBufferIdleTimer);
+      this._thumbBufferIdleTimer = null;
+    }
     this.releaseSharedThumbModule();
     // A build that was still in flight holds a context too, and an init that
     // threw between creating it and publishing it leaves it here.
@@ -7984,6 +10822,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     }
     this.thumbnailSource = null;
     this.previewInitPromise = null;
+    // A new pipeline is a new chance for the rung — the next source's ladder
+    // is somebody else's files.
+    this._previewRungFailures = 0;
   }
 
   /**
@@ -8596,6 +11437,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   /**
    * Set extra bottom padding for subtitles when controls are visible
    */
+  /** See CanvasRenderer.subtitleReservePx. */
+  getSubtitleReserve(): number {
+    return this.videoRenderer?.subtitleReservePx() ?? 0;
+  }
+
+  /** Hold the caption still while the viewer drags it. */
+  setSubtitleHeld(held: boolean): void {
+    this.videoRenderer?.setSubtitleHeld(held);
+  }
+
   setSubtitleControlsPadding(padding: number): void {
     if (this.videoRenderer) {
       this.videoRenderer.setSubtitleControlsPadding(padding);
@@ -8823,18 +11674,34 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * — and therefore native-video-smooth — in the common case.
    */
   private hasHealthyAudioAnchor(): boolean {
-    // Software-mixed path deliberately does NOT skip the seek, however healthy
-    // the buffer looks. AudioRenderer's re-anchor drops the scheduled audio,
-    // which leaves the demuxer parked at its read-ahead position — seconds of
-    // media beyond the playhead at a fast rate. The next chunk to arrive then
-    // reads as an underrun and pivots the whole clock onto that read-ahead
-    // media time (AudioRenderer's "Pivot global clock if we underrun"), so the
-    // playhead jumps forward and the video queue, now entirely in the past, is
-    // discarded: measured 1.5-3.6s of the film SKIPPED on every speed change,
-    // plus a 1-2s freeze while decode refills. The seek is what rewinds the
-    // demuxer back to the saved position and keeps that from happening. A brief
-    // hitch is the correct trade against silently skipping content.
-    return false;
+    // This returned a flat `false` — no machine ever skipped the corrective
+    // seek — and the reason it did was real at the time: AudioRenderer's
+    // re-anchor DROPPED the scheduled audio, which left the demuxer parked at
+    // its read-ahead position, and the next chunk to arrive read as an
+    // underrun and pivoted the whole clock onto that read-ahead media time
+    // ("Pivot global clock if we underrun"). 1.5-3.6s of the film skipped on
+    // every speed change. The seek was what rewound the demuxer back.
+    //
+    // That premise is gone. AudioRenderer.setPlaybackRate now TAKES BACK the
+    // audio scheduled ahead — the unstarted sources are stopped and their
+    // original pre-stretch buffers pushed to the front of the pending queue,
+    // re-stretched at the new tempo, rescheduled behind the chunk still
+    // playing — and it deliberately keeps hasFirstBuffer/firstBufferMediaTime
+    // so the clock cannot leap to the read-ahead. No media is dropped, so
+    // there is no hole for an underrun to pivot on, and the span the seek went
+    // back to fetch is the span the renderer is still holding.
+    //
+    // What the seek costs, meanwhile, is the whole stop: the demux loop
+    // cancelled, the read in flight waited out, the audio decoder flushed, the
+    // renderer reset (which throws away exactly the audio just reclaimed) and
+    // a backwards demuxer seek — with the picture living off its queue for all
+    // of it. That is "2x hone se pehle thodi der ko ruk jaata hai", and on the
+    // prepare path it is at its worst, because that path exists precisely for
+    // pipelines with nothing to spare.
+    //
+    // So ask the renderer whether the reclaim is actually available, rather
+    // than assuming either way. Thin or cold audio still takes the seek.
+    return this.audioRenderer?.canCarryRateChange?.() ?? false;
   }
 
 
@@ -8984,6 +11851,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       }
       this._splitAudioEof = false;
       this.splitAudioQueue.clear();
+      // A source of its own, so a clean slate for its failures too.
+      this._splitAudioDead = false;
+      this._splitAudioErrorSince = 0;
       this._lastSplitAudioPts = 0;
       // Sync the freshly-opened audio demuxer to where the player ACTUALLY is.
       // This setup is async: a recovery recreate's resume-seek (or any seek that
@@ -9050,7 +11920,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // foreground, the un-throttled background Worker timer when hidden (rAF is
   // throttled in background, which is exactly what stalled audio there).
   private async pumpSplitAudio(): Promise<boolean> {
-    if (!this.audioDemuxer) return false;
+    if (!this.audioDemuxer || this._splitAudioDead) return false;
     if (this._splitAudioEof && this.splitAudioQueue.length === 0) return false;
     const state = this.stateManager.getState();
     if (
@@ -9102,9 +11972,18 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       ) {
         const pkt = await demuxer.readPacket();
         if (!pkt) {
+          // No bytes is either the end of the track or a source that has
+          // stopped answering — they reach C as the same thing. Ask, the way
+          // the muxed loop asks (see getSourceFailure), or an expired audio
+          // URL passes for a finished one and the film plays on in silence.
+          const failure = this.getSplitAudioFailure();
+          if (failure) throw failure;
           this._splitAudioEof = true;
           break;
         }
+        // A packet arrived, so whatever went wrong before was a moment, not
+        // the end of the road.
+        this._splitAudioErrorSince = 0;
         if (
           this._splitAudioTrackId !== -1 &&
           pkt.streamIndex !== this._splitAudioTrackId
@@ -9121,12 +12000,44 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         if (!holdForVideo) this.feedSplitAudio(bufferedTarget);
       }
     } catch (e) {
-      Logger.warn(TAG, `Split audio demux error: ${(e as any)?.message ?? e}`);
+      const message = (e as any)?.message ?? String(e);
+      // A bad packet is worth stepping over: the next read usually works, and
+      // this loop's whole job is to keep the sound coming. A source that has
+      // stopped answering is not that. It fails every read the same way, and
+      // this pump runs on the animation frame — so the same warning went out
+      // sixty times a second, for ever, while the viewer watched a picture
+      // with no sound and no reason given. (Measured on a signed URL that
+      // began answering 403 mid-playback: 777 identical lines and counting.)
+      //
+      // So: ask the source whether this is a fact about the URL, and failing
+      // that, give the track a few seconds to produce ONE packet. Neither
+      // answer is recoverable here — the link has to be re-issued, which is
+      // the embedding page's business, and it can only do that if it is told.
+      const failure = this.getSplitAudioFailure();
+      const stuckFor = this._splitAudioErrorSince
+        ? performance.now() - this._splitAudioErrorSince
+        : 0;
+      if (!this._splitAudioErrorSince) {
+        this._splitAudioErrorSince = performance.now();
+        Logger.warn(TAG, `Split audio demux error: ${message}`);
+      }
+      if (failure || stuckFor >= MoviPlayer.SPLIT_AUDIO_GIVE_UP_MS) {
+        this._splitAudioDead = true;
+        this.failFatally(
+          failure ??
+            new Error(
+              `Audio track stopped reading after ${(stuckFor / 1000).toFixed(1)}s: ${message}`,
+            ),
+        );
+      }
     } finally {
       this.audioDemuxInFlight = false;
     }
 
-    return !this._splitAudioEof || this.splitAudioQueue.length > 0;
+    return (
+      !this._splitAudioDead &&
+      (!this._splitAudioEof || this.splitAudioQueue.length > 0)
+    );
   }
 
   private feedSplitAudio(bufferedTarget: number): void {
@@ -9270,6 +12181,31 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   private async recoverBrokenAudio(): Promise<void> {
     if (this._destroyed || this._audioRecoveryInFlight) return;
+    // On an encrypted source there is nothing to re-align to: the audio track
+    // gets no clear lead of its own (the packager's lead covers the video), so
+    // the first packet fails and so will every one after it.
+    //
+    // Go SILENT rather than stopping. The video's clear lead is real playback
+    // and worth showing; ending it here would throw away the whole point of
+    // getting this far. What must not continue is the waiting — audio empty,
+    // video bound to it, the stall detector nudging a seek, forever. Cutting
+    // audio out of the picture entirely is what unblocks the video, and the
+    // stop then comes from the video decoder when ITS clear lead runs out.
+    if (this._sourceIsEncrypted) {
+      if (this._encryptedAudioSilenced) return;
+      this._encryptedAudioSilenced = true;
+      Logger.warn(
+        TAG,
+        "Encrypted source: audio needs a licence — going silent so the clear video lead can still play",
+      );
+      this.disableAudio = true;
+      try {
+        this.audioRenderer.pause();
+      } catch {
+        /* nothing scheduled */
+      }
+      return;
+    }
     if (this._audioRecoveries >= MoviPlayer.MAX_AUDIO_RECOVERIES) {
       Logger.warn(
         TAG,
@@ -9387,8 +12323,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (lang === this._activeAudioLang && this.audioDemuxer) return true;
 
     const t = this.getCurrentTime();
-    const resume =
-      this.stateManager.is("playing") || this.stateManager.is("buffering");
 
     // --- PREP (old audio keeps playing): build + open + seek the new audio
     // demuxer on an isolated WASM module. The slow work (open = source measure,
@@ -9476,8 +12410,33 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this._activeAudioLang = lang;
     this._splitAudioEof = false;
     this.splitAudioQueue.clear();
+    // Another language is another source: whatever the last one died of is
+    // not this one's to carry.
+    this._splitAudioDead = false;
+    this._splitAudioErrorSince = 0;
     this._lastSplitAudioPts = t;
-    if (resume) {
+    // Restart the pump on the state AS IT IS NOW, and count a seek in flight
+    // as live.
+    //
+    // This used to read the state from BEFORE the swap — before an open, a
+    // seek and a decoder reconfigure, any of which can outlast the state that
+    // was current when the switch was asked for. Restoring a remembered
+    // language is the case that proves it: the element asks as the media
+    // loads, so the answer was taken during the opening seek ("seeking", which
+    // counted as neither playing nor buffering), the swap landed into a
+    // playing player, and the pump was never started again. Nothing decoded a
+    // single audio packet after that — the stall detector found the buffer
+    // empty, buffering held the full fifteen seconds of the bound escape, and
+    // playback resumed with audioReady=false. Measured on a dubbed video: 15s
+    // silent, then a 2.6s desync seek to catch the sound up.
+    //
+    // Safe to start whenever: pumpSplitAudio has its own state guard and idles
+    // if it should not be running.
+    if (
+      this.stateManager.is("playing") ||
+      this.stateManager.is("buffering") ||
+      this.waitingForVideoSync
+    ) {
       if (!this.audioRenderer.isAudioPlaying()) this.audioRenderer.play();
       this.startAudioLoop();
     }
@@ -9594,13 +12553,118 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
+   * Add an external subtitle track after the source has loaded.
+   *
+   * The config path (`config.subtitleTracks`) is read once, when the source is
+   * opened — everything that arrives later, a file the viewer picked among it,
+   * had no way in short of reloading the video. Nothing else needs to change:
+   * selectSubtitleLang() already fetches the URL on demand, so a `blob:` from
+   * a picked File loads exactly like a hosted `.srt` does.
+   *
+   * `lang` is the key the menu and selectSubtitleLang() address a track by, so
+   * an entry with an existing lang replaces it rather than adding a duplicate
+   * the viewer cannot tell apart.
+   */
+  addSubtitleTrack(entry: SubtitleSourceEntry): void {
+    const at = this._subtitleTracks.findIndex((t) => t.lang === entry.lang);
+    if (at >= 0) this._subtitleTracks[at] = entry;
+    else this._subtitleTracks.push(entry);
+    Logger.info(TAG, `External subtitle added: ${entry.label} (${entry.lang})`);
+  }
+
+  /**
+   * Add cues to a subtitle track that is being generated rather than loaded —
+   * speech recognition writing captions as it goes is what this is for.
+   *
+   * The first call for a `lang` creates the track (it appears in the subtitle
+   * menu like any other); later calls extend it. Cues may arrive in any order —
+   * a recogniser that jumps to wherever the viewer seeked, then fills in the
+   * rest — and are kept sorted; one that duplicates a cue already there (same
+   * text, starting within a tenth of a second) is ignored, so overlapping
+   * windows do not print a line twice. Empty or zero-length cues are dropped.
+   *
+   * If the track is the one showing, the new cues are on screen on the next
+   * subtitle tick.
+   *
+   * `pending: true` with no cues lists the track before anything is known —
+   * speech recognition warming up — and getSubtitleLangs() reports it as
+   * pending until its first cue lands (or `pending: false` says there will be
+   * none).
+   */
+  appendSubtitleCues(
+    lang: string,
+    label: string,
+    cues: SubtitleCue[],
+    pending?: boolean,
+  ): void {
+    let list = this._generatedSubCues.get(lang);
+    if (!list) {
+      list = [];
+      this._generatedSubCues.set(lang, list);
+      this.addSubtitleTrack({ url: "", lang, label, format: "vtt" });
+    }
+    let added = 0;
+    for (const cue of cues) {
+      const text = cue.text?.trim();
+      if (!text || !(cue.end > cue.start)) continue;
+      const dupe = list.some(
+        (c) => c.text === text && Math.abs(c.start - cue.start) < 0.1,
+      );
+      if (dupe) continue;
+      // Binary search for the insertion point — lists run to thousands.
+      let lo = 0;
+      let hi = list.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (list[mid].start <= cue.start) lo = mid + 1;
+        else hi = mid;
+      }
+      list.splice(lo, 0, { start: cue.start, end: cue.end, text });
+      added++;
+    }
+    if (added || pending === false) this._pendingSubLangs.delete(lang);
+    else if (pending && list.length === 0) this._pendingSubLangs.add(lang);
+    // The renderer remembers which index it last drew; an insertion ahead of it
+    // shifts that index onto a different cue, so restart it rather than leave
+    // the wrong line up.
+    if (added && this._activeSubtitleLang === lang) {
+      this.startExternalSubtitles();
+    }
+  }
+
+  /**
+   * Take a generated track (see appendSubtitleCues) out of the menu, cues and
+   * all, switching subtitles off if it was showing. False if there is none.
+   */
+  removeSubtitleCues(lang: string): boolean {
+    if (!this._generatedSubCues.has(lang)) return false;
+    if (this._activeSubtitleLang === lang) {
+      this.stopExternalSubtitles();
+      this._externalSubCues = [];
+      this._activeSubtitleLang = "";
+      this.videoRenderer?.clearSubtitles();
+      this.emit("subtitleTrackChange" as any, { lang: null, label: null });
+    }
+    this._generatedSubCues.delete(lang);
+    this._pendingSubLangs.delete(lang);
+    this._subtitleTracks = this._subtitleTracks.filter((t) => t.lang !== lang);
+    return true;
+  }
+
+  /**
    * Get available external subtitle tracks
    */
-  getSubtitleLangs(): { lang: string; label: string; active: boolean }[] {
+  getSubtitleLangs(): {
+    lang: string;
+    label: string;
+    active: boolean;
+    pending?: boolean;
+  }[] {
     return this._subtitleTracks.map((t) => ({
       lang: t.lang,
       label: t.label,
       active: t.lang === this._activeSubtitleLang,
+      ...(this._pendingSubLangs.has(t.lang) ? { pending: true } : {}),
     }));
   }
 
@@ -9624,6 +12688,19 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (!track) {
       Logger.warn(TAG, `Subtitle track not found for lang: ${lang}`);
       return false;
+    }
+
+    // A generated track has nothing to fetch: its cues are already here, and
+    // still arriving.
+    const generated = this._generatedSubCues.get(lang);
+    if (generated) {
+      this.videoRenderer?.setSubtitleFormat("vtt");
+      this._externalSubCues = generated;
+      this._activeSubtitleLang = lang;
+      this.selectSubtitleTrack(null);
+      this.startExternalSubtitles();
+      this.emit("subtitleTrackChange" as any, { lang, label: track.label });
+      return true;
     }
 
     try {
@@ -10075,6 +13152,34 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
+   * Take the sound down a slope, for a player that is about to go away.
+   *
+   * See AudioRenderer.fadeOut. An adaptive stream's audio comes out of a media
+   * element rather than our gain node, so there is nothing to ramp — it is
+   * stepped down instead, often enough that the ear hears a slope and not a
+   * staircase.
+   */
+  fadeOutAudio(durationMs: number = 200): void {
+    this.audioRenderer.fadeOut(durationMs);
+    const wrapper = this.streamWrapper;
+    if (!wrapper) return;
+    const from = this.audioRenderer.getVolume?.() ?? 1;
+    const steps = Math.max(4, Math.round(durationMs / 25));
+    for (let i = 1; i <= steps; i++) {
+      setTimeout(
+        () => {
+          try {
+            wrapper.setVolume(Math.max(0, from * (1 - i / steps)));
+          } catch {
+            /* the stream is already gone */
+          }
+        },
+        (durationMs * i) / steps,
+      );
+    }
+  }
+
+  /**
    * Get volume (0-1)
    */
   getVolume(): number {
@@ -10152,6 +13257,21 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // 4.31s — a four-second jump backwards, and then the race forwards to
         // catch up with the sound.
         const pictureAt = this.getCurrentTime();
+        // …and keep the clock off the audio until the re-read has landed. The
+        // context resuming is enough for the clock to sync to the audio clock —
+        // still frozen where the context went to sleep, 0s on an autoplay that
+        // was muted from the start — so the seek below began by pausing the
+        // clock at 0:00, and the time and the bar sat at zero for the whole
+        // re-read before jumping back. Unmastered, the clock runs on the wall
+        // and tracks the picture, which is exactly what it did while the audio
+        // was being dropped; it is handed back to the audio once the audio is
+        // anchored where the picture is.
+        this.clock.setAudioProvider(null);
+        const remasterClock = () => {
+          if (!this.disableAudio && !this._destroyed) {
+            this.clock.setAudioProvider(this.audioRenderer);
+          }
+        };
         // …but the SEEK only once the context is RUNNING. Seeking first put the re-read
         // audio on an anchor that the "running" statechange then discarded,
         // and every buffer decoded in between was already late against a wall
@@ -10164,17 +13284,30 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         ]).then(() => {
           if (this.muted || this.stateManager.getState() !== "playing") {
             this.audioRenderer.releaseResyncSilence();
+            remasterClock();
             return;
           }
           Logger.info(
             TAG,
             `Unmute: audio was being dropped — re-reading from ${pictureAt.toFixed(2)}s (where the picture was at the tap) so it lands with it`,
           );
-          this.seek(pictureAt)
+          // Machinery, not a seek the viewer asked for: no spinner, no
+          // seeking/seeked for the page, and it lands playing. It re-reads what
+          // is already in the source's buffer, at the frame already on screen —
+          // a loading ring over that read as the tap having broken something.
+          this.seek(pictureAt, {
+            internal: true,
+            suppressSpinner: true,
+            preservePlaying: true,
+          })
             // Whatever happens — landed, failed, superseded — the hold has to
-            // come off, or tap-to-unmute ends in permanent silence.
+            // come off, or tap-to-unmute ends in permanent silence; and the
+            // clock goes back to the audio, or it runs on the wall for good.
             .catch(() => {})
-            .finally(() => this.audioRenderer.releaseResyncSilence());
+            .finally(() => {
+              this.audioRenderer.releaseResyncSilence();
+              remasterClock();
+            });
         });
       }
     }
@@ -10230,13 +13363,68 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * (resets to 0 on seek/reset), so callers must handle it going backwards.
    * Null when there's no video renderer (audio-only / adaptive streams).
    */
-  getRenderHealth(): { framesPresented: number; sourceFps: number } | null {
+  getRenderHealth(): {
+    framesPresented: number;
+    sourceFps: number;
+    hostContended: boolean;
+  } | null {
     if (!this.videoRenderer || this.streamWrapper) return null;
     const vt = this.trackManager.getActiveVideoTrack() as VideoTrack | null;
     return {
       framesPresented: this.videoRenderer.getStats().framesPresented,
       sourceFps: vt?.frameRate && vt.frameRate > 0 ? vt.frameRate : 30,
+      hostContended: this.videoRenderer.isHostContended(),
     };
+  }
+
+  /**
+   * What this source needs, in BITS per second, to arrive in real time.
+   *
+   * Total bytes over duration, not the video track's declared bitrate: a remux
+   * carries every audio track and every subtitle in the same container, and the
+   * demuxer reads the lot — on the 40GB file this was written for, five audio
+   * tracks including TrueHD Atmos. What has to come down the wire is the file,
+   * so the file is what the figure is taken from. Declared per-track bitrates
+   * would answer a question nobody is asking, and MKV often omits them anyway.
+   *
+   * 0 when it cannot be known — a local file, or a source that has not resolved
+   * its size — which is the signal to say nothing rather than guess.
+   *
+   * Deliberately NOT paired with a throughput accessor here. The ABR's reading
+   * is a floor once the source parks at the prefetch gate, and publishing it
+   * beside this invites exactly the comparison that cried wolf twice; the link
+   * side of the question belongs to probeLinkBandwidth.
+   */
+  requiredLinkBps(): number {
+    const bytes =
+      (this.source as { getKnownSize?: () => number } | null)?.getKnownSize?.() ??
+      0;
+    const duration = this.getDuration();
+    if (!(bytes > 0) || !(duration > 0)) return 0;
+    return (bytes * 8) / duration;
+  }
+
+  /**
+   * Is the DEVICE the bottleneck right now, rather than the delivery?
+   *
+   * The link notice needs this because its only other evidence is that
+   * playback stopped, and a decoder that cannot keep up stops playback too —
+   * the catch-up hold does it on purpose ("holding sound and clock for it").
+   * Without this, a slow decoder on a heavy file would arm a verdict about the
+   * connection, and a probe that happens to read low while competing with the
+   * player's own streaming would then blame the link for the device's problem.
+   * That is the same wrong-cause-named mistake the notice already made twice,
+   * arriving from the third direction.
+   *
+   * Two answers, cheapest first. Self-inflicted buffering is the player's own
+   * doing by definition, so it is never the link. The renderer's decode-bound
+   * verdict is the settled judgement.
+   *
+   * Used only to hold a notice back, so a false positive here costs nothing but
+   * silence, which is the right way to be wrong about this.
+   */
+  deviceIsBottleneck(): boolean {
+    return this._bufferingSelfInflicted || (this.videoRenderer?.isDecodeBound?.() ?? false);
   }
 
   /**
@@ -10248,6 +13436,48 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   isDecodeBound(): boolean {
     return this.videoRenderer?.isDecodeBound?.() ?? false;
+  }
+
+  /**
+   * Did the DELIVERY run dry just now — a read waiting on bytes the network
+   * had not brought yet?
+   *
+   * deviceIsBottleneck answers the other half of the question and cannot
+   * answer this one: it reads how fast the picture reaches the screen, and a
+   * picture can run slow for reasons that never stop playback. From an 8K60
+   * AV1 file on Google Drive: the host page held rAF to ~40/s, the picture
+   * presented ~32fps, deviceIsBottleneck said "device" — and every stall in
+   * the session was the sound running out because the next bytes had not
+   * arrived. Those stalls were never counted against the link, so the notice
+   * that the file needs 41 Mbps never came. A stall with a read parked on the
+   * network is the delivery's, whatever the picture is doing.
+   */
+  deliveryStarved(withinMs: number = MoviPlayer.DELIVERY_STARVED_WINDOW_MS): boolean {
+    const at =
+      (this.source as { lastNetworkWait?: () => number } | null)?.lastNetworkWait?.() ?? 0;
+    return at > 0 && performance.now() - at < withinMs;
+  }
+  private static readonly DELIVERY_STARVED_WINDOW_MS = 3000;
+
+  /** The best rate the media has actually arrived at from this source,
+   *  BITS/second, or -1 — see HttpSource.bestDeliveryBps. */
+  /** What has actually been arriving, on average, over the last half minute
+   *  of active streaming — BITS/second, or -1. The honest "is the link
+   *  keeping up" figure; deliveryRateBps is the kinder one to quote. */
+  sustainedDeliveryBps(): number {
+    const src = this.source as {
+      recentDeliveryBps?: (windowMs?: number, minMs?: number) => number;
+    } | null;
+    return src?.recentDeliveryBps?.(30_000, 5_000) ?? -1;
+  }
+
+  deliveryRateBps(): number {
+    const src = this.source as {
+      bestDeliveryBps?: () => number;
+      recentDeliveryBps?: () => number;
+    } | null;
+    const best = src?.bestDeliveryBps?.() ?? -1;
+    return best > 0 ? best : (src?.recentDeliveryBps?.() ?? -1);
   }
 
   getStats(): Record<string, string | number | boolean> {
@@ -10495,6 +13725,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     return this.audioRenderer.wasEverActivated();
   }
 
+  /**
+   * True when the browser will refuse to start audio now — no gesture on the
+   * page yet and nothing unlocked this session. The element then skips the
+   * wait for a warm-up that cannot come.
+   */
+  isAudioStartRefused(): boolean {
+    if (this.disableAudio) return false;
+    return this.audioRenderer.isStartRefused();
+  }
+
   /** True when audio-only (data-saver) mode is active. */
   isAudioOnly(): boolean {
     return this._audioOnly;
@@ -10510,6 +13750,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   setAudioOnly(enabled: boolean): void {
     if (this._audioOnly === enabled) return;
     this._audioOnly = enabled;
+    // Captions are not part of the picture, and they are the one thing on
+    // screen that still has to keep time while it is gone.
+    this.videoRenderer?.setPictureSuspended(enabled);
     if (this.streamWrapper) {
       // Adaptive streams: the wrapper picks an audio-only / smallest-video
       // variant live (no reload, so the stream — and its LIVE state — survives).
@@ -10857,6 +14100,23 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.waitingForVideoSync = false;
 
     try {
+      // Let a read already inside the demuxer land before seeking it — the
+      // same wait seek() and the rendition swap do. Cancelling the rAF stops
+      // the NEXT pass, not a readPacket that Asyncify has suspended mid-call,
+      // and a seek issued over that read takes its pending slot: the read's
+      // bytes then arrive to "No pending read to fulfill", the readPacket never
+      // resolves, and demuxInFlight holds the whole pipeline until the demux
+      // timeout. Measured right after a hard 8K → 4K swap, where this catch-up
+      // fires by design: a 35s freeze while the source kept filling for nobody.
+      let guard = 0;
+      while (this.demuxInFlight && guard++ < 100) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      if (this.seekSessionId !== mySessionId) {
+        clearTimeout(holdTimer);
+        return; // Superseded
+      }
+
       // Flush video decoder only — audio decoder and renderer untouched
       if (this.videoDecoder) {
         await this.videoDecoder.flush();
@@ -11068,6 +14328,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (this.source instanceof FileSource) return;
 
     Logger.debug(TAG, "Starting pause-time buffering");
+    // Hold the window: what pause-time buffering reads ahead must not cost
+    // the bytes between the playhead and it. See holdWindow.
+    if (this.source instanceof HttpSource) this.source.holdWindow();
     this.pauseBufferTimerId = window.setInterval(() => {
       this.pauseBufferTick();
     }, MoviPlayer.PAUSE_BUFFER_INTERVAL_MS);
@@ -11173,6 +14436,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * Get buffered time in seconds
    * Returns the furthest time position that has been buffered
    */
+  /** The source's buffered end, in bytes, when the buffer-bar clamp was last
+   *  raised — see getBufferedTime. */
+  private _bufferedLatchBytes = 0;
+
   getBufferedTime(): number {
     if (this.streamWrapper) {
       return this.streamWrapper.getBufferEndTime();
@@ -11264,6 +14531,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // Never past the end: the same skew can overshoot in the other
         // direction, and a bar wider than the track is its own small lie.
         const computed = Math.min(duration, this.getCurrentTime() + forwardTime);
+        // The clamp stands for bytes that are still there. A window that
+        // moved BACK (a new stream at a seek target, a reset) has dropped the
+        // bytes the old end was measuring, so the old end goes with them.
+        if (bufferedEndBytes < this._bufferedLatchBytes) this.lastBufferedTime = 0;
+        this._bufferedLatchBytes = bufferedEndBytes;
         this.lastBufferedTime = Math.max(this.lastBufferedTime, computed);
         return this.lastBufferedTime;
       }
@@ -11328,6 +14600,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       return this.source.getBufferStart();
     }
     return -1;
+  }
+
+  /**
+   * Whether a quality switch is preparing its rung right now.
+   *
+   * For the element's stuck watchdog, which judges progress by the ACTIVE
+   * source's bytes. A step down holds that source's download for the prep
+   * (see suspendNetwork in switchVideoRenditionInPlace), so the bytes stop by
+   * design while the new rung's arrive somewhere the watchdog cannot see —
+   * and it read that as stuck and nudged a seek into the prep, which the prep
+   * then abandoned as the viewer seeking. The prep has its own budget.
+   */
+  isPreparingRendition(): boolean {
+    return this._pendingSwitchSource !== null;
   }
 
   /**
@@ -11535,6 +14821,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     newDemuxer: Demuxer,
     newTrack: VideoTrack,
     newStartTime: number,
+    prepDeadline: number,
+    status: { exhausted: boolean; readInFlight?: Promise<unknown> },
   ): Promise<{ decoder: MoviVideoDecoder; frames: VideoFrame[] } | null> {
     const staged: VideoFrame[] = [];
     const mediaTime = (f: VideoFrame) => f.timestamp / 1_000_000 - newStartTime;
@@ -11609,18 +14897,38 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.getCurrentTime() + MoviPlayer.SEAMLESS_PRIME_MAX_AHEAD_S,
       );
 
-      const deadline = performance.now() + MoviPlayer.SEAMLESS_PRIME_BUDGET_MS;
+      // Its own budget, or whatever the whole prep has left — whichever runs
+      // out first. The open may already have eaten most of it.
+      const deadline = Math.min(
+        performance.now() + MoviPlayer.SEAMLESS_PRIME_BUDGET_MS,
+        prepDeadline,
+      );
       let started = false;
       let fed = 0;
       for (;;) {
         if (decoderFailed || this._destroyed) break;
-        if (performance.now() > deadline) break;
+        if (performance.now() > deadline) {
+          status.exhausted = true;
+          break;
+        }
         dropStale();
         const last = staged.length > 0 ? mediaTime(staged[staged.length - 1]) : -Infinity;
         if (last >= target && staged.length >= MoviPlayer.SEAMLESS_PRIME_MIN_FRAMES) {
           return { decoder: dec, frames: staged };
         }
-        const packet = await newDemuxer.readPacket();
+        // The deadline above is checked at the TOP of each pass, which bounds a
+        // slow DECODE but not a slow READ — and on the rung that needs this
+        // most, the read is the whole wait. Unbounded, the 5s budget was worth
+        // whatever a single readPacket felt like taking on a 1.2GB file.
+        const read = newDemuxer.readPacket();
+        const packet = await withDeadline(read, deadline - performance.now());
+        if (packet === TIMED_OUT) {
+          status.exhausted = true;
+          // Still suspended inside the demuxer — which the hard path goes on
+          // to seek and play from. It has to land first; see the swap.
+          status.readInFlight = read.catch(() => undefined);
+          break;
+        }
         if (!packet) break; // EOF before we could get ahead
         if (packet.streamIndex !== newTrack.id) continue;
         // A decoder that has just configured needs a random-access point, and
@@ -11683,7 +14991,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         this.videoRenderer &&
         (this.stateManager.getState() === "playing" ||
           this.stateManager.getState() === "buffering" ||
-          this.waitingForVideoSync)
+          this.waitingForVideoSync ||
+          // …and for the one frame a forced completion left owing. See
+          // _pictureOwedFrom: without this the frames a paused seek was
+          // waiting for arrive just after it gives up and are all dropped.
+          this._pictureOwedFrom !== -1)
       ) {
         // A frame arriving while a seek waits for sync is that seek WORKING —
         // the decoder walking from the keyframe towards the target. Stamped
@@ -11703,7 +15015,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // the audio schedule's end for the audio path's sake — see
         // _videoResumeTarget.
         const gate =
-          this._videoResumeTarget !== -1 ? this._videoResumeTarget : this.seekTargetTime;
+          this._videoResumeTarget !== -1
+            ? this._videoResumeTarget
+            : this.seekTargetTime !== -1
+              ? this.seekTargetTime
+              // Nothing else is filtering, but an owed picture still must not
+              // be paid with a frame from before the position asked for.
+              : this._pictureOwedFrom;
         // CRITICAL: Check seekTargetTime !== -1 instead of >= 0 to support negative start times
         // Some media files have negative PTS offsets (e.g., startTime = -0.105s)
         if (gate !== -1 && frameTime < gate) {
@@ -11716,6 +15034,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // packets run seconds ahead of this frame and must not decode twice.
         if (this._videoResumeTarget !== -1) {
           this._videoResumeTarget = Number.NEGATIVE_INFINITY;
+          this._pictureOwedFrom = -1;
           this.videoRenderer.queueFrame(frame);
           return;
         }
@@ -11735,6 +15054,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           }
         }
 
+        this._pictureOwedFrom = -1;
         this.videoRenderer.queueFrame(frame);
       } else {
         frame.close();
@@ -11743,6 +15063,16 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     dec.setOnError((error) => {
       Logger.error(TAG, "Video decoder error", error);
+      // On a source we KNOW is encrypted, this is where the clear lead ran out.
+      // The decoder is telling the truth — it cannot decode these samples — but
+      // "Decoding error" describes the symptom and hides the cause, and the
+      // cause is one the embedder can act on. Say it plainly instead, and stop
+      // pulling: the rest of the file is bytes we can never use, and reading it
+      // to the end is what turned this into a hundreds-of-megabytes download.
+      if (this._sourceIsEncrypted) {
+        this.encryptedSourceGaveUp();
+        return;
+      }
       this.emit("error", error);
       // Note: Decoder now has built-in recovery, only pauses after MAX_ERRORS
     });

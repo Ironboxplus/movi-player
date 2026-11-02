@@ -117,6 +117,7 @@ export class WorkerSoftwareAudioDecoder {
   private nextRequestId = 1;
   private pending = new Map<number, PendingRequest>();
   private _downmix = true;
+  private _failFast = false;
   private generation = 1;
   private trackId = -1;
   private queueDepth = 0;
@@ -169,6 +170,12 @@ export class WorkerSoftwareAudioDecoder {
       trackId: this.trackId,
       downmix,
     });
+  }
+
+  /** Declare broken on the first failure; mirrors SoftwareAudioDecoder.setFailFast. */
+  setFailFast(on: boolean): void {
+    this._failFast = on;
+    this.worker.postMessage({ type: "setFailFast", failFast: on });
   }
 
   setOnData(callback: (frame: PCMFrame) => void): void {
@@ -268,6 +275,7 @@ export class WorkerSoftwareAudioDecoder {
           track: { ...track, codecId, extradata: undefined },
           extradata,
           downmix: this._downmix,
+          failFast: this._failFast,
           controlBuffer: this.cancelGeneration?.buffer,
         },
         transfer,

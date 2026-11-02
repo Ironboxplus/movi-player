@@ -13,7 +13,16 @@ const dropZone = document.getElementById("dropZone");
 const filePicker = document.getElementById("filePicker");
 const folderPicker = document.getElementById("folderPicker");
 const loadingOverlay = document.getElementById("loadingOverlay");
+// Whether anything has been loaded this session — gates the picker's close
+// button and Escape, so the back arrow can't strand you on an empty picker.
+// Declared up here because loadFile() sets it well above the block that reads it.
+let hasMedia = false;
 const loadingName = document.getElementById("loadingName");
+// The picker's URL tab: focus the link field. Files and Folder are labels
+// around their inputs, so they open the picker by themselves.
+document.getElementById("xtabUrl")?.addEventListener("click", () => {
+  document.getElementById("linkInput")?.focus();
+});
 
 const playlistPanel = document.getElementById("playlistPanel");
 const playlistItemsEl = document.getElementById("playlistItems");
@@ -25,6 +34,7 @@ const addFilesBtn = document.getElementById("addFilesBtn");
 const addFolderBtn = document.getElementById("addFolderBtn");
 const nextBtn = document.getElementById("nextBtn");
 const shuffleBtn = document.getElementById("shuffleBtn");
+const repeatBtn = document.getElementById("repeatBtn");
 const autoplayBtn = document.getElementById("autoplayBtn");
 const playlistSearchWrap = document.getElementById("playlistSearchWrap");
 const playlistSearch = document.getElementById("playlistSearch");
@@ -55,7 +65,7 @@ customElements.whenDefined("movi-player").then(() => {
   playerEl.addEventListener("loadeddata", () => {
     hideLoading();
     const t = playerEl.title;
-    if (t) document.title = t + " — Movi Player";
+    if (t) document.title = t + " — MoviPlayer";
   });
   // Title typically isn't known at loadeddata — MoviElement auto-loads
   // it from FFmpeg metadata / Content-Disposition / URL filename after
@@ -64,7 +74,7 @@ customElements.whenDefined("movi-player").then(() => {
   // title resolves (or when an integrator sets the attribute later).
   playerEl.addEventListener("titlechange", (e) => {
     const t = e?.detail?.title || playerEl.title;
-    if (t) document.title = t + " — Movi Player";
+    if (t) document.title = t + " — MoviPlayer";
   });
   // Strip-mode layout: tag both the outer shell (centres the strip in
   // the viewport, swaps the black panel for a neutral surface) and the
@@ -88,10 +98,9 @@ customElements.whenDefined("movi-player").then(() => {
         if (playlistItemEls[playlistIndex]) applyItemProgress(playlistItemEls[playlistIndex], f);
       }
     }
-    if (autoplayEnabled && playlist.length && playlistIndex >= 0) {
-      const next = getNextIndex();
-      if (next >= 0) playPlaylistItem(next);
-    }
+    // No advance here. The element owns it — `autoadvance` follows the toggle
+    // above, and it resolves the next item through the same order and wrap the
+    // panel's Next uses. The load lands back here as `itemchange`.
   });
   playerEl.addEventListener("timeupdate", () => {
     if (playlistIndex < 0) return;
@@ -296,77 +305,101 @@ let playlistIndex = -1;
 let currentFile = null;
 const playlistItemEls = [];
 
-// Shuffle: when on, auto-advance follows a random permutation of indices
-// instead of sequential order. shuffleOrder holds the permutation; the
-// currently playing index's position in it determines what plays next.
+// Shuffle, repeat and auto-advance are the ELEMENT's, not this page's. The
+// queue is handed over in syncPlayerQueue(), which means the element already
+// knows the order, the wrap and what comes next — and its own context menu
+// offers the same two toggles. Keeping a second copy here is how the panel
+// button and the menu row end up disagreeing, so there is only one copy and
+// this is the view of it: writes go to the element, and the element's
+// `shufflechange` / `loopchange` paint the buttons back.
 let shuffleEnabled = false;
-let shuffleOrder = [];
+let repeatMode = "off"; // "off" | "all" | "one"
+let autoplayEnabled = true;
 
-function rebuildShuffleOrder() {
-  // Fisher–Yates over all indices, with the current item moved to the front
-  // so "next" starts from wherever we are rather than jumping immediately.
-  const order = playlist.map((_, i) => i);
-  for (let i = order.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [order[i], order[j]] = [order[j], order[i]];
-  }
-  if (playlistIndex >= 0) {
-    const at = order.indexOf(playlistIndex);
-    if (at > 0) [order[0], order[at]] = [order[at], order[0]];
-  }
-  shuffleOrder = order;
+function paintShuffle(on) {
+  shuffleEnabled = !!on;
+  shuffleBtn.setAttribute("aria-pressed", shuffleEnabled ? "true" : "false");
+  shuffleBtn.title = shuffleEnabled ? "Shuffle on" : "Shuffle";
 }
-
-// Index that auto-advance (ended) should play after the current one, or -1
-// when the playlist/shuffle run is exhausted.
-function getNextIndex() {
-  if (shuffleEnabled) {
-    if (!shuffleOrder.length) return -1;
-    const pos = shuffleOrder.indexOf(playlistIndex);
-    const next = pos + 1;
-    return next < shuffleOrder.length ? shuffleOrder[next] : -1;
-  }
-  return playlistIndex < playlist.length - 1 ? playlistIndex + 1 : -1;
-}
-
 function setShuffle(on) {
-  shuffleEnabled = on;
-  shuffleBtn.setAttribute("aria-pressed", on ? "true" : "false");
-  if (on) rebuildShuffleOrder();
-  try { localStorage.setItem("movi-shuffle", on ? "1" : "0"); } catch {}
+  paintShuffle(on);
+  try { playerEl.shuffle = shuffleEnabled; } catch {}
+  try { localStorage.setItem("movi-shuffle", shuffleEnabled ? "1" : "0"); } catch {}
 }
-// Next: explicit user action — plays the next item (shuffle-aware) even when
-// the autoplay toggle is off.
+
+function paintRepeat(mode) {
+  repeatMode = mode === "all" || mode === "one" ? mode : "off";
+  repeatBtn.dataset.mode = repeatMode;
+  repeatBtn.setAttribute("aria-pressed", repeatMode === "off" ? "false" : "true");
+  repeatBtn.title =
+    repeatMode === "all" ? "Repeat playlist" : repeatMode === "one" ? "Repeat one" : "Repeat off";
+  // Which arrow shows is `data-mode`'s job in CSS — `hidden` on an <svg> is
+  // not honoured, the UA rule behind it only reaches HTML elements.
+}
+function setRepeat(mode) {
+  paintRepeat(mode);
+  // "all" is what makes the queue join up: the element wraps past the last
+  // item, and its auto-advance turns on with it.
+  try { playerEl.loopMode = repeatMode; } catch {}
+  try { localStorage.setItem("movi-repeat", repeatMode); } catch {}
+}
+
+// Next: explicit user action — plays the next item even when the autoplay
+// toggle is off. The element resolves it, so it follows the shuffle run and
+// wraps when repeat-all is on; the load comes back through `itemchange`.
 nextBtn.addEventListener("click", () => {
   if (!playlist.length || playlistIndex < 0) return;
-  const next = getNextIndex();
-  if (next >= 0) playPlaylistItem(next, { forcePlay: true });
+  try { playerEl.next(); } catch {}
 });
 shuffleBtn.addEventListener("click", () => setShuffle(!shuffleEnabled));
-try { if (localStorage.getItem("movi-shuffle") === "1") setShuffle(true); } catch {}
+// Off → all → one → off, the order every player uses.
+repeatBtn.addEventListener("click", () => {
+  setRepeat(repeatMode === "off" ? "all" : repeatMode === "all" ? "one" : "off");
+});
+// The element's context menu can toggle both as well; follow it.
+playerEl.addEventListener("shufflechange", (e) => {
+  paintShuffle(!!e.detail?.enabled);
+  try { localStorage.setItem("movi-shuffle", shuffleEnabled ? "1" : "0"); } catch {}
+});
+playerEl.addEventListener("loopchange", (e) => {
+  paintRepeat(e.detail?.mode || (e.detail?.enabled ? "one" : "off"));
+  try { localStorage.setItem("movi-repeat", repeatMode); } catch {}
+});
 
 // Autoplay: when on, the next item plays automatically once the current one
-// ends. Defaults to on so existing auto-advance behaviour is preserved.
-let autoplayEnabled = true;
+// ends. Defaults to on so existing auto-advance behaviour is preserved. The
+// advance itself is the element's — `autoadvance` is the attribute for it —
+// so there is no second timer here racing its one.
 function setAutoplay(on) {
   autoplayEnabled = on;
   autoplayBtn.setAttribute("aria-checked", on ? "true" : "false");
   // Keep the element attribute in sync so its own autoplay path doesn't
   // start playback when the toggle is off.
-  if (on) playerEl.setAttribute("autoplay", "");
-  else playerEl.removeAttribute("autoplay");
+  if (on) {
+    playerEl.setAttribute("autoplay", "");
+    playerEl.setAttribute("autoadvance", "");
+  } else {
+    playerEl.removeAttribute("autoplay");
+    playerEl.removeAttribute("autoadvance");
+  }
   try { localStorage.setItem("movi-autoplay", on ? "1" : "0"); } catch {}
 }
 autoplayBtn.addEventListener("click", () => setAutoplay(!autoplayEnabled));
 try { setAutoplay(localStorage.getItem("movi-autoplay") !== "0"); } catch { setAutoplay(true); }
+try { if (localStorage.getItem("movi-shuffle") === "1") setShuffle(true); else paintShuffle(false); } catch { paintShuffle(false); }
+try { setRepeat(localStorage.getItem("movi-repeat") || "off"); } catch { paintRepeat("off"); }
 const fileMeta = new Map();
 const metaQueue = [];
 let metaProcessing = false;
 let thumbWasmPromise = null;
 
 function loadFile(file) {
+  hasMedia = true;
+  // Opening one file leaves the queue behind; without this the bar keeps a
+  // Next button pointing into a playlist that is no longer on screen.
+  if (!playlist.length) { try { playerEl.playlist = []; } catch {} }
   overlay.classList.add("hidden");
-  document.title = file.name + " — Movi Player";
+  document.title = file.name + " — MoviPlayer";
   if (playerEl.setFile) playerEl.setFile(file);
   else playerEl.src = file;
   // Opening a single file always autoplays — the playlist toggle only governs
@@ -500,6 +533,38 @@ playlistPanel.addEventListener("keydown", (e) => {
   }
 });
 
+// ─── The player's own queue ───────────────────────────────
+// The element has a queue of its own, and a queue of src-less items is one it
+// never loads: it owns only the control surface — the Next/Previous buttons in
+// the bar, Shift+N / Shift+P, and the skip pair on the lock screen and the
+// system media keys — and announces every move as a cancelable `itemchange`.
+//
+// That is exactly what this page needs. Its items are local Files, and
+// playPlaylistItem() does more than write a src (poster, autoplay rules,
+// thumbnail metadata, progress), so the loading stays here. Handing over the
+// list buys the buttons and the OS controls without moving any of that.
+function syncPlayerQueue() {
+  try {
+    playerEl.playlist = playlist.map((f, i) => ({ id: String(i), title: f.name }));
+    playerEl.playlistIndex = playlistIndex;
+  } catch {
+    // An older bundled element without the queue — the panel still works.
+  }
+}
+
+playerEl.addEventListener("itemchange", (e) => {
+  // Nothing is written by the element; this page loads the item.
+  e.preventDefault();
+  const { index } = e.detail || {};
+  if (typeof index !== "number") return;
+  // The index is already the answer: the element stepped through its own play
+  // order, so the shuffle run and the repeat-all wrap are baked in and the
+  // bar's Next, the panel's Next and auto-advance can't disagree.
+  if (index >= 0 && index < playlist.length) {
+    playPlaylistItem(index, { forcePlay: true });
+  }
+});
+
 function setPlaylist(files, { rootName } = {}) {
   const videos = files.filter(isVideoFile);
   if (!videos.length) return;
@@ -520,7 +585,8 @@ function setPlaylist(files, { rootName } = {}) {
     playlistSearch.value = "";
     applySearchFilter();
   }
-  if (shuffleEnabled) rebuildShuffleOrder();
+  // A new queue draws a fresh order; setPlaylistItems does it inside.
+  syncPlayerQueue();
   playPlaylistItem(0);
 }
 
@@ -540,7 +606,8 @@ function appendToPlaylist(files) {
     showPlaylist();
   }
   renderPlaylist();
-  if (shuffleEnabled) rebuildShuffleOrder();
+  // A new queue draws a fresh order; setPlaylistItems does it inside.
+  syncPlayerQueue();
   if (wasEmpty) playPlaylistItem(0);
 }
 
@@ -595,14 +662,21 @@ function playPlaylistItem(i, { forcePlay = false } = {}) {
   if (!file) return;
   playlistIndex = i;
   currentFile = file;
+  hasMedia = true;
   overlay.classList.add("hidden");
-  document.title = file.name + " — Movi Player";
+  document.title = file.name + " — MoviPlayer";
   // Drop poster so previous item's poster doesn't bleed in
   playerEl.removeAttribute("poster");
   playerEl.removeAttribute("postertime");
   playerEl.setAttribute("postertime", "10%");
   if (playerEl.setFile) playerEl.setFile(file);
   else playerEl.src = file;
+  // AFTER the source, not before. The items handed to the element are src-less,
+  // so a source it did not write itself is one from outside the queue and it
+  // resets the index to -1 — which is exactly right, and exactly what would
+  // undo this write if it came first. Writing the index says where the queue
+  // IS without announcing a move, so it cannot bounce back as an itemchange.
+  try { playerEl.playlistIndex = i; } catch {}
   if (autoplayEnabled || forcePlay) playerEl.play?.().catch(() => {});
   updateActiveItem(i);
 }
@@ -1082,6 +1156,79 @@ async function pickFolder({ append = false } = {}) {
   folderPicker.click();
 }
 
+// ─── ChromeOS Files app ───────────────────────────────────
+// Registered as a file handler in the manifest, so double-clicking a video in
+// the ChromeOS Files app opens it here. The files arrive through the Launch
+// Handler API rather than a picker: FileSystemFileHandles, which have to be
+// resolved to Files before the player can take them.
+//
+// The consumer is set synchronously, at module evaluation. A launch that
+// arrives before one is registered is queued, but only until the page decides
+// it is not interested — registering after an await risks dropping it.
+//
+// Feature-detected because this page also ships to Firefox, and to Chrome off
+// ChromeOS, where launchQueue does not exist.
+if (
+  "launchQueue" in window &&
+  typeof LaunchParams !== "undefined" &&
+  "files" in LaunchParams.prototype
+) {
+  window.launchQueue.setConsumer(async (params) => {
+    if (!params.files?.length) return;
+    const files = [];
+    for (const handle of params.files) {
+      try {
+        files.push(await handle.getFile());
+      } catch {
+        // A handle whose permission has lapsed or whose file has moved —
+        // skip it rather than failing the whole launch.
+      }
+    }
+    if (!files.length) return;
+    // Files-app multi-select becomes a playlist, the way picking several in
+    // the page's own dialog already does.
+    if (files.length === 1) loadFile(files[0]);
+    else setPlaylist(files);
+  });
+}
+
+// ─── Back to the picker ───────────────────────────────────
+// The title bar's arrow (titlemode="back") only fires an event; this is what
+// it means here. Anything already playing keeps playing behind the picker —
+// the close button and Escape put you straight back to it, so the arrow is
+// never a one-way door.
+// Whether the video was playing when the picker went up, so closing it puts
+// playback back the way it was found. Without this, stepping out and back in
+// left a paused video and no sign of why.
+let wasPlayingBeforePicker = false;
+
+function showPicker() {
+  overlay.classList.remove("hidden");
+  overlay.classList.toggle("dismissible", hasMedia);
+  // `paused` is play INTENT, not pipeline state — a buffering video still reads
+  // as playing, which is the answer this wants.
+  try { wasPlayingBeforePicker = !playerEl.paused; } catch { wasPlayingBeforePicker = false; }
+  try { playerEl.pause?.(); } catch {}
+  // A reload of ?url=... would replay the video the viewer just stepped out
+  // of, so the address bar goes back to the bare page too.
+  if (window.location.search) {
+    history.replaceState(null, "", window.location.pathname);
+  }
+  document.title = "MoviPlayer";
+}
+
+function hidePicker() {
+  if (!hasMedia) return;
+  overlay.classList.add("hidden");
+  // Resume only if it was running when we left. A video the viewer had
+  // deliberately paused stays paused — coming back is not a request to start
+  // it.
+  if (wasPlayingBeforePicker) playerEl.play?.().catch(() => {});
+}
+
+playerEl.addEventListener("back", showPicker);
+document.getElementById("overlayClose")?.addEventListener("click", hidePicker);
+
 // ─── URL / single-file load ───────────────────────────────
 function filenameFromPath(path) {
   try {
@@ -1103,10 +1250,10 @@ function showFileAccessError(fileUrl) {
     })();
     const how = isChromium
       ? `open <b style="color:#A78BFA">chrome://extensions</b>,
-        find <b style="color:#A78BFA">Movi Player</b>, click <b style="color:#A78BFA">Details</b>,
+        find <b style="color:#A78BFA">MoviPlayer</b>, click <b style="color:#A78BFA">Details</b>,
         and enable <b style="color:#A78BFA">"Allow access to file URLs"</b>`
       : `open <b style="color:#A78BFA">about:addons</b>,
-        select <b style="color:#A78BFA">Movi Player</b>, open the
+        select <b style="color:#A78BFA">MoviPlayer</b>, open the
         <b style="color:#A78BFA">Permissions</b> tab, and allow
         <b style="color:#A78BFA">"Access your data for sites in the file:// domain"</b>`;
     dropText.innerHTML = `
@@ -1137,7 +1284,8 @@ async function loadFileUrl(fileUrl) {
 if (url) {
   if (url.startsWith("file://")) {
     const name = filenameFromPath(url).replace(/\.[^.]+$/, "");
-    document.title = (name || "Video") + " — Movi Player";
+    document.title = (name || "Video") + " — MoviPlayer";
+    hasMedia = true;
     loadFileUrl(url);
   } else {
     let name = decodeURIComponent(url.split("/").pop().split("?")[0]);
@@ -1148,7 +1296,8 @@ if (url) {
         if (segments.length > 0) name = decodeURIComponent(segments[segments.length - 1]).replace(/[-_]/g, " ");
       } catch {}
     }
-    document.title = (name || "Video") + " — Movi Player";
+    document.title = (name || "Video") + " — MoviPlayer";
+    hasMedia = true;
     customElements.whenDefined("movi-player").then(() => { playerEl.src = url; });
   }
 } else {
@@ -1326,9 +1475,224 @@ setInterval(() => {
   refreshCacheInfo();
 }, 4000);
 
+// ─── Link field, and the two settings the popup used to own ──────────
+// All of this ran in popup.js until the popup was removed. The toolbar icon
+// opens this page directly now, so it lives here.
+(() => {
+  const linkForm = document.getElementById("linkForm");
+  const linkInput = document.getElementById("linkInput");
+  const linkPaste = document.getElementById("linkPaste");
+
+  // Navigating rather than setting playerEl.src reuses the whole ?url= path
+  // above — the file-vs-stream branch, the title, the name derivation.
+  const play = (raw) => {
+    const value = (raw || "").trim();
+    if (!/^https?:\/\//i.test(value)) {
+      linkInput.value = value;
+      linkInput.focus();
+      linkInput.setCustomValidity("Enter a link starting with http:// or https://");
+      linkInput.reportValidity();
+      setTimeout(() => linkInput.setCustomValidity(""), 10);
+      return;
+    }
+    location.href = `player.html?url=${encodeURIComponent(value)}`;
+  };
+
+  linkForm?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    play(linkInput.value);
+  });
+  linkInput?.addEventListener("input", () => linkInput.setCustomValidity(""));
+
+  linkPaste?.addEventListener("click", async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      linkInput.value = (text || "").trim();
+      linkInput.focus();
+    } catch {
+      // Clipboard read refused — the field is still there to type into,
+      // which is the whole reason it exists.
+      linkInput.focus();
+    }
+  });
+
+  // ── Detect-download-links toggle ──
+  // Source of truth is the storage flag (the user's preference). The
+  // permission only makes the HEAD probes succeed; we never try to revoke it
+  // on OFF, because a permission granted as required on an older install
+  // cannot be revoked without a reinstall. The flag alone gates the content
+  // script, which fully disables the feature.
+  const probeToggle = document.getElementById("probe-toggle");
+  const probeSub = document.getElementById("probe-sub");
+  const PROBE_ORIGINS = { origins: ["<all_urls>"] };
+
+  if (probeToggle) {
+    chrome.storage.local.get("probeBlankLinks", (data) => {
+      probeToggle.checked = !!data.probeBlankLinks;
+    });
+
+    probeToggle.addEventListener("change", () => {
+      if (!probeToggle.checked) {
+        chrome.storage.local.set({ probeBlankLinks: false });
+        return;
+      }
+      // Resolves granted=true instantly with no prompt when the permission is
+      // already held, so this covers both first run and every run after.
+      chrome.permissions.request(PROBE_ORIGINS, (granted) => {
+        probeToggle.checked = granted;
+        chrome.storage.local.set({ probeBlankLinks: granted });
+        if (!granted) {
+          probeSub.textContent = "Permission denied";
+          probeSub.style.color = "#ef4444";
+          setTimeout(() => {
+            probeSub.textContent = "Scan CDN / no-extension links for video";
+            probeSub.style.color = "";
+          }, 2000);
+        }
+      });
+    });
+  }
+
+  // ── Take over page videos ──
+  //
+  // The flag alone gates it: the content script reads it on every page, and
+  // nothing is injected while it is off. The takeover itself is the library's
+  // upgradeVideoElements(), which only ever takes a <video> that is playing a
+  // file at a URL — the streaming sites feed their element from JavaScript, so
+  // there is no file to open and it leaves them alone.
+  const takeoverToggle = document.getElementById("takeover-toggle");
+  const takeoverSub = document.getElementById("takeover-sub");
+  const takeoverGrant = document.getElementById("takeover-grant");
+  const TAKEOVER_SAID = takeoverSub ? takeoverSub.textContent : "";
+  const TAKEOVER_ORIGINS = { origins: ["<all_urls>"] };
+
+  /**
+   * Say when the setting is on but cannot do the half that matters.
+   *
+   * Without site access the extension cannot add the CORS header a site never
+   * sent, so a file from another origin — which includes every file a page
+   * serves from its own address and redirects to a CDN — falls back to the
+   * browser's own decoders. That is the case this exists to beat, and it
+   * failed quietly: the player looked like it was working and the console
+   * filled with blocked fetches. Now the row says so, and offers the fix.
+   */
+  function refreshTakeoverRow() {
+    if (!takeoverToggle) return;
+    chrome.storage.local.get("takeOverPageVideos", (data) => {
+      const on = !!data.takeOverPageVideos;
+      takeoverToggle.checked = on;
+      chrome.permissions.contains(TAKEOVER_ORIGINS, (granted) => {
+        const needs = on && !granted;
+        if (takeoverGrant) takeoverGrant.hidden = !needs;
+        if (!takeoverSub) return;
+        takeoverSub.textContent = needs
+          ? "Needs site access — without it, other-origin files fall back to the browser"
+          : TAKEOVER_SAID;
+        takeoverSub.style.color = needs ? "#f5b83d" : "";
+      });
+    });
+  }
+  refreshTakeoverRow();
+  chrome.permissions.onAdded.addListener(refreshTakeoverRow);
+  chrome.permissions.onRemoved.addListener(refreshTakeoverRow);
+  takeoverGrant?.addEventListener("click", () => {
+    chrome.permissions.request(TAKEOVER_ORIGINS, () => refreshTakeoverRow());
+  });
+
+  if (takeoverToggle) {
+    takeoverToggle.addEventListener("change", () => {
+      const on = takeoverToggle.checked;
+      chrome.storage.local.set({ takeOverPageVideos: on });
+      const say = (words) => {
+        if (!takeoverSub) return;
+        const said = takeoverSub.dataset.said || takeoverSub.textContent;
+        takeoverSub.dataset.said = said;
+        takeoverSub.textContent = words;
+        setTimeout(() => {
+          takeoverSub.textContent = said;
+        }, 2600);
+      };
+      if (!on) {
+        say("Off — pages keep their own player");
+        return;
+      }
+      // Site access is what lets the extension add the CORS header a site
+      // never sent — without it a file from another origin still plays, but
+      // through the browser's own decoders, which is the thing this is for.
+      // Asked for, not required: the setting stays on either way.
+      chrome.permissions.request(TAKEOVER_ORIGINS, (granted) => {
+        say(
+          granted
+            ? "On — open a page with a video file in it"
+            : "On — without site access, other-origin files fall back to the browser",
+        );
+        setTimeout(refreshTakeoverRow, 2700);
+      });
+    });
+  }
+
+  // ── Experimental features row ──
+  // `window.chrome` is NOT a Chromium test inside an extension page — Firefox
+  // defines a `chrome` alias for the WebExtension APIs too, so this row would
+  // otherwise offer a chrome://flags link Firefox cannot open. The extension
+  // URL scheme is the honest signal.
+  const flagBtn = document.getElementById("open-flags");
+  const flagSub = document.getElementById("flags-sub");
+  const isChromium = (() => {
+    try {
+      return chrome.runtime.getURL("").startsWith("chrome-extension://");
+    } catch {
+      return false;
+    }
+  })();
+
+  // Same probe as app/compare.html: setting WebGL2 drawingBufferColorSpace to
+  // rec2100-pq only sticks when the experimental flag is on in Chromium.
+  const flagEnabled = (() => {
+    if (!isChromium) return false;
+    try {
+      const gl = document.createElement("canvas").getContext("webgl2");
+      if (!gl || gl.drawingBufferColorSpace === undefined) return false;
+      gl.drawingBufferColorSpace = "rec2100-pq";
+      return gl.drawingBufferColorSpace === "rec2100-pq";
+    } catch {
+      return false;
+    }
+  })();
+
+  if (flagBtn && flagSub) {
+    if (flagEnabled) {
+      // Already on — a check badge, not a button, so it does not suggest the
+      // user still has something to do.
+      flagSub.textContent = "Enabled — HDR & codecs unlocked";
+      flagSub.style.color = "#10b981";
+      const badge = document.createElement("span");
+      badge.className = "setting-badge";
+      badge.title = "Experimental features enabled";
+      badge.textContent = "\u2713";
+      flagBtn.replaceWith(badge);
+    } else if (!isChromium) {
+      flagBtn.style.display = "none";
+      flagSub.textContent = "Chrome only";
+    } else {
+      flagBtn.addEventListener("click", () => {
+        chrome.tabs.create({ url: "chrome://flags/#enable-experimental-web-platform-features" });
+      });
+    }
+  }
+})();
+
 // ─── Forward keyboard ─────────────────────────────────────
 document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) return;
+  // Escape leaves the picker when there is a video behind it — checked before
+  // the player sees the key, which would otherwise take it as "exit
+  // fullscreen" and leave the picker up.
+  if (e.code === "Escape" && !overlay.classList.contains("hidden") && hasMedia) {
+    hidePicker();
+    e.preventDefault();
+    return;
+  }
   if (!playerEl || !playerEl.shadowRoot) return;
   if (document.activeElement === playerEl || playerEl.contains(e.target)) return;
 

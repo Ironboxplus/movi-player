@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the Firefox add-on.
 #
-# Firefox and Chrome ship the SAME add-on: popup, content script, player page,
+# Firefox and Chrome ship the SAME add-on: content script, player page,
 # icons and the movi-player bundle all live in chrome-extension/ and are copied
 # in here verbatim, so there is exactly one copy of the UI to maintain. Only
 # manifest.json differs (Gecko needs an add-on id, an event-page background and
@@ -16,7 +16,7 @@ ROOT="$(dirname "$DIR")"
 SRC="$ROOT/chrome-extension"
 
 # Shared files the add-on needs, copied from the Chrome extension.
-SHARED="background.js content.js content.css marker.js popup.html popup.js player.html player.js"
+SHARED="background.js content.js content.css early.js marker.js siteplayer.js player.html player.js popup.html popup.js upgrade.js"
 
 # SKIP_BUILD=1 lets the release orchestrator build the player once and reuse it
 # across every target instead of rebuilding here.
@@ -36,13 +36,14 @@ for f in element.slim.js movi.wasm; do
 done
 
 echo "Copying shared files from chrome-extension/..."
-rm -rf "$DIR/dist" "$DIR/icons"
-mkdir -p "$DIR/dist" "$DIR/icons"
+rm -rf "$DIR/dist" "$DIR/icons" "$DIR/fonts"
+mkdir -p "$DIR/dist" "$DIR/icons" "$DIR/fonts"
 
 for f in $SHARED; do
   cp "$SRC/$f" "$DIR/$f"
 done
 cp "$SRC"/icons/*.png "$SRC"/icons/*.svg "$DIR/icons/"
+cp "$SRC"/fonts/*.woff2 "$DIR/fonts/"
 # The slim bundle plus its engine — see the note in chrome-extension/build.sh.
 # AMO refuses a JS file over 5MB; the all-in-one build is 11.8MB.
 cp "$ROOT/dist/element.slim.js" "$ROOT/dist/movi.wasm" "$DIR/dist/"

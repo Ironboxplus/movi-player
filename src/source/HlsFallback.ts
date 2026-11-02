@@ -31,6 +31,12 @@ export interface HlsMediaTrack {
   container: "ts" | "mp4";
   totalDuration: number;
   isLive: boolean;
+  /**
+   * The playlist declares encrypted segments. Playback still runs as far as any
+   * clear lead — see declaresEncryption() — but it WILL stop, and this is what
+   * lets the player name the reason instead of reporting a decoder fault.
+   */
+  encrypted?: boolean;
 }
 
 export interface HlsAudioRendition extends HlsMediaTrack {
@@ -53,6 +59,8 @@ export interface HlsFallbackPlan {
   container: "ts" | "mp4";
   totalDuration: number;
   isLive: boolean;
+  /** Encrypted segments were declared — see HlsMediaTrack.encrypted. */
+  encrypted?: boolean;
   /** Separate audio languages (present only when the variant has an AUDIO group). */
   audioRenditions?: HlsAudioRendition[];
   /** Subtitle languages (segmented WebVTT). */
@@ -331,6 +339,23 @@ export async function loadHlsVariant(
   }
 }
 
+/**
+ * Whether a playlist declares encrypted segments.
+ *
+ * This path hands segments straight to the FFmpeg demuxer, which is given no
+ * key and no key-fetching of its own, so ANY method other than NONE will
+ * eventually fail — SAMPLE-AES (DRM) and plain AES-128 (clear-key) alike.
+ *
+ * Flagged, not refused: a packager may leave a clear lead so a player can start
+ * while it fetches a key, and that plays. The flag is what lets the player say
+ * why playback stopped when it reaches the encrypted part. Covers both tags,
+ * since a master declares its DRM with EXT-X-SESSION-KEY and a media playlist
+ * with EXT-X-KEY.
+ */
+function declaresEncryption(playlist: string): boolean {
+  return /#EXT-X-(?:SESSION-)?KEY:[^\n]*METHOD=(?!NONE)/i.test(playlist);
+}
+
 async function loadMediaTrack(
   url: string,
   headers?: Record<string, string>,
@@ -339,6 +364,7 @@ async function loadMediaTrack(
   try {
     const text = await fetchText(url, headers, signal);
     const track = parseMediaPlaylist(text, url);
+    if (declaresEncryption(text)) track.encrypted = true;
     return track.segments.length > 0 ? track : null;
   } catch (e) {
     Logger.warn(TAG, `media playlist load failed: ${url}`, e);
@@ -359,9 +385,21 @@ export async function analyzeHlsFallback(
   try {
     const text = await fetchText(url, headers, signal);
 
+    // A master declares its DRM with EXT-X-SESSION-KEY, before any variant is
+    // fetched — carry that down so the plan is flagged even when the variant
+    // playlists say nothing themselves. See declaresEncryption().
+    const masterEncrypted = declaresEncryption(text);
+    if (masterEncrypted) {
+      Logger.info(
+        TAG,
+        "Playlist declares encryption — playing what is clear; decoding will stop where encryption starts",
+      );
+    }
+
     // Media playlist directly (muxed, no alternate renditions).
     if (!isMaster(text)) {
       const track = parseMediaPlaylist(text, url);
+      if (masterEncrypted) track.encrypted = true;
       if (track.segments.length === 0) {
         Logger.warn(TAG, "media playlist has no segments");
         return null;
@@ -390,6 +428,7 @@ export async function analyzeHlsFallback(
     }
 
     const videoTrack = await loadMediaTrack(best.url, headers, signal);
+    if (videoTrack && masterEncrypted) videoTrack.encrypted = true;
     if (!videoTrack) {
       Logger.warn(TAG, "best variant media playlist unusable");
       return null;

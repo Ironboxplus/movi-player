@@ -15,6 +15,70 @@ import { CodecParser } from "./CodecParser";
 
 const TAG = "VideoDecoder";
 
+/* lib.dom's WebCodecs colour enums are older than the spec the browsers ship:
+   VideoColorPrimaries there is bt709/bt470bg/smpte170m with no bt2020, and the
+   transfer list has no pq or hlg — the very values an HDR stream needs. So the
+   names are typed here, and handed to the config with one cast at the boundary
+   rather than each map being typed as `any`. Verified against Chrome:
+   isConfigSupported accepts {bt2020, pq, bt2020-ncl}. */
+type WcPrimaries =
+  | "bt709"
+  | "bt470bg"
+  | "smpte170m"
+  | "bt2020"
+  | "smpte432";
+type WcTransfer =
+  | "bt709"
+  | "smpte170m"
+  | "iec61966-2-1"
+  | "linear"
+  | "pq"
+  | "hlg";
+type WcMatrix =
+  | "rgb"
+  | "bt709"
+  | "bt470bg"
+  | "smpte170m"
+  | "bt2020-ncl";
+
+/** FFmpeg's name for a colour property, in the words WebCodecs will accept.
+ *  Only the values the enums actually contain are here; anything else is left
+ *  out of the config rather than passed through, because one value outside the
+ *  enum makes the whole colorSpace dictionary unreadable. */
+const WC_PRIMARIES: Record<string, WcPrimaries> = {
+  bt709: "bt709",
+  bt470bg: "bt470bg",
+  smpte170m: "smpte170m",
+  bt2020: "bt2020",
+  smpte432: "smpte432",
+};
+
+const WC_TRANSFER: Record<string, WcTransfer> = {
+  bt709: "bt709",
+  // BT.2020's 10- and 12-bit transfer IS the BT.709 curve; only the bit depth
+  // differs, and WebCodecs has no separate name for it.
+  "bt2020-10": "bt709",
+  "bt2020-12": "bt709",
+  smpte170m: "smpte170m",
+  "iec61966-2-1": "iec61966-2-1",
+  srgb: "iec61966-2-1",
+  linear: "linear",
+  pq: "pq",
+  smpte2084: "pq",
+  hlg: "hlg",
+  "arib-std-b67": "hlg",
+};
+
+const WC_MATRIX: Record<string, WcMatrix> = {
+  rgb: "rgb",
+  gbr: "rgb",
+  bt709: "bt709",
+  bt470bg: "bt470bg",
+  smpte170m: "smpte170m",
+  "bt2020-ncl": "bt2020-ncl",
+  bt2020nc: "bt2020-ncl",
+};
+
 export class MoviVideoDecoder {
   private decoder: VideoDecoder | null = null;
   private swDecoder: SoftwareVideoDecoder | WorkerSoftwareVideoDecoder | null =
@@ -55,6 +119,13 @@ export class MoviVideoDecoder {
   // ... (fields same) ...
   private isConfigured: boolean = false;
   private onFrame: ((frame: VideoFrame) => void) | null = null;
+
+  // When the decoder last handed out a frame. This is the honest answer to
+  // "is the picture still coming?", and it is asked at the SOURCE rather than
+  // at the renderer, whose queue reads empty and whose presented-frame count
+  // resets on every clear — both of which make a slow-but-working pipeline
+  // look identical to a dead one.
+  private lastFrameOutAt: number = 0;
   private onError: ((error: Error) => void) | null = null;
   private waitingForKeyframe: boolean = false;
   // When the current keyframe wait began (0 while not waiting). The wait itself
@@ -79,6 +150,12 @@ export class MoviVideoDecoder {
   // stream — its keyframe was rejected afterwards — so later flushes go straight
   // to a full close()+new decoder. Per source; cleared by configure().
   private _hardRecreateNeeded: boolean = false;
+  // Latched when recovery has failed MAX_ERRORS times for this source: there is
+  // nothing left to try, so stop decoding and stop reporting. The caller goes on
+  // feeding regardless — it has no way to know the pipeline is finished — and
+  // without this every remaining packet raised the fatal error again. Cleared by
+  // configure(), which is what a new source or rendition comes through.
+  private _gaveUp: boolean = false;
   private hardwareRetryCount: number = 0;
   private lastHardwareRetryTime: number = 0;
   private isResurrecting: boolean = false;
@@ -137,12 +214,21 @@ export class MoviVideoDecoder {
     this.bindings = bindings;
   }
 
-  private setWaitingForKeyframe(waiting: boolean): void {
+  private setWaitingForKeyframe(waiting: boolean, reason = "unspecified"): void {
     // Restart the tiny-packet drop window whenever we begin waiting for a
     // keyframe — that marks a fresh (re)configure/flush, the only phase where
     // the corrupt sub-4-byte packets appear.
     if (waiting) this.chunksSinceKeyframeWait = 0;
     if (this.waitingForKeyframe === waiting) return;
+    // Say WHY. Beginning to wait stops the picture until a keyframe arrives —
+    // a second or more on a long-GOP source — and until now it happened
+    // silently from six different places. A player-level log then reported
+    // "Decoder waiting for keyframe mid-playback" without anything anywhere
+    // saying what had started it, and a hold traced back to here had no origin
+    // that could be read out of a log. Every entry into the wait names itself.
+    if (waiting) {
+      Logger.info(TAG, `Waiting for a keyframe — ${reason}`);
+    }
     this.waitingForKeyframe = waiting;
     this.keyframeWaitSince = waiting ? performance.now() : 0;
     if (this.onKeyframeWaitChange) {
@@ -152,6 +238,24 @@ export class MoviVideoDecoder {
         // listener errors must not break the decoder pipeline
       }
     }
+  }
+
+  /** The track's colour metadata as WebCodecs spells it, or null when the
+   *  track says nothing this enum has a word for. */
+  private static webCodecsColorSpace(track: {
+    colorPrimaries?: string;
+    colorTransfer?: string;
+    colorSpace?: string;
+  }): VideoColorSpaceInit | null {
+    const primaries = WC_PRIMARIES[(track.colorPrimaries || "").toLowerCase()];
+    const transfer = WC_TRANSFER[(track.colorTransfer || "").toLowerCase()];
+    const matrix = WC_MATRIX[(track.colorSpace || "").toLowerCase()];
+    if (!primaries && !transfer && !matrix) return null;
+    const out: VideoColorSpaceInit = {};
+    if (primaries) out.primaries = primaries as VideoColorPrimaries;
+    if (transfer) out.transfer = transfer as VideoTransferCharacteristics;
+    if (matrix) out.matrix = matrix as VideoMatrixCoefficients;
+    return out;
   }
 
   /**
@@ -175,8 +279,10 @@ export class MoviVideoDecoder {
     this.hardwareRetryCount = 0;
     this.lastHardwareRetryTime = 0;
     // A new source/rendition gets a fresh verdict on whether the cheap in-place
-    // re-arm is enough for it.
+    // re-arm is enough for it — and on whether it is decodable at all.
     this._hardRecreateNeeded = false;
+    this._gaveUp = false;
+    this.errorCount = 0;
     if (this.swDecoder) {
       this.swDecoder.close();
       this.swDecoder = null;
@@ -253,16 +359,27 @@ export class MoviVideoDecoder {
       hardwareAcceleration: "prefer-hardware",
     };
 
-    // Add color space if available
-    if (track.colorPrimaries || track.colorTransfer || track.colorSpace) {
-      config.colorSpace = {
-        primaries: track.colorPrimaries as VideoColorPrimaries,
-        transfer: track.colorTransfer as VideoTransferCharacteristics,
-        matrix: track.colorSpace as VideoMatrixCoefficients,
-      };
+    // Add color space if available, in WebCodecs' OWN words.
+    //
+    // FFmpeg's names are not the enum values: PQ is "smpte2084" there and "pq"
+    // here, HLG is "arib-std-b67" and "hlg". A value outside the enum does not
+    // degrade — it makes the whole dictionary unreadable, so isConfigSupported
+    // throws a TypeError and the fallback below configures the decoder with NO
+    // colour metadata at all. That is what every HDR file was doing: the log
+    // line "Codec config failed with color space. Retrying without explicit
+    // color metadata." on a perfectly ordinary bt2020/PQ stream. The frames
+    // then come out of the decoder untagged, and an untagged frame uploaded
+    // into a rec2100-pq canvas is treated as sRGB and converted — which is the
+    // picture that is technically in an HDR canvas and looks like SDR.
+    //
+    // Anything not in the enum is LEFT OUT rather than passed through, so one
+    // unknown value costs its own field and not the whole config.
+    const wcColorSpace = MoviVideoDecoder.webCodecsColorSpace(track);
+    if (wcColorSpace) {
+      config.colorSpace = wcColorSpace;
       Logger.info(
         TAG,
-        `Decoder color space: primaries=${track.colorPrimaries}, transfer=${track.colorTransfer}, matrix=${track.colorSpace}`,
+        `Decoder color space: primaries=${wcColorSpace.primaries ?? "-"}, transfer=${wcColorSpace.transfer ?? "-"}, matrix=${wcColorSpace.matrix ?? "-"} (from ${track.colorPrimaries ?? "-"}/${track.colorTransfer ?? "-"}/${track.colorSpace ?? "-"})`,
       );
     }
 
@@ -500,6 +617,7 @@ export class MoviVideoDecoder {
     // Create decoder
     this.decoder = new VideoDecoder({
       output: (frame) => {
+        this.lastFrameOutAt = performance.now();
         this.openGopErrorCount = 0;
         this.errorCount = 0;
         this.isResurrecting = false; // Success!
@@ -578,7 +696,7 @@ export class MoviVideoDecoder {
 
     if (success) {
       this.isConfigured = true;
-      this.setWaitingForKeyframe(true); // Wait for keyframe on new decoder
+      this.setWaitingForKeyframe(true, "decoder (re)configured");
 
       // Process pending chunks
       if (this.pendingChunks.length > 0) {
@@ -625,6 +743,9 @@ export class MoviVideoDecoder {
 
     this.swDecoder = decoder;
     decoder.setOnFrame((frame) => {
+      // Upstream: stamps the last software frame out so the stall detectors can
+      // tell a slow decoder from a starved one (see the lastFrameOutAt reader).
+      this.lastFrameOutAt = performance.now();
       if (this.onFrame) this.onFrame(frame);
       else {
         this.pendingFrames.push(frame);
@@ -682,7 +803,7 @@ export class MoviVideoDecoder {
       // held, so the stream must resume on a keyframe, and an open-GOP CRA must
       // go in as `key` rather than being downgraded to `delta`.
       this.justFlushed = true;
-      this.setWaitingForKeyframe(true);
+      this.setWaitingForKeyframe(true, "flushed");
       return true;
     } catch (error) {
       Logger.warn(TAG, "In-place decoder re-arm failed, falling back", error);
@@ -705,6 +826,7 @@ export class MoviVideoDecoder {
     // Create new
     this.decoder = new VideoDecoder({
       output: (frame) => {
+        this.lastFrameOutAt = performance.now();
         this.openGopErrorCount = 0;
         this.errorCount = 0;
         this.isResurrecting = false; // Success!
@@ -739,7 +861,7 @@ export class MoviVideoDecoder {
       // Wait for next keyframe to resync — don't re-feed cached keyframe
       // as subsequent non-keyframes may fail on certain content (DoVi P8 etc.)
       // causing a recreate→re-feed→fail loop that triggers software fallback.
-      this.setWaitingForKeyframe(true);
+      this.setWaitingForKeyframe(true, "recovering from a decoder error");
       return true;
     } catch (error) {
       Logger.error(TAG, "Failed to recreate decoder", error);
@@ -865,7 +987,7 @@ export class MoviVideoDecoder {
         webCodecsAvailable &&
         !this.forceSoftware &&
         !this.requiresSoftware &&
-        this.shouldRetryHardware(data)
+        this.shouldRetryHardware(data, isIdr)
       ) {
         Logger.info(
           TAG,
@@ -912,6 +1034,14 @@ export class MoviVideoDecoder {
     if (!this.decoder) {
       return; // Silently skip when not configured
     }
+
+    // Given up on this source — see _gaveUp. Must come BEFORE the closed-state
+    // check below, which is what kept re-arriving here: recovery leaves the
+    // decoder closed, so every later packet re-entered that branch and raised
+    // the fatal error again. A cbcs stream whose every sample fails produced
+    // 160 fatal errors in three seconds that way, each one dispatching an
+    // `error` event to the host page and rebuilding the controls.
+    if (this._gaveUp) return;
 
     // Check if decoder is in a valid state
     if (this.decoder.state === "closed") {
@@ -1195,6 +1325,18 @@ export class MoviVideoDecoder {
         (codecForFallback.startsWith("hvc1.") ||
           codecForFallback.startsWith("hev1.")) &&
         !this.justFlushed;
+      // The same reasoning covers a rejection at a SEEK's restart point, in
+      // any codec: justFlushed means this keyframe is the one the seek chose
+      // to resume on, and the decoder has refused it. That is a fact about
+      // the stream's restart points, not a moment — the next one will be
+      // refused too, and each refusal costs a whole GOP of frozen picture
+      // while the reset skips to the next keyframe.
+      //
+      // Measured on a 1080p H.264 file with CRA keyframes at 84.32, 85.64 and
+      // 87.00: seeking anywhere between 83 and 87 refused all three, decoded
+      // nothing, and left the last painted frame on screen — one frame for a
+      // four-second stretch, every time, because the session-wide count of 15
+      // was nowhere near reached.
       const openGopFallbackLimit = isHevcMidStream
         ? MoviVideoDecoder.MID_STREAM_OPENGOP_REJECT_LIMIT
         : 15;
@@ -1218,7 +1360,21 @@ export class MoviVideoDecoder {
         try {
           this.decoder.reset();
           this.decoder.configure(this.lastConfig!);
-          this.setWaitingForKeyframe(true);
+          // A reset leaves the decoder in exactly the state a flush does: it
+          // holds no references and will take nothing but a key frame. Say so,
+          // because that is what decides how the NEXT CRA is sent —
+          // craAsDelta is `isOpenGopKey && !justFlushed`, so without this the
+          // CRA goes as `delta`, a freshly configured decoder answers "a key
+          // frame is required after configure()", and we reset again. That is
+          // the loop: every keyframe in a CRA run refused in turn, nothing
+          // decoded, the last picture left on screen.
+          //
+          // Measured on a 1080p H.264 file whose keyframes at 84.32, 85.64 and
+          // 87.00 are all CRA: seeking anywhere between 83 and 87 painted one
+          // identical frame, every time. The recreate path a few lines down
+          // has set this for the same reason all along.
+          this.justFlushed = true;
+          this.setWaitingForKeyframe(true, "reset + reconfigure after an error");
           return;
         } catch (e) {
           Logger.warn(
@@ -1235,11 +1391,18 @@ export class MoviVideoDecoder {
     }
 
     if (this.errorCount >= MoviVideoDecoder.MAX_ERRORS) {
-      Logger.error(
-        TAG,
-        `Max errors (${MoviVideoDecoder.MAX_ERRORS}) exceeded within short duration. Emitting fatal error.`,
-      );
-      if (this.onError) this.onError(error);
+      // Latch, and report ONCE. Recovery has already failed MAX_ERRORS times,
+      // so there is nothing left to try for this source, and the caller keeps
+      // feeding — processLoop has no idea the pipeline is finished. Without the
+      // latch every remaining packet raised its own fatal error.
+      if (!this._gaveUp) {
+        this._gaveUp = true;
+        Logger.error(
+          TAG,
+          `Max errors (${MoviVideoDecoder.MAX_ERRORS}) exceeded within short duration. Emitting fatal error.`,
+        );
+        if (this.onError) this.onError(error);
+      }
       return;
     }
 
@@ -1270,7 +1433,7 @@ export class MoviVideoDecoder {
         try {
           if (this.decoder && this.decoder.state !== "closed") {
             this.decoder.configure(this.lastConfig);
-            this.setWaitingForKeyframe(true);
+            this.setWaitingForKeyframe(true, "reconfigured after an error");
             this.errorCount = 0; // Reset error count as we are trying a new config/hack
             return;
           } else {
@@ -1298,7 +1461,7 @@ export class MoviVideoDecoder {
         this.decoder.reset();
         this.decoder.configure(this.lastConfig!);
 
-        this.setWaitingForKeyframe(true);
+        this.setWaitingForKeyframe(true, "recreated after repeated errors");
         return;
       } catch (e) {
         Logger.warn(TAG, "Fast reset failed, trying full recreation");
@@ -1480,7 +1643,7 @@ export class MoviVideoDecoder {
     // after configure" and corrupts the next true IDR's decode too. This is the
     // authoritative "references missing" signal; the decode() path keys its
     // CRA→delta downgrade off NOT being in this state.
-    this.setWaitingForKeyframe(true);
+    this.setWaitingForKeyframe(true, "flush() called");
     if (this.swDecoder) {
       return this.swDecoder.flush();
     }
@@ -1525,8 +1688,22 @@ export class MoviVideoDecoder {
       // drain a hang on every auto quality switch in Brave, resetting and
       // reconfiguring a decoder that was working through its backlog exactly
       // as asked. The ceiling still catches a genuine hang.
+      // …and the ceiling has to scale with it too, which is the same bug one
+      // level up. 5000ms is 83 chunks at the 60ms-per-chunk rate this line
+      // already assumes; past that the budget stopped growing while the work
+      // kept doing so. A decoder holding 645 frames at EOF — measured, on a
+      // 30s VP8 clip whose whole file had been read — was given the same five
+      // seconds as one holding 84, could not drain in it, and was reset. That
+      // reset discards every queued frame, and at EOF there is nothing left to
+      // refill them: the picture stopped four seconds in while the clock ran
+      // on to the end.
+      //
+      // Nothing below 83 chunks changes, so an ordinary seek or quality
+      // switch is untouched. The outer bound still catches a genuine hang;
+      // it is simply no longer reached by a decoder doing exactly what it
+      // was asked.
       const pending = this.decoder.decodeQueueSize || 0;
-      const flushBudgetMs = Math.min(5000, Math.max(1000, pending * 60));
+      const flushBudgetMs = Math.min(30000, Math.max(1000, pending * 60));
       await Promise.race([
         this.decoder.flush(),
         new Promise<void>((_, reject) =>
@@ -1639,7 +1816,7 @@ export class MoviVideoDecoder {
   /**
    * Helper to check if we should try switching back to hardware
    */
-  private shouldRetryHardware(data: Uint8Array): boolean {
+  private shouldRetryHardware(data: Uint8Array, isIdr: boolean): boolean {
     if (!this.useSoftware || !this.currentTrack) return false;
 
     // Don't retry when the fallback reason is permanent for this track —
@@ -1655,8 +1832,16 @@ export class MoviVideoDecoder {
     // Safety: Don't retry too many times if it keeps failing
     if (this.hardwareRetryCount >= 10) return false;
 
-    // CRITICAL: Only retry hardware if this keyframe is actually an IDR/Sync frame.
-    // Hardware decoders will reject non-IDR keyframes as start points after a seek/flush.
+    // Only a true IDR/BLA is a restart point the HW decoder will accept — a
+    // CRA is exactly what it refused when we fell to software, so attempting
+    // resurrection on one just burns a retry (of 10, never refilled until the
+    // next configure()) plus a visible freeze while the failed attempt plays
+    // out. The demuxer classifies this C-side (is_idr); trust it first.
+    if (!isIdr) return false;
+
+    // Second opinion from the packet bytes, for callers that default isIdr to
+    // true. Hardware decoders will reject non-IDR keyframes as start points
+    // after a seek/flush.
     if (!this.isLikelySyncFrame(data)) {
       return false;
     }
@@ -1669,54 +1854,83 @@ export class MoviVideoDecoder {
   }
 
   /**
-   * Bitwise NAL unit inspection to detect true Sync/IDR frames
+   * Bitwise NAL unit inspection to detect true Sync/IDR frames.
+   *
+   * This must WALK the packet's NAL units, not read the first header: keyframe
+   * packets routinely lead with AUD/SPS/PPS/SEI before the slice (the AUD case
+   * is confirmed on the very DoVi/HDR HEVC streams that fall to software — see
+   * stripAudLengthPrefixed). The old single-header read saw the AUD's type,
+   * answered "not a sync frame" for every keyframe in the stream, and hardware
+   * resurrection never fired at all — software until a reload.
+   *
+   * The verdict comes from the first VCL NAL, and CRA does NOT count: a CRA
+   * restart is what the hardware decoder refused when we fell back, so
+   * resurrecting on one only burns a capped retry.
    */
   private isLikelySyncFrame(data: Uint8Array): boolean {
     if (!this.lastConfig) return true;
     const codec = this.lastConfig.codec.toLowerCase();
 
     try {
-      let headerPos = -1;
-      // Search for NAL start code (0001 or 001) or assume AVCC 4-byte size
-      if (data[0] === 0 && data[1] === 0 && data[2] === 1) headerPos = 3;
-      else if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1)
-        headerPos = 4;
-      else if (data.length > 4) headerPos = 4; // Most MP4/MKV hardware chunks are AVCC
-
-      if (headerPos === -1 || headerPos >= data.length) return false;
-
-      const header = data[headerPos];
-
-      // H.264 (AVC)
-      if (codec.includes("avc1") || codec.includes("h264")) {
-        const type = header & 0x1f;
-        return type === 5; // IDR Slice
-      }
-
-      // H.265 (HEVC)
-      if (
+      const isAvc = codec.includes("avc1") || codec.includes("h264");
+      const isHevc =
         codec.includes("hvc1") ||
         codec.includes("hev1") ||
-        codec.includes("h265")
-      ) {
-        const type = (header >> 1) & 0x3f;
-        // Types 16-21 are IRAP (Intra Random Access Point)
-        // 19/20 are IDR, 21 is CRA (Clean Random Access)
-        return type >= 16 && type <= 21;
-      }
+        codec.includes("h265");
+      const isVvc = codec.includes("vvc1") || codec.includes("vvi1");
+      // AV1/VP9 and anything else NAL-less: nothing to inspect, trust the
+      // demuxer's keyframe/isIdr flags.
+      if (!isAvc && !isHevc && !isVvc) return true;
 
-      // H.266 (VVC) — 2-byte NAL header
-      // Byte 1: nal_unit_type(5) | nuh_temporal_id_plus1(3)
-      // IDR_W_RADL=7, IDR_N_LP=8, CRA=9, GDR=10
-      if (codec.includes("vvc1") || codec.includes("vvi1")) {
-        if (headerPos + 1 < data.length) {
-          const type = (data[headerPos + 1] >> 3) & 0x1f;
-          return type >= 7 && type <= 9;
+      for (const [b0, b1] of MoviVideoDecoder.nalUnitHeaders(data)) {
+        if (isAvc) {
+          const type = b0 & 0x1f;
+          if (type >= 1 && type <= 5) return type === 5; // first VCL slice; 5 = IDR
+        } else if (isHevc) {
+          const type = (b0 >> 1) & 0x3f;
+          // VCL range is 0-31; sync = BLA(16-18)/IDR(19-20), NOT CRA(21).
+          if (type <= 31) return type >= 16 && type <= 20;
+        } else {
+          // VVC 2-byte NAL header: type in byte 1. VCL range is 0-11;
+          // sync = IDR_W_RADL(7)/IDR_N_LP(8), NOT CRA(9)/GDR(10).
+          const type = (b1 >> 3) & 0x1f;
+          if (type <= 11) return type >= 7 && type <= 8;
         }
       }
     } catch (e) {}
 
-    return true; // Default to true if parsing fails or codec unknown
+    // No VCL NAL found or parsing failed — don't block the retry on it; the
+    // demuxer's isIdr gate in shouldRetryHardware is the primary authority.
+    return true;
+  }
+
+  /**
+   * First two bytes of every NAL unit in a packet, handling both Annex B
+   * start codes and the 4-byte big-endian length prefixes of avcC/hvcC.
+   * Stops (returning what it has) on a malformed length rather than guessing.
+   */
+  private static nalUnitHeaders(data: Uint8Array): Array<[number, number]> {
+    const headers: Array<[number, number]> = [];
+    if (data.length < 4) return headers;
+    if (
+      data[0] === 0 &&
+      data[1] === 0 &&
+      (data[2] === 1 || (data[2] === 0 && data[3] === 1))
+    ) {
+      for (const nal of this.splitAnnexBNalUnits(data)) {
+        if (nal.length >= 2) headers.push([nal[0], nal[1]]);
+      }
+      return headers;
+    }
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let i = 0;
+    while (i + 4 <= data.length) {
+      const len = view.getUint32(i);
+      if (len <= 0 || i + 4 + len > data.length) return headers;
+      if (len >= 2) headers.push([data[i + 4], data[i + 5]]);
+      i += 4 + len;
+    }
+    return headers;
   }
 
   /**
@@ -1778,6 +1992,18 @@ export class MoviVideoDecoder {
   // (observed: high-bitrate 1080p H.264) throw a transient EncodingError on
   // each IDR; recreate recovers within ~1 GOP, but the brief empty queue would
   // otherwise trip stall detection into a buffering loop.
+  /**
+   * Milliseconds since the decoder last produced a frame, or Infinity if it
+   * has produced none yet. A pipeline that is merely SLOW keeps this small —
+   * the frames are late, not absent — which is what tells a capability
+   * shortfall apart from a supply one.
+   */
+  msSinceLastFrame(): number {
+    return this.lastFrameOutAt === 0
+      ? Number.POSITIVE_INFINITY
+      : performance.now() - this.lastFrameOutAt;
+  }
+
   isRecentlyRecovering(graceMs: number = 1200): boolean {
     if (this.waitingForKeyframe) return true;
     if (this.lastRecreateTime === 0) return false;

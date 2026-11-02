@@ -2,12 +2,13 @@
 # chrome-extension/ by build.sh — see that script for why.
 dist/
 icons/
+fonts/
 background.js
 content.js
 content.css
 marker.js
-popup.html
-popup.js
+early.js
 player.html
 player.js
+upgrade.js
 *.zip

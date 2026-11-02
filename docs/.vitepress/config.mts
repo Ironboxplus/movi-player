@@ -7,11 +7,17 @@ export default defineConfig({
   // Keeps every URL consistent with the canonical (which never has .html).
   cleanUrls: true,
   title: "Movi-Player",
+  // What this SITE is, not what the product is — the product line belongs on
+  // the landing page, and Google, finding nothing here that described
+  // documentation, went and scraped a paragraph out of the demo instead.
   description:
-    "Modern, modular video player for the web powered by WebCodecs + FFmpeg WASM",
+    "Documentation for movi-player: install it, the element and its attributes, events, the JavaScript API, and the React, Vue and Svelte wrappers.",
 
   head: [
     ["link", { rel: "icon", type: "image/svg+xml", href: "/movi-player/favicon.svg" }],
+    // A multiple of 48px square, which is what Google asks for when it picks a
+    // site's search-result icon — the smaller sizes below are for tabs.
+    ["link", { rel: "icon", type: "image/png", sizes: "192x192", href: "/movi-player/favicon-192x192.png" }],
     ["link", { rel: "icon", type: "image/png", sizes: "32x32", href: "/movi-player/favicon-32x32.png" }],
     ["link", { rel: "icon", type: "image/png", sizes: "16x16", href: "/movi-player/favicon-16x16.png" }],
     ["link", { rel: "icon", type: "image/x-icon", href: "/movi-player/favicon.ico" }],
@@ -56,14 +62,15 @@ export default defineConfig({
       { text: "Home", link: "/" },
       { text: "🚀 Getting Started", link: "/guide/getting-started" },
       { text: "🔌 API", link: "/api/player" },
-      { text: "🎮 Examples", link: "https://movi-player-examples.vercel.app/" },
+      { text: "🎮 Examples", link: "https://moviplayer.com/examples" },
       {
-        text: "v0.4.0",
+        text: "v0.4.1",
         items: [
           {
             text: "Versions",
             items: [
-              { text: "v0.4.0 (Latest)", link: "/changelog#0-4-0" },
+              { text: "v0.4.1 (Latest)", link: "/changelog#0-4-1" },
+              { text: "v0.4.0", link: "/changelog#0-4-0" },
               { text: "v0.3.5", link: "/changelog#0-3-5" },
               { text: "v0.3.4", link: "/changelog#0-3-4" },
               { text: "v0.3.1", link: "/changelog#0-3-1" },
@@ -118,6 +125,18 @@ export default defineConfig({
           ],
         },
         {
+          // One page per thing developers search for — each links back to
+          // the live demos on moviplayer.com/examples.
+          text: "Recipes",
+          items: [
+            { text: "HLS Player (.m3u8)", link: "/guide/hls-player" },
+            { text: "MPEG-DASH Player (.mpd)", link: "/guide/dash-player" },
+            { text: "Play MKV in the Browser", link: "/guide/play-mkv-in-browser" },
+            { text: "HEVC / H.265 in the Browser", link: "/guide/hevc-h265-in-browser" },
+            { text: "React, Vue & Svelte", link: "/guide/react-vue-svelte-video-player" },
+          ],
+        },
+        {
           text: "Advanced",
           items: [
             { text: "Performance", link: "/guide/performance" },
@@ -146,7 +165,7 @@ export default defineConfig({
 
     footer: {
       message: 'Released under the Apache-2.0 License. <a href="/movi-player/privacy-policy">Privacy Policy</a> · <a href="/movi-player/terms-of-service">Terms of Service</a>',
-      copyright: "Copyright © 2024-present Ujjwal Kashyap",
+      copyright: "Copyright © 2024-present Ujjawal Kashyap",
     },
 
     search: {

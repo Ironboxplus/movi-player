@@ -1,12 +1,12 @@
-# Movi Player Firefox Add-on
+# MoviPlayer Firefox Add-on
 
-Play any video URL with Movi Player directly in Firefox — the same add-on as
+Play any video URL with MoviPlayer directly in Firefox — the same add-on as
 [`chrome-extension/`](../chrome-extension/), repackaged for Gecko.
 
 ## Features
 
 - **Play button overlay** on video links detected on any page
-- **Right-click context menu** → "Open with Movi Player" on any link or `<video>`
+- **Right-click context menu** → "Open with MoviPlayer" on any link or `<video>`
 - **Popup** to paste and play any video URL, or play a local file
 - Supports: MP4, MKV, WebM, MOV, TS, AVI, HLS (`.m3u8`), MPEG-DASH (`.mpd`), HEVC, AV1, HDR
 
@@ -28,13 +28,15 @@ this README are the only tracked files here.
 
 ## Why only manifest.json differs
 
-The popup, content script, player page, icons and player bundle are byte-for-byte
+The content script, player page, icons and player bundle are byte-for-byte
 the Chrome extension's, so there is one copy of the UI to maintain. The manifest
 is the only Gecko-specific file:
 
 | Key | Chrome | Firefox |
 | --- | --- | --- |
 | `background` | `service_worker` | `scripts` — Gecko MV3 uses an event page, not a service worker |
+| `incognito` | `split`, so the player page opens in the private window it was launched from | omitted — Firefox has no `split`, and installs an extension asking for it as `not_allowed`, which would shut the add-on out of private windows entirely. No key means the default `spanning` |
+| `file_handlers` | registers as a ChromeOS file handler, so the Files app can open videos here | omitted — the key is ChromeOS-only |
 | `browser_specific_settings.gecko` | — | add-on `id` (required for signing), `strict_min_version`, `data_collection_permissions` (required by AMO) |
 | `cross_origin_embedder_policy` / `..._opener_policy` | set | dropped — Chrome-only manifest keys. The player only uses `SharedArrayBuffer` when `crossOriginIsolated` is true and falls back to single-threaded WASM + Asyncify I/O otherwise, so nothing here needs them |
 
@@ -72,15 +74,21 @@ isn't JS. Same element, same API — the bundle reaches the engine through
 ## Permissions
 
 Host access is optional. Firefox MV3 treats host permissions as opt-in, so the
-"Scan CDN / no-extension links for video" toggle in the popup requests
+"Scan CDN / no-extension links for video" toggle on the player page requests
 `<all_urls>` on demand — everything else works without it.
 
-File (`file:///*`) access is granted from **about:addons → Movi Player →
+`scripting` registers `early.js` — a MAIN-world, `document_start` script that
+records the listeners and Intersection/ResizeObservers a page attaches to its
+`<video>`, so the takeover can hand them to the player. It is registered only
+while "Take over page videos" is on AND host access is granted, and removed
+when either goes; no page runs it otherwise.
+
+File (`file:///*`) access is granted from **about:addons → MoviPlayer →
 Permissions** if you want the play-button overlay on local directory listings.
 
 ## How it works
 
-- **Content script** scans every page for `<a>` tags with video extensions and adds a play button; on a direct-video page it offers an "Open with Movi Player" card
+- **Content script** scans every page for `<a>` tags with video extensions and adds a play button; on a direct-video page it offers an "Open with MoviPlayer" card
 - **Background event page** handles context-menu clicks, opens the player tab, and probes extension-less links with a HEAD request
 - **Player page** loads the `movi-player` element with the video URL — full controls, seek, subtitles, HDR
 - **No server needed** — everything runs locally in the browser via WASM
