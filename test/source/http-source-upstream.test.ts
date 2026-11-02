@@ -628,10 +628,12 @@ describe("HttpSource origins that ignore Range", () => {
     expect(source.getPosition()).toBe(128 * 1024);
     const replay = new Uint8Array(await source.read(128 * 1024, 2048));
     expect(Buffer.from(replay).equals(payload.subarray(128 * 1024, 128 * 1024 + 2048))).toBe(true);
-    // The legacy persistent head cache is intentionally dormant in both
-    // upstream and the fork; metadata LRU + the active range window are the
-    // live borrowing surfaces. Do not pretend the dormant cache is populated.
-    expect(source.peekHead(0, 64)).toBeNull();
+    // The persistent head cache is live since upstream 8ae111e: it fills from
+    // what the first reads delivered (so a first hover preview needs no
+    // refetch), contiguous from byte 0.
+    const head = source.peekHead(0, 64);
+    expect(head).not.toBeNull();
+    expect(Buffer.from(head!).equals(payload.subarray(0, 64))).toBe(true);
     expect(source.peekRange(128 * 1024, 64)).not.toBeNull();
     expect(source.peekMetadata(128 * 1024, 64)).not.toBeNull();
     expect(source.getKey()).toBe(fixture.url);
@@ -690,13 +692,13 @@ describe("HttpSource origins that ignore Range", () => {
     expect(linearNotifications).toBe(2);
 
     // Consuming more than the 2 MiB cap must have advanced the bounded
-    // sliding window. Bytes discarded behind it are genuinely unreachable on
-    // a no-Range origin and must fail immediately rather than redownload the
-    // complete object at a wrong logical offset.
+    // sliding window. Bytes discarded behind it are no longer in the window,
+    // but the head cache (upstream 8ae111e) still holds the start of the file,
+    // so a read of byte 0 is answered from it - with the right byte, never a
+    // redownload of the complete object at a wrong logical offset.
     expect(source.getBufferStart()).toBeGreaterThan(0);
-    await expect(source.read(0, 1)).rejects.toThrow(
-      "Server does not support range requests",
-    );
+    const first = new Uint8Array(await source.read(0, 1));
+    expect(first[0]).toBe(payload[0]);
 
   }, 20_000);
 });
