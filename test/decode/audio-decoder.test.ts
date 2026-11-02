@@ -1124,8 +1124,10 @@ describe("audio track switch reuses the decoder worker", () => {
     const { bindings } = makeBindings();
     const decoder = new MoviAudioDecoder();
     decoder.setBindings(bindings);
+    // Static since upstream 0.4.1 (the track-switch path asks the class, not an
+    // instance, whether a codec needs software decoding).
     const forceSoftware = vi.spyOn(
-      MoviAudioDecoder.prototype as unknown as {
+      MoviAudioDecoder as unknown as {
         needsSoftwareDecoding(codec: string): boolean;
       },
       "needsSoftwareDecoding",

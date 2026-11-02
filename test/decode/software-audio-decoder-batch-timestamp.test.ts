@@ -80,6 +80,11 @@ describe("SoftwareAudioDecoder.decodeBatch — PCM timeline continuity (A1 fix, 
     // Batch #1: one second of audio, packet PTS anchors the clock at 0.
     setNextBatch({ pts: 0, numberOfFrames: 48_000 });
     decoder.decodeBatch([{ data: new Uint8Array(4), pts: 0 }]);
+    // Upstream 0.4.1 cuts a block far past 150ms into pieces that carry their
+    // own media times (see SoftwareAudioDecoder.enqueueFrame), so one second of
+    // PCM arrives as several frames, not one.
+    const firstBatchPieces = frames.length;
+    expect(firstBatchPieces).toBeGreaterThan(1);
 
     // Batch #2: the packet's own PTS (0.99s) undershoots where batch #1's
     // real audio actually ends (1.000s) — exactly the container/decoder
@@ -88,16 +93,20 @@ describe("SoftwareAudioDecoder.decodeBatch — PCM timeline continuity (A1 fix, 
     setNextBatch({ pts: 0.99, numberOfFrames: 48_000 });
     decoder.decodeBatch([{ data: new Uint8Array(4), pts: 0.99 }]);
 
-    expect(frames).toHaveLength(2);
-    const [first, second] = frames;
+    const first = frames[0];
+    const second = frames[firstBatchPieces];
     expect(first.timestamp).toBe(0);
+    // Pieces are contiguous on the PCM timeline, within and across batches.
+    for (let i = 1; i < frames.length; i++) {
+      const prev = frames[i - 1];
+      const end = prev.timestamp + (prev.numberOfFrames / prev.sampleRate) * 1_000_000;
+      expect(Math.abs(frames[i].timestamp - end)).toBeLessThan(1);
+    }
     // The old `pts * 1_000_000` would have produced 990_000 here — BEHIND
     // batch #1's end (1_000_000), a backward jump on the PCM timeline. The
     // fix must place it continuously after batch #1 instead.
     expect(second.timestamp).toBe(1_000_000);
-    expect(second.timestamp).toBeGreaterThanOrEqual(
-      first.timestamp + (first.numberOfFrames / first.sampleRate) * 1_000_000,
-    );
+    expect(second.timestamp).toBeGreaterThanOrEqual(first.timestamp);
   });
 
   it("resets the batch timeline on flush, matching the per-packet path's reset points", async () => {
@@ -118,6 +127,7 @@ describe("SoftwareAudioDecoder.decodeBatch — PCM timeline continuity (A1 fix, 
     setNextBatch({ pts: 5, numberOfFrames: 48_000 });
     decoder.decodeBatch([{ data: new Uint8Array(4), pts: 5 }]);
     expect(frames[0].timestamp).toBe(5_000_000);
+    const beforeFlush = frames.length;
 
     await decoder.flush();
 
@@ -125,6 +135,6 @@ describe("SoftwareAudioDecoder.decodeBatch — PCM timeline continuity (A1 fix, 
     // continued from the pre-seek position.
     setNextBatch({ pts: 40, numberOfFrames: 48_000 });
     decoder.decodeBatch([{ data: new Uint8Array(4), pts: 40 }]);
-    expect(frames[1].timestamp).toBe(40_000_000);
+    expect(frames[beforeFlush].timestamp).toBe(40_000_000);
   });
 });
