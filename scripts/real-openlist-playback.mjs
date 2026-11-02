@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { mkdir, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import {
   byteBudget,
@@ -48,8 +49,8 @@ const seekRecoveryMs = Number(
 // Traffic here is seeks x prefetch window: every seek restarts the HTTP stream
 // and refills up to ~225 MB, so a full sweep with fixed repetitions cost
 // 3.6-7 GiB and ~18 min. One decisive seek per code path proves the path; the
-// old repeat-until-it-shows behaviour is only reachable through
-// MOVI_BLACKBOX_EXHAUSTIVE=1, and the report records which mode ran so the two
+// extra head/tail/near-keyframe seeks and the 5-seek burst are only reachable
+// through MOVI_BLACKBOX_EXHAUSTIVE=1, and the report records which mode ran so the two
 // are never compared by accident.
 const exhaustiveSeeks = process.env.MOVI_BLACKBOX_EXHAUSTIVE === "1";
 // Two is the smallest burst that proves "only the last target wins": the second
@@ -1525,51 +1526,301 @@ async function runVisibilityCycle(page, label) {
   };
 }
 
-/**
- * Seek and wait for the seek to finish before a subtitle probe opens its cue
- * window, so the window measures the subtitle path and not seek recovery (which
- * the seek matrix already measures on its own).
- *
- * The bitmap branch used to give the seek a fixed 1s and then start its 12s cue
- * window. On a heavy DTS-HD MA remux the post-seek audio cold-prime holds
- * playback until a 2s audio cushion and a few video frames are buffered, and
- * on a link slower than the file's bitrate that alone can outlast 13s. Memories
- * (2026-09-15, run on a weak local network) read as "bitmap subtitles never
- * render" six times in a row while its only decoded cue sat 1.4s ahead of a
- * playhead still held in cold-prime — consistent with that, though not proven
- * to be it; either way the probe was charging seek recovery to subtitles.
- */
-async function seekForSubtitleProbe(page, label, target) {
-  await page.evaluate((seconds) => {
-    document.querySelector("movi-player").currentTime = seconds;
-  }, target);
-  try {
-    await page.waitForFunction(
-      (seconds) => {
-        const element = document.querySelector("movi-player");
-        return (
-          Math.abs(element.currentTime - seconds) < 5 &&
-          ["playing", "paused"].includes(element.player?.getState?.())
-        );
+const ffprobePath =
+  process.env.MOVI_FFPROBE ?? "D:/tool/ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe";
+
+// ffprobe echoes its whole command line, including the signed raw_url, in the
+// error of a failed spawn and in its own stderr; anything that reaches a report
+// or a log goes through this first.
+const scrubUrls = (text) => String(text).replace(/https?:\/\/\S+/g, "<url>");
+
+function runFfprobe(args) {
+  return new Promise((resolvePromise, reject) => {
+    execFile(
+      ffprobePath,
+      args,
+      { maxBuffer: 256 * 1024 * 1024, timeout: 180_000, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              `ffprobe failed: ${scrubUrls(error.message)}${stderr ? ` | ${scrubUrls(stderr).slice(0, 500)}` : ""}`,
+            ),
+          );
+          return;
+        }
+        resolvePromise(stdout);
       },
-      target,
-      { timeout: 60_000 },
     );
-  } catch (error) {
-    const state = await page
-      .evaluate(() => {
-        const element = document.querySelector("movi-player");
-        return { at: element?.currentTime ?? null, state: element?.player?.getState?.() ?? "missing" };
-      })
-      .catch(() => null);
-    throw new Error(
-      `${label} subtitle probe: seek to ${target.toFixed(2)}s did not settle within 60s ` +
-        `(${JSON.stringify(state)}): ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
+  });
 }
 
-async function validateSubtitles(page, label) {
+const IMAGE_SUBTITLE_CODECS = new Set([
+  "hdmv_pgs_subtitle",
+  "dvd_subtitle",
+  "dvb_subtitle",
+  "xsub",
+]);
+
+// A bitmap subtitle stream carries a "display" segment (kilobytes) and a
+// "clear" segment (~30 bytes) per cue; only the first one has anything to show.
+const MIN_IMAGE_DISPLAY_BYTES = 100;
+// Forced-only tracks (a handful of foreign-language lines) and stub tracks are
+// not what a viewer picks, and a harness that picks them is waiting for a cue
+// that is minutes away or never comes (Paprika's "English (Forced Only)" has 10).
+const MIN_SUBTITLE_FRAMES = 100;
+const CUE_SCAN_INTERVAL_S = 30;
+const CUE_SCAN_BOUND_S = 600;
+const SUBTITLE_SEEK_LEAD_S = 1.5;
+const SUBTITLE_END_TOLERANCE_S = 2;
+
+/**
+ * Read the subtitle ground truth from the media file itself, with ffprobe, so
+ * the subtitle check can be decided against a cue that is KNOWN to exist
+ * instead of probing positions and calling a silent window a failure (or, worse,
+ * an "inconclusive"). Track ids in movi are the container stream indexes
+ * (Demuxer.ts `id: info.index`), so the ffprobe index is the id to select.
+ *
+ * Packets are read forward from the middle with the seek done on the default
+ * (video) stream: passing -select_streams here makes ffprobe seek on the sparse
+ * subtitle stream, which started ~580s early and crawled on a remux.
+ */
+async function probeSubtitleGroundTruth(rawUrl, durationS) {
+  const startedAt = Date.now();
+  const header = JSON.parse(
+    await runFfprobe([
+      "-v", "error",
+      "-select_streams", "s",
+      "-show_entries",
+      "stream=index,codec_name:stream_disposition=forced:stream_tags=language,title,NUMBER_OF_FRAMES:format=start_time",
+      "-of", "json",
+      rawUrl,
+    ]),
+  );
+  const streams = (header.streams ?? []).map((stream) => {
+    const tags = stream.tags ?? {};
+    const framesKey = Object.keys(tags).find((key) => key.startsWith("NUMBER_OF_FRAMES"));
+    return {
+      id: Number(stream.index),
+      codec: String(stream.codec_name ?? ""),
+      kind: IMAGE_SUBTITLE_CODECS.has(stream.codec_name) ? "image" : "text",
+      language: String(tags.language ?? ""),
+      title: String(tags.title ?? ""),
+      forced: stream.disposition?.forced === 1,
+      frames: framesKey === undefined ? null : Number(tags[framesKey]),
+    };
+  });
+  if (streams.length === 0) {
+    return { absent: true, probeMs: Date.now() - startedAt };
+  }
+  const startTime = Number(header.format?.start_time) || 0;
+
+  const languageRank = (stream) => {
+    const language = stream.language.toLowerCase();
+    if (["eng", "en"].includes(language)) return 0;
+    if (["zho", "chi", "zh"].includes(language)) return 1;
+    if (!language || language === "und") return 2;
+    return 3;
+  };
+  const qualifying = streams
+    .filter(
+      (s) =>
+        !s.forced &&
+        !/forced/i.test(s.title) &&
+        (s.frames === null || s.frames >= MIN_SUBTITLE_FRAMES),
+    )
+    .sort(
+      (a, b) =>
+        languageRank(a) - languageRank(b) ||
+        (a.kind === b.kind ? 0 : a.kind === "text" ? -1 : 1) ||
+        a.id - b.id,
+    );
+  if (qualifying.length === 0) {
+    throw new Error(
+      `file has subtitle tracks but none is a full, non-forced track: ${JSON.stringify(streams)}`,
+    );
+  }
+  const track = qualifying[0];
+
+  const packets = [];
+  let scannedS = 0;
+  let minPos = Infinity;
+  let maxPos = 0;
+  let cueIndex = -1;
+  const isDisplay = (packet) =>
+    track.kind === "image" ? packet.size > MIN_IMAGE_DISPLAY_BYTES : packet.size > 0;
+  const readInterval = async (fromS) => {
+    const out = JSON.parse(
+      await runFfprobe([
+        "-v", "error",
+        "-read_intervals", `${fromS.toFixed(3)}%+${CUE_SCAN_INTERVAL_S}`,
+        "-show_entries", "packet=stream_index,pts_time,duration_time,size,pos",
+        "-of", "json",
+        rawUrl,
+      ]),
+    );
+    for (const raw of out.packets ?? []) {
+      const pos = Number(raw.pos);
+      if (Number.isFinite(pos)) {
+        minPos = Math.min(minPos, pos);
+        maxPos = Math.max(maxPos, pos);
+      }
+      if (Number(raw.stream_index) !== track.id) continue;
+      packets.push({
+        pts: Number(raw.pts_time),
+        duration: Number(raw.duration_time),
+        size: Number(raw.size),
+      });
+    }
+    scannedS += CUE_SCAN_INTERVAL_S;
+  };
+
+  // Contiguous intervals, never re-reading a span. The cue's end is the NEXT
+  // packet of the stream (a bitmap cue's clear segment), which can sit in the
+  // interval after the one holding the display packet, so keep reading until
+  // both are in hand or the bound is hit.
+  let from = startTime + durationS * 0.5;
+  while (scannedS < CUE_SCAN_BOUND_S) {
+    await readInterval(from);
+    from += CUE_SCAN_INTERVAL_S;
+    packets.sort((a, b) => a.pts - b.pts);
+    if (cueIndex < 0) cueIndex = packets.findIndex(isDisplay);
+    if (cueIndex < 0) continue;
+    const cue = packets[cueIndex];
+    const textEnd = cue.pts + cue.duration;
+    if (track.kind === "text" && Number.isFinite(textEnd) && textEnd > cue.pts) break;
+    if (packets[cueIndex + 1] !== undefined) break;
+  }
+  const evidence = {
+    track,
+    scannedS,
+    approxBytesSpan: Number.isFinite(minPos) ? maxPos - minPos : null,
+    packetsOfTrack: packets.length,
+  };
+  if (cueIndex < 0) {
+    throw new Error(
+      `no displayable cue of track ${track.id} within ${scannedS}s after the middle: ${JSON.stringify(evidence)}`,
+    );
+  }
+  const cue = packets[cueIndex];
+  const next = packets[cueIndex + 1];
+  const textEnd = cue.pts + cue.duration;
+  const cueEndPts =
+    track.kind === "text" && Number.isFinite(textEnd) && textEnd > cue.pts
+      ? textEnd
+      : next?.pts;
+  if (!Number.isFinite(cueEndPts) || cueEndPts <= cue.pts) {
+    throw new Error(
+      `cue of track ${track.id} at ${cue.pts}s has no determinable end: ${JSON.stringify(evidence)}`,
+    );
+  }
+  return {
+    absent: false,
+    track,
+    cueStart: Number((cue.pts - startTime).toFixed(3)),
+    cueEnd: Number((cueEndPts - startTime).toFixed(3)),
+    cueBytes: cue.size,
+    scannedS,
+    approxBytesSpan: evidence.approxBytesSpan,
+    probeMs: Date.now() - startedAt,
+  };
+}
+
+/**
+ * Arm an in-page recorder for the ground-truth cue. The cue lives for a second
+ * or two and the seek step that lands before it samples for 8s, so a check made
+ * AFTER that sampling would look at an overlay that has already been cleared.
+ * The recorder watches the clock, and the moment the player is inside the known
+ * cue window with the overlay showing it, captures the same evidence the old
+ * probe read (cue/overlay geometry for text, opaque-pixel count for bitmap).
+ */
+async function armSubtitleProbe(page, truth) {
+  await page.evaluate(
+    ({ cueStart, cueEnd, kind }) => {
+      const state = (globalThis.__moviSubtitleProbe = { observed: null });
+      const read = () => {
+        const element = document.querySelector("movi-player");
+        const renderer = element?.player?.videoRenderer;
+        const overlay = renderer?.subtitleOverlay;
+        const cue = renderer?.activeSubtitleCue;
+        if (!overlay || overlay.style.display === "none") return null;
+        if (kind === "text") {
+          if (!cue?.text || !overlay.textContent?.trim()) return null;
+          const rect = overlay.getBoundingClientRect();
+          return {
+            at: Number(element.currentTime),
+            cueStart: Number(cue.start ?? -1),
+            cueEnd: Number(cue.end ?? -1),
+            cueText: String(cue.text),
+            overlayText: String(overlay.textContent).trim(),
+            display: String(overlay.style.display),
+            width: Number(rect.width),
+            height: Number(rect.height),
+            streamedCueCount: Number(renderer.subtitleCues?.length ?? 0),
+          };
+        }
+        if (!cue?.image) return null;
+        const media = overlay.querySelector("canvas, img");
+        if (!media) return null;
+        // <img>.src is a data: URL set fire-and-forget; reading before the
+        // browser has decoded it would draw a blank surface.
+        if (media.tagName === "IMG" && !(media.complete === true && media.naturalWidth > 0)) {
+          return null;
+        }
+        const off = document.createElement("canvas");
+        off.width = media.tagName === "IMG" ? media.naturalWidth || media.width : media.width;
+        off.height = media.tagName === "IMG" ? media.naturalHeight || media.height : media.height;
+        if (!off.width || !off.height) return null;
+        const ctx = off.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return null;
+        try {
+          ctx.drawImage(media, 0, 0, off.width, off.height);
+        } catch {
+          return null;
+        }
+        const { data } = ctx.getImageData(0, 0, off.width, off.height);
+        let opaquePixels = 0;
+        let totalPixels = 0;
+        for (let i = 3; i < data.length; i += 4) {
+          totalPixels++;
+          if (data[i] > 10) opaquePixels++;
+        }
+        return {
+          at: Number(element.currentTime),
+          cueStart: Number(cue.start ?? -1),
+          cueEnd: Number(cue.end ?? -1),
+          pixels: { hasMedia: true, totalPixels, opaquePixels },
+        };
+      };
+      const timer = setInterval(() => {
+        const t = Number(document.querySelector("movi-player")?.currentTime ?? -1);
+        // Only inside the known cue window: an overlay showing some OTHER cue
+        // at another time proves nothing about this one.
+        if (t < cueStart || t > cueEnd) return;
+        const observed = read();
+        // An image cue whose bitmap is still transparent might be mid-decode;
+        // keep polling until the window closes rather than recording it.
+        if (!observed) return;
+        if (observed.pixels && observed.pixels.opaquePixels === 0) {
+          state.lastBlank = observed;
+          return;
+        }
+        state.observed = observed;
+        clearInterval(timer);
+      }, 100);
+      state.stop = () => clearInterval(timer);
+    },
+    { cueStart: truth.cueStart, cueEnd: truth.cueEnd, kind: truth.track.kind },
+  );
+}
+
+/**
+ * Decide the subtitle check against the ground truth: the cue at
+ * [cueStart, cueEnd] exists in the file, so it must render once the clock has
+ * been through that span. No cue by cueEnd plus a small tolerance is a failure,
+ * with enough evidence to tell a broken pipeline from a wrong track.
+ */
+async function validateSubtitles(page, label, truth) {
   const tracks = await page.evaluate(() => {
     const player = document.querySelector("movi-player")?.player;
     return (player?.getSubtitleTracks?.() ?? []).map((track) => ({
@@ -1580,312 +1831,112 @@ async function validateSubtitles(page, label) {
       subtitleType: String(track.subtitleType ?? ""),
     }));
   });
-  if (tracks.length === 0) {
-    return { status: "not-present", tracks: [], attempts: [] };
+  if (truth.absent) {
+    if (tracks.length > 0) {
+      throw new Error(
+        `${label} player reports subtitle tracks but ffprobe found none: ${JSON.stringify(tracks)}`,
+      );
+    }
+    return { status: "not-present", tracks: [] };
+  }
+  const { track, cueStart, cueEnd } = truth;
+  const playerTrack = tracks.find((t) => t.id === track.id);
+  if (!playerTrack) {
+    throw new Error(
+      `${label} ground-truth track ${track.id} is not among the player's subtitle tracks: ${JSON.stringify(tracks)}`,
+    );
   }
 
-  const attempts = [];
-  const preferredTrackOrder = (track) => {
-    const language = track.language.toLowerCase();
-    if (["eng", "en"].includes(language)) return 0;
-    if (["zho", "chi", "zh"].includes(language)) return 1;
-    if (!language || language === "und") return 2;
-    return 3;
-  };
-  const candidates = (type) =>
-    tracks
-      .filter((track) => track.subtitleType === type)
-      .sort((a, b) => preferredTrackOrder(a) - preferredTrackOrder(b))
-      .slice(0, 4);
-  // Minimal mode probes exactly one track at the current position, which the
-  // harness has just left mid-film after the middle seek: every seek to hunt
-  // for a cue costs a stream restart and a refilled prefetch window, and a
-  // sample that shows no cue in one window is inconclusive, not broken. Text
-  // tracks win over bitmap ones because a text cue is the cheaper, more
-  // frequent proof; bitmap is only tried when the file has no text track.
-  // `null` in a target list means "do not seek".
-  const textTracks = candidates("text");
-  const textProbeTracks = exhaustiveSeeks ? textTracks : textTracks.slice(0, 1);
-  let cueSeen = false;
-  for (const track of textProbeTracks) {
-    const configured = await page.evaluate(
-      (trackId) =>
-        document.querySelector("movi-player")?.player?.selectSubtitleTrack(trackId),
-      track.id,
-    );
-    if (!configured) {
-      attempts.push({ trackId: track.id, result: "configure-failed" });
-      continue;
-    }
-    const duration = await page.evaluate(
-      () => Number(document.querySelector("movi-player")?.duration ?? 0),
-    );
-    const textTargets = exhaustiveSeeks
-      ? [duration * 0.35, duration * 0.2, duration * 0.5, duration * 0.75]
-      : [null];
-    for (const target of textTargets) {
-      if (target !== null) await seekForSubtitleProbe(page, label, target);
-      if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
-        await page.evaluate(() => document.querySelector("movi-player").play());
-      }
-      cueSeen = false;
-      try {
-        await page.waitForFunction(
-          () => {
-            const player = document.querySelector("movi-player")?.player;
-            const renderer = player?.videoRenderer;
-            const overlay = renderer?.subtitleOverlay;
-            return Boolean(
-              renderer?.activeSubtitleCue?.text &&
-                overlay &&
-                overlay.style.display !== "none" &&
-                overlay.textContent?.trim(),
-            );
-          },
-          null,
-          { timeout: subtitleProbeMs },
-        );
-        cueSeen = true;
-        const rendered = await page.evaluate(() => {
-          const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
-          const overlay = renderer?.subtitleOverlay;
-          const cue = renderer?.activeSubtitleCue;
-          const rect = overlay?.getBoundingClientRect?.();
-          return {
-            cueStart: Number(cue?.start ?? -1),
-            cueEnd: Number(cue?.end ?? -1),
-            cueText: String(cue?.text ?? ""),
-            overlayText: String(overlay?.textContent ?? "").trim(),
-            display: String(overlay?.style?.display ?? ""),
-            width: Number(rect?.width ?? 0),
-            height: Number(rect?.height ?? 0),
-            streamedCueCount: Number(renderer?.subtitleCues?.length ?? 0),
-          };
-        });
-        if (
-          !rendered.overlayText ||
-          rendered.width <= 0 ||
-          rendered.height <= 0 ||
-          !Number.isFinite(rendered.cueStart) ||
-          !Number.isFinite(rendered.cueEnd) ||
-          rendered.cueEnd <= rendered.cueStart
-        ) {
-          throw new Error(
-            `subtitle overlay/cue was malformed: ${JSON.stringify(rendered)}`,
-          );
-        }
-        const postProbePlayback = await assertPlaybackStillAdvances(
-          page,
-          label,
-          "text subtitle selection/streaming/render",
-        );
-        return {
-          status: "rendered-text",
-          tracks,
-          attempts,
-          selectedTrack: track,
-          rendered,
-          postProbePlayback,
-        };
-      } catch (error) {
-        // Without retries a cue that appeared and then rendered malformed (or
-        // froze playback) is a real defect and must fail the sample; only the
-        // cue window timing out is allowed to read as inconclusive.
-        if (!exhaustiveSeeks && cueSeen) throw error;
-        attempts.push({
-          trackId: track.id,
-          target,
-          result: "no-visible-text-cue",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-  }
-
-  // Bitmap subtitles cannot be prefetched through the text-only cue API.
-  // Exercise their real streaming decoder/render path at several ordinary
-  // dialogue positions and require an actual image cue in the HTML overlay.
-  const imageTracks = exhaustiveSeeks
-    ? candidates("image")
-    : textTracks.length > 0
-      ? []
-      : candidates("image").slice(0, 1);
-  for (const track of imageTracks) {
-    const configured = await page.evaluate(
-      (trackId) => document.querySelector("movi-player")?.player?.selectSubtitleTrack(trackId),
-      track.id,
-    );
-    if (!configured) {
-      attempts.push({ trackId: track.id, result: "configure-failed" });
-      continue;
-    }
-    const duration = await page.evaluate(
-      () => Number(document.querySelector("movi-player")?.duration ?? 0),
-    );
-    const imageTargets = exhaustiveSeeks
-      ? [duration * 0.2, duration * 0.5, duration * 0.75]
-      : [null];
-    for (const target of imageTargets) {
-      if (target !== null) await seekForSubtitleProbe(page, label, target);
-      if (!(await page.evaluate(() => document.querySelector("movi-player")?.playing))) {
-        await page.evaluate(() => document.querySelector("movi-player").play());
-      }
-      cueSeen = false;
-      try {
-        await page.waitForFunction(
-          () => {
-            const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
-            const overlay = renderer?.subtitleOverlay;
-            if (
-              !renderer?.activeSubtitleCue?.image ||
-              !overlay ||
-              overlay.style.display === "none"
-            ) {
-              return false;
-            }
-            const media = overlay.querySelector("canvas, img");
-            if (!media) return false;
-            // <img>.src is set fire-and-forget by CanvasRenderer (a data:
-            // URL PNG built from an already-decoded ImageBitmap — see
-            // docs/PLAN_MERGE.MD's PGS pixel-path hop table). DOM presence
-            // alone doesn't prove the browser has finished decoding that
-            // data URL yet, so a read landing in that window would draw an
-            // incomplete/blank image. This is a one-shot "not yet decoded
-            // -> decoded" transition (unlike the live WebGL video canvas
-            // this harness's picture check used to race against — that one
-            // is a continuously-redrawn surface with no "done" signal at
-            // all); requiring `complete && naturalWidth > 0` here is a
-            // narrow, theoretical window this closes, not a reproduced bug.
-            // The <canvas> branch (text-shaped bitmap subtitle renderers,
-            // if any) is left exactly as before — canvas has no decode
-            // step to wait for.
-            if (media.tagName === "IMG") {
-              return media.complete === true && media.naturalWidth > 0;
-            }
-            return true;
-          },
-          null,
-          { timeout: subtitleProbeMs },
-        );
-        cueSeen = true;
-        // The waitForFunction above proves the <canvas>/<img> element exists,
-        // is displayed, and (for <img>) has finished decoding — it does NOT
-        // prove the bitmap has any actual content. An all-transparent bitmap
-        // (empty PGS frame, or a decode failure that produces a correctly-
-        // sized but blank surface) satisfies all of that with zero rendered
-        // content. Read the alpha channel back and require some of it to be
-        // opaque.
-        const pixels = await page.evaluate(() => {
-          const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
-          const media = renderer?.subtitleOverlay?.querySelector("canvas, img");
-          if (!media) return { hasMedia: false, totalPixels: 0, opaquePixels: 0 };
-          const off = document.createElement("canvas");
-          off.width = media.tagName === "IMG" ? media.naturalWidth || media.width : media.width;
-          off.height = media.tagName === "IMG" ? media.naturalHeight || media.height : media.height;
-          if (!off.width || !off.height) {
-            return { hasMedia: true, totalPixels: 0, opaquePixels: 0 };
-          }
-          const ctx = off.getContext("2d", { willReadFrequently: true });
-          if (!ctx) return { hasMedia: true, totalPixels: 0, opaquePixels: 0 };
-          try {
-            ctx.drawImage(media, 0, 0, off.width, off.height);
-          } catch {
-            return { hasMedia: true, totalPixels: 0, opaquePixels: 0 };
-          }
-          const { data } = ctx.getImageData(0, 0, off.width, off.height);
-          let opaquePixels = 0;
-          let totalPixels = 0;
-          for (let i = 3; i < data.length; i += 4) {
-            totalPixels++;
-            if (data[i] > 10) opaquePixels++;
-          }
-          return { hasMedia: true, totalPixels, opaquePixels };
-        });
-        if (!pixels.hasMedia || pixels.totalPixels === 0 || pixels.opaquePixels === 0) {
-          throw new Error(
-            `bitmap subtitle overlay rendered with zero non-transparent pixels: ${JSON.stringify(pixels)}`,
-          );
-        }
-        const postProbePlayback = await assertPlaybackStillAdvances(
-          page,
-          label,
-          "bitmap subtitle selection/render",
-        );
-        return {
-          status: "rendered-image",
-          tracks,
-          attempts,
-          selectedTrack: track,
-          pixels,
-          postProbePlayback,
-        };
-      } catch (error) {
-        if (!exhaustiveSeeks && cueSeen) throw error;
-        // "No cue appeared at t" has two readings and the bare timeout cannot
-        // tell them apart: the bitmap pipeline is broken, or this position
-        // simply has nothing to show. Samples with many PGS tracks hide the
-        // ambiguity by brute force — Paprika needed 7 attempts before one
-        // landed, Star Trek 3 — but a 2-track sample only gets 6 chances and
-        // can run out while the decoder is perfectly healthy. So record what
-        // the streaming decoder actually produced: how many cues it has for
-        // this track, and where the nearest one to this target is. A nonzero
-        // cue list with the nearest cue minutes away is a sampling miss; an
-        // empty list after a 12s wait is a real failure.
-        const cueContext = await page
-          .evaluate(() => {
-            const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
-            const cues = renderer?.subtitleCues ?? [];
-            const at = Number(
-              document.querySelector("movi-player")?.currentTime ?? -1,
-            );
-            let nearest = null;
-            for (const cue of cues) {
-              const distance =
-                at < cue.start ? cue.start - at : at > cue.end ? at - cue.end : 0;
-              if (nearest === null || distance < nearest.distance) {
-                nearest = { start: cue.start, end: cue.end, distance };
-              }
-            }
-            return { streamedCueCount: cues.length, at, nearest };
-          })
-          .catch(() => null);
-        attempts.push({
-          trackId: track.id,
-          target,
-          result: "no-visible-image-cue",
-          error: error instanceof Error ? error.message : String(error),
-          ...(cueContext ?? {}),
-        });
-      }
-    }
-  }
-
-  // One window at one position cannot tell a broken pipeline from a stretch of
-  // film with no dialogue, so minimal mode reports "inconclusive" instead of
-  // failing; the attempt (with the decoder's cue context for bitmap tracks) is
-  // kept so a human can judge, and the exhaustive mode is the way to get a
-  // verdict. A track that only ever failed to configure is still a failure.
-  if (
-    !exhaustiveSeeks &&
-    attempts.some((a) => a.result === "no-visible-text-cue" || a.result === "no-visible-image-cue")
-  ) {
-    process.stderr.write(
-      `  [${label}] subtitles inconclusive: no cue rendered in ${subtitleProbeMs}ms window (not a failure)\n`,
-    );
-    return {
-      status: "no-cue-in-window",
-      inconclusive: true,
-      tracks,
-      attempts,
-      selectedTrack: tracks.find((t) => t.id === attempts.at(-1)?.trackId) ?? null,
-      windowMs: subtitleProbeMs,
-    };
-  }
-
-  throw new Error(
-    `${label} has subtitle tracks but none completed real cue rendering: tracks=${JSON.stringify(tracks)} attempts=${JSON.stringify(attempts)}`,
+  const deadline = cueEnd + SUBTITLE_END_TOLERANCE_S;
+  const clockNow = await page.evaluate(
+    () => Number(document.querySelector("movi-player")?.currentTime ?? 0),
   );
+  // Wall time the clock needs to reach the deadline at 1x, plus slack for a
+  // post-seek stall; this bounds the wait, it is not a blind window.
+  const waitMs = Math.max(10_000, (deadline - clockNow) * 1000 + 20_000);
+  let timedOut = false;
+  await page
+    .waitForFunction(
+      (limit) => {
+        const probe = globalThis.__moviSubtitleProbe;
+        return (
+          Boolean(probe?.observed) ||
+          Number(document.querySelector("movi-player")?.currentTime ?? 0) > limit
+        );
+      },
+      deadline,
+      { timeout: waitMs },
+    )
+    .catch(() => {
+      timedOut = true;
+    });
+
+  const probe = await page.evaluate(() => {
+    const state = globalThis.__moviSubtitleProbe;
+    state?.stop?.();
+    const renderer = document.querySelector("movi-player")?.player?.videoRenderer;
+    const cues = renderer?.subtitleCues ?? [];
+    const at = Number(document.querySelector("movi-player")?.currentTime ?? -1);
+    let nearest = null;
+    for (const cue of cues) {
+      const distance = at < cue.start ? cue.start - at : at > cue.end ? at - cue.end : 0;
+      if (nearest === null || distance < nearest.distance) {
+        nearest = { start: cue.start, end: cue.end, distance };
+      }
+    }
+    return {
+      observed: state?.observed ?? null,
+      lastBlank: state?.lastBlank ?? null,
+      currentTime: at,
+      streamedCueCount: cues.length,
+      nearest,
+    };
+  });
+  if (!probe.observed) {
+    throw new Error(
+      `${label} subtitle cue never rendered: track=${JSON.stringify(track)} expected=[${cueStart}, ${cueEnd}]s ` +
+        `currentTime=${probe.currentTime.toFixed(2)}s${timedOut ? " (wait timed out)" : ""} ` +
+        `streamedCueCount=${probe.streamedCueCount} nearestStreamedCue=${JSON.stringify(probe.nearest)} ` +
+        `blankBitmapSeen=${JSON.stringify(probe.lastBlank)}`,
+    );
+  }
+
+  const rendered = probe.observed;
+  if (track.kind === "text") {
+    if (
+      !rendered.overlayText ||
+      rendered.width <= 0 ||
+      rendered.height <= 0 ||
+      !Number.isFinite(rendered.cueStart) ||
+      !Number.isFinite(rendered.cueEnd) ||
+      rendered.cueEnd <= rendered.cueStart
+    ) {
+      throw new Error(`${label} subtitle overlay/cue was malformed: ${JSON.stringify(rendered)}`);
+    }
+  } else if (
+    !rendered.pixels?.hasMedia ||
+    rendered.pixels.totalPixels === 0 ||
+    rendered.pixels.opaquePixels === 0
+  ) {
+    throw new Error(
+      `${label} bitmap subtitle overlay rendered with zero non-transparent pixels: ${JSON.stringify(rendered.pixels)}`,
+    );
+  }
+  const postProbePlayback = await assertPlaybackStillAdvances(
+    page,
+    label,
+    track.kind === "text" ? "text subtitle selection/streaming/render" : "bitmap subtitle selection/render",
+  );
+  return {
+    status: track.kind === "text" ? "rendered-text" : "rendered-image",
+    tracks,
+    selectedTrack: track,
+    expected: { cueStart, cueEnd },
+    rendered,
+    postProbePlayback,
+  };
 }
+
 
 async function runOne(browser, token, mediaPath) {
   const label = basename(mediaPath);
@@ -2354,20 +2405,46 @@ async function runOne(browser, token, mediaPath) {
   })();
 
   const duration = playAfter.duration;
+
+  // Subtitle ground truth comes from the file itself, before any seek, so the
+  // one seek this harness makes can be aimed at a cue that is known to exist.
+  // Failing here fails the sample (runPhase records it) rather than silently
+  // skipping the subtitle check; the track is selected BEFORE the seek so the
+  // stream the seek restarts already carries its packets.
+  const subtitleTruth = await runPhase("subtitle ground truth", async () => {
+    const truth = await probeSubtitleGroundTruth(media.raw_url, duration);
+    if (!truth.absent) {
+      const configured = await page.evaluate(
+        (trackId) => document.querySelector("movi-player")?.player?.selectSubtitleTrack(trackId),
+        truth.track.id,
+      );
+      if (!configured) {
+        throw new Error(`${label} could not select ground-truth subtitle track ${truth.track.id}`);
+      }
+      await armSubtitleProbe(page, truth);
+    }
+    return truth;
+  });
+
   // Minimal mode is one seek, named "middle seek" because seekProgress and the
-  // picture/audio evidence in seekAndSample key on that phase name. Its target
-  // is the middle nudged by 0.4s on purpose: just off a keyframe it still
-  // exercises the ordinary seek path and also P3's restart barrier (the case a
-  // seek landing exactly on a keyframe never reaches), so one seek covers both.
-  // The exhaustive matrix adds head / tail and the on-keyframe middle.
+  // picture/audio evidence in seekAndSample key on that phase name. With a
+  // subtitle track it lands SUBTITLE_SEEK_LEAD_S before a real cue found in the
+  // file (mid-film, and an arbitrary cue time is almost never on a keyframe, so
+  // the seek still covers both the ordinary path and P3's restart barrier);
+  // without one it is the middle nudged by 0.4s, deliberately off a keyframe
+  // for the same reason. The exhaustive matrix adds head / tail and a second
+  // middle nudged off the first.
+  const middleTarget = subtitleTruth?.absent === false
+    ? subtitleTruth.cueStart - SUBTITLE_SEEK_LEAD_S
+    : duration * 0.5 + 0.4;
   const seekMatrix = exhaustiveSeeks
     ? [
         ["head seek", Math.max(2, duration * 0.02)],
-        ["middle seek", duration * 0.5],
+        ["middle seek", middleTarget],
         ["tail seek", Math.min(duration - 10, duration * 0.95)],
-        ["near-keyframe seek", duration * 0.5 + 0.4],
+        ["near-keyframe seek", middleTarget + 0.4],
       ]
-    : [["middle seek", duration * 0.5 + 0.4]];
+    : [["middle seek", middleTarget]];
 
   const seeks = [];
   for (const [phase, rawTarget] of seekMatrix) {
@@ -2387,6 +2464,13 @@ async function runOne(browser, token, mediaPath) {
     // four targets it was.
     seeks.push(result ?? { phase, target: Number(target.toFixed(2)), status: "failed" });
   }
+
+  // Right after the middle seek and before anything else moves the playhead:
+  // the in-page recorder has normally captured the cue by now, and if it has
+  // not, the clock is still approaching the cue window.
+  const subtitles = subtitleTruth
+    ? await runPhase("subtitles", () => validateSubtitles(page, label, subtitleTruth))
+    : null;
 
   const rapidSeeks = await runPhase("consecutive seeks", () =>
     runRapidSeeks(page, label, duration),
@@ -2409,10 +2493,6 @@ async function runOne(browser, token, mediaPath) {
     seeks.find((s) => s.phase === "middle seek" && s.status !== "failed") ??
     seeks.find((s) => s.status !== "failed") ??
     seeks[0];
-
-  const subtitles = await runPhase("subtitles", () =>
-    validateSubtitles(page, label),
-  );
 
   // The content gate, stated once for the whole session. `steady playback`
   // records picture/audio evidence rather than asserting it (see the note
@@ -2524,6 +2604,7 @@ async function runOne(browser, token, mediaPath) {
     pictureEvidence,
     audioEvidence,
     postSeek: seekProgress,
+    subtitleGroundTruth: subtitleTruth,
     subtitles,
     finalState: finalSnapshot.state,
     network: finalSnapshot.network
