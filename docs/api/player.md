@@ -894,61 +894,28 @@ player.off("stateChange", handler);
 
 ## A/V Synchronization
 
-### Audio-Master Sync Model
+### One Time Source
 
-**File:** [src/core/Clock.ts](../src/core/Clock.ts)
+**Files:** [src/core/TimeSource.ts](../src/core/TimeSource.ts), [src/core/Clock.ts](../src/core/Clock.ts), [src/render/AudioRenderer.ts](../src/render/AudioRenderer.ts)
 
-**Principle:** Audio is the master clock, video syncs to audio
+**Principle:** there is exactly one clock. The picture and the seek bar both read it; neither keeps a clock of its own.
 
-**Why Audio-Master?**
+This is Chromium's `TimeSource` model (`media/base/time_source.h`). The audio renderer is the time source: it records every buffer it hands to the audio thread as a segment `{ctxStart, ctxEnd, mediaStart, rate}`, and answers `mediaTimeAt(performance.now())` — the media time being _heard_ — by mapping `performance.now()` to context time with `AudioContext.getOutputTimestamp()` and looking the result up in that list. Inside a segment it is a linear map; in a hole (an underrun) it holds at the end of the last segment that played, because no media was consumed across it.
 
-- Audio glitches are **very noticeable** (pops, clicks)
-- Video frame drops are **less noticeable** (smooth motion blur)
-- Web Audio API provides high-precision timing
-
-### Sync Implementation
+When the sound cannot answer (no audio track, audio disabled, the browser refusing to start the context, a track that ended before the file) `PlaybackTimeSource` falls back to a wall clock that continues from the last heard time — every read from the audio re-bases it, so the point it continues from is always current. It switches back to the sound the moment the sound answers again.
 
 ```typescript
-class Clock {
-  // Get current playback time from audio renderer
-  getTime(): number {
-    if (this.audioRenderer.isHealthy()) {
-      return this.audioRenderer.getAudioClock();
-    }
-    // Fallback to wall clock if audio unhealthy
-    return this.wallClockTime;
-  }
-}
+// CanvasRenderer, every frame:
+const time = timeSource.now(); // the sound, or the wall clock continuing from it
 ```
 
-**CanvasRenderer Sync:**
+There is no deadband and no periodic correction, so a disturbance (an underrun, a stalled device clock, a rate change, a seek) cannot leave an offset behind: the next read already reflects what is being heard. The hardware clock running tens of ppm off `performance.now()` is a different `getOutputTimestamp()` pair on the next call, and never accumulates.
 
-```typescript
-presentFrame() {
-  const audioTime = this.getAudioTime();
-  const frame = this.frameQueue[0];
+### Late frames and video underflow
 
-  if (frame.timestamp <= audioTime) {
-    // Audio ahead or in sync → present frame
-    this.renderFrame(frame);
-    this.frameQueue.shift();
-  } else {
-    // Video ahead → wait for audio to catch up
-    // Check again next RAF
-  }
-}
-```
+A frame whose interval ended more than `clamp(frame / 2, 1/60 s, 1/8 s)` before the time source is dropped and counted (`getVideoPlaybackQuality().droppedVideoFrames`), never shown — ITU-R BR.265's half-frame tolerance as Chromium's `video_renderer_algorithm.cc` applies it.
 
-### Sync Modes
-
-1. **Loose Sync (Default)**
-   - Video uses wall clock for smooth presentation
-   - Periodic corrections from audio clock
-   - ±50ms tolerance before correction
-
-2. **Tight Sync (Optional)**
-   - Every frame checked against audio time
-   - More accurate, may cause frame drops
+If the picture then has no on-time frame for `VIDEO_UNDERFLOW_THRESHOLD_MS` (3 s, Chromium's `video_underflow_threshold_`) while the sound still has plenty buffered, the player enters its normal `buffering` state: the audio context and the clock stop together, the decoder catches up to the held clock (frames it delivers are dropped as late), and the usual resume gate restarts sound, clock and picture together.
 
 ### Buffer Health
 

@@ -58,9 +58,11 @@ src/
 │   │                          MoviPlayer instance.
 │   ├── CanvasRenderer.ts      WebGL2 video presentation. HDR via display-p3
 │   │                          on Chromium; PQ tone-map shader elsewhere.
-│   │                          Owns the frame queue and A/V sync.
+│   │                          Owns the frame queue; shows frames against
+│   │                          the time source and drops the late ones.
 │   ├── AudioRenderer.ts       Web Audio scheduling, Signalsmith stretcher
 │   │                          for non-1x rates, stable-audio compressor.
+│   │                          The audio clock: a list of scheduled segments.
 │   └── HLSPlayerWrapper.ts    Delegates to hls.js for HLS sources, with a
 │                              compatible API surface.
 │
@@ -71,7 +73,10 @@ src/
 │   ├── PlayerState.ts         State machine: idle → loading → ready →
 │   │                          playing ⇄ paused ⇄ seeking ⇄ buffering →
 │   │                          ended | error.
-│   ├── Clock.ts               Media-time clock with playbackRate support.
+│   ├── Clock.ts               Media-time clock with playbackRate support;
+│   │                          a shell over the one PlaybackTimeSource.
+│   ├── TimeSource.ts          PlaybackTimeSource: the sound's answer to "what
+│   │                          is being heard", a wall clock when it has none.
 │   ├── TrackManager.ts        Active video/audio/subtitle track selection.
 │   └── PlaybackController.ts  High-level play/pause coordination.
 │
@@ -398,6 +403,12 @@ props a frame after the
 element connected, by which point the poster is already up under the default —
 so a poster standing over an unpainted source is taken down and re-armed.
 
+### 7.12 There is one clock, and it is what is being heard
+
+`AudioRenderer` records every buffer it starts as a segment `{ctxStart, ctxEnd, mediaStart, rate}` (Chromium's `AudioClock`, `media/audio/audio_clock.cc`) and answers `mediaTimeAt(performance.now())` by mapping `performance.now()` to context time through `AudioContext.getOutputTimestamp()` and looking that up in the list. A hole between segments (an underrun) holds the answer at the end of the last segment that played; the start of the first holds it until the sound is audible. `PlaybackTimeSource` (`src/core/TimeSource.ts`) is what everything else reads: the sound's answer when there is one, a wall clock continuing from the last heard time when there is not (no track, audio disabled, autoplay refused, the track ended before the file). `Clock` and `CanvasRenderer` both read it; neither keeps a clock of its own.
+
+Do not add a second clock that is "corrected towards" the audio. That is what was here before — a presentation wall clock with a 150ms deadband, 25% corrections and 400ms soft/hard branches, and a UI clock with its own 100ms deadband — and every disturbance (one underrun, a stalled device clock, a rate change) left whatever it left under the deadband in place for the rest of the film. A frame is late when its interval ended more than `clamp(frame/2, 1/60s, 1/8s)` ago (Chromium `video_renderer_algorithm.cc`); it is dropped, never shown. A picture with no on-time frame for `VIDEO_UNDERFLOW_THRESHOLD_MS` (3s) while the sound is fine is a stall like the others: sound and clock stop together, the decoder catches up to the held clock, the resume gate lets go. Rate changes, seeks, loops and track switches write new segments or empty the list (`reset()`); none patches an anchor.
+
 ---
 
 ## 8. Common pitfalls
@@ -500,7 +511,7 @@ When reporting "this works" / "this is fixed", actually load a representative fi
 | Symptom | Start here |
 |---------|------------|
 | Decoder error / EncodingError loop | [src/decode/VideoDecoder.ts](src/decode/VideoDecoder.ts) `_doRecover`, plus the feed and read decisions (`feedVideo`, `feedAudio`, `needsMorePackets`) in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |
-| A/V drift, audio out of sync | `notifySeekCompletion` and `dropsBeforeAudioStart` in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |
+| A/V drift, audio out of sync | `mediaTimeAt` / `appendSegment` in [src/render/AudioRenderer.ts](src/render/AudioRenderer.ts), `isLate` / `trackUnderflow` in [src/render/CanvasRenderer.ts](src/render/CanvasRenderer.ts); the seek side is `notifySeekCompletion` and `dropsBeforeAudioStart` in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts). The simulation rig is `test/helpers/av-sim.ts` |
 | Stuttering 4K/8K, frame drops | Renderer queue cap (`baseHwQueue`), `Backpressure during sync` logs |
 | Mobile lag with no decoder errors | Check `ambientmode`, `resume` attributes; bisect against `app/test-native.html` |
 | Seek lands at wrong time on `.ts` | `seekKeyframeOffset` (UI clamp) + `onKeyframeWaitChange` (mid-playback recovery) in [src/core/MoviPlayer.ts](src/core/MoviPlayer.ts) |

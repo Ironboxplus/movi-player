@@ -2310,6 +2310,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    * is being caught up to a clock held where it stopped (see processLoop).
    */
   private _catchingUpVideo: boolean = false;
+  /** Non-reference skipping was switched on for a catch-up (and must go off with it). */
+  private _catchUpSkipEngaged: boolean = false;
+  /** The performance detector asked for non-reference skipping for good. */
+  private _perfSkipLatched: boolean = false;
   private _lastRateChangeAt: number = 0;
   private _lastSeekResumeAt: number = 0;
 
@@ -2764,6 +2768,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         //      resolution (network fine, buffer full, frames dropping) — the
         //      plain ABR is network-only and never reacts to a decode bottleneck.
         this.videoRenderer.setOnPerformanceDegrade(() => {
+          this._perfSkipLatched = true;
           this.videoDecoder?.setPerformanceSkip(true);
           this.abrDeviceDownshift();
         });
@@ -6235,7 +6240,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // ahead of pts=0 while it hunts for the first video frame. Without a
       // flush + audio reset here, the first audio packet
       // that surfaces after demuxer.seek(targetTime) can land at a stale
-      // interleaved PTS (e.g. 2.6s), anchoring firstBufferMediaTime there
+      // interleaved PTS (e.g. 2.6s), starting the audio timeline there
       // and forcing video to skip ahead to catch up — the first-play
       // stutter. Mirrors the replay path which flushes + resets first.
       await this.videoDecoder.flush();
@@ -7290,41 +7295,36 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
-   * Re-anchor AudioRenderer and Clock at the CURRENT position across an
-   * audio track switch — no position change, just a decoder rebuild.
+   * Start AudioRenderer's timeline over and re-seat the Clock at the CURRENT
+   * position across an audio track switch — no position change, just a decoder
+   * rebuild.
    *
    * B1 (docs/PLAN_MERGE.MD §4.11): the audioTrackChange handler used to close
    * the old MoviAudioDecoder and construct a new one without touching either
-   * object. That left two things stale:
+   * object, and what the old track had scheduled went on describing the clock:
+   * the gap while the old worker tears down and the new one spins up reads as
+   * an ordinary underrun, and the first buffer of the new track (whatever raw
+   * PTS it carries, with no check that it continues the old timeline) was
+   * stitched onto the old one. The step that made in the media clock was then
+   * only ever partly corrected (measured 0.064x-4.13x across samples).
    *
-   *   - AudioRenderer's scheduling anchor (firstBufferScheduledAt /
-   *     firstBufferMediaTime) survived the switch. The gap while the old
-   *     worker tears down and the new one spins up/configures reads as an
-   *     ordinary buffer underrun to AudioRenderer, whose underrun-recovery
-   *     path (AudioRenderer.ts's commitAudioBuffer) silently re-pivots that
-   *     anchor to whatever raw PTS the new track's first decoded buffer
-   *     carries — with no check that it continues the old timeline.
-   *   - Clock.syncedToAudio survived the switch too, so Clock treated the
-   *     resulting step discontinuity as ordinary drift and only ever nudged
-   *     baseTime by 50% of it per getTime() call (Clock.ts) instead of
-   *     hard-resyncing — turning a step into an extended, direction-
-   *     dependent rate distortion (measured 0.064x-4.13x across samples).
-   *
-   * Both primitives already exist and are exactly what the seek path uses
-   * to rebuild the pipeline at a fixed position (see seek()'s
-   * `audioRenderer.reset()` -> `clock.seek(target)` sequence). The demuxer
-   * side is refreshDemuxerForAudioSwitch, issued by the audioTrackChange
-   * handler after applyStreamDiscard() — it has to happen AFTER the discard
-   * flags flip, or the re-enabled track still has no packet at the target.
+   * Both primitives already exist and are exactly what the seek path uses to
+   * rebuild the pipeline at a fixed position (see seek()'s
+   * `audioRenderer.reset()` -> `clock.seek(target)` sequence). The demuxer side
+   * is refreshDemuxerForAudioSwitch, issued by the audioTrackChange handler
+   * after applyStreamDiscard() — it has to happen AFTER the discard flags flip,
+   * or the re-enabled track still has no packet at the target.
    *
    *   - `audioRenderer.reset()` stops the old track's already-scheduled Web
-   *     Audio nodes and clears hasFirstBuffer, so the new track's first
-   *     buffer establishes a FRESH anchor instead of hitting the
-   *     underrun-recovery re-pivot.
-   *   - `clock.seek(currentTime)` re-anchors Clock's wall clock to the
-   *     position we were actually at and drops syncedToAudio, so the next
-   *     getTime() call hard-syncs cleanly to the new anchor the first time
-   *     it becomes healthy, instead of gradually drift-correcting toward it.
+   *     Audio nodes and empties the list of scheduled segments, so the old
+   *     track's timeline is gone and the new track's first buffer starts a
+   *     fresh one.
+   *   - `clock.seek(currentTime)` puts the time source's wall clock at the
+   *     position we were actually at. With no segments the audio has no answer,
+   *     so the picture runs on the wall clock from there until the new sound is
+   *     audible — and the time source takes it up the moment it is. Nothing
+   *     else (the picture included) has to be told: they all read that one
+   *     source.
    *
    * Captured as its own method (not inlined in the handler) so it can be
    * driven directly in a test without wiring a full MoviPlayer instance.
@@ -7464,6 +7464,34 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (consumed <= 0) break; // decoder errored/broke — drop the rest
       if (consumed >= batch.length) break;
       batch = batch.slice(consumed);
+    }
+  }
+
+  /**
+   * The picture is behind a clock that is about to be held, and has to reach it.
+   *
+   * Every frame the decoder delivers until it does is late and will be dropped,
+   * so the only thing that matters is how fast it gets there — and the frames
+   * nothing references (H.264 nal_ref_idc == 0, HEVC TRAIL_N/RASL_N/RADL_N and
+   * the like, flagged `disposable` by the demuxer) are exactly the ones that can
+   * be skipped without breaking the stream: mpv's --framedrop=decoder. The
+   * decoder already has that switch for adaptive load shedding; it is thrown
+   * for the length of the catch-up and put back after, unless the performance
+   * detector has thrown it for good.
+   */
+  private beginVideoCatchUp(): void {
+    this._catchingUpVideo = true;
+    if (this.videoDecoder && !this._perfSkipLatched && !this._catchUpSkipEngaged) {
+      this.videoDecoder.setPerformanceSkip(true);
+      this._catchUpSkipEngaged = true;
+    }
+  }
+
+  private endVideoCatchUp(): void {
+    this._catchingUpVideo = false;
+    if (this._catchUpSkipEngaged) {
+      this._catchUpSkipEngaged = false;
+      if (!this._perfSkipLatched) this.videoDecoder?.setPerformanceSkip(false);
     }
   }
 
@@ -7642,7 +7670,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         !this.waitingForVideoSync && aheadReady && audioReady && videoReady;
       if (canResume) {
         this._primingAudio = false;
-        this._catchingUpVideo = false;
+        this.endVideoCatchUp();
         this._bufferingSelfInflicted = false;
         // Stamp the resume so the stall detector can tell this — a warm
         // pipeline picking back up — from a cold first play, and not hand it
@@ -7853,7 +7881,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         (this.videoRenderer?.getVideoUnderflowMs() ?? 0) >=
           VIDEO_UNDERFLOW_THRESHOLD_MS;
       if (pictureUnderflow) {
-        this._catchingUpVideo = true;
+        this.beginVideoCatchUp();
         this.enterStallBuffering(
           `Video underflow: no on-time frame for ${Math.round(this.videoRenderer?.getVideoUnderflowMs() ?? 0)}ms ` +
             `(sound buffered ${this.audioRenderer.getBufferedDuration().toFixed(2)}s), ` +
@@ -8951,9 +8979,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const packet = this.audioQueue.shift()!;
       // Decode audio even when muted. AudioRenderer keeps gain at 0 so
       // it stays silent, but the audio clock advances normally — without
-      // this, unmute pivots firstBufferMediaTime to wherever the demuxer
+      // this, unmute starts the audio timeline at wherever the demuxer
       // is (~1-3s ahead of presentation due to video buffer), and the
-      // drift correction in CanvasRenderer judders the video to chase it.
+      // picture has to jump forward to chase it.
       this.audioDecoder.decode(packet.data, packet.timestamp, packet.keyframe);
       this.noteAudioFed(packet);
     }
@@ -9189,7 +9217,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this._seekIsInternal = opts?.internal ?? false;
     // A seek rebuilds the picture at its target; there is nothing left to catch
     // up to the clock that was held.
-    this._catchingUpVideo = false;
+    this.endVideoCatchUp();
 
     if (this.streamWrapper) {
       return this.streamWrapper.seek(seconds);
@@ -11993,9 +12021,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // brief read-ahead pivot on rate change, far better than a stalled seek.
     //
     // Also skip it when a healthy audio clock is already anchoring playback:
-    // AudioRenderer.setPlaybackRate() re-anchors in place (stops the stale
-    // old-rate sources, pulls scheduledTime to now, keeps firstBufferMediaTime)
-    // so the pivot is already prevented WITHOUT a seek. The seek is a
+    // AudioRenderer.setPlaybackRate() carries the change in place (stops the
+    // stale old-rate sources, takes their buffers back, reschedules them at the
+    // new rate behind what is playing) so the pivot is already prevented
+    // WITHOUT a seek. The seek is a
     // re-prime of the whole demux→decode→render pipeline — invisible spinner,
     // but a brief frame hitch. Dropping it here makes the common case (audio
     // playing, buffer healthy) as seek-free as a native <video> rate change.
@@ -12056,8 +12085,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // audio scheduled ahead — the unstarted sources are stopped and their
     // original pre-stretch buffers pushed to the front of the pending queue,
     // re-stretched at the new tempo, rescheduled behind the chunk still
-    // playing — and it deliberately keeps hasFirstBuffer/firstBufferMediaTime
-    // so the clock cannot leap to the read-ahead. No media is dropped, so
+    // playing — and the segment it leaves behind keeps the old rate it was
+    // written with, so the clock cannot leap to the read-ahead. No media is dropped, so
     // there is no hole for an underrun to pivot on, and the span the seek went
     // back to fetch is the span the renderer is still holding.
     //

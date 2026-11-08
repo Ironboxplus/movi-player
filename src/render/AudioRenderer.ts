@@ -176,7 +176,7 @@ export class AudioRenderer {
   } | null = null;
   // Set while frames are being thrown away because the context is suspended
   // and we are muted (autoplay-blocked). Tells the recovery path that the
-  // clock anchor describes dropped audio and has to be rebuilt.
+  // scheduled timeline describes dropped audio and has to be rebuilt.
   private droppedWhileSuspended = false;
 
   /**
@@ -272,7 +272,7 @@ export class AudioRenderer {
    *
    * So the seam is found in the audio itself. The first buffer whose timestamp
    * jumps back is where the new pass begins; it is marked on the way in, and
-   * the anchor is armed with the context time it is actually started at.
+   * the seam is recorded with the context time it is actually started at.
    */
   private _loopArm: { lastAudioTime: number; found: boolean } | null = null;
   /**
@@ -1590,7 +1590,7 @@ export class AudioRenderer {
     // isPlaying / intentionalSuspend already set synchronously at the top of
     // play() so no decoded frames are dropped during the async resume window.
 
-    // NOTE: We do NOT reset scheduledTime or sync anchors here.
+    // NOTE: We do NOT reset scheduledTime or the scheduled segments here.
     // If we are resuming from pause (suspend), the buffer is preserved
     // and we want to continue exactly where we left off.
     // If this is a fresh start or seek, reset() would have been called previously.
@@ -2079,9 +2079,9 @@ export class AudioRenderer {
 
     // Resume AudioContext on unmute (user gesture) if it was suspended.
     // Awaited, so callers can sequence work behind a context that is actually
-    // running: the "running" statechange drops the stale clock anchor (see
-    // contextStateHandler), and anything scheduled before that lands on an
-    // anchor about to be thrown away — audio for those seconds is discarded
+    // running: the "running" statechange drops the timeline of dropped audio
+    // (see contextStateHandler), and anything scheduled before that lands on a
+    // timeline about to be thrown away — audio for those seconds is discarded
     // as late while the wall clock walks the picture forward without it.
     //
     // …but only while playback is actually running. pause() suspends the
@@ -3231,23 +3231,22 @@ export class AudioRenderer {
         sharedContextActivated = true;
         Logger.debug(TAG, "AudioContext recovered to running state");
         // Audio frames that arrived while the context was suspended were
-        // dropped, so the clock mapping (first-buffer anchor + the
-        // max-scheduled clamp) describes a moment that never played. Left
-        // alone, getAudioClock() then reports a time pinned near where the
-        // drop began — and since video presentation follows the audio clock,
-        // the picture freezes on its first frame. That is the black start on
-        // a muted autoplay: unmuting and seeking rebuilt the mapping, which
+        // dropped, so the scheduled timeline describes a moment that never
+        // played. Left alone, the audio clock would report a time pinned near
+        // where the drop began — and since video presentation follows the audio
+        // clock, the picture freezes on its first frame. That is the black start
+        // on a muted autoplay: unmuting and seeking rebuilt the mapping, which
         // is why it "fixed itself".
         //
-        // Drop the anchor instead: the next buffer scheduled after recovery
-        // re-establishes it, and until then getAudioClock() returns -1 and the
+        // Drop the timeline instead: the next buffer scheduled after recovery
+        // starts a new one, and until then the audio clock answers -1 and the
         // wall clock drives the video.
         if (this.droppedWhileSuspended) {
           this.droppedWhileSuspended = false;
           this.hasFirstBuffer = false;
           this._segments = [];
           this.maxScheduledMediaTime = 0;
-          Logger.debug(TAG, "Audio clock anchor reset after suspended drop");
+          Logger.debug(TAG, "Audio timeline reset after suspended drop");
         }
       }
     };

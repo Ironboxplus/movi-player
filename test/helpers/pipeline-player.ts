@@ -104,7 +104,7 @@ export interface PipelineFixture {
   readPacket: ReturnType<typeof vi.fn>;
   videoDecode: ReturnType<typeof vi.fn>;
   audioDecode: ReturnType<typeof vi.fn>;
-  videoDecoder: { queueSize: number };
+  videoDecoder: { queueSize: number; setPerformanceSkip: ReturnType<typeof vi.fn> };
   audioDecoder: { queueSize: number };
   tick: () => Promise<void>;
 }
@@ -134,6 +134,7 @@ export async function makePipelinePlayer(
     isWaitingForKeyframe: false,
     isRecentlyRecovering: () => false,
     keyframeWaitMs: () => 0,
+    setPerformanceSkip: vi.fn(),
     flush: vi.fn(async () => {}),
     getStats: () => (video.worker ? { worker: { queueDepth: 0 } } : {}),
     decode: vi.fn(() => {

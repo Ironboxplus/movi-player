@@ -60,6 +60,9 @@ describe("video underflow while the sound is fine", () => {
     expect(f.player.videoRenderer.stopPresentationLoop).toHaveBeenCalled();
     expect(f.player.wasPlayingBeforeRebuffer).toBe(true);
     expect(f.player._catchingUpVideo).toBe(true);
+    // The decoder is told to do less: nothing references a non-reference frame,
+    // so skipping them is the quickest way to reach a clock that is held.
+    expect(f.videoDecoder.setPerformanceSkip).toHaveBeenCalledWith(true);
   }, 20_000);
 
   it("waits out a shorter gap: the sound is not glitched for a hitch in the picture", async () => {
@@ -112,6 +115,19 @@ describe("video underflow while the sound is fine", () => {
     expect(f.player.audioRenderer.resumeFromBuffering).toHaveBeenCalledOnce();
     expect(f.player.stateManager.getState()).not.toBe("buffering");
     expect(f.player._catchingUpVideo).toBe(false);
+    // …and back to decoding everything once it has.
+    expect(f.videoDecoder.setPerformanceSkip).toHaveBeenLastCalledWith(false);
+  }, 20_000);
+
+  it("leaves non-reference skipping on if the performance detector asked for it for good", async () => {
+    const f = await playing({ videoUnderflowMs: VIDEO_UNDERFLOW_THRESHOLD_MS + 100 });
+    f.player._perfSkipLatched = true;
+    await f.tick();
+    expect(f.player.stateManager.getState()).toBe("buffering");
+    expect(f.videoDecoder.setPerformanceSkip).not.toHaveBeenCalled();
+
+    f.player.endVideoCatchUp();
+    expect(f.videoDecoder.setPerformanceSkip).not.toHaveBeenCalled();
   }, 20_000);
 
   it("does not discard anything while buffering for some other reason", async () => {
