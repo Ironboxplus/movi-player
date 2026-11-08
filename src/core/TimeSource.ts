@@ -113,3 +113,15 @@ export class PlaybackTimeSource {
     this._fromAudio = false;
   }
 }
+
+/**
+ * How long the picture may go without an on-time frame, while the sound still
+ * has plenty to play, before the player calls it a video underflow and holds
+ * the sound and the clock together so the decoder can catch up.
+ *
+ * Chromium's default: `video_underflow_threshold_` in renderer_impl.h, tunable
+ * between 1s and 8s, used by RendererImpl::OnBufferingStateChange
+ * (renderer_impl.cc) to defer the underflow so that a picture that hitches does
+ * not glitch a sound that is fine.
+ */
+export const VIDEO_UNDERFLOW_THRESHOLD_MS = 3000;

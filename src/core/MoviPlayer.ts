@@ -42,6 +42,7 @@ import { LRUCache } from "../cache";
 import { Demuxer } from "../demux";
 import { TrackManager } from "./TrackManager";
 import { Clock } from "./Clock";
+import { VIDEO_UNDERFLOW_THRESHOLD_MS } from "./TimeSource";
 import { PlayerStateManager } from "./PlayerState";
 import { loadPersistedLinkBps, lowerLinkBps, raiseLinkBps } from "../utils/LinkRate";
 import { Logger, LogLevel } from "../utils/Logger";
@@ -2304,6 +2305,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   // buffer it left behind — rather than a real data/decode stall. Those resume
   // the moment the pipeline is ready instead of serving the stall floor.
   private _bufferingSelfInflicted: boolean = false;
+  /**
+   * True from a video underflow until the stall it caused resumes: the picture
+   * is being caught up to a clock held where it stopped (see processLoop).
+   */
+  private _catchingUpVideo: boolean = false;
   private _lastRateChangeAt: number = 0;
   private _lastSeekResumeAt: number = 0;
 
@@ -7462,6 +7468,48 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
+   * Hold playback while a stream refills: the one way into "buffering" from
+   * playing, shared by every kind of stall (audio running dry, the picture
+   * running dry, the picture falling too far behind).
+   */
+  private enterStallBuffering(reason: string): void {
+    Logger.warn(TAG, reason);
+    this.wasPlayingBeforeRebuffer = true;
+    // A stall landing right after a rate change is one WE caused:
+    // AudioRenderer's re-anchor drops the scheduled old-rate audio, so
+    // the buffer reads empty for exactly as long as the decoder needs to
+    // refill. Nothing is actually starving — the decoder is idle and the
+    // video queue is full — so this must not serve the underrun recovery
+    // (1.5s dwell + a 2s cushion for software audio). Without this every
+    // speed change froze the picture for ~1.5-2s.
+    //
+    // A stall just after a SEEK resumed is the same story: the seek
+    // flushed both decoders, so playback restarts on whatever thin
+    // cushion the first packets provide and the underrun detector fires
+    // a few hundred ms later. Captured on a streaming 4K AV1 source —
+    // seek lands at 2.05s, audio ducks at 2.29s, stall at 2.50s, then
+    // the picture sat frozen for a further 1516ms serving the floor
+    // alone. The resume gate in processLoop is the right gate for both.
+    const now = performance.now();
+    this._bufferingSelfInflicted =
+      now - this._lastRateChangeAt <
+        MoviPlayer.SELF_INFLICTED_STALL_WINDOW_MS ||
+      now - this._lastSeekResumeAt <
+        MoviPlayer.SELF_INFLICTED_STALL_WINDOW_MS;
+    this.stateManager.setState("buffering");
+    this.clock.pause();
+    // Suspend AudioContext so already-scheduled audio doesn't play ahead of video.
+    // Keep isPlaying=true so render() still accepts AudioData and buffers fill up.
+    if (this.audioRenderer) {
+      this.audioRenderer.suspendForBuffering();
+    }
+    // Stop presentation loop so decoded frames accumulate in queue
+    // (otherwise it keeps consuming them and videoReady never becomes true)
+    if (this.videoRenderer) this.videoRenderer.stopPresentationLoop();
+    this._stallStartTime = 0;
+  }
+
+  /**
    * Main Playback Loop
    */
   private processLoop = async () => {
@@ -7558,6 +7606,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       // change is not that case — we discarded the scheduled audio ourselves in
       // the re-anchor and the decoder is idle and refilling at full speed — so
       // it takes the light threshold (_bufferingSelfInflicted).
+      // Catching the picture up to a clock that stopped: whatever the decoder
+      // delivers is behind that clock until it has caught up, and is dropped as it
+      // arrives, so "a frame is queued" below means one that can be shown ON TIME.
+      // The clock is held, so this converges: the decoder only has to reach it.
+      if (this._catchingUpVideo && this.videoRenderer) {
+        this.videoRenderer.discardLateFrames(this.clock.getTime());
+      }
       const audioTargetS =
         this._primingAudio && !this._bufferingSelfInflicted ? 2.0 : 0.1;
       const audioReady =
@@ -7587,6 +7642,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         !this.waitingForVideoSync && aheadReady && audioReady && videoReady;
       if (canResume) {
         this._primingAudio = false;
+        this._catchingUpVideo = false;
         this._bufferingSelfInflicted = false;
         // Stamp the resume so the stall detector can tell this — a warm
         // pipeline picking back up — from a cold first play, and not hand it
@@ -7778,7 +7834,32 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const audioBlocking =
         (audioUnderrunning || (this._bindAV && audioStarved)) &&
         this.audioSourceStarved();
-      if (videoStalled || audioBlocking) {
+      // The picture is not keeping up although neither side has run dry: the
+      // decoder is slower than the clock, so every frame it delivers is already
+      // late and is dropped (see CanvasRenderer.isLate), and the picture sits on
+      // what it has while the sound plays on. Chromium waits out exactly this for
+      // a while before calling it an underflow — with the audio still full, a
+      // video underflow is deferred by video_underflow_threshold_ (3s) so that a
+      // hitch in the picture does not cost a glitch in the sound
+      // (renderer_impl.cc OnBufferingStateChange; renderer_impl.h) — and then
+      // pauses the audio and the clock TOGETHER so the decoder can catch up to
+      // where the clock stopped. The same here: this is a stall like the others,
+      // and goes through the same buffering state and the same resume gate.
+      const pictureUnderflow =
+        this.videoIsConsumed() &&
+        !this.trackManager.getActiveVideoTrack()?.isAttachedPic &&
+        // A picture that has nothing left to show is finished, not behind.
+        !(this.eofReached && this.videoSourceStarved()) &&
+        (this.videoRenderer?.getVideoUnderflowMs() ?? 0) >=
+          VIDEO_UNDERFLOW_THRESHOLD_MS;
+      if (pictureUnderflow) {
+        this._catchingUpVideo = true;
+        this.enterStallBuffering(
+          `Video underflow: no on-time frame for ${Math.round(this.videoRenderer?.getVideoUnderflowMs() ?? 0)}ms ` +
+            `(sound buffered ${this.audioRenderer.getBufferedDuration().toFixed(2)}s), ` +
+            "holding audio and clock until the picture catches up",
+        );
+      } else if (videoStalled || audioBlocking) {
         // An underrun isn't a silent buffer dipping low — it's a hole the user
         // ALREADY heard as a click. Waiting the full stall window means five or
         // six audible glitches before the spinner appears, which is the whole
@@ -7818,47 +7899,13 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           this._stallStartFrames = framesNow;
         } else if (stallElapsed > effectiveStallTimeout) {
           // Only enter buffering after 500ms of continuous stall
-          Logger.warn(
-            TAG,
+          this.enterStallBuffering(
             audioUnderrunning
               ? "Stall detected: audio underrunning for 500ms (decode behind realtime), entering buffering state"
               : audioBlocking
                 ? "Stall detected: audio buffer empty and bound to video, entering buffering state"
                 : "Stall detected: buffers empty for 500ms, entering buffering state",
           );
-          this.wasPlayingBeforeRebuffer = true;
-          // A stall landing right after a rate change is one WE caused:
-          // AudioRenderer's re-anchor drops the scheduled old-rate audio, so
-          // the buffer reads empty for exactly as long as the decoder needs to
-          // refill. Nothing is actually starving — the decoder is idle and the
-          // video queue is full — so this must not serve the underrun recovery
-          // (1.5s dwell + a 2s cushion for software audio). Without this every
-          // speed change froze the picture for ~1.5-2s.
-          //
-          // A stall just after a SEEK resumed is the same story: the seek
-          // flushed both decoders, so playback restarts on whatever thin
-          // cushion the first packets provide and the underrun detector fires
-          // a few hundred ms later. Captured on a streaming 4K AV1 source —
-          // seek lands at 2.05s, audio ducks at 2.29s, stall at 2.50s, then
-          // the picture sat frozen for a further 1516ms serving the floor
-          // alone. The readiness checks below are the right gate for both.
-          const now = performance.now();
-          this._bufferingSelfInflicted =
-            now - this._lastRateChangeAt <
-              MoviPlayer.SELF_INFLICTED_STALL_WINDOW_MS ||
-            now - this._lastSeekResumeAt <
-              MoviPlayer.SELF_INFLICTED_STALL_WINDOW_MS;
-          this.stateManager.setState("buffering");
-          this.clock.pause();
-          // Suspend AudioContext so already-scheduled audio doesn't play ahead of video.
-          // Keep isPlaying=true so render() still accepts AudioData and buffers fill up.
-          if (this.audioRenderer) {
-            this.audioRenderer.suspendForBuffering();
-          }
-          // Stop presentation loop so decoded frames accumulate in queue
-          // (otherwise it keeps consuming them and videoReady never becomes true)
-          if (this.videoRenderer) this.videoRenderer.stopPresentationLoop();
-          this._stallStartTime = 0;
         }
       } else {
         this._stallStartTime = 0;
@@ -9140,6 +9187,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     },
   ): Promise<void> {
     this._seekIsInternal = opts?.internal ?? false;
+    // A seek rebuilds the picture at its target; there is nothing left to catch
+    // up to the clock that was held.
+    this._catchingUpVideo = false;
 
     if (this.streamWrapper) {
       return this.streamWrapper.seek(seconds);

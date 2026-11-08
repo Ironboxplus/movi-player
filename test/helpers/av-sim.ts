@@ -272,6 +272,8 @@ export class AvSim {
   audioCushion: number;
   private loopFlipPending = false;
   private playing = false;
+  /** Held for buffering: the decoders run, the clock, sound and picture do not. */
+  private holding = false;
 
   constructor(opts: SimOptions = {}) {
     this.fps = opts.fps ?? 24;
@@ -338,6 +340,32 @@ export class AvSim {
   /** Begin (or resume) playback the way MoviPlayer.play() does. */
   play(): void {
     void this.audio.play();
+    this.clock.start();
+    this.canvas.startPresentationLoop();
+    this.playing = true;
+  }
+
+  /**
+   * Stall the way MoviPlayer.enterStallBuffering() does: the clock, the sound
+   * and the presentation loop stop together, and the decoders carry on.
+   */
+  holdForBuffering(): void {
+    this.clock.pause();
+    this.audio.suspendForBuffering();
+    this.canvas.stopPresentationLoop();
+    this.playing = false;
+    this.holding = true;
+  }
+
+  /** The resume gate's side: pictures the clock has passed are dropped as they arrive. */
+  get isHolding(): boolean {
+    return this.holding;
+  }
+
+  /** Come out of a stall: sound, clock and picture start together. */
+  resumeFromBuffering(): void {
+    this.holding = false;
+    this.audio.resumeFromBuffering();
     this.clock.start();
     this.canvas.startPresentationLoop();
     this.playing = true;
@@ -438,6 +466,11 @@ export class AvSim {
   /** One display refresh: decoders run, then the presentation loop. */
   step(dtMs = VSYNC_MS): void {
     this.ref.t += dtMs;
+    if (this.holding) {
+      this.service(dtMs);
+      this.canvas.discardLateFrames(this.clock.getTime());
+      return;
+    }
     if (!this.playing) return;
     this.service(dtMs);
     (this.canvas as unknown as { presentationTick(): void }).presentationTick();

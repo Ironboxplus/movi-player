@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { VIDEO_UNDERFLOW_THRESHOLD_MS } from "../../src/core/TimeSource";
 import { AvSim, VSYNC_MS, halfFrame } from "../helpers/av-sim";
 
 vi.mock("../../dist/wasm/movi.js", () => ({ default: vi.fn(async () => ({})) }));
@@ -143,6 +144,46 @@ describe("A/V sync follows the one time source", () => {
 
       const w = sim.run(30);
       expect(w.maxErr).toBeLessThanOrEqual(halfFrame(24));
+    });
+  });
+
+  describe("a video underflow is held, and resumes in step", () => {
+    it("pauses sound and clock together after three seconds, then resumes in step", () => {
+      const sim = new AvSim({ fps: 24, decodeSpeed: 4 });
+      sim.start();
+      sim.run(10, 3);
+
+      // The decoder drops to a quarter of real time. Until the picture has gone
+      // three seconds without a frame on time, nothing is held: that is the
+      // deferral that spares the sound a glitch for a hitch in the picture.
+      sim.decodeSpeed = 0.25;
+      let steps = 0;
+      while (underflowMs(sim) < VIDEO_UNDERFLOW_THRESHOLD_MS && steps++ < 2000) sim.step();
+      expect(underflowMs(sim)).toBeGreaterThanOrEqual(VIDEO_UNDERFLOW_THRESHOLD_MS);
+      // The sound was still playing all that time; the clock was not stopped.
+      expect(sim.audio.getBufferedDuration()).toBeGreaterThan(0);
+
+      // The player's response (MoviPlayer.enterStallBuffering): hold everything.
+      sim.holdForBuffering();
+      const heldAt = sim.clock.getTime();
+      const presentedBefore = sim.presented.length;
+      sim.decodeSpeed = 4; // the stall is over: the decoder recovers
+
+      // Held, the decoder catches up to a clock that is not moving; the resume
+      // gate waits for a frame that is on time, and nothing is shown or heard.
+      let held = 0;
+      while (sim.queueSize < 1 && held++ < 2000) sim.step();
+      expect(sim.queueSize).toBeGreaterThanOrEqual(1);
+      expect(sim.clock.getTime()).toBe(heldAt);
+      expect(sim.presented.length).toBe(presentedBefore);
+      expect(sim.ctx.state).toBe("suspended");
+
+      sim.resumeFromBuffering();
+      sim.run(3);
+      const w = sim.run(30);
+      expect(w.samples).toBeGreaterThan(1000);
+      expect(w.maxErr).toBeLessThanOrEqual(halfFrame(24));
+      expect(underflowMs(sim)).toBe(0);
     });
   });
 
