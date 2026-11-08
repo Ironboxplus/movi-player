@@ -4,6 +4,7 @@
  */
 
 import { Logger } from "../utils/Logger";
+import type { PlaybackTimeSource } from "../core/TimeSource";
 import type { SubtitleCue } from "../types";
 import { KARAOKE_GHOST_DELIM } from "./sanitizeVttHtml";
 
@@ -81,15 +82,17 @@ export class CanvasRenderer {
   // Base size of 120 provides ~2s at 60fps, ~4s at 30fps
   private static readonly MAX_FRAME_QUEUE = 120;
 
-  // Ceiling on how long the presentation anchor may be pushed into the future
-  // to wait for a high-latency audio output. See audioStartLeadMs().
-  //
-  // Set above a real Bluetooth lead (~305ms of device lead plus ~305ms of
-  // output latency) on purpose: capping BELOW it doesn't avoid the wait, it
-  // splits it — the picture starts early by the remainder and the drift
-  // correction still has to claw that back, which is the stutter this is here
-  // to remove. It is a guard against a nonsense reading, not a budget.
-  private static readonly MAX_AUDIO_START_LEAD_S = 0.7;
+  /**
+   * How early a frame may be shown, in seconds: half a refresh at 60Hz.
+   *
+   * A frame picked now is on screen from the NEXT refresh, not this instant, so
+   * the nearer refresh for a frame due within half a refresh is this one.
+   * Chromium reaches the same place by choosing the frame with the most
+   * coverage of the refresh window (FindBestFrameByCoverage). The old rule —
+   * "due within a full frame interval" when nothing else was — showed every
+   * frame a refresh or two early, a steady lead on the sound.
+   */
+  private static readonly DUE_TOLERANCE_S = 1 / 120;
 
   private hdrEnabled: boolean = true;
   private isHDRSource: boolean = false;
@@ -277,30 +280,22 @@ export class CanvasRenderer {
   // present-capping is exactly the right answer for that one.
   private static readonly PERF_CONTENTION_SELF_SHARE = 0.35;
 
-  // Audio time provider for A/V sync
-  private getAudioTime: (() => number) | null = null;
+  // The time the picture is shown against: the player's one time source (see
+  // core/TimeSource.ts). The renderer keeps no clock of its own — a second one,
+  // free-running between corrections, is exactly what let the picture and the
+  // sound settle a fixed distance apart after a single hiccup.
+  private timeSource: PlaybackTimeSource | null = null;
   private _isAudioHealthy: (() => boolean) | null = null;
-  // Seconds until scheduled audio is actually audible — see
-  // AudioRenderer.secondsUntilAudible(). Non-zero only on a high-latency
-  // output (Bluetooth), and only for the moment after a start or a seek.
-  private _audioStartLead: (() => number) | null = null;
   private _shouldMeasurePerf: (() => boolean) | null = null;
 
-  // Presentation timing
-  private presentationStartTime: number = 0;
-  private presentationStartPts: number = 0;
+  // Presentation state
   private lastPresentedPts: number = -1;
-  private syncedToAudio: boolean = false;
-
-  // Set when the picture's anchor was dropped ON PURPOSE — a rate change, or an
-  // audio pipeline that was just rewound under it — as opposed to noticing we
-  // had drifted. The difference matters at the re-sync below: a spontaneous
-  // unsync is usually output jitter and re-anchoring on it stutters, so it is
-  // gated behind a large drift; a REQUESTED one has no old anchor worth
-  // keeping, and declining to re-anchor there is what left the offset in place.
-  private reanchorRequested: boolean = false;
-  private lastKnownAudioTime: number = -1;
   private playbackRate: number = 1.0;
+  /**
+   * performance.now() since which no on-time frame has been on screen or
+   * waiting, 0 while there is one. See getVideoUnderflowMs().
+   */
+  private _underflowSince: number = 0;
   private justSeeked: boolean = false; // Track if we just seeked (for post-seek frame handling)
   /** When a frame last went up, or when the queue was last cleared. Only used
    *  to bound how long the picture may be held while pre-roll is dropped. */
@@ -2799,27 +2794,21 @@ export class CanvasRenderer {
   }
 
   /**
-   * Set audio time provider for A/V sync
-   * Pass null to disable A/V sync and run video independently
+   * Set the time source the picture is presented against. Pass null to leave the
+   * renderer without a clock (nothing is presented from the queue until it has
+   * one).
+   *
+   * `isAudioHealthy` is only for the performance detectors, which must not blame
+   * the video pipeline for a stall that starved the audio too; it plays no part
+   * in what time it is.
    */
-  setAudioTimeProvider(
-    getAudioTime: (() => number) | null,
+  setTimeSource(
+    source: PlaybackTimeSource | null,
     isAudioHealthy?: (() => boolean) | null,
-    audioStartLead?: (() => number) | null,
   ): void {
-    this.getAudioTime = getAudioTime;
+    this.timeSource = source;
     this._isAudioHealthy = isAudioHealthy || null;
-    this._audioStartLead = audioStartLead || null;
-    if (getAudioTime) {
-      Logger.debug(TAG, "Audio time provider set");
-    } else {
-      Logger.debug(
-        TAG,
-        "Audio time provider disabled - video running independently",
-      );
-      // Reset sync state when disabling audio
-      this.syncedToAudio = false;
-    }
+    Logger.debug(TAG, source ? "Time source set" : "Time source cleared");
   }
 
   /**
@@ -2924,53 +2913,14 @@ export class CanvasRenderer {
 
     this.isPlaying = true;
 
-    // Only reset timing if we don't have frames (fresh start/seek)
-    // If we have queue, we are resuming, so keep last known PTS to avoid jumps
+    // A fresh start or seek has nothing on screen to continue from; a resume
+    // keeps the last presented time so the picture does not jump. Either way
+    // there is no clock to re-anchor: the time source was never ours.
     if (this.frameQueue.length === 0) {
       this.lastPresentedPts = -1;
       this.framesPresented = 0; // Reset frame counter for fresh start
-      this.syncedToAudio = false;
-      // Do NOT anchor the wall clock yet on a fresh start. If we set
-      // presentationStartTime here — before the first frame has decoded or
-      // audio has begun (8K/AV1 decode warmup can take ~1s) — getVideoTime
-      // accrues that elapsed against a stream that isn't playing, so the video
-      // clock races ahead. That surfaced as a ~1s startup "drift" that then
-      // hard-resets to audio, and in timing variants where a frame is already
-      // queued during the wait it presents frames at high speed (a startup
-      // fast-forward flash). Leave it at 0 so getVideoTime reports "not
-      // started" until the first frame / first audio sample anchors it cleanly
-      // (getVideoTime's videoTime<0 reset, or the first-frame present path).
-      this.presentationStartTime = 0;
-      this.presentationStartPts = 0;
-    } else {
-      // Resuming with frames: the stream is already playing, so start the wall
-      // clock now and anchor it to the last presented time to prevent a jump.
-      //
-      // "Now", unless the sound for this run hasn't reached the speakers yet —
-      // an ordinary unpause never waits (the audio anchor is long past, so the
-      // lead reads zero), but a resume out of the post-seek queue wait is a
-      // fresh audio run whose first buffer is still in flight. See
-      // audioStartLeadMs().
-      this.presentationStartTime = performance.now() + this.audioStartLeadMs();
-      if (this.lastPresentedPts >= 0) {
-        this.presentationStartPts = this.lastPresentedPts;
-      } else {
-        this.presentationStartPts = this.frameQueue[0].timestamp / 1_000_000;
-      }
-      this.syncedToAudio = false;
-      // Anchored on the frame we paused on — no jump — but that frame is NOT
-      // where the sound resumes. pause() suspends the context, it does not
-      // flush what the device already holds, so the audio clock comes back a
-      // step away from the paused picture: measured at +254ms, +11ms and
-      // -31ms across three resumes of one file. Left to the soft-sync branch
-      // every one of those steps under 400ms is accepted and kept for the
-      // rest of the run. It is the same situation a rate change creates, and
-      // it has the same answer: this unsync was caused by us, so there is no
-      // old anchor worth protecting — re-anchor on the sound the moment it is
-      // actually running. Nothing happens while the context is still coming
-      // out of suspend; the audio clock reports -1 until then.
-      this.reanchorRequested = true;
     }
+    this._underflowSince = 0;
 
     this.presentationLoop();
     Logger.debug(TAG, "Presentation loop started");
@@ -2981,6 +2931,7 @@ export class CanvasRenderer {
    */
   stopPresentationLoop(): void {
     this.isPlaying = false;
+    this._underflowSince = 0;
     this.stopSubtitleClock();
     // The perf windows are rates measured across wall-clock time, and nothing
     // is going to tick them while the loop is stopped. See resetPerfWindows().
@@ -3094,7 +3045,8 @@ export class CanvasRenderer {
     // a starving pipeline still registers its low present rate).
     this.samplePerformance();
 
-    // Get current playback time with high precision
+    // The time source's reading is the time: what is being heard, or a wall
+    // clock continuing from it when there is no sound to follow.
     let currentPlaybackTime = this.getCurrentPlaybackTime();
 
     // Startup fix: If we have frames but no time reference, show first frame
@@ -3106,8 +3058,6 @@ export class CanvasRenderer {
       currentPlaybackTime = 0;
     }
 
-    // For true 60fps, always try to present a frame if available
-    // This ensures we maintain frame rate even if timing is slightly off
     if (this.frameQueue.length === 0) {
       if (this.lastPresentedPts >= 0 || this.lastRenderedFrame) {
         this.updateActiveSubtitle();
@@ -3115,54 +3065,12 @@ export class CanvasRenderer {
         this.activeSubtitleCue = null;
       }
       this.renderSubtitles();
+      this.trackUnderflow(currentPlaybackTime);
       return; // No frames available, wait for next cycle
     }
 
     // Select the best frame to present
     const frameToPresent = this.selectFrameForPresentation(currentPlaybackTime);
-
-    // For 60fps videos, always present a frame if available to maintain smooth playback
-    // If no frame was selected but we have frames, use the first one
-    if (
-      !frameToPresent &&
-      this._presentFpsCap === 0 &&
-      this.videoFrameRate >= 60 &&
-      this.frameQueue.length > 0
-    ) {
-      // For 60fps, present the first available frame to maintain cadence
-      const firstFrame = this.frameQueue[0];
-      const frameTime = firstFrame.timestamp / 1_000_000;
-      const frameInterval = 1.0 / this.videoFrameRate;
-      // Reject frames that are too far ahead OR too far behind. Without the
-      // upper cap, hardware decoders that emit 8K frames in bursts queue
-      // many future-PTS frames; on >60Hz displays this fallback then drains
-      // them faster than wall-clock, advancing currentTime past the audio
-      // clock and tripping the audio-desync resync seek loop.
-      const ahead = frameTime - currentPlaybackTime;
-      const behind = currentPlaybackTime - frameTime;
-      if (ahead <= frameInterval && behind <= frameInterval * 2) {
-        this.drawFrame(firstFrame);
-
-        // Retain for resize redraws
-        this.releaseRetainedFrame();
-        try {
-          this.lastRenderedFrame = firstFrame.clone();
-        } catch (e) {
-          // Frame closed, ignore
-          this.lastRenderedFrame = null;
-        }
-
-        firstFrame.close();
-        this.frameQueue.shift();
-        this.lastPresentedPts = frameTime;
-        this.currentTime = frameTime;
-        this.framesPresented++;
-        this.onFramePresented?.(this.currentTime);
-        this.onFramePresented?.(this.currentTime);
-        this._lastPresentAt = performance.now();
-        return;
-      }
-    }
 
     if (frameToPresent) {
       // Draw and close the frame (drawFrame will update currentTime)
@@ -3186,6 +3094,8 @@ export class CanvasRenderer {
       }
     }
 
+    this.trackUnderflow(currentPlaybackTime);
+
     // Always update and render subtitles based on current playback time
     // This ensures subtitles appear/disappear at the right time even if no new frame is drawn
     this.updateActiveSubtitle();
@@ -3195,182 +3105,113 @@ export class CanvasRenderer {
   };
 
   /**
-   * Get current playback time using wall clock with loose A/V sync
-   * Video runs smoothly on wall clock, with periodic drift correction from audio
-   * This ensures smooth 60fps video playback while maintaining A/V sync
+   * The media time the picture is to be shown against, in seconds; -1 before
+   * there is any reference.
+   *
+   * The time source's reading, every frame, and nothing else. This used to be a
+   * wall clock of its own (anchor + elapsed) that was pulled towards the audio
+   * only when it had strayed past a deadband — and then only a fraction of the
+   * way — so whatever a disturbance left under the deadband stayed for the rest
+   * of the film. Chromium's video renderer does not keep a clock at all: it asks
+   * the audio renderer when each frame's time is (VideoRendererImpl asks
+   * TimeSource::GetWallClockTimes, renderers/video_renderer_impl.cc), and so
+   * does this.
    */
   private getCurrentPlaybackTime(): number {
-    // No picture at all: the sound IS the clock. Everything below exists to
-    // hold frames in step with the audio, and there are no frames — while the
-    // last-presented-PTS fallback right under this would pin every caption to
-    // -1 for the whole track, since nothing is ever presented.
+    const source = this.timeSource;
+    // No picture at all: the sound IS the clock, and the captions follow it.
     if (!this.isVideoConfigured || this.subtitleClockTimer !== null) {
-      return this.getAudioTime ? this.getAudioTime() : -1;
+      return source ? source.now() : -1;
     }
-    // When the presentation loop is stopped (player paused), the
-    // wall-clock formula below would advance time forever — but no one
-    // is consuming frames, so updateActiveSubtitle (called from
-    // setSubtitleCues during prefetch / track switches while paused)
-    // would pick increasingly-out-of-sync cues and the in-video
-    // subtitle would silently swap underneath the user. Return the last
-    // actually-presented PTS (or, before the first frame, the anchor
-    // pts) so the active cue stays pinned to the visible frame.
+    // When the presentation loop is stopped (player paused), nobody is
+    // consuming frames, but updateActiveSubtitle (called from setSubtitleCues
+    // during prefetch / track switches while paused) still asks. Pin to the
+    // last actually-presented PTS so the active cue stays on the visible frame.
     if (!this.isPlaying) {
-      if (this.lastPresentedPts >= 0) return this.lastPresentedPts;
-      if (this.presentationStartPts > 0) return this.presentationStartPts;
-      return -1;
+      return this.lastPresentedPts >= 0 ? this.lastPresentedPts : -1;
     }
-    // Always use wall clock for video timing (smooth 60fps)
-    //
-    // The anchor can sit in the FUTURE: on a high-latency output the sound for
-    // this run is not audible yet, so the anchor is placed at the moment it
-    // will be (see audioStartLeadMs). Floor the elapsed at zero exactly as the
-    // audio clock floors its own — the picture holds on the anchor frame until
-    // the sound reaches it, rather than running backwards from it.
-    let videoTime = -1;
-    if (this.presentationStartTime > 0) {
-      const elapsed = (performance.now() - this.presentationStartTime) / 1000;
-      videoTime =
-        this.presentationStartPts + Math.max(0, elapsed) * this.playbackRate;
-    }
-
-    // Check audio for drift correction (but don't block video)
-    let audioHealthy: boolean | null = null;
-    if (this.getAudioTime) {
-      const audioTime = this.getAudioTime();
-      const isHealthy = this._isAudioHealthy ? this._isAudioHealthy() : true;
-      audioHealthy = isHealthy;
-
-      // Track last known audio time for capping video when audio drops out
-      if (audioTime >= 0) {
-        this.lastKnownAudioTime = audioTime;
-      }
-
-      if (audioTime >= 0 && isHealthy) {
-        // Every drift budget below is in MEDIA seconds, and what the eye
-        // judges is REAL ones. At 0.25x a 150ms media offset is 600ms of the
-        // sound arriving after the mouth — the same number that is fine at 1x
-        // is four times as wrong at quarter speed. Scale the budgets with the
-        // rate, and never past 1, so speeds above 1x keep exactly the
-        // tolerances they have today.
-        const rateScale = Math.min(this.playbackRate, 1);
-
-        // First sync - initialize wall clock to match audio
-        if (!this.syncedToAudio) {
-          const drift = videoTime >= 0 ? Math.abs(videoTime - audioTime) : 0;
-          const isVeryEarlyPlayback = this.framesPresented <= 3;
-
-          // Reset presentation anchors if:
-          // 1. Video hasn't started yet (videoTime < 0), OR
-          // 2. Very early playback (≤3 frames) AND drift is significant (>30ms)
-          //    This gives Bluetooth audio time to stabilize before hard sync
-          // 3. Drift is very large (> 400ms) - critical desync recovery
-          // A drift too small for the 400ms bar below but too small for the
-          // continuous correction's own 150ms threshold has nowhere to go: the
-          // else-branch marks us synced and the offset becomes permanent. That
-          // is audible — measured on a 4K60 file, speed changes settled the
-          // picture 120-148ms off the sound and it stayed there. When the
-          // unsync was REQUESTED there is no old anchor worth protecting, so
-          // re-anchor whatever the drift is.
-          if (
-            this.reanchorRequested ||
-            videoTime < 0 ||
-            (isVeryEarlyPlayback && drift > 0.03 * rateScale) ||
-            drift > 0.4 * rateScale
-          ) {
-            this.reanchorRequested = false;
-            this.presentationStartTime =
-              performance.now() + this.audioStartLeadMs();
-            this.presentationStartPts = audioTime;
-            this.syncedToAudio = true;
-            Logger.debug(TAG, `Initial A/V sync: audioTime=${audioTime.toFixed(3)}s, framesPresented=${this.framesPresented}, drift=${(drift * 1000).toFixed(0)}ms, early=${isVeryEarlyPlayback}`);
-            return audioTime;
-          } else {
-            // We're already playing, just mark as synced without resetting
-            // This prevents stuttering when Bluetooth latency causes audio clock fluctuations
-            this.syncedToAudio = true;
-            this.reanchorRequested = false;
-            Logger.debug(TAG, `Soft A/V sync (no reset): videoTime=${videoTime.toFixed(3)}s, audioTime=${audioTime.toFixed(3)}s, framesPresented=${this.framesPresented}, drift=${(drift * 1000).toFixed(0)}ms`);
-          }
-        }
-
-        // High-FPS (≥50fps) at slow speed: aggressive drift correction to prevent
-        // video racing ahead of audio due to backpressure-induced audio gaps.
-        const isSlowHighFps = this.playbackRate < 0.99 && this.videoFrameRate >= 50;
-
-        // …but not against a clock that has not started yet. Before the first
-        // scheduled buffer is audible the audio clock is flat at the run's
-        // starting media time by construction, so `drift` here is not drift at
-        // all — it is the lead itself, read as error. On Bluetooth that is
-        // ~600ms, far past the 150ms threshold, so this fired every frame and
-        // walked presentationStartPts backwards ~600ms over a handful of ticks:
-        // the picture stopped dead until the wall clock caught up with where
-        // the anchor had been dragged to. That is the freeze a moment after
-        // every seek that only ever showed up on Bluetooth. The anchor is
-        // already placed for the lead above; there is nothing to correct until
-        // sound is actually coming out.
-        if (
-          videoTime >= 0 &&
-          this.framesPresented > 30 &&
-          this.audioStartLeadMs() <= 0
-        ) {
-          const drift = videoTime - audioTime;
-          // Anything under this threshold is banked forever: the branch above
-          // marks us synced without moving the anchor, and this is the only
-          // thing that would have closed it. Read off a 25fps file watched at
-          // 0.25x — resume after a pause settled the picture 70ms off the
-          // sound and kept it there, because 70ms never reached the 150ms bar,
-          // and 70ms of media at quarter speed is 280ms of real lip-sync
-          // error. The deadband is wide on purpose (a tight one chases
-          // Bluetooth's own clock jitter and judders), so keep the width in
-          // REAL time and let the media-time figure follow the rate. Clamped
-          // rather than scaled so the tighter high-fps value still wins where
-          // it applies and 1x is bit-for-bit what it was.
-          const threshold = Math.min(isSlowHighFps ? 0.05 : 0.15, 0.15 * rateScale);
-          const strength = isSlowHighFps ? 0.5 : 0.25;
-
-          if (Math.abs(drift) > threshold) {
-            this.presentationStartPts -= drift * strength;
-          }
-        }
-
-        const elapsed = (performance.now() - this.presentationStartTime) / 1000;
-        return (
-          this.presentationStartPts + Math.max(0, elapsed) * this.playbackRate
-        );
-      }
-    }
-
-    // Once audio has established a clock, never let a hardware decoder drain
-    // video frames far ahead while that clock is unhealthy. This applies at
-    // every normal playback rate: the existing slow/high-FPS guard missed the
-    // common 24fps/1x case and allowed it to race through queued frames.
-    const shouldCapToAudio =
-      videoTime >= 0 &&
-      this.lastKnownAudioTime >= 0 &&
-      this.syncedToAudio &&
-      audioHealthy === false;
-    if (shouldCapToAudio) {
-      return Math.min(videoTime, this.lastKnownAudioTime + 0.15);
-    }
-    return videoTime >= 0 ? videoTime : -1;
+    return source ? source.now() : -1;
   }
 
   /**
-   * How far in the future to place a fresh presentation anchor so the picture
-   * starts moving with the sound rather than ahead of it, in ms.
+   * How far from its own interval a frame may be shown, in seconds.
    *
-   * Zero on every ordinary output — the provider reports the real figure and it
-   * is a handful of milliseconds there. Capped so a device reporting something
-   * absurd (or a stale reading taken across a route change) can't park the
-   * picture: past a third of a second the honest thing is to start the picture
-   * and let the drift correction close the rest.
+   * ITU-R BR.265 puts the acceptable drift at half a frame; Chromium floors it
+   * at 1/60 s (below what anyone can see, and enough for 60fps content to be
+   * stable) and caps it at 1/8 s so low frame rates are not left visibly off
+   * (video_renderer_algorithm.cc, max_acceptable_drift_).
    */
-  private audioStartLeadMs(): number {
-    if (!this._audioStartLead) return 0;
-    const lead = this._audioStartLead();
-    if (!(lead > 0)) return 0;
-    return Math.min(lead, CanvasRenderer.MAX_AUDIO_START_LEAD_S) * 1000;
+  private maxAcceptableDrift(): number {
+    const interval = 1 / Math.max(1, this.videoFrameRate);
+    return Math.min(1 / 8, Math.max(1 / 60, interval / 2));
+  }
+
+  /**
+   * Is a frame too late to show at `time`? Chromium measures a frame's drift as
+   * the distance from the deadline to the frame's [start, end] interval
+   * (CalculateAbsoluteDriftForFrame) — a 24fps frame is right for 42ms, not
+   * for an instant — and a frame whose interval ended more than the acceptable
+   * drift ago is one the algorithm will not pick.
+   */
+  private isLate(frameSec: number, time: number): boolean {
+    return time - (frameSec + 1 / Math.max(1, this.videoFrameRate)) > this.maxAcceptableDrift();
+  }
+
+  /**
+   * Note whether the picture has something on time, for getVideoUnderflowMs().
+   *
+   * On time means the frame on screen still covers the clock (within the
+   * acceptable drift of the end of its interval), or the next frame is queued
+   * and simply not due yet. Anything else — an empty queue, or a queue that was
+   * nothing but late frames — is the picture failing to keep up, whatever the
+   * sound is doing.
+   */
+  private trackUnderflow(time: number): void {
+    let onTime = true;
+    if (time >= 0 && this.lastPresentedPts >= 0) {
+      const covered = !this.isLate(this.lastPresentedPts, time);
+      const waiting =
+        this.frameQueue.length > 0 && this.frameQueue[0].timestamp / 1_000_000 > time;
+      onTime = covered || waiting;
+    }
+    if (onTime) {
+      this._underflowSince = 0;
+    } else if (this._underflowSince === 0) {
+      this._underflowSince = performance.now();
+    }
+  }
+
+  /**
+   * How long, in ms, the picture has been without an on-time frame; 0 while it
+   * has one.
+   *
+   * The renderer only measures. What to do about it belongs to the player, which
+   * knows whether the sound still has plenty to play: Chromium defers a video
+   * underflow for three seconds in that case (renderer_impl.cc, the deferred
+   * video underflow, and `video_underflow_threshold_` in renderer_impl.h) and
+   * only then pauses everything so the decoder can catch up.
+   */
+  getVideoUnderflowMs(): number {
+    return this._underflowSince > 0 ? performance.now() - this._underflowSince : 0;
+  }
+
+  /**
+   * Drop every queued frame that is too late for `time`, counting each as
+   * dropped, without touching what is on screen. For the player to call while
+   * it holds playback to let the decoder catch up: the frames that arrive then
+   * are late by however long the hold lasts, and they can never be shown.
+   */
+  discardLateFrames(time: number): number {
+    let dropped = 0;
+    while (this.frameQueue.length > 0) {
+      const head = this.frameQueue[0];
+      if (!this.isLate(head.timestamp / 1_000_000, time)) break;
+      head.close();
+      this.frameQueue.shift();
+      this.framesDropped++;
+      dropped++;
+    }
+    return dropped;
   }
 
   /**
@@ -3393,19 +3234,17 @@ export class CanvasRenderer {
       // makes video play 1-2s behind audio for several seconds. If audio
       // is already ahead, skip stale frames so the first-presented frame
       // is near the current playback position.
-      if (this.getAudioTime) {
-        const audioTime = this.getAudioTime();
-        if (audioTime >= 0) {
-          const tolerance = 0.2; // 200ms — beyond this and the lag is visible
-          while (this.frameQueue.length > 1) {
-            const head = this.frameQueue[0];
-            const headSec = head.timestamp / 1_000_000;
-            if (headSec < audioTime - tolerance) {
-              head.close();
-              this.frameQueue.shift();
-            } else {
-              break;
-            }
+      const audioTime = this.timeSource ? this.timeSource.now() : -1;
+      if (audioTime >= 0) {
+        // The same bar as everywhere else: a frame too late to show is not shown.
+        while (this.frameQueue.length > 1) {
+          const head = this.frameQueue[0];
+          if (this.isLate(head.timestamp / 1_000_000, audioTime)) {
+            head.close();
+            this.frameQueue.shift();
+            this.framesDropped++;
+          } else {
+            break;
           }
         }
       }
@@ -3415,18 +3254,6 @@ export class CanvasRenderer {
       this.currentTime = this.lastPresentedPts;
       this.framesPresented = 1; // First frame presented
       this._lastPresentAt = performance.now();
-
-      // Initialize presentation timing.
-      //
-      // This frame goes up now — it is the picture at the seek target and the
-      // viewer should see it immediately — but the clock that walks FORWARD
-      // from it starts when the sound does. On a normal output that is the same
-      // instant; on Bluetooth the audio for this run is ~600ms from being
-      // audible, and starting the wall clock now would run the picture that far
-      // ahead of it. See audioStartLeadMs().
-      this.presentationStartTime = performance.now() + this.audioStartLeadMs();
-      this.presentationStartPts = this.lastPresentedPts;
-      this.syncedToAudio = false;
 
       Logger.debug(
         TAG,
@@ -3499,20 +3326,17 @@ export class CanvasRenderer {
       // 9.35, 9.45 — a three second rewind, sixty-two backward presentations in
       // one run, which is the flicker where frames "come and then go".
       //
-      // Skipping them leaves them for the prune below, which drops anything
-      // more than maxBehind behind the clock — it could not reach them before
-      // because it stops at the frame this loop selected. The three sites that
-      // legitimately restart the picture somewhere else (an empty queue, the
-      // stale-frame drop, clearQueue on a real seek) all reset lastPresentedPts
-      // to -1, so a genuine backward seek is untouched.
+      // Skipping them leaves them for the prune below, which drops what can
+      // never be shown. The three sites that legitimately restart the picture
+      // somewhere else (an empty queue, the stale-frame drop, clearQueue on a
+      // real seek) all reset lastPresentedPts to -1, so a genuine backward seek
+      // is untouched.
       if (this.lastPresentedPts >= 0 && frameTime < this.lastPresentedPts - 0.0005) {
-        this._backwardsRefused++;
         continue;
       }
 
       // Frame is due if its timestamp is at or before currentTime (with small tolerance)
-      if (frameTime <= currentTime + 0.005) {
-        // 5ms tolerance
+      if (frameTime <= currentTime + CanvasRenderer.DUE_TOLERANCE_S) {
         bestFrame = frame;
         bestIndex = i;
       } else if (frameTime > currentTime + maxLookAhead) {
@@ -3521,51 +3345,22 @@ export class CanvasRenderer {
       }
     }
 
-    // If no frame is due yet, check if we should present an early frame
-    // This handles the case where we're slightly behind
-    if (!bestFrame && this.frameQueue.length > 0) {
-      const firstFrame = this.frameQueue[0];
-      const firstFrameTime = firstFrame.timestamp / 1_000_000;
-
-      // Same rule as the loop above, and it has to be repeated here: this
-      // fallback reaches straight for the head of the queue, so without it the
-      // no-going-backwards test is simply stepped around — which is exactly
-      // what a first attempt at this did, leaving the count of backward
-      // presentations unchanged at sixty-odd.
-      const wouldGoBackwards =
-        this.lastPresentedPts >= 0 &&
-        firstFrameTime < this.lastPresentedPts - 0.0005;
-
-      // If first frame is coming up soon (within one frame interval), present it
-      if (!wouldGoBackwards && firstFrameTime <= currentTime + frameInterval) {
-        bestFrame = firstFrame;
-        bestIndex = 0;
-      }
-    }
-
-    // Pre-roll after a seek is not playback.
+    // A frame whose moment has passed is not shown.
     //
-    // A resync restarts the decoder at the keyframe BEFORE the target, so the
-    // frames that arrive first sit behind the clock. Presenting them plays that
-    // gap at whatever rate the decoder can manage — measured at 3.3x on a 4K60
-    // source, which is the picture visibly racing for a moment before settling.
-    // Dropping them instead holds the last frame a fraction longer and then
-    // resumes at 1x, already in sync. It shows at 60fps first because the same
-    // gap in seconds holds two and a half times the frames.
-    if (bestFrame && this.justSeeked) {
-      const behind = currentTime - bestFrame.timestamp / 1_000_000;
-      const tolerance = Math.max(0.12, frameInterval * 4);
-      // …but never hold for long. A machine that cannot reach the clock at all
-      // would otherwise show a frozen picture over playing audio, which is
-      // worse than a late one — so past this the stale frame goes up anyway.
-      const held = performance.now() - this._lastPresentAt;
-      if (behind > tolerance && held < 500) {
-        for (const f of this.frameQueue.splice(0, bestIndex + 1)) {
-          f.close();
-          this.framesSkippedLate++;
-        }
-        return null;
-      }
+    // The latest due frame is the best candidate, so if even that one ended
+    // longer ago than the acceptable drift, everything queued before it did too:
+    // the lot is dropped, counted, and the picture stays on what it has until a
+    // frame that is on time arrives. This is ffplay's framedrop and Chromium's
+    // refusal to pick a frame past max_acceptable_drift_. Showing it anyway —
+    // which this used to do for anything within two seconds — is what let the
+    // picture run seconds behind the sound with the player none the wiser: the
+    // frames were all dutifully presented, each as late as the one before.
+    if (bestFrame && this.isLate(bestFrame.timestamp / 1_000_000, currentTime)) {
+      const late = this.frameQueue.splice(0, bestIndex + 1);
+      for (const f of late) f.close();
+      this.framesDropped += late.length;
+      bestFrame = null;
+      bestIndex = -1;
     }
 
     // Clear justSeeked flag after we've found a frame
@@ -3573,22 +3368,19 @@ export class CanvasRenderer {
       this.justSeeked = false;
     }
 
-    // Drop old frames that are too far behind (more than 2 frame intervals)
-    // BUT do not drop the best frame we just found!
-    const maxBehind = Math.max(2.0, frameInterval * 2);
-    while (this.frameQueue.length > 0) {
-      const oldestFrame = this.frameQueue[0];
-      const oldestFrameTime = oldestFrame.timestamp / 1_000_000;
-
-      // If this is the frame we want to present, do not prune it
-      if (oldestFrame === bestFrame) break;
-
-      if (currentTime - oldestFrameTime > maxBehind) {
-        this.frameQueue.shift()?.close();
-        this.framesSkippedLate++;
-      } else {
-        break;
-      }
+    // Frames that can never be shown: older than the picture already on screen.
+    // A corrective seek restarts the demuxer behind the playhead without
+    // clearing this queue, so what arrives next starts from the keyframe before
+    // it. They are counted so a held picture can say why (see below).
+    while (
+      this.frameQueue.length > 0 &&
+      this.lastPresentedPts >= 0 &&
+      this.frameQueue[0] !== bestFrame &&
+      this.frameQueue[0].timestamp / 1_000_000 < this.lastPresentedPts - 0.0005
+    ) {
+      this.frameQueue.shift()?.close();
+      this.framesSkippedLate++;
+      this._backwardsRefused++;
     }
 
     // If we found a frame, update tracking and remove old frames
@@ -5330,51 +5122,13 @@ export class CanvasRenderer {
   }
 
   /**
-   * Forget the audio clock this renderer was following, keeping the frames and
-   * the presentation anchor. For an audio track switch: the old track's clock
-   * is void and the new one is being built, which is not the audio dropping
-   * out. Left alone, getCurrentPlaybackTime reads the silence as an outage and
-   * holds the picture at the old track's last time plus 0.15s until the new
-   * sound arrives (seconds), then discards the frames it was held behind. With
-   * the sync released the picture runs on its wall clock, and the first
-   * healthy audio sync takes the usual path (hard re-anchor beyond 0.4s,
-   * otherwise soft). A real outage never calls this, so the cap still holds.
-   */
-  releaseAudioSync(): void {
-    this.syncedToAudio = false;
-    this.lastKnownAudioTime = -1;
-  }
-
-  /**
    * Set playback rate
    */
   setPlaybackRate(rate: number): void {
-    const currentTime = this.getCurrentPlaybackTime();
+    // Nothing to re-anchor: the time source runs at the rate itself (the sound
+    // carries its own per segment, the wall clock is told by the clock), and the
+    // picture only ever reads it.
     this.playbackRate = Math.max(0.25, Math.min(4, rate));
-
-    // Always update presentation anchors when playback rate changes
-    // This ensures video timing is recalculated with the new rate
-    if (this.presentationStartTime > 0) {
-      this.presentationStartTime = performance.now();
-      this.presentationStartPts = currentTime;
-    }
-
-    // Mark as not synced so we can re-sync to audio with new rate — and say
-    // that this one was asked for, so the re-sync actually re-anchors instead
-    // of accepting whatever offset the rate change introduced.
-    this.syncedToAudio = false;
-    this.reanchorRequested = true;
-  }
-
-  /**
-   * The audio pipeline was rebuilt underneath a picture that never stopped —
-   * the rate-change rewind does exactly this. The sound now starts from a media
-   * time the video's anchor knows nothing about, so re-anchor the picture on it
-   * rather than leaving the two a fixed distance apart forever.
-   */
-  requestAudioReanchor(): void {
-    this.syncedToAudio = false;
-    this.reanchorRequested = true;
   }
 
   /**
@@ -5434,7 +5188,7 @@ export class CanvasRenderer {
       frameQueueSize: this.frameQueue.length,
       colorSpace: this.colorSpace,
       resolution: this.width > 0 ? `${this.width}x${this.height}` : "N/A",
-      syncedToAudio: this.syncedToAudio,
+      syncedToAudio: this.timeSource?.isAudioDriven() ?? false,
     };
   }
 
@@ -5460,12 +5214,9 @@ export class CanvasRenderer {
       }
     }
     if (dropped > 0) {
-      // Reset presentation anchors so the next surviving frame starts cleanly
-      // against the new clock position.
-      this.presentationStartTime = 0;
-      this.presentationStartPts = 0;
+      // Nothing on screen is known to be right any more: let the next surviving
+      // frame go up as the first frame of a run.
       this.lastPresentedPts = -1;
-      this.syncedToAudio = false;
       Logger.debug(
         TAG,
         `Dropped ${dropped} stale frames before ${targetTimeSec.toFixed(3)}s (tolerance ${toleranceSec.toFixed(2)}s)`,
@@ -5935,14 +5686,8 @@ export class CanvasRenderer {
     }
     this.frameQueue = [];
     this.lastPresentedPts = -1;
-    this.syncedToAudio = false;
-    this.lastKnownAudioTime = -1;
     this.framesPresented = 0; // Reset frame counter
-
-    // Reset presentation timing to prevent stuttering after seek
-    // This ensures the next frame after seek starts with fresh timing
-    this.presentationStartTime = 0;
-    this.presentationStartPts = 0;
+    this._underflowSince = 0;
 
     // Mark that we just seeked - this will make frame selection more forgiving
     this.justSeeked = true;
@@ -5951,7 +5696,7 @@ export class CanvasRenderer {
     // seek — measuring from there would spend the whole allowance at once.
     this._lastPresentAt = performance.now();
 
-    Logger.debug(TAG, "Frame queue cleared and presentation timing reset");
+    Logger.debug(TAG, "Frame queue cleared");
   }
 
   /**

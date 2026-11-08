@@ -20,7 +20,7 @@ afterEach(() => {
  * for 42ms: a picture 30ms "behind" the sound by pts is still the right one.
  */
 function underflowMs(sim: AvSim): number {
-  return (sim.canvas as unknown as { getVideoUnderflowMs?: () => number }).getVideoUnderflowMs?.() ?? 0;
+  return sim.canvas.getVideoUnderflowMs();
 }
 
 describe("A/V sync follows the one time source", () => {

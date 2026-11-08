@@ -12,9 +12,7 @@ import { Clock, type AudioClockProvider } from "../../src/core/Clock";
 
 function fakeAudio(overrides: Partial<AudioClockProvider> = {}): AudioClockProvider {
   return {
-    getAudioClock: () => -1,
-    hasHealthyBuffer: () => true,
-    isAudioPlaying: () => true,
+    mediaTimeAt: () => -1,
     ...overrides,
   };
 }
@@ -161,120 +159,152 @@ describe("Clock: playback rate", () => {
   });
 });
 
-describe("Clock: audio-sync drift correction", () => {
-  it("hard-syncs to the audio clock on the first healthy reading", () => {
+describe("Clock: one time source, no deadband", () => {
+  it("reads the audio time source from the first reading", () => {
     const now = vi.spyOn(performance, "now");
     now.mockReturnValue(0);
-    const audio = fakeAudio({ getAudioClock: () => 10, hasHealthyBuffer: () => true });
     const clock = new Clock();
-    clock.setAudioProvider(audio);
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => 10 }));
     clock.start();
 
     expect(clock.getTime()).toBe(10);
     expect(clock.isSyncedToAudio()).toBe(true);
   });
 
-  it("ignores audio while its buffer is unhealthy and uses the wall clock instead", () => {
+  it("follows the audio exactly, however small the difference from the wall clock", () => {
+    // The old clock ran its own wall time and ignored any disagreement under
+    // 100ms ("banked forever"), then corrected half of the rest. There is no
+    // wall time to disagree with while the audio answers.
     const now = vi.spyOn(performance, "now");
     now.mockReturnValue(0);
-    const audio = fakeAudio({ getAudioClock: () => 99, hasHealthyBuffer: () => false });
+    let audioTime = 0;
     const clock = new Clock();
-    clock.setAudioProvider(audio);
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => audioTime }));
     clock.start();
+    clock.getTime();
 
-    now.mockReturnValue(500); // +0.5s wall clock
-    expect(clock.getTime()).toBeCloseTo(0.5, 6);
+    now.mockReturnValue(1_000);
+    audioTime = 0.95; // 50ms behind the wall clock, under the old 100ms bar
+    expect(clock.getTime()).toBeCloseTo(0.95, 9);
+
+    now.mockReturnValue(2_000);
+    audioTime = 1.8; // 200ms behind: not "half corrected" either
+    expect(clock.getTime()).toBeCloseTo(1.8, 9);
+  });
+
+  it("passes the instant it is asked about through to the audio side", () => {
+    const now = vi.spyOn(performance, "now");
+    now.mockReturnValue(4_321);
+    const asked: number[] = [];
+    const clock = new Clock();
+    clock.setAudioProvider(
+      fakeAudio({
+        mediaTimeAt: (t) => {
+          asked.push(t);
+          return 7;
+        },
+      }),
+    );
+    clock.start();
+    clock.getTime();
+    expect(asked.at(-1)).toBe(4_321);
+  });
+
+  it("carries on from the last heard time when the audio goes away, without a jump", () => {
+    const now = vi.spyOn(performance, "now");
+    now.mockReturnValue(0);
+    let audioTime = 10;
+    const clock = new Clock();
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => audioTime }));
+    clock.start();
+    expect(clock.getTime()).toBe(10);
+
+    now.mockReturnValue(500);
+    expect(clock.getTime()).toBe(10); // still the sound
+    audioTime = -1; // the sound is gone (track ended, context refused)
+    now.mockReturnValue(1_000); // the last read was at 500ms
+    expect(clock.getTime()).toBeCloseTo(10.5, 6);
     expect(clock.isSyncedToAudio()).toBe(false);
+
+    now.mockReturnValue(1_700);
+    expect(clock.getTime()).toBeCloseTo(11.2, 6);
   });
 
-  it("ignores a negative audio clock reading (not yet available)", () => {
+  it("takes the audio's value when it answers again", () => {
     const now = vi.spyOn(performance, "now");
     now.mockReturnValue(0);
-    const audio = fakeAudio({ getAudioClock: () => -1 });
+    let audioTime = -1;
     const clock = new Clock();
-    clock.setAudioProvider(audio);
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => audioTime }));
+    clock.seek(5);
     clock.start();
 
-    now.mockReturnValue(300);
-    expect(clock.getTime()).toBeCloseTo(0.3, 6);
+    now.mockReturnValue(2_000);
+    expect(clock.getTime()).toBeCloseTo(7, 6); // wall clock from the seek
+
+    audioTime = 7.05; // what is actually being heard
+    expect(clock.getTime()).toBeCloseTo(7.05, 9);
+    expect(clock.isSyncedToAudio()).toBe(true);
+    now.mockReturnValue(2_500);
+    audioTime = 7.55;
+    expect(clock.getTime()).toBeCloseTo(7.55, 9);
   });
 
-  it("applies only 50% gradual correction for drift within small-but-over-threshold range", () => {
+  it("setAudioProvider(null) continues the wall clock from the last audio time", () => {
     const now = vi.spyOn(performance, "now");
     now.mockReturnValue(0);
-    let audioTime = 0;
-    const audio = fakeAudio({ getAudioClock: () => audioTime, hasHealthyBuffer: () => true });
     const clock = new Clock();
-    clock.setAudioProvider(audio);
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => 10 }));
     clock.start();
-    clock.getTime(); // consumes the first-call hard sync (to audioTime=0)
-
-    // Wall clock advances 1.0s (playbackRate=1) while audio only advanced to
-    // 0.8s — 200ms of drift, over the 100ms correction threshold.
-    now.mockReturnValue(1_000);
-    audioTime = 0.8;
-    const corrected = clock.getTime();
-    // Wall clock alone would read 1.0s; 50% correction toward the 0.2s drift
-    // pulls it to 0.9s, not all the way to 0.8s.
-    expect(corrected).toBeCloseTo(0.9, 2);
-  });
-
-  it("does not correct drift within the 100ms threshold", () => {
-    const now = vi.spyOn(performance, "now");
-    now.mockReturnValue(0);
-    let audioTime = 0;
-    const audio = fakeAudio({ getAudioClock: () => audioTime, hasHealthyBuffer: () => true });
-    const clock = new Clock();
-    clock.setAudioProvider(audio);
-    clock.start();
-    clock.getTime(); // consumes the first-call hard sync (to audioTime=0)
-
-    now.mockReturnValue(1_000);
-    audioTime = 0.95; // 50ms drift — under the 100ms threshold
-    expect(clock.getTime()).toBeCloseTo(1.0, 6);
-  });
-
-  it("setAudioProvider(null) drops the sync latch and falls back to wall clock only", () => {
-    const now = vi.spyOn(performance, "now");
-    now.mockReturnValue(0);
-    const audio = fakeAudio({ getAudioClock: () => 10, hasHealthyBuffer: () => true });
-    const clock = new Clock();
-    clock.setAudioProvider(audio);
-    clock.start();
-    clock.getTime(); // triggers the hard sync — sync only happens inside getTime()
+    clock.getTime();
     expect(clock.isSyncedToAudio()).toBe(true);
 
     clock.setAudioProvider(null);
     expect(clock.isSyncedToAudio()).toBe(false);
 
-    // setAudioProvider(null) only clears the latch — it does not re-anchor
-    // baseTime, so the wall clock keeps counting up from where the hard
-    // sync left it (audio 10s at wall-clock 0), not from 0.
     now.mockReturnValue(400);
     expect(clock.getTime()).toBeCloseTo(10.4, 6);
   });
-});
 
-describe("Clock.getVideoSyncTime — always prefers audio when a valid reading exists", () => {
-  it("returns the audio clock when healthy", () => {
+  it("exposes the same time source the renderer reads", () => {
+    const now = vi.spyOn(performance, "now");
+    now.mockReturnValue(0);
     const clock = new Clock();
-    clock.setAudioProvider(fakeAudio({ getAudioClock: () => 7, hasHealthyBuffer: () => true }));
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => 33 }));
     clock.start();
-    expect(clock.getVideoSyncTime()).toBe(7);
+    expect(clock.timeSource.now()).toBe(33);
+    expect(clock.getTime()).toBe(33);
   });
 
-  it("still returns the (clamped) audio clock even when the buffer is unhealthy, as long as it's non-negative", () => {
+  it("holds the audio time through a pause and does not read the audio meanwhile", () => {
+    const now = vi.spyOn(performance, "now");
+    now.mockReturnValue(0);
+    const mediaTimeAt = vi.fn(() => 12);
     const clock = new Clock();
-    clock.setAudioProvider(fakeAudio({ getAudioClock: () => 3, hasHealthyBuffer: () => false }));
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt }));
     clock.start();
-    expect(clock.getVideoSyncTime()).toBe(3);
+    clock.pause();
+    expect(clock.getTime()).toBe(12);
+    const calls = mediaTimeAt.mock.calls.length;
+    now.mockReturnValue(9_000);
+    expect(clock.getTime()).toBe(12);
+    expect(mediaTimeAt.mock.calls.length).toBe(calls);
+  });
+});
+
+describe("Clock.getVideoSyncTime — the same reading as getTime", () => {
+  it("returns the audio time", () => {
+    const clock = new Clock();
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => 7 }));
+    clock.start();
+    expect(clock.getVideoSyncTime()).toBe(7);
   });
 
   it("falls back to the wall clock when audio has no valid reading yet", () => {
     const now = vi.spyOn(performance, "now");
     now.mockReturnValue(0);
     const clock = new Clock();
-    clock.setAudioProvider(fakeAudio({ getAudioClock: () => -1 }));
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => -1 }));
     clock.start();
 
     now.mockReturnValue(700);
@@ -283,7 +313,7 @@ describe("Clock.getVideoSyncTime — always prefers audio when a valid reading e
 
   it("returns the paused time while not running, ignoring the audio provider", () => {
     const clock = new Clock();
-    clock.setAudioProvider(fakeAudio({ getAudioClock: () => 55 }));
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => 55 }));
     clock.seek(3);
     expect(clock.getVideoSyncTime()).toBe(3);
   });
@@ -293,10 +323,18 @@ describe("Clock.getVideoSyncTime — always prefers audio when a valid reading e
     now.mockReturnValue(0);
     const clock = new Clock();
     clock.setDuration(2);
-    clock.setAudioProvider(fakeAudio({ getAudioClock: () => -1 }));
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => -1 }));
     clock.start();
 
     now.mockReturnValue(9_000);
     expect(clock.getVideoSyncTime()).toBe(2);
+  });
+
+  it("does not clamp the sound to the duration: it is what is being played", () => {
+    const clock = new Clock();
+    clock.setDuration(2);
+    clock.setAudioProvider(fakeAudio({ mediaTimeAt: () => 2.4 }));
+    clock.start();
+    expect(clock.getVideoSyncTime()).toBe(2.4);
   });
 });

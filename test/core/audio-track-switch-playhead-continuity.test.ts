@@ -210,7 +210,17 @@ describe("audio track switch: the playhead is continuous", () => {
         internals.renderDecodedPCM(makeFrame(t));
         step(0.05, `joined audio at ${t.toFixed(2)}s`);
       }
-      for (let i = 0; i < 20; i++) step(0.05, "steady after the switch");
+      // The decoder keeps delivering, as a real one does: a clock that is the
+      // sound holds where the sound stops, so a test that stopped feeding it
+      // after 0.6s would be asserting that silence moves the playhead.
+      for (let i = 0; i < 20; i++) {
+        // One 0.1s frame per two 0.05s steps keeps the sound just ahead.
+        if (i % 2 === 0) {
+          internals.renderDecodedPCM(makeFrame(t));
+          t += FRAME_DURATION;
+        }
+        step(0.05, "steady after the switch");
+      }
 
       // A playhead that never fell back or ran ahead also ends where the wall
       // clock says it should: 0.3 + 0.2 + 0.3 + 1.0s after the first reading.

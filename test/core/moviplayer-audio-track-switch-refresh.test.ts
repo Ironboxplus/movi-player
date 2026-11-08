@@ -117,11 +117,16 @@ describe("audio track switch: the demuxer refreshes, the picture does not", () =
     await f.settle();
   }, 20_000);
 
-  it("releases the renderer's audio sync together with the audio and clock resets", async () => {
+  it("starts the audio timeline over and re-seats the clock where the playhead was", async () => {
     const f = await switching();
     f.player.clock.seek(10);
     f.switchNow();
-    expect(f.player.videoRenderer.releaseAudioSync).toHaveBeenCalledTimes(1);
+    // The old track's timeline is gone with its sound: a new segment list, not
+    // an anchor patched. The picture is not told anything — it reads the same
+    // time source, which carries on from 10s on the wall clock until the new
+    // sound arrives.
+    expect(f.player.audioRenderer.reset).toHaveBeenCalledTimes(1);
+    expect(f.player.clock.getTime()).toBeCloseTo(10, 1);
     await f.settle();
   }, 20_000);
 

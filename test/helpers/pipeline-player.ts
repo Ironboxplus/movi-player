@@ -88,6 +88,8 @@ export interface PipelineOptions {
   audioBuffered?: number;
   /** Decoded frames the video renderer holds. */
   rendererQueue?: number;
+  /** How long the picture has been without an on-time frame, in ms. */
+  videoUnderflowMs?: number;
   waitingForVideoSync?: boolean;
   wasPlayingBeforeRebuffer?: boolean;
   /** What `readPacket()` returns, in order; `null` (EOF) afterwards. */
@@ -185,7 +187,8 @@ export async function makePipelinePlayer(
       stopPresentationLoop: vi.fn(),
       startPresentationLoop: vi.fn(),
       clearQueue: vi.fn(),
-      releaseAudioSync: vi.fn(),
+      getVideoUnderflowMs: () => opts.videoUnderflowMs ?? 0,
+      discardLateFrames: vi.fn(() => 0),
       getHeadFrameTime: () => 12,
       getStats: () => ({ framesPresented: 0 }),
     },

@@ -105,6 +105,29 @@ function audioStartRefused(): boolean {
  */
 let contextSuspendIntent = false;
 
+/**
+ * A stretch of the output timeline: from `ctxStart` to `ctxEnd` (context
+ * seconds) the device plays media `mediaStart` onward, `rate` media seconds per
+ * context second. The Chromium AudioClock's "buffer" entry
+ * (media/audio/audio_clock.cc), minus the frame counts.
+ */
+interface ScheduledSegment {
+  ctxStart: number;
+  ctxEnd: number;
+  mediaStart: number;
+  rate: number;
+}
+
+/**
+ * Two stretches that meet within this many seconds, at the same rate, are one.
+ * Keeps an hour of 20ms buffers from becoming 180k entries to search; the
+ * error it admits is bounded by this, once, not accumulated (a stretch that
+ * drifts further than it starts a new entry).
+ */
+const SEGMENT_JOIN_TOLERANCE_S = 0.001;
+/** How much of the already-heard timeline is kept to answer for. */
+const SEGMENT_KEEP_BEHIND_S = 2;
+
 export class AudioRenderer {
   private audioContext: AudioContext | null = null;
   // Fixed fan-in bus: every decoded source connects here. Keeping the input
@@ -156,24 +179,22 @@ export class AudioRenderer {
   // clock anchor describes dropped audio and has to be rebuilt.
   private droppedWhileSuspended = false;
 
-  // Audio clock tracking for A/V sync
-  private firstBufferScheduledAt: number = 0;
   /**
-   * The context time this RUN of sound starts at — the moment the picture has
-   * to wait out before the first of it reaches the speakers. See
-   * secondsUntilAudible().
+   * The output timeline, as it was written: one entry per stretch of sound (or
+   * of silence that stands for media) handed to the audio thread.
    *
-   * Not the same thing as firstBufferScheduledAt, which is the anchor the
-   * media clock's arithmetic hangs off and is RE-BASED whenever that
-   * arithmetic needs it to be — most importantly by a speed change, which
-   * moves it to "now" so the old rate's elapsed time is not read at the new
-   * one. Nothing about the sound restarts there; it is playing, and has been.
-   * Reading that re-based anchor as a run start answers "how long until it is
-   * audible" with the device's whole output latency, which on Bluetooth is a
-   * quarter of a second of picture parked at every speed change.
+   * This is what the audio clock is. Chromium's AudioClock
+   * (media/audio/audio_clock.cc) keeps the same thing — the extents of what has
+   * been rendered, with the playback rate each stretch was rendered at — and
+   * answers "what is being heard" by looking the playhead up in it, rather than
+   * by counting elapsed time from a first buffer. Counting from an anchor
+   * assumes every buffer after it landed edge to edge, and nothing does: an
+   * underrun, a late schedule or a rate change each leaves the count describing
+   * sound that was never played, which is how picture and sound drifted apart
+   * for good after one hiccup. A list written at the moment each buffer is
+   * started has no such assumption to violate.
    */
-  private soundRunStartedAt: number = 0;
-  private firstBufferMediaTime: number = 0;
+  private _segments: ScheduledSegment[] = [];
   private hasFirstBuffer: boolean = false;
   // performance.now() of the last buffer underrun (a hole we patched with
   // silence). Sustained underruns mean packets aren't reaching the renderer in
@@ -209,39 +230,34 @@ export class AudioRenderer {
   /**
    * The sound is over, and no more of it is coming.
    *
-   * getAudioClock() clamps to maxScheduledMediaTime so a runaway clock cannot
-   * outrun what has been scheduled. That is right while more audio is on its
-   * way and wrong once there is none: an audio track SHORTER than the picture
-   * leaves the clock parked at the last sample for good, and everything that
-   * follows it — the master clock and the renderer's own presentation timing
-   * both read this — stops with it. Measured on a 4K AV1 MKV whose Opus track
+   * The audio clock holds at the end of the last thing scheduled, so that it
+   * cannot outrun the sound. That is right while more audio is on its way and
+   * wrong once there is none: an audio track SHORTER than the picture leaves
+   * the clock parked at the last sample for good, and everything that follows
+   * it — the master clock and the renderer's own presentation timing both read
+   * this — stops with it. Measured on a 4K AV1 MKV whose Opus track
    * ends at 193.4s against a picture running to 243.8s: playback stopped dead
    * at 3:13 with fifty seconds of video left.
    *
    * Once the player says the stream has ended AND the head has reached it,
-   * report no clock at all. Both readers already treat a negative time as
-   * "time this yourself", which is exactly right: there is no sound left to
+   * report no clock at all. The time source treats that as "carry on from the
+   * last time you gave me", which is exactly right: there is no sound left to
    * sync to, and the picture should play out on its own.
    */
   private _streamEnded: boolean = false;
 
   /**
-   * A media-time origin that takes effect at a CONTEXT time still in the
-   * future — how a gapless loop turns the corner.
+   * The context time at which the next loop pass begins sounding — the seam of
+   * a gapless loop.
    *
-   * The audio clock is `firstBufferMediaTime + elapsed-since-the-anchor`, so
-   * moving the origin back to zero for the next pass cannot be done when that
-   * pass is SCHEDULED: its samples are queued a cushion ahead of the ones
-   * being heard, and re-anchoring then would drop the clock to zero while the
-   * end of the previous pass is still coming out of the speakers.
-   *
-   * So the new origin is armed with the context time its first sample begins
-   * at, and getAudioClock()/getCurrentTime() adopt it once the output has
-   * actually reached that point. Before the seam they read the old pass, after
-   * it the new one, and the samples themselves were never interrupted.
+   * The clock needs nothing done at the seam: the new pass's samples are
+   * simply another segment whose media time starts over, and the lookup finds
+   * it when the playhead gets there. What the seam is still needed for is the
+   * bookkeeping that is about WHEN: isLoopSeamPending() tells the player when
+   * to turn the picture over, and the furthest-scheduled media time belongs to
+   * the pass being heard until then.
    */
-  private _pendingAnchor: { atContextTime: number; mediaOrigin: number } | null =
-    null;
+  private _loopSeamAt: number | null = null;
 
   /**
    * A loop pass the player has started reading, whose first buffer has not
@@ -1186,6 +1202,7 @@ export class AudioRenderer {
     const minTime = now + 0.005 + deviceLead;
 
     // Detect buffer underrun
+    let underran = false;
     if (this.scheduledTime < now) {
       // Record it: a run of these means the decode pipeline is behind realtime
       // and playback is audibly broken. The player watches this to show its
@@ -1224,14 +1241,10 @@ export class AudioRenderer {
       }
 
       this.scheduledTime = minTime;
-
-      if (this.hasFirstBuffer) {
-        // Pivot global clock if we underrun (resync)
-        this.firstBufferScheduledAt = minTime;
-        this.firstBufferMediaTime = audioTime;
-        // The sound ran out and begins again here, so this one IS a run start.
-        this.soundRunStartedAt = minTime;
-      }
+      // Nothing to re-anchor: the hole is simply the stretch of the timeline no
+      // segment covers, and the clock holds across it (see mediaTimeAt). The
+      // sound that follows starts a segment of its own where it is placed.
+      underran = true;
     }
 
     // Packets are flowing again if this buffer arrived without a hole; fade
@@ -1247,33 +1260,43 @@ export class AudioRenderer {
     // the future, so they were invisible in every log.
     let targetScheduleTime = this.scheduledTime;
 
-    if (this.hasFirstBuffer) {
-      const expectedTime =
-        this.firstBufferScheduledAt +
-        (audioTime - this.firstBufferMediaTime) / this._playbackRate;
-
-      const drift = expectedTime - this.scheduledTime;
-      // 1. Re-anchoring to the media timeline. A 20ms disagreement between
-      //    where the PTS says this buffer belongs and where the previous one
-      //    ended was corrected by jumping straight to the PTS — tearing a 20ms
-      //    hole, or overlapping 20ms of two buffers, on every correction. On a
-      //    source whose PTS grid does not divide evenly into its frame
-      //    duration that correction fires over and over, which is a click
-      //    every few hundred milliseconds and nothing in the log.
+    const prev = this._segments[this._segments.length - 1];
+    if (this.hasFirstBuffer && prev && !underran && !loopStart) {
+      // 1. A gap in the MEDIA between the last buffer and this one — the PTS
+      //    says this sound belongs later than where the previous one ended. A
+      //    20ms disagreement between the two was once corrected by jumping
+      //    straight to the PTS — tearing a 20ms hole, or overlapping 20ms of two
+      //    buffers, on every correction. On a source whose PTS grid does not
+      //    divide evenly into its frame duration that correction fires over and
+      //    over, which is a click every few hundred milliseconds and nothing in
+      //    the log.
       //
-      //    Forward is now filled rather than jumped. Backward is not honoured
-      //    at all: playing two buffers over each other is worse than being
-      //    20ms early, and the clock's own sync corrects the offset without
-      //    touching the audio.
-      if (drift > 0.02) {
+      //    Forward is filled rather than jumped. Backward is not honoured at
+      //    all: playing two buffers over each other is worse than being 20ms
+      //    early.
+      //
+      //    The filler is a segment that ADVANCES media time at the playback
+      //    rate: the silence stands for media that really has no sound (the
+      //    file's audio starts late, or has a hole), so the picture plays on
+      //    through it. That is unlike the holes below, which are only the
+      //    output being late and consume no media at all.
+      const prevMediaEnd = prev.mediaStart + (prev.ctxEnd - prev.ctxStart) * prev.rate;
+      const gap = (audioTime - prevMediaEnd) / this._playbackRate;
+      if (gap > 0.02) {
         this.fillSeam(
           this.scheduledTime,
-          drift,
+          gap,
           numberOfChannels,
           sampleRate,
           "re-anchor",
         );
-        targetScheduleTime = expectedTime;
+        this.appendSegment(
+          this.scheduledTime,
+          this.scheduledTime + gap,
+          prevMediaEnd,
+          this._playbackRate,
+        );
+        targetScheduleTime = this.scheduledTime + gap;
       }
     }
 
@@ -1295,11 +1318,12 @@ export class AudioRenderer {
     }
     source.start(when);
 
-    // The next loop pass starts sounding at `when` — that is the seam, exact
-    // at any rate, and the clock takes the new origin once output reaches it.
+    // The next loop pass starts sounding at `when` — that is the seam, exact at
+    // any rate. Its samples are an ordinary segment (media time starting over);
+    // the seam is remembered only to tell the player when the picture turns over.
     if (loopStart && this.hasFirstBuffer) {
       this._loopArm = null;
-      this._pendingAnchor = { atContextTime: when, mediaOrigin: audioTime };
+      this._loopSeamAt = when;
       this._nextPassMaxMediaTime = 0;
       Logger.debug(
         TAG,
@@ -1307,11 +1331,16 @@ export class AudioRenderer {
       );
     }
 
+    // What the device is about to play, and when: the one place the audio clock
+    // is written. The span is what was actually scheduled — the stretched
+    // buffer's own length when the stretcher ran, so a rate change that came
+    // out a few frames off its nominal length is still mapped exactly.
+    const ctxSpan = usedStretcher
+      ? processedBuffer.duration
+      : audioBuffer.duration / this._playbackRate;
+    this.appendSegment(when, when + ctxSpan, audioTime, audioBuffer.duration / ctxSpan);
+
     if (!this.hasFirstBuffer) {
-      this.firstBufferScheduledAt = when;
-      this.firstBufferMediaTime = audioTime;
-      // A genuine start: nothing is coming out of the speakers yet.
-      this.soundRunStartedAt = when;
       this.hasFirstBuffer = true;
       Logger.debug(
         TAG,
@@ -1383,7 +1412,7 @@ export class AudioRenderer {
     outputEverFed = true;
 
     const endMediaTime = audioTime + audioBuffer.duration;
-    if (this._pendingAnchor) {
+    if (this._loopSeamAt !== null) {
       if (endMediaTime > this._nextPassMaxMediaTime) {
         this._nextPassMaxMediaTime = endMediaTime;
       }
@@ -1849,8 +1878,6 @@ export class AudioRenderer {
     if (this._playbackRate === newRate) return;
     this.discardPendingPCM();
 
-    const oldRate = this._playbackRate;
-
     // Clear stretcher state when rate changes.
     if (this.preservePitch && this.signalsmith) {
       this.signalsmith.tempo = newRate;
@@ -1880,9 +1907,8 @@ export class AudioRenderer {
       );
     }
 
-    // Re-anchor the audio→media clock at the CURRENT play position, then take
-    // back the stale old-rate audio scheduled ahead of `now` so the rate change
-    // is heard immediately instead of after a multi-second tail.
+    // Take back the stale old-rate audio scheduled ahead of `now`, so the rate
+    // change is heard immediately instead of after a multi-second tail.
     //
     // TAKE BACK, not throw away — that distinction is the whole second of
     // silence this used to cost.
@@ -1909,37 +1935,23 @@ export class AudioRenderer {
     // — a chunk, tens of milliseconds — and is the bridge across the change
     // rather than a click to be faded over.
     //
-    // Crucially we do NOT clear firstBufferMediaTime / hasFirstBuffer the way
-    // reset() does. Keeping the anchor (mapped through the OLD rate up to now)
-    // means the next chunk schedules via expectedTime against the current
-    // playhead — so the audio clock does NOT leap to the demuxer's read-ahead
-    // mediaTime, and the video does not hard-snap forward. That leap was the
-    // "jumps 1–3s ahead on rate change" regression.
+    // The audio clock needs no re-anchoring for any of this, and that is the
+    // point of keeping it as a list of what was scheduled: the retained segment
+    // keeps the old rate it was written with, the segments taken back are
+    // struck from the list, and what is rescheduled is written at the new rate.
+    // There is no "elapsed time since an anchor" to be read at the wrong rate —
+    // which is what froze the picture for the length of the pre-change history
+    // when this was done to a PAUSED player.
     //
-    // None of this may be skipped while the context is SUSPENDED, which is
-    // what pause() leaves behind — and requiring "running" here skipped all of
-    // it, so a rate change made from a paused player re-anchored nothing.
-    // getAudioClock() maps the whole span since the anchor through the
-    // CURRENT rate, so on resume the entire pre-change history was re-scaled:
-    // anchored at media 108.716, played 6.82s at 1x to a pause at 115.532,
-    // then 1x → 0.25x gave 108.716 + 6.82 * 0.25 = 110.42 — the clock reported
-    // 110.427 and the picture, which may not go back over frames it has
-    // already shown, froze for the 5.1s hole. At 0.25x that is 20 seconds of
-    // still image. A suspended context is the ideal place to do this work:
-    // currentTime is frozen at the instant of the pause, so `now` IS the
-    // paused position and the same arithmetic that is right while running is
-    // right here. Only a closed context has nothing to re-anchor.
+    // None of this may be skipped while the context is SUSPENDED, which is what
+    // pause() leaves behind: currentTime is frozen at the instant of the pause,
+    // so `now` IS the paused position. Only a closed context has nothing to do.
     if (
       this.audioContext &&
       this.audioContext.state !== "closed" &&
       this.hasFirstBuffer
     ) {
       const now = this.audioContext.currentTime;
-      const currentMediaTime =
-        this.firstBufferMediaTime +
-        (now - this.firstBufferScheduledAt) * oldRate;
-      this.firstBufferScheduledAt = now;
-      this.firstBufferMediaTime = currentMediaTime;
 
       // A hair of slack on "has it begun": a source due within a few
       // milliseconds is already the audio thread's, and stopping it is a cut in
@@ -1972,6 +1984,10 @@ export class AudioRenderer {
           reclaimed.push({ buffer: origin.buffer, audioTime: origin.audioTime });
         }
       }
+
+      // The segments of everything that was taken back (and of the silence
+      // laid in front of it) are no longer on the timeline.
+      this.truncateSegmentsAt(seam);
 
       // Back at the FRONT of the queue and in schedule order: this is the media
       // immediately after what is playing, and everything already waiting comes
@@ -2101,7 +2117,7 @@ export class AudioRenderer {
     // no longer over — see _streamEnded.
     this._streamEnded = false;
     // Whatever loop seam was armed belonged to the run being thrown away.
-    this._pendingAnchor = null;
+    this._loopSeamAt = null;
     this._loopArm = null;
     this._nextPassMaxMediaTime = 0;
     // Silence first, always — not only under stable audio.
@@ -2181,11 +2197,10 @@ export class AudioRenderer {
     this._ducked = false;
     this._lastUnderrunAt = 0;
 
-    // Reset clock tracking
+    // Reset clock tracking: the old timeline described sound that is being
+    // thrown away, and the next buffer starts a new one.
     this.hasFirstBuffer = false;
-    this.firstBufferScheduledAt = 0;
-    this.soundRunStartedAt = 0;
-    this.firstBufferMediaTime = 0;
+    this._segments = [];
     this.scheduledCount = 0;
     this.maxScheduledMediaTime = 0;
 
@@ -2234,113 +2249,11 @@ export class AudioRenderer {
    */
   getCurrentTime(): number {
     // Use accurate audio clock during playback
-    if (
-      this.isPlaying &&
-      this.audioContext &&
-      this.audioContext.state === "running" &&
-      this.hasFirstBuffer
-    ) {
-      this.adoptPendingAnchor();
-      const elapsed =
-        this.audioContext.currentTime - this.firstBufferScheduledAt;
-      let computedTime =
-        this.firstBufferMediaTime + Math.max(0, elapsed * this._playbackRate);
-
-      const latency =
-        (this.audioContext as any).outputLatency ||
-        (this.audioContext as any).baseLatency ||
-        0;
-      if (latency > 0) {
-        computedTime -= latency * this._playbackRate;
-        // Prevent time from going below the first buffer time (Bluetooth high latency fix)
-        computedTime = Math.max(computedTime, this.firstBufferMediaTime);
-      }
-
-      return computedTime;
+    if (this.isPlaying && this.audioContext?.state === "running") {
+      const heard = this.mediaTimeAt(performance.now());
+      if (heard >= 0) return heard;
     }
     return this.currentMediaTime;
-  }
-
-  /**
-   * How long from now until the audio we have scheduled is actually HEARD —
-   * i.e. how long getAudioClock() will keep returning firstBufferMediaTime
-   * unchanged before it starts advancing. Zero once sound is playing out, and
-   * on every device whose latency is small enough not to matter.
-   *
-   * Two separate delays stack up at the start of every playback run, and both
-   * are deliberate:
-   *
-   *  - the first buffer is placed one output-latency ahead (`deviceLead`, see
-   *    render()) so the scheduler has a window to queue the buffers behind it
-   *    instead of handing a deep device a single buffer and starving it;
-   *  - and what is scheduled at context time T is heard at T + outputLatency,
-   *    which getAudioClock() subtracts so video syncs to what is HEARD.
-   *
-   * On a wired or built-in output that is ~5-25ms twice over and nobody can
-   * tell. On Bluetooth it is ~305ms twice over: for the first ~600ms after a
-   * seek there is no sound yet, and the audio clock is flat by construction.
-   *
-   * The video side has to know that, because its own clock is wall-clock based
-   * and would otherwise start advancing immediately from an anchor taken off
-   * that flat value — running ~600ms ahead of the sound, until the drift
-   * correction notices and yanks the presentation anchor backwards, which is
-   * seen as the picture freezing a moment after every seek. Bluetooth only,
-   * because on anything else the number is too small to cross the threshold.
-   */
-  /**
-   * What secondsUntilAudible() will report once the next run's first buffer is
-   * scheduled — the deviceLead render() is about to apply, plus the latency it
-   * will then take to be heard.
-   *
-   * Callers that have to decide whether to hold playback need the figure BEFORE
-   * any buffer exists: right after a seek the flush has cleared hasFirstBuffer,
-   * so secondsUntilAudible() honestly reports zero and would talk them out of a
-   * wait that is coming regardless.
-   */
-  expectedStartLead(): number {
-    if (!this.audioContext) return 0;
-    const ctx = this.audioContext as AudioContext & {
-      outputLatency?: number;
-      baseLatency?: number;
-    };
-    const latency = ctx.outputLatency || ctx.baseLatency || 0;
-    // Mirrors render()'s deviceLead, warm case included — this figure is what
-    // the video side holds for, so a prediction bigger than the real delay is
-    // a picture parked for nothing.
-    const warmOutput = outputEverFed;
-    return Math.min(warmOutput ? 0.12 : 0.5, latency) + latency;
-  }
-
-  /**
-   * How long until sound is actually coming out — measured once there is a
-   * buffer to measure, predicted before there is.
-   *
-   * The two halves answer the same question at different moments and must not
-   * be mixed up: after a seek's flush there is no scheduled buffer, so the
-   * measurement honestly reports zero, and a caller that acts on it starts the
-   * picture with no lead at all. Past the first buffer the prediction is
-   * stale — the live figure counts down to zero as the sound approaches, and
-   * must be allowed to reach it, or the drift correction it gates never runs.
-   */
-  startLead(): number {
-    if (!this.audioContext) return 0;
-    return this.hasFirstBuffer
-      ? this.secondsUntilAudible()
-      : this.expectedStartLead();
-  }
-
-  secondsUntilAudible(): number {
-    if (!this.audioContext || !this.hasFirstBuffer) return 0;
-    if (this.audioContext.state !== "running") return 0;
-    const ctx = this.audioContext as AudioContext & {
-      outputLatency?: number;
-      baseLatency?: number;
-    };
-    const latency = ctx.outputLatency || ctx.baseLatency || 0;
-    return Math.max(
-      0,
-      this.soundRunStartedAt + latency - ctx.currentTime,
-    );
   }
 
   /**
@@ -2366,32 +2279,202 @@ export class AudioRenderer {
     return this.getBufferedDuration() >= minSeconds;
   }
 
-  /**
-   * Get the audio clock - THE MASTER TIME SOURCE FOR A/V SYNC
-   * Returns accurate time based on when audio actually started playing
-   * Returns -1 if audio hasn't started yet
-   * Clamps to maxScheduledMediaTime when audio has ended
-   */
+  // ─── The audio clock: what is being heard ──────────────────────────
 
   /**
-   * Take up an armed origin once the output has actually reached it. Called
-   * from both clock readers rather than on a timer: the only moment that
-   * matters is the one being asked about.
+   * Where the output device is, in context time, at `perfNowMs`.
+   *
+   * getOutputTimestamp() is the W3C-specified pair {contextTime, performanceTime}
+   * taken at one instant: the position of the sample being played out, with the
+   * device's own latency already inside it, against the performance.now() clock.
+   * That pairing is what converts between the two clocks without either being
+   * counted from an anchor — it is re-read every time, so the audio hardware
+   * running a hundred ppm off performance.now() is simply a different pair on
+   * the next call and never accumulates. The fallback, for a browser without it,
+   * is the context's own currentTime minus its reported output latency.
+   *
+   * Suspended contexts report a frozen position, which is right: the playhead
+   * is not moving.
    */
-  private adoptPendingAnchor(): void {
-    const p = this._pendingAnchor;
-    if (!p || !this.audioContext) return;
-    if (this.audioContext.currentTime < p.atContextTime) return;
-    this.firstBufferScheduledAt = p.atContextTime;
-    this.firstBufferMediaTime = p.mediaOrigin;
-    this._pendingAnchor = null;
-    // The clamp's horizon now belongs to the pass being heard.
+  private heardContextTime(perfNowMs: number): number {
+    const ctx = this.audioContext as
+      | (AudioContext & { outputLatency?: number; baseLatency?: number })
+      | null;
+    if (!ctx) return 0;
+    if (ctx.state === "running" && typeof ctx.getOutputTimestamp === "function") {
+      const ts = ctx.getOutputTimestamp();
+      if (
+        typeof ts.contextTime === "number" &&
+        typeof ts.performanceTime === "number" &&
+        ts.performanceTime > 0
+      ) {
+        return ts.contextTime + (perfNowMs - ts.performanceTime) / 1000;
+      }
+    }
+    const latency = ctx.outputLatency || ctx.baseLatency || 0;
+    const sinceNow = ctx.state === "running" ? (perfNowMs - performance.now()) / 1000 : 0;
+    return ctx.currentTime - latency + sinceNow;
+  }
+
+  /**
+   * The media time being HEARD at `perfNowMs` (performance.now() ms), or -1
+   * when the sound is not a usable reference — nothing scheduled, a context the
+   * browser is keeping suspended, or a track that has played out.
+   *
+   * This is the audio time source (Chromium's TimeSource, time_source.h): the
+   * playhead is looked up in the list of what was scheduled. Inside a segment
+   * it is a linear map; before the first segment (the output has not reached
+   * it yet) it holds at that segment's start, so the picture waits for the
+   * sound to become audible; in a hole between segments, or past the end, it
+   * holds at the end of the last segment that played. A hole is the output
+   * running out of audio — no media was consumed across it, so there is none
+   * to count.
+   */
+  mediaTimeAt(perfNowMs: number): number {
+    const ctx = this.audioContext;
+    const segs = this._segments;
+    if (!ctx || segs.length === 0) return -1;
+    // A suspend we asked for (pause, buffering) holds the clock where it is; one
+    // we did not — autoplay refused, an interruption — is not a clock at all.
+    if (ctx.state !== "running" && !(ctx.state === "suspended" && contextSuspendIntent)) {
+      return -1;
+    }
+    const heard = this.heardContextTime(perfNowMs);
+    this.settleLoopSeam(heard);
+
+    // The last segment that starts at or before the playhead.
+    let lo = 0;
+    let hi = segs.length - 1;
+    let idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (segs[mid].ctxStart <= heard) {
+        idx = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (idx < 0) return segs[0].mediaStart;
+
+    const seg = segs[idx];
+    // Nothing follows the last segment once the player has said the stream is
+    // over: report no clock, and the time source carries on without it (see
+    // _streamEnded).
+    if (this._streamEnded && idx === segs.length - 1 && heard >= seg.ctxEnd - 0.01) {
+      return -1;
+    }
+    return seg.mediaStart + (Math.min(heard, seg.ctxEnd) - seg.ctxStart) * seg.rate;
+  }
+
+  /**
+   * Master clock for A/V sync, now. Prefer mediaTimeAt(): it takes the instant
+   * to answer for, which is what lets a frame ask when ITS time is rather than
+   * when this call happened to be made.
+   */
+  getAudioClock(): number {
+    return this.mediaTimeAt(performance.now());
+  }
+
+  /**
+   * Chromium's GetWallClockTimes (audio_renderer_impl.cc): when, on the
+   * performance.now() clock, `mediaTime` is or was or will be heard. Inside what
+   * has been scheduled it is exact; beyond either end it is extrapolated from
+   * that end at the playback rate, so a frame past the buffered audio still gets
+   * a sensible deadline. Null when there is no timeline to convert through.
+   */
+  wallClockTimeFor(mediaTime: number, perfNowMs: number = performance.now()): number | null {
+    const segs = this._segments;
+    if (!this.audioContext || segs.length === 0) return null;
+    const heard = this.heardContextTime(perfNowMs);
+    const rate = this._playbackRate || 1;
+    let ctxAt: number | null = null;
+    for (const seg of segs) {
+      const mediaEnd = seg.mediaStart + (seg.ctxEnd - seg.ctxStart) * seg.rate;
+      if (mediaTime >= seg.mediaStart && mediaTime <= mediaEnd) {
+        const at = seg.ctxStart + (mediaTime - seg.mediaStart) / seg.rate;
+        // A media time can occur in more than one pass of a loop; the one the
+        // playhead has not left behind is the one meant.
+        if (ctxAt === null || at >= heard) {
+          ctxAt = at;
+          if (at >= heard) break;
+        }
+      }
+    }
+    if (ctxAt === null) {
+      const first = segs[0];
+      const last = segs[segs.length - 1];
+      if (mediaTime < first.mediaStart) {
+        ctxAt = first.ctxStart - (first.mediaStart - mediaTime) / rate;
+      } else {
+        const lastMediaEnd = last.mediaStart + (last.ctxEnd - last.ctxStart) * last.rate;
+        ctxAt = last.ctxEnd + (mediaTime - lastMediaEnd) / rate;
+      }
+    }
+    return perfNowMs + (ctxAt - heard) * 1000;
+  }
+
+  /** Is the output playing, so that media time is advancing? (Chromium's `is_time_moving`.) */
+  isTimeMoving(): boolean {
+    return (
+      this.isPlaying &&
+      this.audioContext?.state === "running" &&
+      this._segments.length > 0
+    );
+  }
+
+  /** Where the media clock begins; -1 until the first buffer is placed. */
+  getAnchorMediaTime(): number {
+    return this._segments.length > 0 ? this._segments[0].mediaStart : -1;
+  }
+
+  private appendSegment(
+    ctxStart: number,
+    ctxEnd: number,
+    mediaStart: number,
+    rate: number,
+  ): void {
+    if (!(ctxEnd > ctxStart)) return;
+    const segs = this._segments;
+    const last = segs[segs.length - 1];
+    if (
+      last &&
+      Math.abs(ctxStart - last.ctxEnd) <= SEGMENT_JOIN_TOLERANCE_S &&
+      Math.abs(rate - last.rate) < 1e-6 &&
+      Math.abs(
+        mediaStart - (last.mediaStart + (last.ctxEnd - last.ctxStart) * last.rate),
+      ) <= SEGMENT_JOIN_TOLERANCE_S
+    ) {
+      last.ctxEnd = ctxEnd;
+    } else {
+      segs.push({ ctxStart, ctxEnd, mediaStart, rate });
+    }
+    // Let go of what was heard long ago, but never the last one: it is what the
+    // clock holds at across a hole.
+    const behind = (this.audioContext?.currentTime ?? 0) - SEGMENT_KEEP_BEHIND_S;
+    let drop = 0;
+    while (drop < segs.length - 1 && segs[drop].ctxEnd < behind) drop++;
+    if (drop > 0) segs.splice(0, drop);
+  }
+
+  /** Strike everything from the timeline after context time `at`. */
+  private truncateSegmentsAt(at: number): void {
+    const segs = this._segments;
+    while (segs.length > 0 && segs[segs.length - 1].ctxStart >= at - 1e-6) segs.pop();
+    const last = segs[segs.length - 1];
+    if (last && last.ctxEnd > at) last.ctxEnd = at;
+  }
+
+  /**
+   * Once the output has reached a loop seam, the furthest-scheduled horizon
+   * belongs to the pass being heard.
+   */
+  private settleLoopSeam(heard: number): void {
+    if (this._loopSeamAt === null || heard < this._loopSeamAt) return;
+    this._loopSeamAt = null;
     this.maxScheduledMediaTime = this._nextPassMaxMediaTime;
     this._nextPassMaxMediaTime = 0;
-    Logger.debug(
-      TAG,
-      `Loop seam reached — media clock now counts from ${p.mediaOrigin.toFixed(3)}s`,
-    );
+    Logger.debug(TAG, "Loop seam reached — the next pass is being heard");
   }
 
   /**
@@ -2399,14 +2482,14 @@ export class AudioRenderer {
    *
    * Everything about the sound carries on untouched — the scheduler keeps
    * placing buffers at `scheduledTime`, so the first sample of the new pass
-   * abuts the last sample of the old one and there is no seam to hear. What
-   * changes is only the BOOKKEEPING: the media time those samples are labelled
-   * with wraps back to the start of the file, and the clock has to wrap with
-   * them, but not until they are heard.
+   * abuts the last sample of the old one and there is no seam to hear. The
+   * media time those samples are labelled with wraps back to the start of the
+   * file, which the timeline records like any other segment; the clock wraps
+   * when the output reaches them, because that is when the lookup lands in them.
    *
    * Call BEFORE the new pass is read. Its first buffer is recognised by its
-   * timestamp stepping back (see _loopArm) and the seam is armed when that
-   * buffer is started.
+   * timestamp stepping back (see _loopArm) and the seam's context time is
+   * recorded when that buffer is started.
    */
   beginLoopPass(): void {
     const last = this._pending[this._pending.length - 1];
@@ -2414,7 +2497,7 @@ export class AudioRenderer {
       found: false,
       lastAudioTime: last ? last.audioTime : this.hasFirstBuffer ? this.currentMediaTime : -1,
     };
-    this._pendingAnchor = null;
+    this._loopSeamAt = null;
     this._nextPassMaxMediaTime = 0;
     // Fresh audio is on its way, so the sound is not over — the same reason
     // reset() clears this, without any of reset()'s teardown.
@@ -2428,14 +2511,16 @@ export class AudioRenderer {
    * loop share one boundary.
    */
   isLoopSeamPending(): boolean {
-    this.adoptPendingAnchor();
-    return this._loopArm !== null || this._pendingAnchor !== null;
+    if (this.audioContext && this._loopSeamAt !== null) {
+      this.settleLoopSeam(this.heardContextTime(performance.now()));
+    }
+    return this._loopArm !== null || this._loopSeamAt !== null;
   }
 
   /** Drop an armed loop seam that is not going to happen after all. */
   cancelLoopPass(): void {
-    if (this._pendingAnchor || this._loopArm) {
-      this._pendingAnchor = null;
+    if (this._loopSeamAt !== null || this._loopArm) {
+      this._loopSeamAt = null;
       this._loopArm = null;
       for (const p of this._pending) p.loopStart = false;
       if (this._nextPassMaxMediaTime > this.maxScheduledMediaTime) {
@@ -2444,57 +2529,6 @@ export class AudioRenderer {
       this._nextPassMaxMediaTime = 0;
       Logger.debug(TAG, "Loop pass cancelled");
     }
-  }
-
-  /** Where the media clock is anchored; -1 until the first buffer is placed. */
-  getAnchorMediaTime(): number {
-    this.adoptPendingAnchor();
-    return this.hasFirstBuffer ? this.firstBufferMediaTime : -1;
-  }
-
-  getAudioClock(): number {
-    if (
-      this.audioContext &&
-      this.audioContext.state === "running" &&
-      this.hasFirstBuffer
-    ) {
-      this.adoptPendingAnchor();
-      const elapsed =
-        this.audioContext.currentTime - this.firstBufferScheduledAt;
-      let computedTime =
-        this.firstBufferMediaTime + Math.max(0, elapsed * this._playbackRate);
-
-      // Adjust for output latency if available (Critical for Android/Bluetooth sync)
-      // outputLatency represents the delay between the audio hardware and the speakers
-      // Subtracting this ensures the video syncs to what is actually HEARD, not just scheduled
-      const latency =
-        (this.audioContext as any).outputLatency ||
-        (this.audioContext as any).baseLatency ||
-        0;
-      if (latency > 0) {
-        computedTime -= latency * this._playbackRate;
-        // Prevent audio clock from going below the first buffer time
-        // This is critical for Bluetooth devices with high latency (100-300ms)
-        // to prevent video stalling at playback start
-        computedTime = Math.max(computedTime, this.firstBufferMediaTime);
-      }
-
-      // Clamp to the maximum scheduled media time to prevent clock runaway
-      if (this.maxScheduledMediaTime > 0) {
-        // …unless there is no more sound coming and the head has reached the
-        // end of it. Then the clamp is not holding back a runaway, it is
-        // holding back the picture — see _streamEnded.
-        if (
-          this._streamEnded &&
-          computedTime >= this.maxScheduledMediaTime - 0.01
-        ) {
-          return -1;
-        }
-        return Math.min(computedTime, this.maxScheduledMediaTime);
-      }
-      return computedTime;
-    }
-    return -1;
   }
 
   /**
@@ -2873,6 +2907,9 @@ export class AudioRenderer {
    * Get the furthest media time (seconds) already scheduled in Web Audio.
    */
   getMaxScheduledMediaTime(): number {
+    if (this.audioContext && this._loopSeamAt !== null) {
+      this.settleLoopSeam(this.heardContextTime(performance.now()));
+    }
     return this.maxScheduledMediaTime;
   }
 
@@ -3208,8 +3245,7 @@ export class AudioRenderer {
         if (this.droppedWhileSuspended) {
           this.droppedWhileSuspended = false;
           this.hasFirstBuffer = false;
-          this.firstBufferScheduledAt = 0;
-          this.firstBufferMediaTime = 0;
+          this._segments = [];
           this.maxScheduledMediaTime = 0;
           Logger.debug(TAG, "Audio clock anchor reset after suspended drop");
         }

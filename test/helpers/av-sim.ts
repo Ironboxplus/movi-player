@@ -324,11 +324,7 @@ export class AvSim {
    */
   private wire(): void {
     this.clock.setAudioProvider(this.audio);
-    this.canvas.setAudioTimeProvider(
-      () => this.audio.getAudioClock(),
-      () => this.audio.hasHealthyBuffer(),
-      () => this.audio.startLead(),
-    );
+    this.canvas.setTimeSource(this.clock.timeSource, () => this.audio.hasHealthyBuffer());
   }
 
   private get c(): Record<string, any> {
@@ -476,7 +472,12 @@ export class AvSim {
   }
 }
 
-/** Half a frame: the ITU-R BT.265 bound the time-source work is held to. */
+/**
+ * Half a frame: the ITU-R BT.265 bound the time-source work is held to, plus
+ * half a millisecond for the oracle itself (the media time is read back out of
+ * float32 samples, and a 60fps frame on a 60Hz display sits exactly on the
+ * bound by construction).
+ */
 export function halfFrame(fps: number): number {
-  return 0.5 / fps;
+  return 0.5 / fps + 0.0005;
 }

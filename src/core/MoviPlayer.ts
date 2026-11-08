@@ -2734,40 +2734,18 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         // now, or the renderer spends the track believing one is coming.
         this.videoRenderer.setPictureSuspended(this._audioOnly);
 
-        // Connect video renderer to audio clock for A/V sync (skip if audio disabled)
-        if (!this.disableAudio) {
-          this.videoRenderer.setAudioTimeProvider(
-            () => this.audioRenderer.getAudioClock(),
-            () => this.audioRenderer.hasHealthyBuffer(),
-            // Measured once there is a buffer, predicted before there is —
-            // see AudioRenderer.startLead().
-            //
-            // The renderer places its post-seek anchor at the one moment the
-            // measurement cannot work: the flush has cleared the scheduled
-            // buffers, so it answers zero, no lead is applied, and the picture
-            // starts immediately. On a high-latency output the sound then
-            // arrives a few hundred ms later, the first A/V sync finds the
-            // video that far ahead and re-anchors it backwards, and the
-            // picture stops until the wall clock catches up — the hitch a beat
-            // after every seek on Bluetooth.
-            //
-            // …and there has to BE sound. With no audio track the lead is
-            // still predicted — no first buffer has ever been scheduled, so
-            // the honest answer to "how long until it is audible" is the
-            // cold-start guess, min(0.5, latency) + latency. Measured at
-            // 560ms, and the picture held for every one of them at each loop
-            // turn of a video-only file: anchored 560ms into the future,
-            // getVideoTime clamps the negative elapsed to zero, so media time
-            // sat at 0.033s with 63 decoded frames queued behind it. The
-            // picture then ran that far behind the clock for the whole pass.
-            () => (this.hasAudioThatCanPlay() ? this.audioRenderer.startLead() : 0),
-          );
-        } else {
-          // When audio is disabled, video runs independently without A/V sync overhead
-          this.videoRenderer.setAudioTimeProvider(null, null, null);
+        // The picture is shown against the same time source the clock reads
+        // (see core/TimeSource.ts): the sound while there is some, a wall clock
+        // continuing from it otherwise. With audio disabled the clock simply
+        // never has an audio side, and the picture runs on the wall clock alone.
+        this.videoRenderer.setTimeSource(
+          this.clock.timeSource,
+          this.disableAudio ? null : () => this.audioRenderer.hasHealthyBuffer(),
+        );
+        if (this.disableAudio) {
           Logger.info(
             TAG,
-            "Video renderer running independently (audio disabled)",
+            "Video renderer running on the wall clock (audio disabled)",
           );
         }
 
@@ -6776,20 +6754,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   }
 
   /**
-   * Is there sound that could carry playback on its own right now? A track that
-   * exists, isn't switched off, and isn't being dropped because the browser
-   * won't start the context. (Split audio lives in its own demuxer, outside the
-   * track manager, so it is counted separately.)
-   */
-  private hasAudioThatCanPlay(): boolean {
-    if (this.disableAudio) return false;
-    if (!this.trackManager.getActiveAudioTrack() && !this.audioDemuxer) {
-      return false;
-    }
-    return !this.audioRenderer.isDroppingAudio();
-  }
-
-  /**
    * Internal handler for seek completion when first target frame is found.
    * Clears the seek flag, synchronizes clock, and transitions to final state.
    */
@@ -7372,7 +7336,6 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       });
     }
     this.audioRenderer.reset();
-    this.videoRenderer?.releaseAudioSync();
     this.clock.seek(currentTime);
   }
 

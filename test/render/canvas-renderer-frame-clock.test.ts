@@ -32,16 +32,10 @@ function fakeFrame(timestampMicros: number): FakeFrame {
 type RendererInternals = CanvasRenderer & {
   frameQueue: FakeFrame[];
   lastPresentedPts: number;
-  presentationStartPts: number;
-  presentationStartTime: number;
-  syncedToAudio: boolean;
-  lastKnownAudioTime: number;
   framesPresented: number;
   justSeeked: boolean;
   isPlaying: boolean;
   playbackRate: number;
-  getAudioTime?: () => number;
-  _isAudioHealthy?: () => boolean;
   activeSubtitleCue: SubtitleCue | null;
   subtitleOverlay: HTMLElement | null;
   _lastRenderedSubtitleKey: string;
@@ -72,10 +66,6 @@ describe("CanvasRenderer.clearQueue — seek/reset semantics", () => {
     Object.assign(renderer, {
       frameQueue: [f1, f2],
       lastPresentedPts: 4.2,
-      presentationStartPts: 4.2,
-      presentationStartTime: 12345,
-      syncedToAudio: true,
-      lastKnownAudioTime: 4.2,
       framesPresented: 87,
       justSeeked: false,
     });
@@ -86,9 +76,6 @@ describe("CanvasRenderer.clearQueue — seek/reset semantics", () => {
     // point, not a regression: framesPresented genuinely goes back to 0.
     expect(renderer.framesPresented).toBe(0);
     expect(renderer.lastPresentedPts).toBe(-1);
-    expect(renderer.presentationStartPts).toBe(0);
-    expect(renderer.presentationStartTime).toBe(0);
-    expect(renderer.syncedToAudio).toBe(false);
     expect(renderer.frameQueue).toEqual([]);
     expect(renderer.justSeeked).toBe(true);
     expect(f1.close).toHaveBeenCalledTimes(1);
@@ -104,9 +91,6 @@ describe("CanvasRenderer.spliceQueue — quality-switch handoff must NOT reset t
     Object.assign(renderer, {
       frameQueue: [kept, evicted],
       lastPresentedPts: 1.9,
-      presentationStartPts: 1.9,
-      presentationStartTime: 999,
-      syncedToAudio: true,
       justSeeked: false,
     });
 
@@ -127,10 +111,9 @@ describe("CanvasRenderer.spliceQueue — quality-switch handoff must NOT reset t
     expect(renderer.frameQueue).toEqual([kept, incomingA]);
 
     // Contract this test locks: unlike clearQueue(), a quality switch must
-    // NOT jump the picture, so none of the timing anchors move.
+    // NOT jump the picture, so what is on screen is left alone. (There is no
+    // presentation clock to move: the time source is the player's, not ours.)
     expect(renderer.lastPresentedPts).toBe(1.9);
-    expect(renderer.presentationStartPts).toBe(1.9);
-    expect(renderer.presentationStartTime).toBe(999);
     expect(renderer.justSeeked).toBe(false);
   });
 
@@ -147,35 +130,24 @@ describe("CanvasRenderer.spliceQueue — quality-switch handoff must NOT reset t
   });
 });
 
-describe("CanvasRenderer.getCurrentPlaybackTime — paused/pre-anchor semantics", () => {
-  it("while paused, pins to the last presented frame rather than advancing the wall clock", () => {
+describe("CanvasRenderer.getCurrentPlaybackTime — paused semantics", () => {
+  it("while paused, pins to the last presented frame rather than following the time source", () => {
     const renderer = makeRenderer();
     Object.assign(renderer, {
       isPlaying: false,
       lastPresentedPts: 3.5,
-      presentationStartPts: 0,
+      timeSource: { now: () => 99 },
     });
 
     expect(renderer.getCurrentPlaybackTime()).toBe(3.5);
   });
 
-  it("while paused before any frame has presented, falls back to the anchor pts", () => {
+  it("while paused before any frame has presented, reports -1 (not started)", () => {
     const renderer = makeRenderer();
     Object.assign(renderer, {
       isPlaying: false,
       lastPresentedPts: -1,
-      presentationStartPts: 1.25,
-    });
-
-    expect(renderer.getCurrentPlaybackTime()).toBe(1.25);
-  });
-
-  it("while paused with neither a presented frame nor an anchor, reports -1 (not started)", () => {
-    const renderer = makeRenderer();
-    Object.assign(renderer, {
-      isPlaying: false,
-      lastPresentedPts: -1,
-      presentationStartPts: 0,
+      timeSource: { now: () => 99 },
     });
 
     expect(renderer.getCurrentPlaybackTime()).toBe(-1);

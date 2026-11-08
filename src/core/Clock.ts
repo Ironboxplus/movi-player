@@ -1,46 +1,47 @@
 /**
- * Clock - Audio/Video synchronization clock
- * Uses audio as the master clock when available for smooth 60Hz playback
+ * Clock - the player's media clock.
+ *
+ * A thin shell over PlaybackTimeSource: the same time source the picture reads,
+ * so the time on the seek bar and the frame on screen cannot disagree. It adds
+ * what only the player needs — pause with a held time, a duration to clamp the
+ * wall-clock fallback to, and the rate.
  */
 
-import { Time } from '../utils/Time';
 import { Logger } from '../utils/Logger';
+import { PlaybackTimeSource, type AudioTimeSource } from './TimeSource';
 
 const TAG = 'Clock';
 
-// Audio clock provider interface
-export interface AudioClockProvider {
-  getAudioClock(): number;
-  hasHealthyBuffer(): boolean;
-  isAudioPlaying(): boolean;
-}
+/** What the clock needs from the audio side. */
+export type AudioClockProvider = AudioTimeSource;
 
 export class Clock {
-  private baseTime: number = 0;
+  private readonly source = new PlaybackTimeSource();
   private pausedTime: number = 0;
   private isRunning: boolean = false;
   private playbackRate: number = 1.0;
-  
-  // Audio clock provider for A/V sync
-  private audioProvider: AudioClockProvider | null = null;
-  private syncedToAudio: boolean = false;
-  private lastAudioTime: number = 0; // Cache last known good audio time
   private duration: number = 0; // Media duration for clamping
-  
+
   /**
-   * Set audio clock provider for master A/V sync
-   * Pass null to disable audio sync and use wall clock only
+   * The time source behind this clock. The video renderer reads it directly, so
+   * that there is exactly one answer to "what time is it" in the player.
+   */
+  get timeSource(): PlaybackTimeSource {
+    return this.source;
+  }
+
+  /**
+   * Set the audio side of the time source. Pass null to run on the wall clock
+   * only (no track, audio disabled).
    */
   setAudioProvider(provider: AudioClockProvider | null): void {
-    this.audioProvider = provider;
-    if (provider) {
-    Logger.debug(TAG, 'Audio provider set');
-    } else {
-      Logger.debug(TAG, 'Audio provider disabled - using wall clock only');
-      this.syncedToAudio = false;
-    }
+    this.source.setAudio(provider);
+    Logger.debug(
+      TAG,
+      provider ? 'Audio provider set' : 'Audio provider disabled - using wall clock only',
+    );
   }
-  
+
   /**
    * Set media duration for clock clamping
    */
@@ -48,178 +49,107 @@ export class Clock {
     this.duration = duration;
     Logger.debug(TAG, `Duration set to ${duration}s`);
   }
-  
+
   /**
    * Start/resume the clock
    */
   start(): void {
     if (this.isRunning) return;
-    
-    // Adjust baseTime to account for paused duration
-    this.baseTime = Time.now() - (this.pausedTime / this.playbackRate);
+    this.source.seek(this.pausedTime);
+    this.source.start();
     this.isRunning = true;
-    this.syncedToAudio = false;
     Logger.debug(TAG, `Started at ${this.pausedTime}s`);
   }
-  
+
   /**
    * Pause the clock
    */
   pause(): void {
     if (!this.isRunning) return;
-    
+
     this.pausedTime = this.getTime();
+    this.source.stop();
     this.isRunning = false;
     Logger.debug(TAG, `Paused at ${this.pausedTime}s`);
   }
-  
+
   /**
    * Seek to a specific time
    */
   seek(time: number): void {
-    if (this.isRunning) {
-      this.baseTime = Time.now() - (time / this.playbackRate);
-    } else {
-      this.pausedTime = time;
-    }
-    this.syncedToAudio = false;
+    this.pausedTime = time;
+    this.source.seek(time);
     Logger.debug(TAG, `Seeked to ${time}s`);
   }
-  
+
   /**
-   * Get current playback time using wall clock with loose A/V sync
-   * Uses wall clock for smooth timing, with periodic drift correction from audio
-   * This ensures smooth video playback while maintaining A/V sync
+   * The media time now: what is being heard while the sound is a usable
+   * reference, a wall clock continuing from it otherwise.
    */
   getTime(): number {
     if (!this.isRunning) {
       return this.pausedTime;
     }
-    
-    // Always calculate wall clock time first (for smooth playback)
-    let wallClockTime = (Time.now() - this.baseTime) * this.playbackRate;
-    
-    // Clamp to duration if set
-    if (this.duration > 0) {
-      wallClockTime = Math.min(wallClockTime, this.duration);
-    }
-    
-    // Check audio for drift correction (but don't block on it)
-    if (this.audioProvider) {
-      const audioTime = this.audioProvider.getAudioClock();
-      if (audioTime >= 0) {
-        // Cache the audio time
-        this.lastAudioTime = audioTime;
-        
-        if (this.audioProvider.hasHealthyBuffer()) {
-          // First sync - initialize wall clock to match audio
-          if (!this.syncedToAudio) {
-            this.baseTime = Time.now() - (audioTime / this.playbackRate);
-            this.syncedToAudio = true;
-            Logger.debug(TAG, `Synced to audio at ${audioTime}s`);
-            return audioTime;
-          }
-          
-          // Loose sync: only correct if wall clock has drifted more than 100ms from audio
-          // This prevents audio jitter from affecting smooth video playback
-          const drift = wallClockTime - audioTime;
-          
-          if (Math.abs(drift) > 0.1) {
-            // Apply gradual correction (50% per check) to avoid jarring jumps
-            const correction = drift * 0.5;
-            this.baseTime += correction / this.playbackRate;
-            // Logger.debug(TAG, `Clock drift correction: ${(drift * 1000).toFixed(1)}ms`);
-          }
-          
-          // Recalculate wall clock time after correction
-          wallClockTime = (Time.now() - this.baseTime) * this.playbackRate;
-          if (this.duration > 0) {
-            wallClockTime = Math.min(wallClockTime, this.duration);
-          }
-        } else {
-          // Audio not healthy - just use wall clock
-        }
-      } else if (this.lastAudioTime > 0) {
-        // Audio returned -1 but we had a previous time - continue with wall clock
-        // Don't return cached audio time as it's stale
-      }
-    }
-    
-    return wallClockTime;
-  }
-  
-  /**
-   * Get time for video frame presentation
-   * Returns audio time if available, otherwise wall clock
-   */
-  getVideoSyncTime(): number {
-    if (!this.isRunning) {
-      return this.pausedTime;
-    }
-    
-    // For video sync, ALWAYS prefer audio when healthy
-    if (this.audioProvider) {
-      const audioTime = this.audioProvider.getAudioClock();
-      if (audioTime >= 0 && this.audioProvider.hasHealthyBuffer()) {
-        return audioTime;
-      } else if (audioTime >= 0) {
-        // Audio not healthy but has a valid (clamped) time
-        return audioTime;
-      }
-    }
-    
-    let time = (Time.now() - this.baseTime) * this.playbackRate;
-    
-    // Clamp to duration if set
-    if (this.duration > 0) {
+    let time = this.source.now();
+    if (time < 0) return this.pausedTime;
+    // The duration bounds the wall clock, which has no sound to stop it. The
+    // sound is never clamped: it is what is actually being played.
+    if (!this.source.isAudioDriven() && this.duration > 0) {
       time = Math.min(time, this.duration);
     }
-    
     return time;
   }
-  
+
+  /**
+   * Time for video frame presentation. The same reading as getTime(): there is
+   * one time source, and the picture is not allowed a different opinion.
+   */
+  getVideoSyncTime(): number {
+    return this.getTime();
+  }
+
   /**
    * Set playback rate
    */
   setPlaybackRate(rate: number): void {
-    const currentTime = this.getTime();
+    // Continue from the current time; the sound carries its own rate per
+    // segment, so only the wall-clock fallback has anything to change.
+    if (this.isRunning) this.pausedTime = this.getTime();
     this.playbackRate = rate;
-    this.seek(currentTime);
+    this.source.setRate(rate);
     Logger.debug(TAG, `Playback rate set to ${rate}`);
   }
-  
+
   /**
    * Get playback rate
    */
   getPlaybackRate(): number {
     return this.playbackRate;
   }
-  
+
   /**
    * Check if clock is running
    */
   isPlaying(): boolean {
     return this.isRunning;
   }
-  
+
   /**
-   * Check if synchronized to audio
+   * Is the time being read from the sound (as opposed to the wall clock)?
    */
   isSyncedToAudio(): boolean {
-    return this.syncedToAudio && this.audioProvider !== null;
+    return this.source.isAudioDriven();
   }
-  
+
   /**
    * Reset clock
    */
   reset(): void {
-    this.baseTime = 0;
     this.pausedTime = 0;
     this.isRunning = false;
     this.playbackRate = 1.0;
-    this.syncedToAudio = false;
-    this.lastAudioTime = 0;
     this.duration = 0;
+    this.source.reset();
     Logger.debug(TAG, 'Reset');
   }
 }
