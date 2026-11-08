@@ -187,6 +187,67 @@ describe("A/V sync follows the one time source", () => {
     });
   });
 
+  describe("with no sound to follow, the wall clock carries the picture", () => {
+    it("a file with no audio track plays at exactly 1x", () => {
+      const sim = new AvSim({ fps: 24, noAudio: true });
+      sim.start();
+      sim.run(300);
+      // 300 simulated seconds: the picture is within half a frame of the clock
+      // it started with, which is the wall clock — no drift, no deadband.
+      const shown = sim.canvas.getLastPresentedTime();
+      expect(Math.abs(shown - 300)).toBeLessThanOrEqual(1 / 24 + 0.02);
+    });
+
+    it("a sound that ends before the picture hands over without a jump", () => {
+      const sim = new AvSim({ fps: 24 });
+      sim.start();
+      sim.run(20, 3);
+      sim.endAudio();
+
+      // Until the last scheduled sample has played, the sound still drives; then
+      // the wall clock continues from where it left off.
+      let last = sim.clockTime();
+      let worstStep = 0;
+      for (let i = 0; i < Math.round(8000 / VSYNC_MS); i++) {
+        sim.step();
+        const t = sim.clockTime();
+        expect(t).toBeGreaterThanOrEqual(last - 1e-9);
+        worstStep = Math.max(worstStep, t - last);
+        last = t;
+      }
+      // Every step was one refresh of real time; none was a jump.
+      expect(worstStep).toBeLessThan((VSYNC_MS / 1000) * 1.5);
+      expect(sim.clock.isSyncedToAudio()).toBe(false);
+      // …and the picture followed it the whole way.
+      expect(Math.abs(sim.canvas.getLastPresentedTime() - last)).toBeLessThanOrEqual(1 / 24 + 0.02);
+    });
+
+    it("sound that comes back, started at the clock, rejoins without the time going backwards", () => {
+      const sim = new AvSim({ fps: 24 });
+      sim.start();
+      sim.run(20, 3);
+      sim.endAudio();
+      sim.run(8);
+
+      sim.restartAudioAtClock();
+      let last = sim.clockTime();
+      let worstStep = 0;
+      for (let i = 0; i < Math.round(3000 / VSYNC_MS); i++) {
+        sim.step();
+        const t = sim.clockTime();
+        expect(t).toBeGreaterThanOrEqual(last - 1e-9);
+        worstStep = Math.max(worstStep, t - last);
+        last = t;
+      }
+      // No step larger than a refresh (the clock waited for the sound to be
+      // audible, which is a pause, not a jump)…
+      expect(worstStep).toBeLessThan((VSYNC_MS / 1000) * 1.5);
+      expect(sim.clock.isSyncedToAudio()).toBe(true);
+      // …and from then on picture and sound are in step again.
+      expect(sim.run(20).maxErr).toBeLessThanOrEqual(halfFrame(24));
+    });
+  });
+
   describe("operations that restart or reshape the audio timeline", () => {
     it("a seek in the middle of playback", () => {
       const sim = new AvSim({ fps: 24 });

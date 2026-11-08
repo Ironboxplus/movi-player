@@ -231,6 +231,8 @@ export interface SimOptions {
   duration?: number;
   /** Frames the video decoder produces per second of real time, as a multiple of fps. */
   decodeSpeed?: number;
+  /** No audio track: the clock has no audio side and nothing is fed to it. */
+  noAudio?: boolean;
 }
 
 export interface Window {
@@ -274,8 +276,10 @@ export class AvSim {
   private playing = false;
   /** Held for buffering: the decoders run, the clock, sound and picture do not. */
   private holding = false;
+  private readonly noAudio: boolean;
 
   constructor(opts: SimOptions = {}) {
+    this.noAudio = opts.noAudio ?? false;
     this.fps = opts.fps ?? 24;
     this.interval = 1 / this.fps;
     this.duration = opts.duration ?? Infinity;
@@ -325,8 +329,39 @@ export class AvSim {
    * how the time source is plumbed.
    */
   private wire(): void {
+    if (this.noAudio) {
+      this.clock.setAudioProvider(null);
+      this.canvas.setTimeSource(this.clock.timeSource, null);
+      return;
+    }
     this.clock.setAudioProvider(this.audio);
     this.canvas.setTimeSource(this.clock.timeSource, () => this.audio.hasHealthyBuffer());
+  }
+
+  /**
+   * The sound ends for good while the picture goes on (a track shorter than the
+   * file): the player says so, and stops feeding it.
+   */
+  endAudio(): void {
+    this.audio.endOfStream();
+    this.audioFeeding = false;
+  }
+
+  /**
+   * Sound starts again at the clock's position: what the player does when it
+   * rebuilds the audio at the playhead (a track switch, a re-read). The video
+   * decoder is not touched.
+   */
+  restartAudioAtClock(): void {
+    this.audio.reset();
+    this.audio.clearEndOfStream();
+    this.audioNext = Math.ceil(this.clock.getTime() / CHUNK_S) * CHUNK_S;
+    this.audioFeeding = true;
+  }
+
+  /** What the picture is being held to right now. */
+  clockTime(): number {
+    return this.clock.getTime();
   }
 
   private get c(): Record<string, any> {
@@ -339,7 +374,7 @@ export class AvSim {
 
   /** Begin (or resume) playback the way MoviPlayer.play() does. */
   play(): void {
-    void this.audio.play();
+    if (!this.noAudio) void this.audio.play();
     this.clock.start();
     this.canvas.startPresentationLoop();
     this.playing = true;
@@ -420,6 +455,7 @@ export class AvSim {
     let guard = 0;
     while (
       this.audioFeeding &&
+      !this.noAudio &&
       this.audio.getBufferedDuration() < this.audioCushion &&
       guard++ < 400
     ) {
