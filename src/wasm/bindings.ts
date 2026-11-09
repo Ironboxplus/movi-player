@@ -855,8 +855,7 @@ export class WasmBindings {
         if (n < 0) continue;
         const [filename, mimeType, offset, size] = decodeUtf8(
           this.module.HEAPU8.slice(bufferPtr, bufferPtr + n),
-        ).split("
-");
+        ).split("\n");
         out.push({
           streamIndex: i,
           filename: filename ?? "",

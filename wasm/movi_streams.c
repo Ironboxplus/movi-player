@@ -54,17 +54,13 @@ int movi_get_attachment_info(MoviContext *ctx, int stream_index, char *buf,
   snprintf(name, sizeof(name), "%s", fn && fn->value ? fn->value : "");
   // The fields are newline-separated; a name cannot carry one.
   for (char *c = name; *c; c++)
-    if (*c == '
-' || *c == '')
+    if (*c == '\n' || *c == '\r')
       *c = ' ';
 
   long long offset = off && off->value ? atoll(off->value) : -1;
   long long size = sz && sz->value ? atoll(sz->value)
                                    : (long long)stream->codecpar->extradata_size;
-  int n = snprintf(buf, buf_size, "%s
-%s
-%lld
-%lld", name,
+  int n = snprintf(buf, buf_size, "%s\n%s\n%lld\n%lld", name,
                    mt && mt->value ? mt->value : "", offset, size);
   return (n < 0 || n >= buf_size) ? -1 : n;
 }
