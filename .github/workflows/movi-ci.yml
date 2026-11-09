@@ -78,6 +78,12 @@ jobs:
       # The unit job has no WASM, so the tests that drive the real FFmpeg build
       # skip there. This is where they run; MOVI_REQUIRE_WASM turns a missing
       # artifact into a failure instead of a silent skip.
+      # The attachment test makes its own MKV with ffmpeg and attaches two real
+      # fonts to it; MOVI_REQUIRE_WASM makes a missing one a failure.
+      - name: ffmpeg and fonts for the attachment test
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
       - name: Run the real-WASM tests against the freshly built WASM
         run: npm run test:run
         env:
