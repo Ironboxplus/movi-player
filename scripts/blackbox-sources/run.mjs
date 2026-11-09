@@ -179,6 +179,26 @@ const watchCue = (needle, maxWallMs) =>
     },
     { needle, maxWallMs },
   );
+// What the player holds when a cue does not show: the engine, the parsed cues,
+// the renderer's own view of the clock. Only read after a failure.
+const subtitleInternals = () =>
+  page.evaluate(() => {
+    const p = document.querySelector("movi-player").player;
+    const w = p?.streamWrapper;
+    const r = w?.getCanvasRenderer?.();
+    return {
+      engine: w?.constructor?.name ?? null,
+      lang: p?._activeSubtitleLang,
+      cues: p?._externalSubCues?.length,
+      timer: p?._externalSubTimer,
+      wrapperTime: w?.getCurrentTime?.(),
+      rendererCues: r?.subtitleCues?.length,
+      rendererActive: r?.activeSubtitleCue?.text ?? null,
+      rendererNow: r?.timeSource?.now?.(),
+      held: r?.subtitleHeld,
+      overlay: r?.subtitleOverlay ? r.subtitleOverlay.outerHTML.slice(0, 400) : null,
+    };
+  });
 const shot = (name) => page.screenshot({ path: resolve(outDir, `${name}.png`) }).catch(() => {});
 
 const cueAt = async (label, cue, start, expectOn, expectOff) => {
@@ -291,7 +311,9 @@ try {
   });
 
   await check("5c. on the rendition the cue is the right one at the right time", async () => {
-    return cueAt("hls", "SUB-1-A", 1, 2, 6);
+    const r = await cueAt("hls", "SUB-1-A", 1, 2, 6);
+    if (!r.ok) console.log("5c internals:", JSON.stringify(await subtitleInternals()));
+    return r;
   });
 
   await check("6. the track no file exists for is greyed out as original-only", async () => {
