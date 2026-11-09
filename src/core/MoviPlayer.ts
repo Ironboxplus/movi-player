@@ -12134,6 +12134,35 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     if (this.videoRenderer) {
       this.videoRenderer.setSubtitleOverlay(overlay);
     }
+    // The element registers its renderer before it hands over the overlay, so
+    // this is where a renderer registered at creation finds somewhere to draw.
+    this._mountCustomRenderer();
+  }
+
+  // The layer a host subtitle renderer draws in: a sibling just under the text
+  // overlay, which the cue path shows, hides and rewrites as it likes.
+  private _subtitleLayer: HTMLElement | null = null;
+
+  private _mountCustomRenderer(): void {
+    const renderer = this._customSubtitleRenderer;
+    const overlay = this.videoRenderer?.getSubtitleOverlay?.() ?? null;
+    const parent = overlay?.parentNode;
+    if (!renderer?.mount || !overlay || !parent) return;
+    let layer = this._subtitleLayer;
+    if (!layer || layer.parentNode !== parent) {
+      layer?.remove();
+      layer = document.createElement("div");
+      layer.className = "movi-subtitle-renderer-layer";
+      layer.style.cssText =
+        "position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:4;";
+      parent.insertBefore(layer, overlay);
+      this._subtitleLayer = layer;
+    }
+    try {
+      renderer.mount(layer);
+    } catch {
+      /* ignore */
+    }
   }
 
   /**
@@ -13760,14 +13789,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // never draw at once.
     this.videoRenderer?.setSubtitleCues([]);
     if (renderer) {
-      const overlay = this.videoRenderer?.getSubtitleOverlay?.() ?? null;
-      if (overlay && renderer.mount) {
-        try {
-          renderer.mount(overlay);
-        } catch {
-          /* ignore */
-        }
-      }
+      this._mountCustomRenderer();
       try {
         renderer.setDelay(this._subtitleDelaySec);
       } catch {
@@ -16237,6 +16259,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // The registrar owns destroy(): the element does it on disconnect / on swap.
     this._stopSubtitleRenderLoop();
     this._customSubtitleRenderer = null;
+    this._subtitleLayer?.remove();
+    this._subtitleLayer = null;
 
     // Cancel a pending deferred preview warm-up.
     if (this._previewWarmTimer) {
