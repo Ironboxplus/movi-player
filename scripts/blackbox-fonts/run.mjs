@@ -226,6 +226,9 @@ async function play(file) {
   await page.evaluate(async () => {
     const p = document.querySelector("movi-player").player;
     await p.selectSubtitleTrack(p.getSubtitleTracks()[0].id);
+    // The packets of a track are only passed on once it is picked: go back and
+    // read the ones the demuxer has already gone past.
+    document.querySelector("movi-player").currentTime = 0;
   });
   try {
     await waitFor(async () => (await ink(page)).count > 50, 60_000, "the cue to be drawn");

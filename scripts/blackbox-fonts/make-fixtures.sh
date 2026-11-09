@@ -37,8 +37,14 @@ Style: Default,DejaVu Sans Mono,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:00.00,0:00:30.00,Default,,0,0,0,,iiiiiiiiii
 ASS
+# One cue a second, each a second long: a track picked a few seconds into the
+# film still has cues ahead of it. (The player reads the packets of a track
+# only once it is picked, so a single 30 s cue read before that would be gone.)
+for t in $(seq 0 29); do
+  printf 'Dialogue: 0,0:00:%02d.00,0:00:%02d.00,Default,,0,0,0,,iiiiiiiiii
+' "$t" "$((t + 1))" >> sub.ass
+done
 
 ATTACH=()
 n=0
