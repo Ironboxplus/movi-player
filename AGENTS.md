@@ -250,7 +250,7 @@ The decisions live in [src/render/SourceSelection.ts](src/render/SourceSelection
 - **`<track data-inband-title data-inband-order>`** marks a subtitle file as the extracted twin of an in-band track of another source (an HLS transcode has no in-band subtitles). Open source has that track (index, then title must agree): the `<track>` is not offered, the in-band track is. Open source has none: the `<track>` is offered under the in-band track's name. Disagreement means it is treated as a plain external file — a duplicate is a smaller mistake than the wrong subtitle.
 - The in-band list of a non-HLS source is remembered (by `resumekey`, else URL); while an HLS entry plays, in-band tracks with no twin are listed greyed out.
 - A source switch carries the subtitle by logical identity (`inband:<index>` or `ext:<lang>`), not by menu text.
-- External subtitles are VTT/SRT/TTML only. ASS/SSA and PGS/SUP render only as in-band tracks (`SubtitleDecoder`); an external ASS/SUP file needs host-side rendering.
+- External subtitles are VTT/SRT/TTML, plus ASS/SSA declared with `<track data-format="ass">` once the host has called `setJassubHost()` (libass through JASSUB, the same path as in-band ASS). PGS/SUP renders only as an in-band track (`SubtitleDecoder`); an external SUP file needs host-side rendering.
 
 ---
 
