@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1-openlist.3] - 2026-11-10
+
+### Added
+- `<source>` list menu that does not depend on what is playing: it stays while an HLS entry plays; a list with an HLS entry has no Auto and opens on `data-default`.
+- Subtitle aliases: `<track data-inband-title data-inband-order>` marks an extracted file as the twin of an in-band track of another source; in-band tracks with no twin are listed greyed out on a rendition; the choice carries across a source switch by logical identity.
+- ASS/SSA through JASSUB (host hands it over with `setJassubHost()`), for embedded tracks and `<track data-format="ass">`; fonts attached to the file are used by family name, only the ones a script uses are fetched, and opening a file no longer reads attachment bodies (FFmpeg matroskadec patch). `subtitlefallbackfont` attribute.
+
+### Fixed
+- External subtitle files on stream engines (Shaka/hls.js/dash.js): registered, timed on the element's playhead, and taken down when their cue ends.
+- A subtitle renderer registered at creation gets a layer to draw in.
+
 ## [0.4.1-openlist.2] - 2026-11-09
 
 ### Fixed
