@@ -3110,6 +3110,12 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         !!forced);
 
     if (isStream) {
+      // Declared subtitle files belong to the video, not to the engine that
+      // plays it. Only the demuxer path used to register them, so on a stream
+      // engine getSubtitleLangs() was empty and the files could not be picked.
+      if (this.config.subtitleTracks && this.config.subtitleTracks.length > 0) {
+        this._subtitleTracks = [...this.config.subtitleTracks];
+      }
       const isHls = lowerUrl.includes(".m3u8") || forced === "hls";
       const isDash = lowerUrl.includes(".mpd") || forced === "dash";
       const kind = isHls
@@ -13411,7 +13417,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       this.stopExternalSubtitles();
       this._externalSubCues = [];
       this._activeSubtitleLang = "";
-      this.videoRenderer?.clearSubtitles();
+      this._cueSink()?.clearSubtitles();
       this.emit("subtitleTrackChange" as any, { lang: null, label: null });
     }
     this._generatedSubCues.delete(lang);
@@ -13451,7 +13457,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
     if (!lang) {
       this._activeSubtitleLang = "";
-      if (this.videoRenderer) this.videoRenderer.clearSubtitles();
+      this._cueSink()?.clearSubtitles();
       this.emit("subtitleTrackChange" as any, { lang: null, label: null });
       return true;
     }
@@ -13466,7 +13472,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // still arriving.
     const generated = this._generatedSubCues.get(lang);
     if (generated) {
-      this.videoRenderer?.setSubtitleFormat("vtt");
+      this._cueSink()?.setSubtitleFormat("vtt");
       this._externalSubCues = generated;
       this._activeSubtitleLang = lang;
       this.selectSubtitleTrack(null);
@@ -13497,7 +13503,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         (fmt === "ass" || /\.(ass|ssa)(\?|#|$)/i.test(track.url)) &&
         ass?.loadExternal
       ) {
-        this.videoRenderer?.setSubtitleCues([]);
+        this._cueSink()?.setSubtitleCues([]);
         this._externalSubCues = [];
         this._activeSubtitleLang = lang;
         // Muxed subtitles off, without the renderer release that does.
@@ -13510,7 +13516,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
       // Tell the renderer which format we're using so it can toggle the
       // VTT-only backdrop styling. TTML renders like plain text (VTT path).
-      this.videoRenderer?.setSubtitleFormat(
+      this._cueSink()?.setSubtitleFormat(
         fmt === "ttml" || fmt === "ass" ? "vtt" : fmt,
       );
 
@@ -13657,8 +13663,11 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     this.stopExternalSubtitles();
     let lastIdx = -1;
     this._externalSubTimer = window.setInterval(() => {
-      if (!this.videoRenderer) return;
-      const time = this.clock.getTime();
+      const sink = this._cueSink();
+      if (!sink) return;
+      const time = this.streamWrapper
+        ? this.streamWrapper.getCurrentTime()
+        : this.clock.getTime();
       // Find active cue
       const idx = this._externalSubCues.findIndex(
         (c) => time >= c.start && time <= c.end,
@@ -13666,12 +13675,20 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       if (idx !== lastIdx) {
         lastIdx = idx;
         if (idx >= 0) {
-          this.videoRenderer.setSubtitleCues([this._externalSubCues[idx]]);
+          sink.setSubtitleCues([this._externalSubCues[idx]]);
         } else {
-          this.videoRenderer.setSubtitleCues([]);
+          sink.setSubtitleCues([]);
         }
       }
     }, 100); // 10Hz check — enough for subtitle timing
+  }
+
+  /** Where external subtitle cues are painted: the stream engine's own canvas
+   *  renderer when one is playing, Movi's otherwise. */
+  private _cueSink(): CanvasRenderer | null {
+    return this.streamWrapper
+      ? this.streamWrapper.getCanvasRenderer()
+      : this.videoRenderer;
   }
 
   /** Stop external subtitle rendering */
@@ -13708,9 +13725,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         /* ignore */
       }
     }
-    if (this.videoRenderer) {
-      this.videoRenderer.setSubtitleDelay(seconds);
-    }
+    this._cueSink()?.setSubtitleDelay(seconds);
     // Non-zero delay needs cues from stream positions the demuxer hasn't
     // necessarily reached yet (negative delay) or has already passed
     // (positive delay across a seek). Prefetch the full cue list once so

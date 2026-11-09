@@ -940,6 +940,11 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
     }
   }
 
+  /** The renderer that owns the canvas and the subtitle overlay. */
+  getCanvasRenderer(): CanvasRenderer | null {
+    return this.canvasRenderer;
+  }
+
   getVideoElement(): HTMLVideoElement {
     return this.videoElement;
   }
