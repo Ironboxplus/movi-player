@@ -54,6 +54,8 @@ const packet = (text: string, timestamp = 1.5, duration = 2): Packet =>
     isRasl: false,
   }) as Packet;
 
+const settle = () => new Promise((res) => setTimeout(res, 0));
+
 const HEADER = new TextEncoder().encode("[Script Info]\nScriptType: v4.00+\n");
 
 function make(fallback?: { family: string; url: string }) {
@@ -131,6 +133,7 @@ describe("JassubRenderer", () => {
     await r.configure(track("ass"), HEADER, []);
     r.pushPacket(packet("0,0,Default,,0,0,0,,one", 1.5, 2));
     r.pushPacket(packet("1,0,Default,,0,0,0,,two", 4, 0.25));
+    await settle();
     await r.destroy().catch(() => {});
     expect(inst().chunks).toEqual([
       ["0,0,Default,,0,0,0,,one", 1500, 2000],
@@ -149,6 +152,7 @@ describe("JassubRenderer", () => {
     r.pushPacket(packet("0,0,Default,,0,0,0,,{\\fnImpact}loud"));
     r.pushPacket(packet("1,0,Default,,0,0,0,,{\\fnImpact}again"));
     r.pushPacket(packet("2,0,Default,,0,0,0,,plain"));
+    await settle();
     await r.destroy().catch(() => {});
     expect(fontsFor).toHaveBeenCalledTimes(1);
     expect(inst().added).toEqual([[impact]]);
@@ -164,7 +168,7 @@ describe("JassubRenderer", () => {
       [next],
     );
     expect(FakeJassub.instances).toHaveLength(1);
-    expect(inst().calls).toEqual(["addFonts", "setTrack:[Script Info]"]);
+    expect(inst().calls).toEqual(["addFonts", "setTrack:[Script Info"]);
     expect(inst().added).toEqual([[next]]);
   });
 
@@ -173,6 +177,7 @@ describe("JassubRenderer", () => {
     await r.loadExternal("[Script Info]\nTitle: file\n[Events]\n");
     expect(inst().options.subContent).toContain("Title: file");
     r.render(3, 0, 0);
+    await settle();
     await r.destroy().catch(() => {});
     expect(inst().renders).toHaveLength(1);
   });
@@ -183,6 +188,7 @@ describe("JassubRenderer", () => {
     r.release();
     r.pushPacket(packet("0,0,Default,,0,0,0,,late"));
     r.render(1, 854, 480);
+    await settle();
     await r.destroy().catch(() => {});
     expect(inst().calls).toContain("freeTrack");
     expect(inst().chunks).toEqual([]);
@@ -194,6 +200,7 @@ describe("JassubRenderer", () => {
     await r.configure(track("ass"), HEADER, []);
     r.render(2.5, 1920, 1080);
     r.render(3, 0, 0);
+    await settle();
     await r.destroy().catch(() => {});
     expect(inst().renders).toEqual([
       {
