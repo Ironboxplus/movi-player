@@ -12,7 +12,10 @@
 
 import { MoviPlayer } from "../core/MoviPlayer";
 import { NativeVideoWrapper } from "./NativeVideoWrapper";
-import { loadingIndicatorMarkup, loadingIndicatorStyles } from "./LoadingIndicator";
+import {
+  loadingIndicatorMarkup,
+  loadingIndicatorStyles,
+} from "./LoadingIndicator";
 import type {
   SourceConfig,
   RendererType,
@@ -38,7 +41,12 @@ import { WasmBindings } from "../wasm/bindings";
 import { isOpenableScheme } from "../source/adapterRegistry";
 
 import { SettingsStorage } from "../utils/SettingsStorage";
-import { QoECollector, beaconSink, type QoESink, type QoESession } from "../utils/QoE";
+import {
+  QoECollector,
+  beaconSink,
+  type QoESink,
+  type QoESession,
+} from "../utils/QoE";
 import { VERSION } from "../version";
 import { IS_SLIM, BUILD } from "../build-flags";
 import { setWasmUrl } from "../wasm/FFmpegLoader";
@@ -58,6 +66,11 @@ import {
   type InbandSlot,
   type InbandTrack,
 } from "./SourceSelection";
+import {
+  JassubRenderer,
+  type FallbackFont,
+  type JassubHost,
+} from "./JassubRenderer";
 import {
   linkSeedBps,
   loadPersistedLinkBps,
@@ -206,8 +219,14 @@ const SYMBOLS = {
     filled: true,
     body: `<circle cx="12" cy="5.5" r="2.3"/><circle cx="12" cy="12" r="2.3"/><circle cx="12" cy="18.5" r="2.3"/>`,
   },
-  chevronLeftBold: { stroke: 1.9, body: `<polyline points="15 18 9 12 15 6"/>` },
-  chevronRightBold: { stroke: 1.9, body: `<polyline points="9 18 15 12 9 6"/>` },
+  chevronLeftBold: {
+    stroke: 1.9,
+    body: `<polyline points="15 18 9 12 15 6"/>`,
+  },
+  chevronRightBold: {
+    stroke: 1.9,
+    body: `<polyline points="9 18 15 12 9 6"/>`,
+  },
   warning: {
     stroke: 2,
     body: `<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>`,
@@ -221,8 +240,14 @@ const SYMBOLS = {
     size: 14,
     body: `<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>`,
   },
-  chevronsLeft: { stroke: 1.75, body: `<path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/>` },
-  chevronsRight: { stroke: 1.75, body: `<path d="M13 17l5-5-5-5M6 17l5-5-5-5"/>` },
+  chevronsLeft: {
+    stroke: 1.75,
+    body: `<path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/>`,
+  },
+  chevronsRight: {
+    stroke: 1.75,
+    body: `<path d="M13 17l5-5-5-5M6 17l5-5-5-5"/>`,
+  },
   replay: {
     stroke: 1.75,
     body: `<path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>`,
@@ -422,11 +447,18 @@ function pointerReallyMoved(e: MouseEvent): boolean {
 /** "512kb" / "2mb" / "1048576" → bytes. Anything unreadable means the default. */
 function parseByteSize(value: string | null): number {
   if (!value) return 0;
-  const m = String(value).trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*(k|kb|m|mb)?$/);
+  const m = String(value)
+    .trim()
+    .toLowerCase()
+    .match(/^(\d+(?:\.\d+)?)\s*(k|kb|m|mb)?$/);
   if (!m) return 0;
   const n = parseFloat(m[1]);
   const unit = m[2];
-  const mult = unit?.startsWith("m") ? 1024 * 1024 : unit?.startsWith("k") ? 1024 : 1;
+  const mult = unit?.startsWith("m")
+    ? 1024 * 1024
+    : unit?.startsWith("k")
+      ? 1024
+      : 1;
   return Math.max(0, Math.floor(n * mult));
 }
 
@@ -537,7 +569,8 @@ export interface MoviControlSpec {
    *  Separate from before/after on purpose: those say where it goes, this says
    *  what it belongs WITH. A control can sit beside the subtitles button and
    *  still be in nobody's capsule. */
-  group?: "play" | "seek" | "volume" | "time" | "settings" | "none" | (string & {});
+  group?:
+    "play" | "seek" | "volume" | "time" | "settings" | "none" | (string & {});
   /** Which surface (or surfaces) it appears on. Default "bar".
    *
    *    "bar"   the control bar along the bottom
@@ -791,7 +824,11 @@ const SHORTCUT_ACTIONS: Record<
   /* Shift, because N and P on their own are worth more to a host than they are
      to a queue most sources never have — and because Shift+N/Shift+P is what
      every viewer who has used a playlist already has in their fingers. */
-  nexttrack: { keys: ["shift+n"], canonical: "shift+n", label: "Next in queue" },
+  nexttrack: {
+    keys: ["shift+n"],
+    canonical: "shift+n",
+    label: "Next in queue",
+  },
   prevtrack: {
     keys: ["shift+p"],
     canonical: "shift+p",
@@ -1100,7 +1137,16 @@ export class MoviElement extends HTMLElement {
   // Pre-muxed video qualities declared via multiple <source> tags with
   // data-height / data-label. Lets the player drive a YouTube-style quality
   // menu for plain MP4 sources (where there's no HLS manifest to enumerate).
-  private _videoQualities: { src: string; type?: string; codec?: string; height: number; label: string; fps?: number; badge?: string; bandwidth?: number }[] = [];
+  private _videoQualities: {
+    src: string;
+    type?: string;
+    codec?: string;
+    height: number;
+    label: string;
+    fps?: number;
+    badge?: string;
+    bandwidth?: number;
+  }[] = [];
   // Last resolution height we emitted a `qualitychange` for. Lets us fire the
   // event on an ABR/in-place switch (which doesn't route through the manual
   // switch path) so hosts can remember the settled quality — without spamming a
@@ -1110,7 +1156,12 @@ export class MoviElement extends HTMLElement {
   // `qualitychange` when it advances, so a transient downshift never lowers a
   // persisting host's remembered quality.
   private _qualityHighWater: number = 0;
-  private _audioTracks: { src: string; type?: string; lang: string; label: string }[] = []; // Multi-language audio
+  private _audioTracks: {
+    src: string;
+    type?: string;
+    lang: string;
+    label: string;
+  }[] = []; // Multi-language audio
   // External subtitles. `inbandTitle` / `inbandOrder` (from `data-inband-*` on
   // the <track>) say the file is the extracted twin of an in-band track of
   // another source — see SourceSelection.ts.
@@ -1309,6 +1360,32 @@ export class MoviElement extends HTMLElement {
   // Host-supplied pluggable subtitle renderer (e.g. jassub/libass). Stored so it
   // survives a source change: re-applied to each fresh player instance.
   private _subtitleRenderer: SubtitleRenderer | null = null;
+  // The page called setSubtitleRenderer itself, so the JASSUB host's default
+  // renderer is not made for it.
+  private _subtitleRendererChosen = false;
+  // How ASS/SSA gets to libass. Set once by the page (see setJassubHost); the
+  // library and its assets belong to the host's bundler, not to this package.
+  private static _jassubHost: JassubHost | null = null;
+
+  /**
+   * Hand the element JASSUB — the library and where its worker and WebAssembly
+   * are served — so ASS/SSA (embedded and external) is drawn by libass with the
+   * file's own fonts. Call it before the first player is created. Pass null to
+   * go back to the built-in text path.
+   */
+  static setJassubHost(host: JassubHost | null): void {
+    MoviElement._jassubHost = host;
+  }
+
+  /** `subtitlefallbackfont="Family Name|url"`, or undefined. */
+  private _subtitleFallbackFont(): FallbackFont | undefined {
+    const raw = this.getAttribute("subtitlefallbackfont");
+    const at = raw ? raw.indexOf("|") : -1;
+    if (!raw || at <= 0) return undefined;
+    const family = raw.slice(0, at).trim();
+    const url = raw.slice(at + 1).trim();
+    return family && url ? { family, url } : undefined;
+  }
   // User-customizable subtitle appearance. Applied as CSS variables on the
   // host element so the shadow-DOM subtitle CSS can read them. Persisted
   // to localStorage so the user's choice survives reloads.
@@ -1383,7 +1460,8 @@ export class MoviElement extends HTMLElement {
       return;
     }
     const put = (attr: string, value: unknown) => {
-      if (value === undefined || value === null || this.hasAttribute(attr)) return;
+      if (value === undefined || value === null || this.hasAttribute(attr))
+        return;
       if (typeof value === "boolean") {
         if (value) this.setAttribute(attr, "");
         return;
@@ -1403,7 +1481,11 @@ export class MoviElement extends HTMLElement {
     // sources: [{ src, type }] — the first playable one, since the element
     // takes a single src (a ladder goes in <source> children, as it does there).
     const sources = setup.sources;
-    if (Array.isArray(sources) && sources.length > 0 && !this.hasAttribute("src")) {
+    if (
+      Array.isArray(sources) &&
+      sources.length > 0 &&
+      !this.hasAttribute("src")
+    ) {
       const first = sources.find(
         (s) => s && typeof (s as { src?: string }).src === "string",
       ) as { src?: string } | undefined;
@@ -1467,7 +1549,9 @@ export class MoviElement extends HTMLElement {
    * caller has to handle anyway on a browser without the API.
    */
   get remote(): unknown {
-    return (this.video as unknown as { remote?: unknown } | null)?.remote ?? null;
+    return (
+      (this.video as unknown as { remote?: unknown } | null)?.remote ?? null
+    );
   }
 
   /** thumb="precise" — anything else (including a bare `thumb`) is keyframes. */
@@ -1590,7 +1674,9 @@ export class MoviElement extends HTMLElement {
       tile.style.removeProperty("background-image");
       tile.style.display = "none";
     }
-    const img = sr.querySelector(".movi-thumbnail-img") as HTMLImageElement | null;
+    const img = sr.querySelector(
+      ".movi-thumbnail-img",
+    ) as HTMLImageElement | null;
     if (img) {
       img.removeAttribute("src");
       img.style.display = "none";
@@ -1823,10 +1909,10 @@ export class MoviElement extends HTMLElement {
   private _aspectPinchDist: number = 0; // Two-finger pinch baseline (fullscreen aspect-fit)
   private _vrSuppressClick: boolean = false; // Swallow the click that ends a drag
   private _vrPadDragging: boolean = false; // On-screen joystick is being dragged
-  private _encrypted: boolean = false;   // Encrypted source mode
-  private _tokenUrl: string = "";        // Token endpoint for encrypted playback
-  private _videoUrl: string = "";        // Video endpoint for encrypted playback
-  private _videoId: string = "";         // Video ID for encrypted playback
+  private _encrypted: boolean = false; // Encrypted source mode
+  private _tokenUrl: string = ""; // Token endpoint for encrypted playback
+  private _videoUrl: string = ""; // Video endpoint for encrypted playback
+  private _videoId: string = ""; // Video ID for encrypted playback
   private _resumeSaveInterval: number | null = null; // Interval to save position
   // True while the initial postertime poster seek is in flight (until the
   // clock is reset back to 0). The poster seek lands in a "paused" state which
@@ -1915,7 +2001,9 @@ export class MoviElement extends HTMLElement {
           if (dataUrl && dataUrl.length > 32) {
             this._lastFrameSnapshot = dataUrl;
           }
-        } catch { /* tainted canvas */ }
+        } catch {
+          /* tainted canvas */
+        }
       }
       // Pre-emptively show the snapshot as a poster overlay. This way, when
       // the user returns the browser can't briefly paint a corrupt canvas
@@ -1928,7 +2016,9 @@ export class MoviElement extends HTMLElement {
       // Visible again. If the GL context is still alive, hide the snapshot
       // immediately. If it was lost, leave the snapshot up — handleContextLost
       // / handleContextRestored own the recovery teardown.
-      const gl = this.canvas?.getContext("webgl2") as WebGL2RenderingContext | null;
+      const gl = this.canvas?.getContext(
+        "webgl2",
+      ) as WebGL2RenderingContext | null;
       const lost = gl?.isContextLost?.() ?? false;
       if (!lost && this._contextLostTime === 0) {
         this._hideSnapshotPoster();
@@ -2019,17 +2109,26 @@ export class MoviElement extends HTMLElement {
    */
   appendSubtitleCues(
     cues: SubtitleCue[],
-    options: { lang: string; label: string; select?: boolean; pending?: boolean },
+    options: {
+      lang: string;
+      label: string;
+      select?: boolean;
+      pending?: boolean;
+    },
   ): boolean {
     if (!this.player) return false;
-    this.player.appendSubtitleCues(options.lang, options.label, cues, options.pending);
+    this.player.appendSubtitleCues(
+      options.lang,
+      options.label,
+      cues,
+      options.pending,
+    );
     this.updateSubtitleTrackMenu();
     this.refreshOpenContextMenu();
     if (options.select) {
-      const active = this.player
-        .getSubtitleLangs()
-        .find((l) => l.active)?.lang;
-      if (active !== options.lang) void this.player.selectSubtitleLang(options.lang);
+      const active = this.player.getSubtitleLangs().find((l) => l.active)?.lang;
+      if (active !== options.lang)
+        void this.player.selectSubtitleLang(options.lang);
     }
     return true;
   }
@@ -2103,7 +2202,7 @@ export class MoviElement extends HTMLElement {
 
     const rate = this._playbackRate;
     const src =
-      typeof this._src === "string" ? this._src : this._src?.name ?? "";
+      typeof this._src === "string" ? this._src : (this._src?.name ?? "");
     const key = `${src}@${rate}`;
     if (key === this._smoothWarnKey) return;
     const seq = ++this._smoothCheckSeq;
@@ -2340,6 +2439,7 @@ export class MoviElement extends HTMLElement {
       "subtitlecolor",
       "subtitlebg",
       "subtitleedge",
+      "subtitlefallbackfont",
       "ambientmode",
       "ambientwrapper",
       "cropbars",
@@ -2567,7 +2667,11 @@ export class MoviElement extends HTMLElement {
     // embedders can forward it without registering a JS sink.
     this._qoe.addSink((e) =>
       this.dispatchEvent(
-        new CustomEvent("movi-qoe", { detail: e, bubbles: true, composed: true }),
+        new CustomEvent("movi-qoe", {
+          detail: e,
+          bubbles: true,
+          composed: true,
+        }),
       ),
     );
 
@@ -3337,7 +3441,12 @@ export class MoviElement extends HTMLElement {
       // someone called pause() and has not called play() since — and a new
       // source clears it, so the auto-advanced track above still starts.
       const state = this.player?.getState();
-      if (state && state !== "playing" && state !== "buffering" && !this._pauseWasAskedFor) {
+      if (
+        state &&
+        state !== "playing" &&
+        state !== "buffering" &&
+        !this._pauseWasAskedFor
+      ) {
         this.play();
       }
     });
@@ -3426,10 +3535,12 @@ export class MoviElement extends HTMLElement {
     shadowRoot.appendChild(nerdStats);
 
     // Nerd stats close button
-    nerdStats.querySelector(".movi-nerd-stats-close")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.toggleNerdStats(shadowRoot);
-    });
+    nerdStats
+      .querySelector(".movi-nerd-stats-close")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.toggleNerdStats(shadowRoot);
+      });
 
     // Create Timeline panel (separate from nerd stats)
     const timelinePanel = document.createElement("div");
@@ -3512,19 +3623,23 @@ export class MoviElement extends HTMLElement {
       }
     }
 
-    timelinePanel.querySelector(".movi-timeline-close")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this._timelineCancelled = true;
-      timelinePanel.style.display = "none";
-      this.focus();
-      // Only re-arm the auto-hide countdown if the bar is currently showing —
-      // that restarts the timer the open panel had suspended so a stuck bar
-      // fades during playback. Never surface a hidden bar here: showControls()
-      // on a hidden bar would fade it in and straight back out (a "flash").
-      if (!this.controlsContainer?.classList.contains("movi-controls-hidden")) {
-        this.showControls();
-      }
-    });
+    timelinePanel
+      .querySelector(".movi-timeline-close")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._timelineCancelled = true;
+        timelinePanel.style.display = "none";
+        this.focus();
+        // Only re-arm the auto-hide countdown if the bar is currently showing —
+        // that restarts the timer the open panel had suspended so a stuck bar
+        // fades during playback. Never surface a hidden bar here: showControls()
+        // on a hidden bar would fade it in and straight back out (a "flash").
+        if (
+          !this.controlsContainer?.classList.contains("movi-controls-hidden")
+        ) {
+          this.showControls();
+        }
+      });
 
     // Create Resume Dialog
     const resumeDialog = document.createElement("div");
@@ -3573,35 +3688,39 @@ export class MoviElement extends HTMLElement {
     this._captionHint.style.display = "none";
     shadowRoot.appendChild(this._captionHint);
 
-    resumeDialog.querySelector(".movi-resume-yes")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const time = parseFloat(resumeDialog.dataset.time || "0");
-      resumeDialog.style.display = "none";
-      this.focus();
-      if (this.player && time > 0) {
-        // Wait for the seek to fully settle (state out of "seeking") before
-        // playing. seek()'s promise resolves once the demuxer.seek + processLoop
-        // are kicked off, but state stays "seeking" until the first frame syncs.
-        // Calling play() during "seeking" takes a deferred-resume shortcut that
-        // skips first-play init (sets _playStartTime, re-aligns demuxer, starts
-        // native audio); on a fresh paused load that path drops us back to t=0
-        // instead of the resume target. Awaiting "seeked" lets play() run the
-        // full first-play pipeline from a settled paused state.
-        const player = this.player;
-        const onSeeked = () => this.play().catch(() => {});
-        player.once("seeked", onSeeked);
-        player.seek(time).catch(() => {
-          player.off("seeked", onSeeked);
-        });
-      }
-    });
+    resumeDialog
+      .querySelector(".movi-resume-yes")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const time = parseFloat(resumeDialog.dataset.time || "0");
+        resumeDialog.style.display = "none";
+        this.focus();
+        if (this.player && time > 0) {
+          // Wait for the seek to fully settle (state out of "seeking") before
+          // playing. seek()'s promise resolves once the demuxer.seek + processLoop
+          // are kicked off, but state stays "seeking" until the first frame syncs.
+          // Calling play() during "seeking" takes a deferred-resume shortcut that
+          // skips first-play init (sets _playStartTime, re-aligns demuxer, starts
+          // native audio); on a fresh paused load that path drops us back to t=0
+          // instead of the resume target. Awaiting "seeked" lets play() run the
+          // full first-play pipeline from a settled paused state.
+          const player = this.player;
+          const onSeeked = () => this.play().catch(() => {});
+          player.once("seeked", onSeeked);
+          player.seek(time).catch(() => {
+            player.off("seeked", onSeeked);
+          });
+        }
+      });
 
-    resumeDialog.querySelector(".movi-resume-no")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      resumeDialog.style.display = "none";
-      this.clearResumePosition();
-      this.focus();
-    });
+    resumeDialog
+      .querySelector(".movi-resume-no")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        resumeDialog.style.display = "none";
+        this.clearResumePosition();
+        this.focus();
+      });
 
     // Move the selection ring to whichever button the pointer is over, so it
     // tracks the mouse the same way arrow keys move it — hovering Cancel puts
@@ -3616,7 +3735,9 @@ export class MoviElement extends HTMLElement {
       resumeYes?.classList.toggle("movi-resume-focused", btn === resumeYes);
       resumeNo?.classList.toggle("movi-resume-focused", btn === resumeNo);
     };
-    resumeYes?.addEventListener("pointerenter", () => focusResumeBtn(resumeYes));
+    resumeYes?.addEventListener("pointerenter", () =>
+      focusResumeBtn(resumeYes),
+    );
     resumeNo?.addEventListener("pointerenter", () => focusResumeBtn(resumeNo));
 
     // Create Keyboard Shortcuts Panel
@@ -3661,10 +3782,12 @@ export class MoviElement extends HTMLElement {
     `;
     shadowRoot.appendChild(shortcutsPanel);
 
-    shortcutsPanel.querySelector(".movi-shortcuts-close")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      shortcutsPanel.style.display = "none";
-    });
+    shortcutsPanel
+      .querySelector(".movi-shortcuts-close")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        shortcutsPanel.style.display = "none";
+      });
 
     // Subtitle Cues Browser — full-cover modal listing every cue, with
     // search + click-to-seek. Useful for finding the exact dialogue
@@ -3687,10 +3810,12 @@ export class MoviElement extends HTMLElement {
     `;
     shadowRoot.appendChild(cuesPanel);
 
-    cuesPanel.querySelector(".movi-cues-close")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.closeCuesPanel();
-    });
+    cuesPanel
+      .querySelector(".movi-cues-close")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.closeCuesPanel();
+      });
 
     // Setup control handlers
     this.setupControlHandlers(shadowRoot);
@@ -3896,7 +4021,8 @@ export class MoviElement extends HTMLElement {
     const half = tip.offsetWidth / 2;
     const centre = btnRect.left + btnRect.width / 2 - barRect.left;
     const limit = Math.max(half + 4, barRect.width - half - 4);
-    tip.style.left = Math.max(half + 4, Math.min(limit, centre)).toFixed(1) + "px";
+    tip.style.left =
+      Math.max(half + 4, Math.min(limit, centre)).toFixed(1) + "px";
     // Clear of the seek bar, not just of the button. Sitting directly over the
     // row it covered the progress track, and the track is the one thing on this
     // bar a viewer watches while reaching for a button.
@@ -3946,7 +4072,10 @@ export class MoviElement extends HTMLElement {
         key: k("prevtrack"),
       };
     if (is("movi-next-btn"))
-      return { text: this.neighbourItemTitle(1) || "Next", key: k("nexttrack") };
+      return {
+        text: this.neighbourItemTitle(1) || "Next",
+        key: k("nexttrack"),
+      };
     if (is("movi-seek-backward"))
       return { text: "Back 10 seconds", key: k("seekback") };
     if (is("movi-seek-forward"))
@@ -3995,7 +4124,8 @@ export class MoviElement extends HTMLElement {
     if (is("movi-settings-btn")) return { text: "Settings", key: "" };
     if (is("movi-aspect-ratio-btn"))
       return { text: "Aspect ratio", key: k("aspect") };
-    if (is("movi-pip-btn")) return { text: "Picture-in-picture", key: k("pip") };
+    if (is("movi-pip-btn"))
+      return { text: "Picture-in-picture", key: k("pip") };
     if (is("movi-more-btn")) return { text: "More", key: "" };
     if (is("movi-fullscreen-btn"))
       return {
@@ -4089,29 +4219,24 @@ export class MoviElement extends HTMLElement {
     hdrBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       this.hdr = !this.hdr;
-      this.showOSD(
-        OSD.hdr,
-        this.hdr ? "HDR On" : "HDR Off",
-      );
+      this.showOSD(OSD.hdr, this.hdr ? "HDR On" : "HDR Off");
     });
 
     // Loop Toggle
     loopBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       this.loop = !this.loop;
-      this.showOSD(
-        OSD.loop,
-        this.loop ? "Loop On" : "Loop Off",
-      );
+      this.showOSD(OSD.loop, this.loop ? "Loop On" : "Loop Off");
     });
 
     // The chapter pill opens the timeline — it names where you are, and the
     // timeline is the picture of that.
-    (shadowRoot.querySelector(".movi-chapter-pill") as HTMLElement | null)
-      ?.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.toggleTimeline();
-      });
+    (
+      shadowRoot.querySelector(".movi-chapter-pill") as HTMLElement | null
+    )?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleTimeline();
+    });
 
     // Time display: click toggles elapsed / remaining. A player's own clock is
     // the obvious place for that, and it costs no room on the bar.
@@ -4133,7 +4258,9 @@ export class MoviElement extends HTMLElement {
     }
 
     // LIVE badge → jump to the live edge and resume.
-    const liveBadge = shadowRoot.querySelector(".movi-live-badge") as HTMLElement;
+    const liveBadge = shadowRoot.querySelector(
+      ".movi-live-badge",
+    ) as HTMLElement;
     liveBadge?.addEventListener("click", (e) => {
       e.stopPropagation();
       this.player?.seekToLive?.();
@@ -4142,7 +4269,9 @@ export class MoviElement extends HTMLElement {
     });
 
     // Stable Audio Toggle
-    const stableAudioBtn = shadowRoot.querySelector(".movi-stable-audio-btn") as HTMLElement;
+    const stableAudioBtn = shadowRoot.querySelector(
+      ".movi-stable-audio-btn",
+    ) as HTMLElement;
     stableAudioBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       if (this.player) {
@@ -4479,10 +4608,7 @@ export class MoviElement extends HTMLElement {
         PREVIEW_SLOW_MAX_WAIT_MS,
         previewPace.lastMs * 1.5,
       );
-      const maxLeft = Math.max(
-        0,
-        maxWait - (now - previewPace.lastShownAt),
-      );
+      const maxLeft = Math.max(0, maxWait - (now - previewPace.lastShownAt));
       cancelSettleTimer();
       previewSettleTimer = window.setTimeout(
         () => {
@@ -4597,11 +4723,14 @@ export class MoviElement extends HTMLElement {
       this.paintChapterHover(time);
 
       // Show chapter title if hovering over a chapter
-      const chapterTitleEl = shadowRoot.querySelector(".movi-seek-chapter-title") as HTMLElement;
+      const chapterTitleEl = shadowRoot.querySelector(
+        ".movi-seek-chapter-title",
+      ) as HTMLElement;
       if (chapterTitleEl) {
         const chapters = this.player?.getChapters() ?? [];
         const chapter = chapters.find((ch, i) => {
-          const end = i < chapters.length - 1 ? chapters[i + 1].start : duration;
+          const end =
+            i < chapters.length - 1 ? chapters[i + 1].start : duration;
           return time >= ch.start && time < end;
         });
         if (chapter) {
@@ -4623,7 +4752,10 @@ export class MoviElement extends HTMLElement {
         (time >= (this.player.getBufferStartTime?.() ?? 0) &&
           time <= (this.player.getBufferEndTime?.() ?? duration));
 
-      if (this.canPreviewFrames() && (previewInWindow || this.hasInstantPreviews())) {
+      if (
+        this.canPreviewFrames() &&
+        (previewInWindow || this.hasInstantPreviews())
+      ) {
         // A storyboard can answer in this very frame — the mosaic is an image
         // the browser already has, and the tile is a background offset into
         // it. Going through requestPreview instead would spend 40ms of
@@ -4664,7 +4796,7 @@ export class MoviElement extends HTMLElement {
       // the signature; anything else leaves the card exactly as wide as it was.
       const widthSig =
         `${this._previewBoxKey}|` +
-        `${chapterTitleEl?.style.display !== "none" ? chapterTitleEl?.textContent ?? "" : ""}|` +
+        `${chapterTitleEl?.style.display !== "none" ? (chapterTitleEl?.textContent ?? "") : ""}|` +
         `${thumbnailTime.textContent?.length ?? 0}|` +
         `${this.canPreviewFrames() ? 1 : 0}`;
       if (widthSig !== previewCardWidth.sig) {
@@ -4937,10 +5069,7 @@ export class MoviElement extends HTMLElement {
             // composedPath crosses shadow boundaries; evt.target alone gets
             // retargeted to the host, which makes every click look "outside".
             const path = evt.composedPath();
-            if (
-              !path.includes(volumeContainer) &&
-              !path.includes(volumeBtn)
-            ) {
+            if (!path.includes(volumeContainer) && !path.includes(volumeBtn)) {
               volumeContainer.classList.remove("active");
               document.removeEventListener("click", closeVolume);
             }
@@ -5162,7 +5291,8 @@ export class MoviElement extends HTMLElement {
     aspectRatioBtn?.addEventListener("click", (e) => {
       e.stopPropagation();
       const fits = ["contain", "cover", "fill", "zoom"] as const;
-      const current = this._objectFit === "control" ? this._currentFit : this._objectFit;
+      const current =
+        this._objectFit === "control" ? this._currentFit : this._objectFit;
       const idx = fits.indexOf(current as any);
       const next = fits[(idx + 1) % fits.length];
       this.setFit(next);
@@ -5231,13 +5361,12 @@ export class MoviElement extends HTMLElement {
     shadowRoot.querySelectorAll(".movi-speed-item").forEach((item) => {
       item.addEventListener("click", (e) => {
         e.stopPropagation();
-        const requested = parseFloat((item as HTMLElement).dataset.speed || "1");
+        const requested = parseFloat(
+          (item as HTMLElement).dataset.speed || "1",
+        );
         const speed = Math.min(requested, this.getMaxAllowedRate());
         this.playbackRate = speed;
-        this.showOSD(
-          OSD.speed,
-          `Speed ${speed}x`,
-        );
+        this.showOSD(OSD.speed, `Speed ${speed}x`);
         this.setBottomMenuOpen(speedMenu, false);
       });
     });
@@ -5534,7 +5663,11 @@ export class MoviElement extends HTMLElement {
           this.updateCanvasSize();
         });
       });
-      this.dispatchEvent(new CustomEvent("fullscreenchange", { detail: { fullscreen: isFullscreen } }));
+      this.dispatchEvent(
+        new CustomEvent("fullscreenchange", {
+          detail: { fullscreen: isFullscreen },
+        }),
+      );
     });
 
     // Show/hide controls - use a flag to track if mouse is over controls
@@ -5677,12 +5810,7 @@ export class MoviElement extends HTMLElement {
     const progressBar = this.shadowRoot?.querySelector(
       ".movi-progress-bar",
     ) as HTMLElement;
-    if (
-      !progressBar ||
-      !this.player ||
-      this.isLoading ||
-      this._isUnsupported
-    )
+    if (!progressBar || !this.player || this.isLoading || this._isUnsupported)
       return;
 
     const state = this.player.getState();
@@ -5749,12 +5877,7 @@ export class MoviElement extends HTMLElement {
     const progressBar = this.shadowRoot?.querySelector(
       ".movi-progress-bar",
     ) as HTMLElement;
-    if (
-      !progressBar ||
-      !this.player ||
-      this.isLoading ||
-      this._isUnsupported
-    )
+    if (!progressBar || !this.player || this.isLoading || this._isUnsupported)
       return;
 
     // Get touch position
@@ -6121,7 +6244,11 @@ export class MoviElement extends HTMLElement {
               const dy = t.clientY - this._vrLastY;
               this._vrLastX = t.clientX;
               this._vrLastY = t.clientY;
-              this.player?.nudgeVR360(dx, dy, this.getBoundingClientRect().height);
+              this.player?.nudgeVR360(
+                dx,
+                dy,
+                this.getBoundingClientRect().height,
+              );
               this._vrPinchDist = 0;
             } else if (e.touches.length === 2) {
               const dist = Math.hypot(
@@ -6401,8 +6528,12 @@ export class MoviElement extends HTMLElement {
     });
 
     // ── On-screen pan joystick (the YouTube-style compass, desktop only) ──
-    const pad = shadowRoot.querySelector(".movi-vr360-pad") as HTMLElement | null;
-    const knob = pad?.querySelector(".movi-vr360-pad-knob") as HTMLElement | null;
+    const pad = shadowRoot.querySelector(
+      ".movi-vr360-pad",
+    ) as HTMLElement | null;
+    const knob = pad?.querySelector(
+      ".movi-vr360-pad-knob",
+    ) as HTMLElement | null;
     if (pad && knob) {
       const RADIUS = 22; // max knob travel from centre (px)
       let padDragging = false;
@@ -6584,7 +6715,10 @@ export class MoviElement extends HTMLElement {
 
     const attr = this.getAttribute("vr");
     const forced = attr !== null;
-    const tokens = (attr ?? "").toLowerCase().split(/[\s,]+/).filter(Boolean);
+    const tokens = (attr ?? "")
+      .toLowerCase()
+      .split(/[\s,]+/)
+      .filter(Boolean);
     const has = (t: string) => tokens.includes(t);
 
     // Stereographic "little planet" is a standalone full-360 layout — it
@@ -6639,7 +6773,8 @@ export class MoviElement extends HTMLElement {
       (e) => {
         const t = e.composedPath()[0] as HTMLElement | undefined;
         if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
-        if (document.activeElement !== this) this.focus({ preventScroll: true });
+        if (document.activeElement !== this)
+          this.focus({ preventScroll: true });
       },
       true,
     );
@@ -6666,10 +6801,16 @@ export class MoviElement extends HTMLElement {
       }
 
       // Resume dialog keyboard navigation
-      const resumeDialog = this.shadowRoot?.querySelector(".movi-resume-dialog") as HTMLElement;
+      const resumeDialog = this.shadowRoot?.querySelector(
+        ".movi-resume-dialog",
+      ) as HTMLElement;
       if (resumeDialog && resumeDialog.style.display !== "none") {
-        const yesBtn = resumeDialog.querySelector(".movi-resume-yes") as HTMLElement;
-        const noBtn = resumeDialog.querySelector(".movi-resume-no") as HTMLElement;
+        const yesBtn = resumeDialog.querySelector(
+          ".movi-resume-yes",
+        ) as HTMLElement;
+        const noBtn = resumeDialog.querySelector(
+          ".movi-resume-no",
+        ) as HTMLElement;
         if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
           e.preventDefault();
           // Toggle focus between Resume and Cancel
@@ -6680,7 +6821,9 @@ export class MoviElement extends HTMLElement {
           return;
         } else if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          const focused = resumeDialog.querySelector(".movi-resume-focused") as HTMLElement;
+          const focused = resumeDialog.querySelector(
+            ".movi-resume-focused",
+          ) as HTMLElement;
           (focused || yesBtn)?.click();
           return;
         } else if (e.key === "Escape") {
@@ -6691,14 +6834,20 @@ export class MoviElement extends HTMLElement {
       }
 
       // Timeline navigation — intercept when timeline is open
-      const timelinePanel = this.shadowRoot?.querySelector(".movi-timeline-panel") as HTMLElement;
+      const timelinePanel = this.shadowRoot?.querySelector(
+        ".movi-timeline-panel",
+      ) as HTMLElement;
       if (timelinePanel && timelinePanel.style.display !== "none") {
         if (e.key === "Escape") {
           e.preventDefault();
           this.toggleTimeline();
           return;
         }
-        if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Enter") {
+        if (
+          e.key === "ArrowLeft" ||
+          e.key === "ArrowRight" ||
+          e.key === "Enter"
+        ) {
           e.preventDefault();
           const items = timelinePanel.querySelectorAll(".movi-timeline-item");
           if (items.length === 0) return;
@@ -6706,7 +6855,9 @@ export class MoviElement extends HTMLElement {
           // Find currently selected item
           let selectedIdx = -1;
           items.forEach((item, i) => {
-            if ((item as HTMLElement).classList.contains("movi-timeline-selected")) {
+            if (
+              (item as HTMLElement).classList.contains("movi-timeline-selected")
+            ) {
               selectedIdx = i;
             }
           });
@@ -6722,7 +6873,9 @@ export class MoviElement extends HTMLElement {
           }
 
           // Update selection
-          items.forEach((item) => (item as HTMLElement).classList.remove("movi-timeline-selected"));
+          items.forEach((item) =>
+            (item as HTMLElement).classList.remove("movi-timeline-selected"),
+          );
           if (selectedIdx >= 0) {
             const selected = items[selectedIdx] as HTMLElement;
             selected.classList.add("movi-timeline-selected");
@@ -6749,8 +6902,7 @@ export class MoviElement extends HTMLElement {
         // when nothing is held with them; Shift+P is a different shortcut that
         // happens to be spelled with one of them, and an audio queue is the
         // most ordinary queue there is.
-        const bareKey =
-          !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
+        const bareKey = !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
         if (
           bareKey &&
           e.key.length === 1 &&
@@ -6835,10 +6987,7 @@ export class MoviElement extends HTMLElement {
             const fps = vTrack?.frameRate || 24;
             const frameTime = 1 / fps;
             this.currentTime = Math.max(0, this.currentTime - frameTime);
-            this.showOSD(
-              `${symbolSvg("chevronsLeft")}`,
-              `-1 Frame`,
-            );
+            this.showOSD(`${symbolSvg("chevronsLeft")}`, `-1 Frame`);
           } else {
             this.performRelativeSeek("left");
           }
@@ -6863,10 +7012,7 @@ export class MoviElement extends HTMLElement {
                 this.duration,
                 this.currentTime + frameTime,
               );
-              this.showOSD(
-                `${symbolSvg("chevronsRight")}`,
-                `+1 Frame`,
-              );
+              this.showOSD(`${symbolSvg("chevronsRight")}`, `+1 Frame`);
             } else {
               this.performRelativeSeek("right");
             }
@@ -6875,14 +7021,22 @@ export class MoviElement extends HTMLElement {
         case "ArrowUp":
           // Up Arrow: Increase volume
           e.preventDefault();
-          if (this.player && this.player.hasAudibleSource() && !this._noAudibleAudio) {
+          if (
+            this.player &&
+            this.player.hasAudibleSource() &&
+            !this._noAudibleAudio
+          ) {
             this.volume = Math.min(this.getMaxVolume(), this.volume + 0.1);
           }
           break;
         case "ArrowDown":
           // Down Arrow: Decrease volume
           e.preventDefault();
-          if (this.player && this.player.hasAudibleSource() && !this._noAudibleAudio) {
+          if (
+            this.player &&
+            this.player.hasAudibleSource() &&
+            !this._noAudibleAudio
+          ) {
             this.volume = Math.max(0, this.volume - 0.1);
           }
           break;
@@ -6897,9 +7051,7 @@ export class MoviElement extends HTMLElement {
           if (this._noAudibleAudio) break;
           this.muted = !this.muted;
           this.showOSD(
-            this.muted
-              ? OSD.muted
-              : OSD.unmuted,
+            this.muted ? OSD.muted : OSD.unmuted,
             this.muted ? "Muted" : "Unmuted",
           );
           break;
@@ -6909,10 +7061,7 @@ export class MoviElement extends HTMLElement {
           e.preventDefault();
           if (!this.isControlAvailable("snapshot")) break;
           this.takeSnapshot();
-          this.showOSD(
-            OSD.snapshot,
-            "Snapshot",
-          );
+          this.showOSD(OSD.snapshot, "Snapshot");
           break;
         case "f":
         case "F":
@@ -6943,13 +7092,16 @@ export class MoviElement extends HTMLElement {
         case "R":
           // R: Rotate video 90° (disabled during PiP)
           e.preventDefault();
-          if (this.player && !this._pipWindow && this.isControlAvailable("rotate")) {
+          if (
+            this.player &&
+            !this._pipWindow &&
+            this.isControlAvailable("rotate")
+          ) {
             const deg = this.player.rotateVideo();
-            this.showOSD(
-              `${symbolSvg("replay")}`,
-              `${deg}°`,
+            this.showOSD(`${symbolSvg("replay")}`, `${deg}°`);
+            const statusEl = this.contextMenuRoot().querySelector(
+              ".movi-rotate-status",
             );
-            const statusEl = this.contextMenuRoot().querySelector(".movi-rotate-status");
             if (statusEl) statusEl.textContent = `${deg}°`;
             this.syncThumbnailRotation(deg);
             this.emitSettingChange("rotatechange", { degrees: deg });
@@ -6962,14 +7114,22 @@ export class MoviElement extends HTMLElement {
           if (!this.isControlAvailable("aspect")) break;
           {
             const fits = ["contain", "cover", "fill", "zoom"] as const;
-            const current = this._objectFit === "control" ? this._currentFit : this._objectFit;
+            const current =
+              this._objectFit === "control"
+                ? this._currentFit
+                : this._objectFit;
             const idx = fits.indexOf(current as any);
             const next = fits[(idx + 1) % fits.length];
             this.setFit(next);
             this.updateFitMode();
             this.updateAspectRatioIcon();
             this.announceAspect(next);
-            const labels: Record<string, string> = { contain: "Fit", cover: "Fill", fill: "Stretch", zoom: "Zoom" };
+            const labels: Record<string, string> = {
+              contain: "Fit",
+              cover: "Fill",
+              fill: "Stretch",
+              zoom: "Zoom",
+            };
             this.showOSD(
               symbolSvg(MoviElement.aspectSymbol(next)),
               labels[next],
@@ -6985,10 +7145,7 @@ export class MoviElement extends HTMLElement {
           if (this.isControlDisabled("loop")) break;
           e.preventDefault();
           this.loop = !this.loop;
-          this.showOSD(
-            OSD.loop,
-            this.loop ? "Loop On" : "Loop Off",
-          );
+          this.showOSD(OSD.loop, this.loop ? "Loop On" : "Loop Off");
           break;
         case "v":
         case "V":
@@ -7010,12 +7167,18 @@ export class MoviElement extends HTMLElement {
               if (activeIdx === -1) {
                 // Currently off → select first
                 this.pickSubtitleLang(extSubs[0].lang);
-                this.showOSD(subOsdOn, `${extSubs[0].label} [${extSubs[0].lang.toUpperCase()}] (1/${extSubs.length})`);
+                this.showOSD(
+                  subOsdOn,
+                  `${extSubs[0].label} [${extSubs[0].lang.toUpperCase()}] (1/${extSubs.length})`,
+                );
               } else if (activeIdx + 1 < extSubs.length) {
                 // Next track
                 const next = extSubs[activeIdx + 1];
                 this.pickSubtitleLang(next.lang);
-                this.showOSD(subOsdOn, `${next.label} [${next.lang.toUpperCase()}] (${activeIdx + 2}/${extSubs.length})`);
+                this.showOSD(
+                  subOsdOn,
+                  `${next.label} [${next.lang.toUpperCase()}] (${activeIdx + 2}/${extSubs.length})`,
+                );
               } else {
                 // Last → off
                 this.pickSubtitleLang(null);
@@ -7025,7 +7188,9 @@ export class MoviElement extends HTMLElement {
             } else if (muxedSubs.length > 0) {
               // Fallback: muxed subtitle tracks
               const active = this.player.trackManager.getActiveSubtitleTrack();
-              const activeIdx = active ? muxedSubs.findIndex(t => t.id === active.id) : -1;
+              const activeIdx = active
+                ? muxedSubs.findIndex((t) => t.id === active.id)
+                : -1;
               const nextIdx = activeIdx + 1;
               if (nextIdx >= muxedSubs.length) {
                 this.pickSubtitleTrack(null);
@@ -7035,8 +7200,14 @@ export class MoviElement extends HTMLElement {
                 this.pickSubtitleTrack(next.id);
                 const muxSubLang = next.language?.toUpperCase() || "";
                 const muxSubLabel = next.label || muxSubLang || "Sub";
-                const muxSubOsd = muxSubLang && muxSubLabel !== muxSubLang ? `${muxSubLabel} [${muxSubLang}]` : muxSubLabel;
-                this.showOSD(subOsdOn, `${muxSubOsd} (${nextIdx + 1}/${muxedSubs.length})`);
+                const muxSubOsd =
+                  muxSubLang && muxSubLabel !== muxSubLang
+                    ? `${muxSubLabel} [${muxSubLang}]`
+                    : muxSubLabel;
+                this.showOSD(
+                  subOsdOn,
+                  `${muxSubOsd} (${nextIdx + 1}/${muxedSubs.length})`,
+                );
               }
               this.updateSubtitleTrackMenu();
             }
@@ -7056,14 +7227,18 @@ export class MoviElement extends HTMLElement {
           if (this.isControlDisabled("cc")) break;
           e.preventDefault();
           if (!this.player || !this.player.isFileSource()) break;
-          const hasActiveMuxed = !!this.player.trackManager.getActiveSubtitleTrack();
-          const hasActiveExt = this.player.getSubtitleLangs().some((t) => t.active);
+          const hasActiveMuxed =
+            !!this.player.trackManager.getActiveSubtitleTrack();
+          const hasActiveExt = this.player
+            .getSubtitleLangs()
+            .some((t) => t.active);
           if (!hasActiveMuxed && !hasActiveExt) break;
           const step = 0.1;
           const direction = e.key === "z" || e.key === "Z" ? -1 : 1;
           // Round to 3 decimals to keep the displayed value stable across
           // many presses despite floating-point accumulation.
-          const next = Math.round((this._subtitleDelay + direction * step) * 1000) / 1000;
+          const next =
+            Math.round((this._subtitleDelay + direction * step) * 1000) / 1000;
           this.subtitleDelay = next;
           const formatted =
             next === 0 ? "0s" : `${next > 0 ? "+" : ""}${next.toFixed(2)}s`;
@@ -7081,10 +7256,22 @@ export class MoviElement extends HTMLElement {
             const bIcon = OSD.audio;
 
             // Build unified list: muxed first, then external
-            type AudioEntry = { type: "muxed"; id: number; label: string; langCode: string } | { type: "ext"; lang: string; label: string; langCode: string };
+            type AudioEntry =
+              | { type: "muxed"; id: number; label: string; langCode: string }
+              | { type: "ext"; lang: string; label: string; langCode: string };
             const allAudio: AudioEntry[] = [
-              ...bMuxed.map((t) => ({ type: "muxed" as const, id: t.id, label: t.label || t.language || `Audio ${t.id}`, langCode: t.language?.toUpperCase() || "" })),
-              ...bExternal.map((t) => ({ type: "ext" as const, lang: t.lang, label: t.label, langCode: t.lang.toUpperCase() })),
+              ...bMuxed.map((t) => ({
+                type: "muxed" as const,
+                id: t.id,
+                label: t.label || t.language || `Audio ${t.id}`,
+                langCode: t.language?.toUpperCase() || "",
+              })),
+              ...bExternal.map((t) => ({
+                type: "ext" as const,
+                lang: t.lang,
+                label: t.label,
+                langCode: t.lang.toUpperCase(),
+              })),
             ];
 
             if (allAudio.length > 1) {
@@ -7093,10 +7280,15 @@ export class MoviElement extends HTMLElement {
               let curIdx = -1;
               if (isNative) {
                 const activeLang = bExternal.find((t) => t.active)?.lang;
-                curIdx = allAudio.findIndex((a) => a.type === "ext" && a.lang === activeLang);
+                curIdx = allAudio.findIndex(
+                  (a) => a.type === "ext" && a.lang === activeLang,
+                );
               } else {
-                const activeId = this.player.trackManager.getActiveAudioTrack()?.id;
-                curIdx = allAudio.findIndex((a) => a.type === "muxed" && a.id === activeId);
+                const activeId =
+                  this.player.trackManager.getActiveAudioTrack()?.id;
+                curIdx = allAudio.findIndex(
+                  (a) => a.type === "muxed" && a.id === activeId,
+                );
               }
               const nextIdx = (curIdx + 1) % allAudio.length;
               const next = allAudio[nextIdx];
@@ -7104,11 +7296,17 @@ export class MoviElement extends HTMLElement {
               if (next.type === "ext") {
                 this.pickAudioLang(next.lang);
               } else {
-                if (this.player.isNativeAudioActive()) this.player.useMuxedAudio();
+                if (this.player.isNativeAudioActive())
+                  this.player.useMuxedAudio();
                 this.pickAudioTrack(next.id);
               }
-              const audioOsdLabel = next.langCode ? `${next.label} [${next.langCode}]` : next.label;
-              this.showOSD(bIcon, `${audioOsdLabel} (${nextIdx + 1}/${allAudio.length})`);
+              const audioOsdLabel = next.langCode
+                ? `${next.label} [${next.langCode}]`
+                : next.label;
+              this.showOSD(
+                bIcon,
+                `${audioOsdLabel} (${nextIdx + 1}/${allAudio.length})`,
+              );
               this.updateAudioTrackMenu();
             }
           }
@@ -7120,10 +7318,7 @@ export class MoviElement extends HTMLElement {
           {
             if (this.isControlAvailable("hdr")) {
               this.hdr = !this.hdr;
-              this.showOSD(
-                OSD.hdr,
-                this.hdr ? "HDR On" : "HDR Off",
-              );
+              this.showOSD(OSD.hdr, this.hdr ? "HDR On" : "HDR Off");
             }
           }
           break;
@@ -7170,14 +7365,16 @@ export class MoviElement extends HTMLElement {
           e.preventDefault();
           {
             const maxRate = this.getMaxAllowedRate();
-            const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].filter(s => s <= maxRate);
-            const curIdx = speeds.findIndex(s => s >= this._playbackRate);
-            const nextIdx = Math.min((curIdx === -1 ? 3 : curIdx) + 1, speeds.length - 1);
-            this.playbackRate = speeds[nextIdx];
-            this.showOSD(
-              OSD.speed,
-              `Speed ${this._playbackRate}x`,
+            const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].filter(
+              (s) => s <= maxRate,
             );
+            const curIdx = speeds.findIndex((s) => s >= this._playbackRate);
+            const nextIdx = Math.min(
+              (curIdx === -1 ? 3 : curIdx) + 1,
+              speeds.length - 1,
+            );
+            this.playbackRate = speeds[nextIdx];
+            this.showOSD(OSD.speed, `Speed ${this._playbackRate}x`);
           }
           break;
         case "-":
@@ -7186,14 +7383,13 @@ export class MoviElement extends HTMLElement {
           e.preventDefault();
           {
             const maxRate = this.getMaxAllowedRate();
-            const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].filter(s => s <= maxRate);
-            const curIdx = speeds.findIndex(s => s >= this._playbackRate);
+            const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].filter(
+              (s) => s <= maxRate,
+            );
+            const curIdx = speeds.findIndex((s) => s >= this._playbackRate);
             const nextIdx = Math.max((curIdx === -1 ? 3 : curIdx) - 1, 0);
             this.playbackRate = speeds[nextIdx];
-            this.showOSD(
-              OSD.speed,
-              `Speed ${this._playbackRate}x`,
-            );
+            this.showOSD(OSD.speed, `Speed ${this._playbackRate}x`);
           }
           break;
         case "?":
@@ -7406,10 +7602,9 @@ export class MoviElement extends HTMLElement {
       // Refined gate: allow context menu unless the click is on a real
       // button, the progress bar, or the menu itself.
       const inStripMode = this.classList.contains("movi-audio-strip");
-      const isOnInteractive =
-        !!shadowTarget?.closest(
-          ".movi-btn, .movi-progress-container, .movi-volume-slider, .movi-context-menu",
-        );
+      const isOnInteractive = !!shadowTarget?.closest(
+        ".movi-btn, .movi-progress-container, .movi-volume-slider, .movi-context-menu",
+      );
       const blockMenu = inStripMode
         ? isOnInteractive
         : shadowTarget &&
@@ -7458,8 +7653,16 @@ export class MoviElement extends HTMLElement {
           const openUp = above >= below;
           const room = Math.max(180, Math.min(460, openUp ? above : below));
           contextMenu.style.setProperty("max-height", `${room}px`, "important");
-          contextMenu.style.setProperty("top", openUp ? "auto" : "0", "important");
-          contextMenu.style.setProperty("bottom", openUp ? "0" : "auto", "important");
+          contextMenu.style.setProperty(
+            "top",
+            openUp ? "auto" : "0",
+            "important",
+          );
+          contextMenu.style.setProperty(
+            "bottom",
+            openUp ? "0" : "auto",
+            "important",
+          );
         } else {
           for (const p of ["max-height", "top", "bottom"]) {
             contextMenu.style.removeProperty(p);
@@ -7510,9 +7713,11 @@ export class MoviElement extends HTMLElement {
           contextMenu.style.visibility = "visible";
           let fx = e.clientX;
           let fy = e.clientY;
-          if (fx + menuWidth > window.innerWidth) fx = window.innerWidth - menuWidth - 10;
+          if (fx + menuWidth > window.innerWidth)
+            fx = window.innerWidth - menuWidth - 10;
           if (fx < 10) fx = 10;
-          if (fy + menuHeight > window.innerHeight) fy = window.innerHeight - menuHeight - 10;
+          if (fy + menuHeight > window.innerHeight)
+            fy = window.innerHeight - menuHeight - 10;
           if (fy < 10) fy = 10;
           contextMenu.style.left = `${fx}px`;
           contextMenu.style.top = `${fy}px`;
@@ -7642,7 +7847,9 @@ export class MoviElement extends HTMLElement {
         // new containing block.
         const closedSet = new Set<Element>(this._portaledSubs);
         for (const sm of Array.from(
-          this._menuPortalRoot?.querySelectorAll(MoviElement.SUBMENU_SELECTOR) || [],
+          this._menuPortalRoot?.querySelectorAll(
+            MoviElement.SUBMENU_SELECTOR,
+          ) || [],
         )) {
           closedSet.add(sm);
         }
@@ -7662,7 +7869,8 @@ export class MoviElement extends HTMLElement {
         if (portalHost) portalHost.style.display = "";
         // Restore the panels' transition next frame so future opens animate.
         requestAnimationFrame(() => {
-          for (const sm of closedSubs) (sm as HTMLElement).style.transition = "";
+          for (const sm of closedSubs)
+            (sm as HTMLElement).style.transition = "";
         });
       }
 
@@ -8015,7 +8223,9 @@ export class MoviElement extends HTMLElement {
           submenu.classList.add("movi-context-menu-submenu-visible");
         }
       } else if (action === "fit") {
-        const submenu = this.contextMenuRoot().querySelector('.movi-context-menu-submenu[data-submenu="fit"]') as HTMLElement;
+        const submenu = this.contextMenuRoot().querySelector(
+          '.movi-context-menu-submenu[data-submenu="fit"]',
+        ) as HTMLElement;
         if (submenu) {
           this.syncFitSubmenuActive(submenu); // touch: reflect current fit
           if (!contextMenu.classList.contains("movi-context-menu-mobile")) {
@@ -8042,13 +8252,12 @@ export class MoviElement extends HTMLElement {
       } else if (audioLang !== undefined) {
         // Select native audio language track
         if (this.player) {
-          const langTrack = this.player.getAudioLangs().find(t => t.lang === audioLang);
+          const langTrack = this.player
+            .getAudioLangs()
+            .find((t) => t.lang === audioLang);
           this.pickAudioLang(audioLang);
           this.updateAudioTrackMenu();
-          this.showOSD(
-            OSD.audio,
-            langTrack?.label || audioLang,
-          );
+          this.showOSD(OSD.audio, langTrack?.label || audioLang);
         }
         hideContextMenu();
       } else if (audioTrackId !== undefined) {
@@ -8060,7 +8269,9 @@ export class MoviElement extends HTMLElement {
           }
           this.pickAudioTrack(trackId);
           this.updateAudioTrackMenu();
-          const trk = this.player.getAudioTracks().find(t => t.id === trackId);
+          const trk = this.player
+            .getAudioTracks()
+            .find((t) => t.id === trackId);
           this.showOSD(
             OSD.audio,
             trk?.label || trk?.language || `Audio ${trackId}`,
@@ -8114,13 +8325,12 @@ export class MoviElement extends HTMLElement {
       } else if (subtitleLang !== undefined) {
         // Select external subtitle language
         if (this.player) {
-          const subTrack = this.player.getSubtitleLangs().find(t => t.lang === subtitleLang);
+          const subTrack = this.player
+            .getSubtitleLangs()
+            .find((t) => t.lang === subtitleLang);
           this.pickSubtitleLang(subtitleLang);
           this.updateSubtitleTrackMenu();
-          this.showOSD(
-            OSD.subOn,
-            subTrack?.label || subtitleLang,
-          );
+          this.showOSD(OSD.subOn, subTrack?.label || subtitleLang);
         }
         hideContextMenu();
       } else if (subtitleTrackId !== undefined) {
@@ -8131,17 +8341,20 @@ export class MoviElement extends HTMLElement {
           if (trackId === -1) {
             this.pickSubtitleTrack(null);
             this.pickSubtitleLang(null);
-            this.showOSD(
-              OSD.subOff,
-              "Subtitles Off",
-            );
+            this.showOSD(OSD.subOff, "Subtitles Off");
           } else {
             this.pickSubtitleLang(null);
             this.pickSubtitleTrack(trackId);
-            const trk = this.player.getSubtitleTracks().find(t => t.id === trackId);
+            const trk = this.player
+              .getSubtitleTracks()
+              .find((t) => t.id === trackId);
             const ctxSubLang = trk?.language?.toUpperCase() || "";
-            const ctxSubLabel = trk?.label || ctxSubLang || `Subtitle ${trackId}`;
-            const ctxSubOsd = ctxSubLang && ctxSubLabel !== ctxSubLang ? `${ctxSubLabel} [${ctxSubLang}]` : ctxSubLabel;
+            const ctxSubLabel =
+              trk?.label || ctxSubLang || `Subtitle ${trackId}`;
+            const ctxSubOsd =
+              ctxSubLang && ctxSubLabel !== ctxSubLang
+                ? `${ctxSubLabel} [${ctxSubLang}]`
+                : ctxSubLabel;
             this.showOSD(subOsdIcon, ctxSubOsd);
           }
         }
@@ -8178,13 +8391,11 @@ export class MoviElement extends HTMLElement {
           .forEach((el) => el.classList.remove("movi-context-menu-active"));
         item.classList.add("movi-context-menu-active");
 
-        this.showOSD(
-          OSD.speed,
-          `Speed ${playbackSpeed}x`,
-        );
+        this.showOSD(OSD.speed, `Speed ${playbackSpeed}x`);
         hideContextMenu();
       } else if (item.dataset.fit) {
-        const fitMode = item.dataset.fit as "contain" | "cover" | "fill" | "zoom";
+        const fitMode = item.dataset.fit as
+          "contain" | "cover" | "fill" | "zoom";
         const viaControl = this._objectFit === "control";
         // setFit, not the raw fields: it picks the right one of the two AND
         // records the choice. Written by hand here, an aspect chosen from this
@@ -8211,7 +8422,12 @@ export class MoviElement extends HTMLElement {
         item.classList.add("movi-context-menu-active");
         // Update the new context menu status too
         const aspectStatus = shadowRoot.querySelector(".movi-aspect-status");
-        const fitLabels: Record<string, string> = { contain: "Fit", cover: "Fill", fill: "Stretch", zoom: "Zoom" };
+        const fitLabels: Record<string, string> = {
+          contain: "Fit",
+          cover: "Fill",
+          fill: "Stretch",
+          zoom: "Zoom",
+        };
         if (aspectStatus) {
           aspectStatus.textContent = fitLabels[fitMode] || fitMode;
         }
@@ -8224,39 +8440,29 @@ export class MoviElement extends HTMLElement {
         hideContextMenu();
       } else if (action === "hdr-toggle") {
         this.hdr = !this.hdr;
-        this.showOSD(
-          OSD.hdr,
-          this.hdr ? "HDR On" : "HDR Off",
-        );
+        this.showOSD(OSD.hdr, this.hdr ? "HDR On" : "HDR Off");
         hideContextMenu();
       } else if (action === "rotate-video") {
         if (this.player && !this._pipWindow) {
           const deg = this.player.rotateVideo();
-          const statusEl = this.contextMenuRoot().querySelector(".movi-rotate-status");
+          const statusEl = this.contextMenuRoot().querySelector(
+            ".movi-rotate-status",
+          );
           if (statusEl) statusEl.textContent = `${deg}°`;
           this.syncThumbnailRotation(deg);
           // The action rotates through the PLAYER, so the element's `rotate`
           // setter (which announces it) is never involved — report it here.
           this.emitSettingChange("rotatechange", { degrees: deg });
-          this.showOSD(
-            OSD.rotate,
-            `Rotate ${deg}°`,
-          );
+          this.showOSD(OSD.rotate, `Rotate ${deg}°`);
         }
         hideContextMenu();
       } else if (action === "loop-toggle") {
         this.loop = !this.loop;
-        this.showOSD(
-          OSD.loop,
-          this.loop ? "Loop On" : "Loop Off",
-        );
+        this.showOSD(OSD.loop, this.loop ? "Loop On" : "Loop Off");
         hideContextMenu();
       } else if (action === "shuffle-toggle") {
         this.shuffle = !this._shuffle;
-        this.showOSD(
-          OSD.shuffle,
-          this._shuffle ? "Shuffle On" : "Shuffle Off",
-        );
+        this.showOSD(OSD.shuffle, this._shuffle ? "Shuffle On" : "Shuffle Off");
         hideContextMenu();
       } else if (action === "stable-audio-toggle") {
         if (this.player) {
@@ -8300,10 +8506,7 @@ export class MoviElement extends HTMLElement {
         hideContextMenu();
       } else if (action === "snapshot") {
         this.takeSnapshot();
-        this.showOSD(
-          OSD.snapshot,
-          "Snapshot",
-        );
+        this.showOSD(OSD.snapshot, "Snapshot");
         hideContextMenu();
       }
     };
@@ -8401,17 +8604,20 @@ export class MoviElement extends HTMLElement {
       if (audioTracks.length > 0) {
         html += audioTracks
           .map((track) => {
-            const isActive = !ctxIsNativeActive && activeAudioTrack?.id === track.id;
+            const isActive =
+              !ctxIsNativeActive && activeAudioTrack?.id === track.id;
             const label = track.label || `Audio ${track.id}`;
             const infoParts: string[] = [];
             if (track.language) {
-              const langCode = track.language.length >= 2
-                ? track.language.substring(0, 3).toUpperCase()
-                : track.language.toUpperCase();
+              const langCode =
+                track.language.length >= 2
+                  ? track.language.substring(0, 3).toUpperCase()
+                  : track.language.toUpperCase();
               infoParts.push(langCode);
             }
             if (track.channels) infoParts.push(`${track.channels}ch`);
-            const info = infoParts.length > 0 ? ` (${infoParts.join(" • ")})` : "";
+            const info =
+              infoParts.length > 0 ? ` (${infoParts.join(" • ")})` : "";
             const activeClass = isActive ? " movi-context-menu-active" : "";
             return `<div class="movi-context-menu-item${activeClass}" data-audio-track-id="${track.id}">${label}${info}</div>`;
           })
@@ -8476,13 +8682,18 @@ export class MoviElement extends HTMLElement {
         ".movi-context-menu-subtitle-filled",
       ) as HTMLElement;
 
-      const ctxSubActive = activeSubtitleTrack !== null || ctxAnyExternalSubActive;
+      const ctxSubActive =
+        activeSubtitleTrack !== null || ctxAnyExternalSubActive;
       if (ctxSubActive) {
-        if (contextMenuSubtitleIcon) contextMenuSubtitleIcon.style.display = "none";
-        if (contextMenuSubtitleFilledIcon) contextMenuSubtitleFilledIcon.style.display = "block";
+        if (contextMenuSubtitleIcon)
+          contextMenuSubtitleIcon.style.display = "none";
+        if (contextMenuSubtitleFilledIcon)
+          contextMenuSubtitleFilledIcon.style.display = "block";
       } else {
-        if (contextMenuSubtitleIcon) contextMenuSubtitleIcon.style.display = "block";
-        if (contextMenuSubtitleFilledIcon) contextMenuSubtitleFilledIcon.style.display = "none";
+        if (contextMenuSubtitleIcon)
+          contextMenuSubtitleIcon.style.display = "block";
+        if (contextMenuSubtitleFilledIcon)
+          contextMenuSubtitleFilledIcon.style.display = "none";
       }
 
       const ctxOffActive = !activeSubtitleTrack && !ctxAnyExternalSubActive;
@@ -8525,7 +8736,9 @@ export class MoviElement extends HTMLElement {
       html += ctxExternalSubs
         .map((t) => {
           const activeClass = t.active ? " movi-context-menu-active" : "";
-          const tail = t.pending ? MoviElement.SUBTITLE_PENDING : ` (${t.lang.toUpperCase()})`;
+          const tail = t.pending
+            ? MoviElement.SUBTITLE_PENDING
+            : ` (${t.lang.toUpperCase()})`;
           return `<div class="movi-context-menu-item${activeClass}" data-subtitle-lang="${t.lang}">${t.label}${tail}</div>`;
         })
         .join("");
@@ -8558,9 +8771,14 @@ export class MoviElement extends HTMLElement {
     });
 
     // Disable rotate during PiP
-    const rotateItem = contextMenu.querySelector('.movi-context-menu-item[data-action="rotate-video"]');
+    const rotateItem = contextMenu.querySelector(
+      '.movi-context-menu-item[data-action="rotate-video"]',
+    );
     if (rotateItem) {
-      rotateItem.classList.toggle("movi-context-menu-disabled", !!this._pipWindow);
+      rotateItem.classList.toggle(
+        "movi-context-menu-disabled",
+        !!this._pipWindow,
+      );
     }
   }
 
@@ -8729,7 +8947,8 @@ export class MoviElement extends HTMLElement {
       // Hover-open: reflect live state. Both of these submenus are static
       // markup whose active row is otherwise only set by clicking in them.
       if (submenu.dataset.submenu === "fit") this.syncFitSubmenuActive(submenu);
-      if (submenu.dataset.submenu === "speed") this.syncSpeedSubmenuActive(submenu);
+      if (submenu.dataset.submenu === "speed")
+        this.syncSpeedSubmenuActive(submenu);
 
       submenu.classList.add("movi-context-menu-submenu-visible");
     };
@@ -8858,7 +9077,8 @@ export class MoviElement extends HTMLElement {
 
   /** The page's stand-in for a picture that is currently elsewhere. */
   private setPipPlaceholderVisible(on: boolean): void {
-    if (this.pipPlaceholder) this.pipPlaceholder.style.display = on ? "flex" : "none";
+    if (this.pipPlaceholder)
+      this.pipPlaceholder.style.display = on ? "flex" : "none";
     // Controls that act on a picture which is not here: PiP moves the canvas,
     // so fullscreen, snapshot, rotate and the rest would work on an empty
     // surface. The class is the single hook the stylesheet hangs all of that on.
@@ -8866,7 +9086,10 @@ export class MoviElement extends HTMLElement {
   }
 
   private restorePiPCanvas(): void {
-    Logger.info(TAG, `restorePiPCanvas called — _pipWindow: ${!!this._pipWindow}, canvas: ${!!this.canvas}, shadowRoot: ${!!this.shadowRoot}`);
+    Logger.info(
+      TAG,
+      `restorePiPCanvas called — _pipWindow: ${!!this._pipWindow}, canvas: ${!!this.canvas}, shadowRoot: ${!!this.shadowRoot}`,
+    );
     if (!this._pipWindow) {
       Logger.info(TAG, "restorePiPCanvas: already restored, skipping");
       return;
@@ -8886,7 +9109,10 @@ export class MoviElement extends HTMLElement {
     const canvas = this.canvas;
     const sr = this.shadowRoot;
     if (!canvas || !sr) {
-      Logger.warn(TAG, `restorePiPCanvas: missing canvas=${!!canvas} shadowRoot=${!!sr}`);
+      Logger.warn(
+        TAG,
+        `restorePiPCanvas: missing canvas=${!!canvas} shadowRoot=${!!sr}`,
+      );
       return;
     }
 
@@ -8905,7 +9131,10 @@ export class MoviElement extends HTMLElement {
       sr.appendChild(this.subtitleOverlay);
     }
 
-    Logger.info(TAG, `restorePiPCanvas: canvas isConnected=${canvas.isConnected}`);
+    Logger.info(
+      TAG,
+      `restorePiPCanvas: canvas isConnected=${canvas.isConnected}`,
+    );
 
     // Invalidate the cached host dimensions so updateCanvasSize() actually
     // re-runs the resize. While in PiP, resizeInPiP() set canvas.width to
@@ -8920,7 +9149,10 @@ export class MoviElement extends HTMLElement {
     // Restore original size
     requestAnimationFrame(() => {
       this.updateCanvasSize();
-      Logger.info(TAG, `restorePiPCanvas: after resize — ${this.canvas?.width}x${this.canvas?.height}`);
+      Logger.info(
+        TAG,
+        `restorePiPCanvas: after resize — ${this.canvas?.width}x${this.canvas?.height}`,
+      );
     });
     Logger.info(TAG, "PiP closed, canvas restored");
   }
@@ -8960,8 +9192,13 @@ export class MoviElement extends HTMLElement {
     // page that had turned PiP off. Leaving a window that is already open
     // stays allowed.
     const pipOpen =
-      !!this._pipWindow || (!!this.video && document.pictureInPictureElement === this.video);
-    if (!pipOpen && (this.isControlDisabled("pip") || this.disablePictureInPicture)) return;
+      !!this._pipWindow ||
+      (!!this.video && document.pictureInPictureElement === this.video);
+    if (
+      !pipOpen &&
+      (this.isControlDisabled("pip") || this.disablePictureInPicture)
+    )
+      return;
     // Native fallback: the visible surface is a real <video>, not the canvas, so
     // use the standard video PiP API. It works even for opaque cross-origin video
     // (PiP never exposes pixels to JS) and inside iframes granted the
@@ -8992,7 +9229,9 @@ export class MoviElement extends HTMLElement {
       Logger.info(TAG, "togglePiP: closing PiP, restoring canvas first");
       const win = this._pipWindow;
       this.restorePiPCanvas();
-      try { win.close(); } catch (_) {}
+      try {
+        win.close();
+      } catch (_) {}
       Logger.info(TAG, "togglePiP: PiP window closed");
       this._emitPipChange(false);
       return;
@@ -9038,8 +9277,11 @@ export class MoviElement extends HTMLElement {
       try {
         const chromeW = pipWindow.outerWidth - pipWindow.innerWidth;
         const chromeH = pipWindow.outerHeight - pipWindow.innerHeight;
-        pipWindow.resizeTo(Math.round(pipWidth) + chromeW, Math.round(pipHeight) + chromeH);
-      } catch {};
+        pipWindow.resizeTo(
+          Math.round(pipWidth) + chromeW,
+          Math.round(pipHeight) + chromeH,
+        );
+      } catch {}
 
       // Carry the theme across. The PiP window is a SEPARATE document, so the
       // --movi-* variables living on the host element in this one mean nothing
@@ -9126,7 +9368,10 @@ export class MoviElement extends HTMLElement {
       // Clear any leftover cursor:none (from a hidden-controls state before
       // entering PiP) so the pointer is visible in the PiP window immediately.
       this.canvas.style.cursor = "default";
-      Logger.info(TAG, `PiP: canvas moved to PiP window, isConnected=${this.canvas.isConnected}`);
+      Logger.info(
+        TAG,
+        `PiP: canvas moved to PiP window, isConnected=${this.canvas.isConnected}`,
+      );
 
       // Bring the caption overlay along so subtitles still render in the PiP
       // window. Its styling lives in the shadow-root CSS + --movi-sub-* custom
@@ -9201,15 +9446,19 @@ export class MoviElement extends HTMLElement {
       };
 
       const seekBackBtn = makeBtn("seek-back", symbolSvg("seekBackward"));
-      const playPauseBtn = makeBtn("play-pause", this.player.getState() === "playing"
-        ? symbolSvg("pause", "", { filled: true })
-        : symbolSvg("play", "", { filled: true }));
+      const playPauseBtn = makeBtn(
+        "play-pause",
+        this.player.getState() === "playing"
+          ? symbolSvg("pause", "", { filled: true })
+          : symbolSvg("play", "", { filled: true }),
+      );
       const seekFwdBtn = makeBtn("seek-fwd", symbolSvg("seekForward"));
       const backToTabBtn = makeBtn("back-to-tab", symbolSvg("backToTab"));
       const isMuted = this._muted;
-      const muteBtn = makeBtn("mute-toggle", isMuted
-        ? symbolSvg("volumeMuted")
-        : symbolSvg("volumeFull"));
+      const muteBtn = makeBtn(
+        "mute-toggle",
+        isMuted ? symbolSvg("volumeMuted") : symbolSvg("volumeFull"),
+      );
 
       btnRow.appendChild(muteBtn);
       btnRow.appendChild(seekBackBtn);
@@ -9233,7 +9482,8 @@ export class MoviElement extends HTMLElement {
       playPauseBtn.addEventListener("click", () => {
         if (!this.player) return;
         const pipPlayState = this.player.getState();
-        if (pipPlayState === "playing" || pipPlayState === "buffering") this.pause();
+        if (pipPlayState === "playing" || pipPlayState === "buffering")
+          this.pause();
         else this.play();
       });
 
@@ -9263,7 +9513,10 @@ export class MoviElement extends HTMLElement {
       progressBar.addEventListener("click", (e: MouseEvent) => {
         if (!this.player || !this.duration) return;
         const rect = progressBar.getBoundingClientRect();
-        const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        const pct = Math.max(
+          0,
+          Math.min(1, (e.clientX - rect.left) / rect.width),
+        );
         this.currentTime = this.barFractionToTime(pct);
       });
 
@@ -9275,7 +9528,10 @@ export class MoviElement extends HTMLElement {
         // clock for good. It sat on the previous video's numbers, 10:35 of
         // 23:13, with a play icon that no longer matched, while the page beside
         // it showed the new video 14 seconds in.
-        if (!this._pipWindow) { clearInterval(pipUpdateInterval); return; }
+        if (!this._pipWindow) {
+          clearInterval(pipUpdateInterval);
+          return;
+        }
         if (!this.player) return; // between sources — wait for the next one
         const cur = this.currentTime;
         const dur = this.duration || 0;
@@ -9314,7 +9570,10 @@ export class MoviElement extends HTMLElement {
 
       // Show controls briefly on open
       pipWindow.document.body.classList.add("show-controls");
-      setTimeout(() => pipWindow.document.body.classList.remove("show-controls"), 2000);
+      setTimeout(
+        () => pipWindow.document.body.classList.remove("show-controls"),
+        2000,
+      );
 
       // Captions follow the strip up and down. The class is toggled from
       // several places (the open flash, the timer, a tap), so this watches the
@@ -9325,9 +9584,11 @@ export class MoviElement extends HTMLElement {
         const follow = () => this.syncPipSubtitlePadding();
         body.addEventListener("mouseenter", follow);
         body.addEventListener("mouseleave", follow);
-        new (pipWindow as unknown as {
-          MutationObserver: typeof MutationObserver;
-        }).MutationObserver(follow).observe(body, {
+        new (
+          pipWindow as unknown as {
+            MutationObserver: typeof MutationObserver;
+          }
+        ).MutationObserver(follow).observe(body, {
           attributes: true,
           attributeFilter: ["class"],
         });
@@ -9371,7 +9632,9 @@ export class MoviElement extends HTMLElement {
         this.restorePiPCanvas();
         // Restore rotation
         if (savedRotation !== 0 && this.player) {
-          requestAnimationFrame(() => this.player?.setVideoRotation(savedRotation));
+          requestAnimationFrame(() =>
+            this.player?.setVideoRotation(savedRotation),
+          );
         }
       };
       pipWindow.addEventListener("pagehide", restore);
@@ -9451,7 +9714,8 @@ export class MoviElement extends HTMLElement {
    *  (false on iOS Safari, which only fullscreens <video>). */
   private nativeFullscreenSupported(): boolean {
     return (
-      typeof this.requestFullscreen === "function" && !!document.fullscreenEnabled
+      typeof this.requestFullscreen === "function" &&
+      !!document.fullscreenEnabled
     );
   }
 
@@ -9535,7 +9799,8 @@ export class MoviElement extends HTMLElement {
     const label = this.shadowRoot?.querySelector(
       '.movi-context-menu-item[data-action="fullscreen"] .movi-context-menu-label',
     ) as HTMLElement | null;
-    if (label) label.textContent = isFullscreen ? "Exit Fullscreen" : "Fullscreen";
+    if (label)
+      label.textContent = isFullscreen ? "Exit Fullscreen" : "Fullscreen";
   }
 
   /**
@@ -9614,7 +9879,8 @@ export class MoviElement extends HTMLElement {
     // !important — a host-driven fullscreen could never grow it, so no resize
     // would ever arrive to drop the strip. Leaving puts the strip back the
     // same way; the resize that follows repaints at the final size.
-    if (this.classList.contains("movi-audio-mode")) this.updateCoverArtOverlay();
+    if (this.classList.contains("movi-audio-mode"))
+      this.updateCoverArtOverlay();
   }
 
   /**
@@ -9645,7 +9911,9 @@ export class MoviElement extends HTMLElement {
    * have and which skips the host and pseudo fallbacks.
    */
   _enterFullscreenForPage(): Promise<void> {
-    return this.isFullscreenActive() ? Promise.resolve() : this.toggleFullscreen(true);
+    return this.isFullscreenActive()
+      ? Promise.resolve()
+      : this.toggleFullscreen(true);
   }
 
   /** @internal For upgrade.ts — see _enterFullscreenForPage. */
@@ -9673,7 +9941,10 @@ export class MoviElement extends HTMLElement {
   }
 
   private updateAspectRatioIcon(): void {
-    const fit = this._objectFit === "control" ? this._currentFit : (this._objectFit as any);
+    const fit =
+      this._objectFit === "control"
+        ? this._currentFit
+        : (this._objectFit as any);
     const name = MoviElement.aspectSymbol(fit);
     // Every place the crop is drawn shows the CURRENT one: the bar button, and
     // the context menu's row. A generic frame there while the setting says
@@ -9695,7 +9966,7 @@ export class MoviElement extends HTMLElement {
         name,
         "movi-context-menu-icon movi-icon-aspect-ratio-ctx",
       );
-      // Keep an open panel / context menu in step - see the method's note.
+    // Keep an open panel / context menu in step - see the method's note.
     this.refreshOpenSettingsSurfaces();
   }
 
@@ -9710,13 +9981,16 @@ export class MoviElement extends HTMLElement {
   /** Stands in for a generated subtitle track's language badge until its
    *  first cue arrives: a small turning ring, in the bar's list and the
    *  context menu alike. */
-  private static readonly SUBTITLE_PENDING = '<span class="movi-subtitle-pending" role="img" aria-label="Making captions" title="Making captions…"></span>';
+  private static readonly SUBTITLE_PENDING =
+    '<span class="movi-subtitle-pending" role="img" aria-label="Making captions" title="Making captions…"></span>';
 
   /** An open context menu is built when it opens; a generated subtitle track
    *  that changes under it (listed, or its first cue landed) redraws it. */
   private refreshOpenContextMenu(): void {
     if (!this._contextMenuVisible) return;
-    const ctx = this.contextMenuRoot().querySelector(".movi-context-menu") as HTMLElement | null;
+    const ctx = this.contextMenuRoot().querySelector(
+      ".movi-context-menu",
+    ) as HTMLElement | null;
     if (ctx) this.updateContextMenuContent(ctx);
   }
 
@@ -9759,9 +10033,10 @@ export class MoviElement extends HTMLElement {
   private formatSubtitleBadge(track: SubtitleTrack): string {
     const parts: string[] = [];
     if (track.language) {
-      const lang = track.language.length >= 2
-        ? track.language.substring(0, 3).toUpperCase()
-        : track.language.toUpperCase();
+      const lang =
+        track.language.length >= 2
+          ? track.language.substring(0, 3).toUpperCase()
+          : track.language.toUpperCase();
       parts.push(lang);
     }
     if (track.subtitleType) {
@@ -9841,14 +10116,16 @@ export class MoviElement extends HTMLElement {
 
     // External audio tracks (native <audio> element)
     menuHTML += nativeLangs
-      .map((t) => `
+      .map(
+        (t) => `
         <div class="movi-audio-track-item ${t.active ? "movi-audio-track-active" : ""}"
              data-audio-lang="${t.lang}">
           ${ICON}
           <span class="movi-audio-track-label">${t.label}</span>
           <span class="movi-audio-track-info">${t.lang.toUpperCase()}</span>
           ${CHECK}
-        </div>`)
+        </div>`,
+      )
       .join("");
 
     audioTrackList.innerHTML = menuHTML;
@@ -9879,8 +10156,12 @@ export class MoviElement extends HTMLElement {
             if (lang) {
               // External audio track — switch to native <audio>
               this.pickAudioLang(lang);
-              const t = this.player.getAudioLangs().find(a => a.lang === lang);
-              const extAudioOsd = t ? `${t.label} [${lang.toUpperCase()}]` : lang.toUpperCase();
+              const t = this.player
+                .getAudioLangs()
+                .find((a) => a.lang === lang);
+              const extAudioOsd = t
+                ? `${t.label} [${lang.toUpperCase()}]`
+                : lang.toUpperCase();
               this.showOSD(audioIcon, extAudioOsd);
             } else if (trackIdStr) {
               // Muxed audio track — switch back to WASM if needed
@@ -9889,10 +10170,16 @@ export class MoviElement extends HTMLElement {
               }
               const tid = parseInt(trackIdStr);
               this.pickAudioTrack(tid);
-              const trk = this.player.getAudioTracks().find(a => a.id === tid);
+              const trk = this.player
+                .getAudioTracks()
+                .find((a) => a.id === tid);
               const muxAudioLang = trk?.language?.toUpperCase() || "";
-              const muxAudioLabel = trk?.label || muxAudioLang || `Audio ${tid}`;
-              const muxAudioOsd = muxAudioLang && muxAudioLabel !== muxAudioLang ? `${muxAudioLabel} [${muxAudioLang}]` : muxAudioLabel;
+              const muxAudioLabel =
+                trk?.label || muxAudioLang || `Audio ${tid}`;
+              const muxAudioOsd =
+                muxAudioLang && muxAudioLabel !== muxAudioLang
+                  ? `${muxAudioLabel} [${muxAudioLang}]`
+                  : muxAudioLabel;
               this.showOSD(audioIcon, muxAudioOsd);
             }
             this.updateAudioTrackMenu();
@@ -9917,7 +10204,7 @@ export class MoviElement extends HTMLElement {
           }
         });
       });
-      // A track change reaches here from every path - the keyboard, the
+    // A track change reaches here from every path - the keyboard, the
     // panel, a host call - so this is where an open menu learns about it.
     this.refreshOpenSettingsSurfaces();
     // Track availability is exactly what decides whether the mobile tray has
@@ -9928,7 +10215,10 @@ export class MoviElement extends HTMLElement {
   /** Move the tick in the audio menu to the entry just chosen, ahead of the
    *  player confirming it. Purely visual and always overwritten by the next
    *  real redraw. */
-  private markAudioItemChosen(lang: string | null, trackId: string | null): void {
+  private markAudioItemChosen(
+    lang: string | null,
+    trackId: string | null,
+  ): void {
     const items = this.shadowRoot?.querySelectorAll(".movi-audio-track-item");
     if (!items) return;
     items.forEach((node) => {
@@ -9958,10 +10248,8 @@ export class MoviElement extends HTMLElement {
 
     if (!qualityList || !qualityBtn || !qualityContainer) return;
 
-    const dashRenditions =
-      (this.player as any)?.getDashRenditions?.() as
-        | { url: string; label: string; id: string }[]
-        | undefined;
+    const dashRenditions = (this.player as any)?.getDashRenditions?.() as
+      { url: string; label: string; id: string }[] | undefined;
     // A declared <source> list is the menu, whatever is playing: it used to
     // vanish the moment the current source was HLS, which left no way back to
     // an entry that was not (see qualityMenuMode). Without a list, the quality
@@ -9976,10 +10264,7 @@ export class MoviElement extends HTMLElement {
     // Pre-muxed multi-quality path: build a virtual track list from the
     // declarative <source> tags so the picker works without an adaptive stream.
     if (mode === "sources") {
-      this.renderPremuxedQualityMenu(
-        qualityList,
-        qualityContainer,
-      );
+      this.renderPremuxedQualityMenu(qualityList, qualityContainer);
       return;
     }
 
@@ -10088,8 +10373,7 @@ export class MoviElement extends HTMLElement {
     qualityList.innerHTML = uniqueTracks
       .map((track) => {
         const isActive = activeTrack?.id === track.id;
-        let label =
-          track.label || (track.height ? `${track.height}p` : "Auto");
+        let label = track.label || (track.height ? `${track.height}p` : "Auto");
         // In Auto mode, show the currently-playing rendition in brackets —
         // e.g. "Auto (720p)" — so the user sees what ABR is actually serving.
         if (track.id === -1 && activeTrack?.id === -1 && activeHeight > 0) {
@@ -10152,9 +10436,9 @@ export class MoviElement extends HTMLElement {
           const picked =
             trackId === -1
               ? 0
-              : (this.player as any).getVideoTracks?.()?.find(
-                  (t: VideoTrack) => t.id === trackId,
-                )?.height || 0;
+              : (this.player as any)
+                  .getVideoTracks?.()
+                  ?.find((t: VideoTrack) => t.id === trackId)?.height || 0;
           if (trackId !== -1) {
             this._involuntaryQualityUntil = 0;
             if (picked > 0) this._lastNotifiedQualityHeight = picked;
@@ -10225,7 +10509,6 @@ export class MoviElement extends HTMLElement {
       /* private mode / disabled storage — preference just won't persist */
     }
   }
-
 
   // How many times we've reloaded onto a different rendition trying to escape a
   // source error on the current video. Bounded so a genuinely dead link still
@@ -10390,7 +10673,10 @@ export class MoviElement extends HTMLElement {
    * yet.
    */
   private forgetRecoveryResume(): void {
-    if (this._pendingSeek !== null && this._pendingSeek === this._recoveryResumeTime) {
+    if (
+      this._pendingSeek !== null &&
+      this._pendingSeek === this._recoveryResumeTime
+    ) {
       this._pendingSeek = null;
     }
     this.endRecoveryResume();
@@ -10569,7 +10855,8 @@ export class MoviElement extends HTMLElement {
         label:
           el.getAttribute("label") || el.getAttribute("srclang") || "Subtitle",
         format:
-          (el.getAttribute("data-format") as "vtt" | "srt" | undefined) || "vtt",
+          (el.getAttribute("data-format") as "vtt" | "srt" | undefined) ||
+          "vtt",
         inbandTitle: el.getAttribute("data-inband-title") || undefined,
         inbandOrder: (() => {
           const raw = el.getAttribute("data-inband-order");
@@ -10590,7 +10877,11 @@ export class MoviElement extends HTMLElement {
     const marked = Array.from(trackEls).find(
       (el) => el.hasAttribute("default") && el.getAttribute("src"),
     );
-    if (marked && !this._carrySubtitleLang && this._carrySubtitleTrackId === null) {
+    if (
+      marked &&
+      !this._carrySubtitleLang &&
+      this._carrySubtitleTrackId === null
+    ) {
       const lang =
         marked.getAttribute("srclang") || marked.getAttribute("lang") || "";
       if (lang) this._carrySubtitleLang = lang;
@@ -10618,9 +10909,14 @@ export class MoviElement extends HTMLElement {
    * before any of this existed. An unmeasured link is not evidence of a slow
    * one, and audio is small enough that guessing high is the cheaper mistake.
    */
-  private pickAudioRendition<T extends { src: string; bandwidth: number; label: string; isDefault: boolean }>(
-    group: T[],
-  ): T {
+  private pickAudioRendition<
+    T extends {
+      src: string;
+      bandwidth: number;
+      label: string;
+      isDefault: boolean;
+    },
+  >(group: T[]): T {
     const rated = group.filter((s) => s.bandwidth > 0);
     if (rated.length < 2) {
       return group.find((s) => s.isDefault) ?? group[0];
@@ -10665,25 +10961,30 @@ export class MoviElement extends HTMLElement {
     if (!this._src && !this._encrypted) {
       const sourceEls = this.querySelectorAll("source");
       if (sourceEls.length > 0) {
-        const allSources = Array.from(sourceEls).map((el) => ({
-          src: el.getAttribute("src") || "",
-          type: el.getAttribute("type") || undefined,
-          kind: el.getAttribute("kind") || undefined,
-          height: parseInt(el.getAttribute("data-height") || "", 10) || 0,
-          codec: el.getAttribute("data-codec") || "",
-          label: el.getAttribute("data-label") || el.getAttribute("label") || "",
-          fps: parseInt(el.getAttribute("data-fps") || "", 10) || 0,
-          badge: el.getAttribute("data-badge") || "",
-          bandwidth:
-            parseInt(
-              el.getAttribute("data-bandwidth") ||
-                el.getAttribute("data-bitrate") ||
-                "",
-              10,
-            ) || 0,
-          srclang: el.getAttribute("srclang") || el.getAttribute("lang") || "",
-          isDefault: el.hasAttribute("data-default") || el.hasAttribute("default"),
-        })).filter((s) => s.src);
+        const allSources = Array.from(sourceEls)
+          .map((el) => ({
+            src: el.getAttribute("src") || "",
+            type: el.getAttribute("type") || undefined,
+            kind: el.getAttribute("kind") || undefined,
+            height: parseInt(el.getAttribute("data-height") || "", 10) || 0,
+            codec: el.getAttribute("data-codec") || "",
+            label:
+              el.getAttribute("data-label") || el.getAttribute("label") || "",
+            fps: parseInt(el.getAttribute("data-fps") || "", 10) || 0,
+            badge: el.getAttribute("data-badge") || "",
+            bandwidth:
+              parseInt(
+                el.getAttribute("data-bandwidth") ||
+                  el.getAttribute("data-bitrate") ||
+                  "",
+                10,
+              ) || 0,
+            srclang:
+              el.getAttribute("srclang") || el.getAttribute("lang") || "",
+            isDefault:
+              el.hasAttribute("data-default") || el.hasAttribute("default"),
+          }))
+          .filter((s) => s.src);
 
         // Separate audio sources (kind="audio") from video sources
         let audioSources = allSources.filter((s) => s.kind === "audio");
@@ -10816,9 +11117,12 @@ export class MoviElement extends HTMLElement {
             // `data-default` attributes; otherwise prefer the first track
             // matching the page locale, else the first one.
             const explicitDefault = audioSources.findIndex((s) => s.isDefault);
-            const localePrefix = (navigator.language || "en").slice(0, 2).toLowerCase();
+            const localePrefix = (navigator.language || "en")
+              .slice(0, 2)
+              .toLowerCase();
             const localeMatch = audioSources.findIndex(
-              (s) => s.srclang && s.srclang.toLowerCase().startsWith(localePrefix),
+              (s) =>
+                s.srclang && s.srclang.toLowerCase().startsWith(localePrefix),
             );
             const idx =
               explicitDefault >= 0
@@ -10854,7 +11158,8 @@ export class MoviElement extends HTMLElement {
    * so the caller surfaces the permanent error.
    */
   private _scheduleConnectionRetry(): boolean {
-    if (this._connectionRetries >= MoviElement.MAX_CONNECTION_RETRIES) return false;
+    if (this._connectionRetries >= MoviElement.MAX_CONNECTION_RETRIES)
+      return false;
     this._connectionRetries++;
     const delay = Math.min(3000 * this._connectionRetries, 15000); // 3s,6s,9s,12s
     Logger.warn(
@@ -10883,7 +11188,10 @@ export class MoviElement extends HTMLElement {
     if (this._fullRecreates >= MoviElement.MAX_FULL_RECREATES) return false;
     this._fullRecreates++;
     this._qualityRecoveryAttempts = 0; // fresh player earns a fresh recovery budget
-    Logger.warn(TAG, `Source error — full fresh recreate (attempt ${this._fullRecreates})`);
+    Logger.warn(
+      TAG,
+      `Source error — full fresh recreate (attempt ${this._fullRecreates})`,
+    );
     // FIRST attempt keeps the rung that was playing. Most of what gets here is
     // not a bandwidth failure at all — a WASM abort after a short read, a
     // demuxer that fell over mid-switch — and a fresh instance on the same rung
@@ -10926,8 +11234,9 @@ export class MoviElement extends HTMLElement {
     let resumeTime = 0;
     try {
       resumeTime =
-        (this.player as { getCurrentTime?: () => number } | null)?.getCurrentTime?.() ||
-        0;
+        (
+          this.player as { getCurrentTime?: () => number } | null
+        )?.getCurrentTime?.() || 0;
     } catch {
       /* crashed player — resume from 0 */
     }
@@ -10970,8 +11279,9 @@ export class MoviElement extends HTMLElement {
       rungBefore &&
       this._src !== rungBefore &&
       this._videoQualities.some((q) => q.src === rungBefore);
-    const auto = !!(this.player as { isAutoQuality?: () => boolean } | null)
-      ?.isAutoQuality?.();
+    const auto = !!(
+      this.player as { isAutoQuality?: () => boolean } | null
+    )?.isAutoQuality?.();
     if (dropped && !auto) {
       const from = this._videoQualities.find((q) => q.src === rungBefore);
       const to = this._videoQualities.find((q) => q.src === this._src);
@@ -11035,7 +11345,8 @@ export class MoviElement extends HTMLElement {
     if (inband.length === 0 || isHlsSource(own)) return;
     const slots = inband.map((t, order) => ({ order, title: t.title }));
     if (own) this._inbandMemory.set(`src:${own}`, slots);
-    if (this._resumeKey) this._inbandMemory.set(`key:${this._resumeKey}`, slots);
+    if (this._resumeKey)
+      this._inbandMemory.set(`key:${this._resumeKey}`, slots);
   }
 
   private _rememberedInband(): InbandSlot[] | undefined {
@@ -11067,14 +11378,16 @@ export class MoviElement extends HTMLElement {
       id: t.id,
       title: t.label || `Subtitle ${t.id}`,
     }));
-    const external: ExternalSubtitle[] = (p?.getSubtitleLangs() ?? []).map((t) => {
-      const meta = this._subtitleTracks.find((m) => m.lang === t.lang);
-      return {
-        ...t,
-        inbandTitle: meta?.inbandTitle,
-        inbandOrder: meta?.inbandOrder,
-      };
-    });
+    const external: ExternalSubtitle[] = (p?.getSubtitleLangs() ?? []).map(
+      (t) => {
+        const meta = this._subtitleTracks.find((m) => m.lang === t.lang);
+        return {
+          ...t,
+          inbandTitle: meta?.inbandTitle,
+          inbandOrder: meta?.inbandOrder,
+        };
+      },
+    );
     // Only the menu may record: it runs against the source that is really
     // open, whereas a rebuild captures while `_src` already names the next one.
     if (note) this._noteInband(inband);
@@ -11106,13 +11419,16 @@ export class MoviElement extends HTMLElement {
     }
     try {
       this._carrySubtitleLang =
-        (p.getSubtitleLangs?.() as { lang: string; active: boolean }[] | undefined)
-          ?.find((t) => t.active)?.lang ?? null;
+        (
+          p.getSubtitleLangs?.() as
+            { lang: string; active: boolean }[] | undefined
+        )?.find((t) => t.active)?.lang ?? null;
       const muxed = p.trackManager?.getActiveSubtitleTrack?.();
       this._carrySubtitleTrackId = muxed ? muxed.id : null;
       this._carryAudioLang =
-        (p.getAudioLangs?.() as { lang: string; active: boolean }[] | undefined)
-          ?.find((t) => t.active)?.lang ?? null;
+        (
+          p.getAudioLangs?.() as { lang: string; active: boolean }[] | undefined
+        )?.find((t) => t.active)?.lang ?? null;
     } catch {
       /* a torn-down player has nothing to report */
     }
@@ -11135,7 +11451,10 @@ export class MoviElement extends HTMLElement {
     this._carryAudioLang = null;
     this._carrySubtitleIdentity = null;
     try {
-      if (audioLang && p.getAudioLangs?.()?.some((t: any) => t.lang === audioLang)) {
+      if (
+        audioLang &&
+        p.getAudioLangs?.()?.some((t: any) => t.lang === audioLang)
+      ) {
         void p.selectAudioLang?.(audioLang);
       }
       // The logical subtitle first: it lands on the in-band track when this
@@ -11209,11 +11528,15 @@ export class MoviElement extends HTMLElement {
   }
 
   private _recreateAtLowerQuality(): boolean {
-    if (this._decodeDownshifts >= MoviElement.MAX_DECODE_DOWNSHIFTS) return false;
-    const sorted = [...this._videoQualities].sort((a, b) => b.height - a.height);
+    if (this._decodeDownshifts >= MoviElement.MAX_DECODE_DOWNSHIFTS)
+      return false;
+    const sorted = [...this._videoQualities].sort(
+      (a, b) => b.height - a.height,
+    );
     if (sorted.length < 2) return false;
     const curH =
-      this.player?.trackManager?.getActiveVideoTrack?.()?.height || sorted[0].height;
+      this.player?.trackManager?.getActiveVideoTrack?.()?.height ||
+      sorted[0].height;
     let idx = sorted.findIndex((q) => q.height === curH);
     if (idx < 0) idx = 0;
     if (idx >= sorted.length - 1) return false; // already lowest — can't drop
@@ -11312,8 +11635,9 @@ export class MoviElement extends HTMLElement {
       this._qualityRecoveryAttempts++;
       try {
         this._recoveryResumeTime =
-          (this.player as { getCurrentTime?: () => number } | null)?.getCurrentTime?.() ??
-          -1;
+          (
+            this.player as { getCurrentTime?: () => number } | null
+          )?.getCurrentTime?.() ?? -1;
       } catch {
         /* ignore */
       }
@@ -11468,8 +11792,9 @@ export class MoviElement extends HTMLElement {
     // Auto stayed at 144p. A mid rung's file is comfortably larger; the Range
     // header caps the download either way, and the link it measures is the same.
     const probeSrc =
-      byBitrate[Math.min(byBitrate.length - 1, Math.floor(byBitrate.length / 2))]
-        ?.src || smallest.src;
+      byBitrate[
+        Math.min(byBitrate.length - 1, Math.floor(byBitrate.length / 2))
+      ]?.src || smallest.src;
 
     const startedAt = performance.now();
     const bits = await probeLinkBandwidth(probeSrc, {
@@ -11609,7 +11934,10 @@ export class MoviElement extends HTMLElement {
    * without re-measuring — see the `_startProbeDone` branch above.
    * `reapplied` only changes the log wording.
    */
-  private async _applyProbePick(bits: number, reapplied: boolean): Promise<void> {
+  private async _applyProbePick(
+    bits: number,
+    reapplied: boolean,
+  ): Promise<void> {
     const byBitrate = [...this._videoQualities].sort(
       (a, b) =>
         (a.bandwidth || this._estimateBitrate(a.height)) -
@@ -11809,7 +12137,8 @@ export class MoviElement extends HTMLElement {
         return 0;
       }
 
-      const secs = timingStart > 0 ? (performance.now() - timingStart) / 1000 : 0;
+      const secs =
+        timingStart > 0 ? (performance.now() - timingStart) / 1000 : 0;
       if (secs <= 0 || timedBytes <= 0) return 0;
       return (timedBytes * 8) / secs;
     } catch {
@@ -11875,17 +12204,18 @@ export class MoviElement extends HTMLElement {
   private _rungBadge(height: number): string {
     if (height <= 0) return "";
     const active = this.player?.trackManager?.getActiveVideoTrack?.() as
-      | { width?: number; height?: number }
-      | undefined;
+      { width?: number; height?: number } | undefined;
     const live =
       active?.width && active?.height
         ? active
         : this.video?.videoWidth > 0 && this.video?.videoHeight > 0
           ? { width: this.video.videoWidth, height: this.video.videoHeight }
           : null;
-    const aspect =
-      live && live.height! > 0 ? live.width! / live.height! : 0;
-    return this._heightBadge(height, aspect > 0 ? Math.round(height * aspect) : 0);
+    const aspect = live && live.height! > 0 ? live.width! / live.height! : 0;
+    return this._heightBadge(
+      height,
+      aspect > 0 ? Math.round(height * aspect) : 0,
+    );
   }
 
   private _heightBadge(height: number, width: number = 0): string {
@@ -11895,7 +12225,8 @@ export class MoviElement extends HTMLElement {
     // can't contradict each other. Height alone was tried and it disagreed
     // in the other direction: a 7680x4050 master read 8K in the stats and 4K
     // on the gear.
-    const eff = width > 0 ? Math.max(height, Math.round(width * 9 / 16)) : height;
+    const eff =
+      width > 0 ? Math.max(height, Math.round((width * 9) / 16)) : height;
     if (eff >= 4320) return "8K";
     if (eff >= 2160) return "4K";
     if (eff >= 1080) return "HD";
@@ -11958,11 +12289,12 @@ export class MoviElement extends HTMLElement {
       // of its own, so those wrappers answer instead — Shaka with its active
       // resolution, any of them with the video element's intrinsic size.
       const active = this.player?.trackManager?.getActiveVideoTrack?.() as
-        | { width?: number; height?: number }
-        | undefined;
+        { width?: number; height?: number } | undefined;
       const wrapperRes = (
         this.player as unknown as {
-          streamWrapper?: { getActiveResolution?: () => { width: number; height: number } };
+          streamWrapper?: {
+            getActiveResolution?: () => { width: number; height: number };
+          };
         } | null
       )?.streamWrapper?.getActiveResolution?.();
       const nativeRes =
@@ -12194,7 +12526,12 @@ export class MoviElement extends HTMLElement {
   private renderDashQualityMenu(
     qualityList: HTMLElement,
     qualityContainer: HTMLElement,
-    renditions: { url: string; label: string; id: string; bandwidth?: number }[],
+    renditions: {
+      url: string;
+      label: string;
+      id: string;
+      bandwidth?: number;
+    }[],
   ): void {
     qualityContainer.style.display = "flex";
     const player = this.player as any;
@@ -12245,7 +12582,8 @@ export class MoviElement extends HTMLElement {
     // "Auto" (adaptive) — shows the rung it's currently serving, "Auto (720p)".
     if (abrCapable) {
       const item = document.createElement("div");
-      item.className = "movi-quality-item" + (isAuto ? " movi-quality-active" : "");
+      item.className =
+        "movi-quality-item" + (isAuto ? " movi-quality-active" : "");
       const wrap = document.createElement("span");
       wrap.className = "movi-quality-label-wrap";
       const label = document.createElement("span");
@@ -12291,7 +12629,10 @@ export class MoviElement extends HTMLElement {
         // Picking a specific quality leaves Auto.
         player?.setAutoQuality?.(false);
         this._writeQualityAutoPref(false);
-        this.announceQualityPick(parseInt(r.label, 10) || 0, r.url !== activeUrl);
+        this.announceQualityPick(
+          parseInt(r.label, 10) || 0,
+          r.url !== activeUrl,
+        );
         if (r.url !== activeUrl) {
           this.markQualityPending(r.url);
           this.switchDashRendition(r.url);
@@ -12340,8 +12681,9 @@ export class MoviElement extends HTMLElement {
     const own = typeof this._src === "string" ? this._src : "";
     if (!autoQualityAllowed(this._videoQualities)) return own;
     return (
-      ((this.player as { getActiveDashRendition?: () => string } | null)
-        ?.getActiveDashRendition?.() as string) || own
+      ((
+        this.player as { getActiveDashRendition?: () => string } | null
+      )?.getActiveDashRendition?.() as string) || own
     );
   }
 
@@ -12493,8 +12835,9 @@ export class MoviElement extends HTMLElement {
   private _stashDurationForRebuild(): void {
     try {
       const d =
-        (this.player as { getDuration?: () => number } | null)?.getDuration?.() ||
-        0;
+        (
+          this.player as { getDuration?: () => number } | null
+        )?.getDuration?.() || 0;
       if (d > 0) this._switchResumeDuration = d;
     } catch {
       /* keep whatever we had */
@@ -12524,7 +12867,11 @@ export class MoviElement extends HTMLElement {
     // and (via _captureTrackSelection) the viewer's subtitle choice.
     const crossesHls =
       isHlsSource(newSrc) || isHlsSource(this._activeRungSrc());
-    if (!crossesHls && p && typeof p.switchVideoRenditionInPlace === "function") {
+    if (
+      !crossesHls &&
+      p &&
+      typeof p.switchVideoRenditionInPlace === "function"
+    ) {
       this._suppressSwReload = true;
       p.switchVideoRenditionInPlace(newSrc)
         .then((ok: boolean) => {
@@ -12538,10 +12885,14 @@ export class MoviElement extends HTMLElement {
   }
 
   private _reloadPremuxedQuality(newSrc: string): void {
-    const wasPaused = this.player ? (this.player as any).getState?.() === "paused" : true;
+    const wasPaused = this.player
+      ? (this.player as any).getState?.() === "paused"
+      : true;
     let resumeTime = 0;
     try {
-      resumeTime = this.player ? (this.player as any).getCurrentTime?.() || 0 : 0;
+      resumeTime = this.player
+        ? (this.player as any).getCurrentTime?.() || 0
+        : 0;
     } catch {}
 
     const target = this._videoQualities.find((q) => q.src === newSrc);
@@ -12549,8 +12900,7 @@ export class MoviElement extends HTMLElement {
     // Detach the currently-playing native audio element so it survives the
     // teardown unmolested, then re-adopt it on the next player instance.
     try {
-      this._carryAudioEl =
-        (this.player as any)?.releaseNativeAudio?.() || null;
+      this._carryAudioEl = (this.player as any)?.releaseNativeAudio?.() || null;
     } catch {
       this._carryAudioEl = null;
     }
@@ -12877,7 +13227,10 @@ export class MoviElement extends HTMLElement {
           `Link probe: best ${bps > 0 ? (bps / 1e6).toFixed(1) + "Mbps" : "no reading"} ` +
             `for ${(needed / 1e6).toFixed(1)}Mbps needed; arriving ` +
             `${arriving > 0 ? (arriving / 1e6).toFixed(1) + "Mbps" : "unknown"} at best, ` +
-            `${(() => { const v = p.sustainedDeliveryBps?.() ?? -1; return v > 0 ? (v / 1e6).toFixed(1) + "Mbps" : "unknown"; })()} sustained ` +
+            `${(() => {
+              const v = p.sustainedDeliveryBps?.() ?? -1;
+              return v > 0 ? (v / 1e6).toFixed(1) + "Mbps" : "unknown";
+            })()} sustained ` +
             `(stalls ${this._linkStalls}, from delivery ${this._deliveryStalls})`,
         );
         // What has ACTUALLY been arriving decides. The probe is a second
@@ -12954,9 +13307,7 @@ export class MoviElement extends HTMLElement {
       if (bps > best) best = bps;
       if (best >= needed) break;
       if (i < MoviElement.LINK_PROBE_TRIES - 1) {
-        await new Promise((r) =>
-          setTimeout(r, MoviElement.LINK_PROBE_GAP_MS),
-        );
+        await new Promise((r) => setTimeout(r, MoviElement.LINK_PROBE_GAP_MS));
       }
     }
     return best;
@@ -13013,8 +13364,7 @@ export class MoviElement extends HTMLElement {
     // …and the same for a file whose video track ends before its audio does:
     // past the last frame there is nothing left to present, so counting
     // presented frames reads a finished picture as a broken one.
-    const hasVideoTrack =
-      !!this.player?.trackManager?.getActiveVideoTrack?.();
+    const hasVideoTrack = !!this.player?.trackManager?.getActiveVideoTrack?.();
     if (
       !hasVideoTrack ||
       this.player?.isAudioOnly?.() ||
@@ -13048,8 +13398,10 @@ export class MoviElement extends HTMLElement {
     // there costs only judder detection, which the PiP window's own small
     // picture would hardly show anyway.)
     if (
-      (typeof document !== "undefined" && document.visibilityState !== "visible") ||
-      performance.now() - this._becameVisibleAt < MoviElement.VISIBILITY_SETTLE_MS
+      (typeof document !== "undefined" &&
+        document.visibilityState !== "visible") ||
+      performance.now() - this._becameVisibleAt <
+        MoviElement.VISIBILITY_SETTLE_MS
     ) {
       this._stutterLastPresented = h.framesPresented;
       this._stutterHistory.length = 0;
@@ -13087,9 +13439,7 @@ export class MoviElement extends HTMLElement {
     // there over playback that was fine and deliberate.
     const capFps = this.pictureRenderer()?.presentFpsCap || 0;
     const expected =
-      capFps > 0
-        ? capFps
-        : Math.min(60, h.sourceFps * this._playbackRate);
+      capFps > 0 ? capFps : Math.min(60, h.sourceFps * this._playbackRate);
 
     // Say so while the picture is JUDDERING. Presenting 25 of 60 frames a
     // second is not playback the viewer asked for — it is the pipeline failing
@@ -13198,7 +13548,13 @@ export class MoviElement extends HTMLElement {
             };
     const allowed = this.dispatchEvent(
       new CustomEvent("smoothwarning", {
-        detail: { measured: true, media: "video", software, softwareReason, message },
+        detail: {
+          measured: true,
+          media: "video",
+          software,
+          softwareReason,
+          message,
+        },
         cancelable: true,
         bubbles: true,
         composed: true,
@@ -13246,7 +13602,8 @@ export class MoviElement extends HTMLElement {
     }
     this._nativeAudioCheckTimer = window.setTimeout(() => {
       this._nativeAudioCheckTimer = null;
-      if (!this._nativeFallbackActive || this._nativeAudioSilentReported) return;
+      if (!this._nativeFallbackActive || this._nativeAudioSilentReported)
+        return;
       // Only once the picture is genuinely running: before that both counters
       // are zero for the ordinary reason.
       if ((el.webkitVideoDecodedByteCount ?? 0) <= 0) {
@@ -13281,8 +13638,12 @@ export class MoviElement extends HTMLElement {
     this.classList.toggle("movi-no-audible-audio", on);
     const sr = this.shadowRoot;
     if (!sr) return;
-    const btn = sr.querySelector(".movi-volume-btn") as HTMLButtonElement | null;
-    const slider = sr.querySelector(".movi-volume-slider") as HTMLInputElement | null;
+    const btn = sr.querySelector(
+      ".movi-volume-btn",
+    ) as HTMLButtonElement | null;
+    const slider = sr.querySelector(
+      ".movi-volume-slider",
+    ) as HTMLInputElement | null;
     // aria and the disabled property as well as the class: a control that is
     // only dimmed is still reachable by keyboard and still announced as usable.
     if (btn) {
@@ -13353,7 +13714,8 @@ export class MoviElement extends HTMLElement {
   // --movi-sub-bg-alpha, --movi-sub-edge) which the subtitle styles
   // in the shadow DOM consume.
 
-  private static readonly SUBTITLE_SETTINGS_STORAGE_KEY = "movi.subtitleSettings";
+  private static readonly SUBTITLE_SETTINGS_STORAGE_KEY =
+    "movi.subtitleSettings";
 
   /**
    * Returns the kind of subtitle currently active so the customize
@@ -13394,8 +13756,7 @@ export class MoviElement extends HTMLElement {
     shadow: "0 0 4px rgba(0, 0, 0, 0.85)",
     outline:
       "-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 2px rgba(0,0,0,0.9)",
-    raised:
-      "1px 1px 0 rgba(255,255,255,0.35), 2px 2px 4px rgba(0,0,0,0.85)",
+    raised: "1px 1px 0 rgba(255,255,255,0.35), 2px 2px 4px rgba(0,0,0,0.85)",
   };
 
   private static readonly SUBTITLE_COLOR_PALETTE: {
@@ -13444,10 +13805,14 @@ export class MoviElement extends HTMLElement {
         // is only ever as trustworthy as the localStorage it came from, and a
         // caption parked off the edge of the picture cannot be dragged back.
         if (Number.isFinite(parsed.posX)) {
-          this._subtitleSettings.posX = MoviElement.clampSubtitlePos(parsed.posX);
+          this._subtitleSettings.posX = MoviElement.clampSubtitlePos(
+            parsed.posX,
+          );
         }
         if (Number.isFinite(parsed.posY)) {
-          this._subtitleSettings.posY = MoviElement.clampSubtitlePos(parsed.posY);
+          this._subtitleSettings.posY = MoviElement.clampSubtitlePos(
+            parsed.posY,
+          );
         }
       }
     } catch {
@@ -13643,13 +14008,23 @@ export class MoviElement extends HTMLElement {
     // A caption wider (or taller) than the picture cannot satisfy both edges,
     // and pulling it at one of them just fights the viewer. Leave that axis.
     const fix = (low: number, high: number, near: number, far: number) =>
-      far - near > high - low ? 0 : near < low ? low - near : far > high ? high - far : 0;
+      far - near > high - low
+        ? 0
+        : near < low
+          ? low - near
+          : far > high
+            ? high - far
+            : 0;
     const fixX = fix(host.left + edge, host.right - edge, box.left, box.right);
     const fixY = fix(host.top + edge, host.bottom - edge, box.top, box.bottom);
     if (!fixX && !fixY) return box;
     const settings = this._subtitleSettings;
-    settings.posX = MoviElement.clampSubtitlePos(settings.posX + (fixX / boxW) * 100);
-    settings.posY = MoviElement.clampSubtitlePos(settings.posY + (fixY / boxH) * 100);
+    settings.posX = MoviElement.clampSubtitlePos(
+      settings.posX + (fixX / boxW) * 100,
+    );
+    settings.posY = MoviElement.clampSubtitlePos(
+      settings.posY + (fixY / boxH) * 100,
+    );
     this.applySubtitlePosition();
     return box;
   }
@@ -13892,13 +14267,21 @@ export class MoviElement extends HTMLElement {
         const parsed = parseFloat(raw);
         if (!Number.isFinite(parsed)) return true;
         // > 1 → percentage (e.g. 75). Else treat as 0–1 alpha.
-        s.bgAlpha = Math.max(0, Math.min(1, parsed > 1 ? parsed / 100 : parsed));
+        s.bgAlpha = Math.max(
+          0,
+          Math.min(1, parsed > 1 ? parsed / 100 : parsed),
+        );
         return true;
       }
       case "subtitleedge": {
         if (raw === null) return true;
         const v = raw.trim().toLowerCase();
-        if (v === "none" || v === "shadow" || v === "outline" || v === "raised") {
+        if (
+          v === "none" ||
+          v === "shadow" ||
+          v === "outline" ||
+          v === "raised"
+        ) {
           s.edge = v;
         }
         return true;
@@ -14131,7 +14514,6 @@ export class MoviElement extends HTMLElement {
     `;
   }
 
-
   private wireSubtitleCustomizePanel(root: HTMLElement): void {
     // Update the preview, the live in-video subtitle, and persist —
     // without re-rendering the whole panel so a slider drag stays
@@ -14161,9 +14543,7 @@ export class MoviElement extends HTMLElement {
       }
     };
     const refreshReadout = (group: "size" | "bg") => {
-      const r = root.querySelector<HTMLElement>(
-        `[data-readout="${group}"]`,
-      );
+      const r = root.querySelector<HTMLElement>(`[data-readout="${group}"]`);
       if (!r) return;
       r.textContent =
         group === "size"
@@ -14217,11 +14597,7 @@ export class MoviElement extends HTMLElement {
         tile.addEventListener("click", (e) => {
           e.stopPropagation();
           const v = tile.dataset.value as
-            | "none"
-            | "shadow"
-            | "outline"
-            | "raised"
-            | undefined;
+            "none" | "shadow" | "outline" | "raised" | undefined;
           if (!v) return;
           this._subtitleSettings.edge = v;
           root
@@ -14363,7 +14739,8 @@ export class MoviElement extends HTMLElement {
 
   // Cues browser state
   private _cuesPanelCues: { start: number; end: number; text: string }[] = [];
-  private _cuesPanelFiltered: { start: number; end: number; text: string }[] = [];
+  private _cuesPanelFiltered: { start: number; end: number; text: string }[] =
+    [];
   private _cuesPanelQuery: string = "";
   private _cuesPanelActiveIdx: number = -1;
   private _cuesPanelTimeUpdateUnsub: (() => void) | null = null;
@@ -14373,9 +14750,7 @@ export class MoviElement extends HTMLElement {
     const panel = this.shadowRoot?.querySelector(
       ".movi-cues-panel",
     ) as HTMLElement | null;
-    const list = panel?.querySelector(
-      ".movi-cues-list",
-    ) as HTMLElement | null;
+    const list = panel?.querySelector(".movi-cues-list") as HTMLElement | null;
     const meta = panel?.querySelector(
       ".movi-cues-meta-count",
     ) as HTMLElement | null;
@@ -14685,7 +15060,8 @@ export class MoviElement extends HTMLElement {
         const viewTop = list.scrollTop;
         const viewBot = viewTop + list.clientHeight;
         if (rowTop < viewTop || rowBot > viewBot) {
-          list.scrollTop = rowTop - list.clientHeight / 2 + row.offsetHeight / 2;
+          list.scrollTop =
+            rowTop - list.clientHeight / 2 + row.offsetHeight / 2;
         }
       }
     }
@@ -14891,7 +15267,10 @@ export class MoviElement extends HTMLElement {
           // Present so the viewer knows it exists; nothing in the source
           // that is playing can show it.
           if ((item as HTMLElement).dataset.originalOnly) {
-            this.showOSD(OSD.subOff, `Only in ${originalLabel} — switch source to use it`);
+            this.showOSD(
+              OSD.subOff,
+              `Only in ${originalLabel} — switch source to use it`,
+            );
             return;
           }
           const trackIdStr = (item as HTMLElement).dataset.trackId;
@@ -14902,10 +15281,14 @@ export class MoviElement extends HTMLElement {
             const subIconOff = OSD.subOff;
             if (subtitleLang !== undefined) {
               // External subtitle track
-              const st = this.player.getSubtitleLangs().find(t => t.lang === subtitleLang);
+              const st = this.player
+                .getSubtitleLangs()
+                .find((t) => t.lang === subtitleLang);
               this.pickSubtitleLang(subtitleLang);
               this.updateSubtitleTrackMenu();
-              const extSubOsd = st ? `${st.label} [${subtitleLang.toUpperCase()}]` : subtitleLang.toUpperCase();
+              const extSubOsd = st
+                ? `${st.label} [${subtitleLang.toUpperCase()}]`
+                : subtitleLang.toUpperCase();
               this.showOSD(subIconOn, extSubOsd);
             } else if (trackIdStr === "null") {
               // Disable all subtitles (muxed + external)
@@ -14918,10 +15301,16 @@ export class MoviElement extends HTMLElement {
               const trackId = parseInt(trackIdStr || "0");
               this.pickSubtitleLang(null);
               this.pickSubtitleTrack(trackId).catch(() => {});
-              const trk = this.player.getSubtitleTracks().find(t => t.id === trackId);
+              const trk = this.player
+                .getSubtitleTracks()
+                .find((t) => t.id === trackId);
               const muxSubLangC = trk?.language?.toUpperCase() || "";
-              const muxSubLabelC = trk?.label || muxSubLangC || `Subtitle ${trackId}`;
-              const muxSubOsdC = muxSubLangC && muxSubLabelC !== muxSubLangC ? `${muxSubLabelC} [${muxSubLangC}]` : muxSubLabelC;
+              const muxSubLabelC =
+                trk?.label || muxSubLangC || `Subtitle ${trackId}`;
+              const muxSubOsdC =
+                muxSubLangC && muxSubLabelC !== muxSubLangC
+                  ? `${muxSubLabelC} [${muxSubLangC}]`
+                  : muxSubLabelC;
               this.showOSD(subIconOn, muxSubOsdC);
             }
             // Re-render so the active row's checkmark + the gear/browse
@@ -14933,7 +15322,7 @@ export class MoviElement extends HTMLElement {
           }
         });
       });
-      // A track change reaches here from every path - the keyboard, the
+    // A track change reaches here from every path - the keyboard, the
     // panel, a host call - so this is where an open menu learns about it.
     this.refreshOpenSettingsSurfaces();
     // Track availability is exactly what decides whether the mobile tray has
@@ -14978,7 +15367,9 @@ export class MoviElement extends HTMLElement {
    * @internal
    */
   _revertsThisGesture(wantPaused: boolean): boolean {
-    return this.toggledThisGesture() && wantPaused === this._gesturePausedAtStart;
+    return (
+      this.toggledThisGesture() && wantPaused === this._gesturePausedAtStart
+    );
   }
 
   private shouldPauseOnToggle(): boolean {
@@ -15212,8 +15603,10 @@ export class MoviElement extends HTMLElement {
     // Backward edge: getSeekableStartTime already bakes in a byte safety margin
     // so the seek's keyframe lands inside the window (the linear time→byte
     // estimate alone is too optimistic — GOP + VBR push the keyframe lower).
-    const lo = this.player.getSeekableStartTime?.()
-      ?? (this.player.getBufferStartTime?.() ?? 0);
+    const lo =
+      this.player.getSeekableStartTime?.() ??
+      this.player.getBufferStartTime?.() ??
+      0;
     const end = this.player.getBufferEndTime?.() ?? this.duration;
     if (!(end > lo)) return time;
     const hi = Math.max(lo, end - Math.max(1, (end - lo) * 0.02));
@@ -15401,11 +15794,14 @@ export class MoviElement extends HTMLElement {
       this.classList.remove("movi-bar-visible");
     }
 
-
     // Shift timeline panel up above controls
-    const bar = this.shadowRoot?.querySelector(".movi-controls-bar") as HTMLElement;
+    const bar = this.shadowRoot?.querySelector(
+      ".movi-controls-bar",
+    ) as HTMLElement;
     const barHeight = bar?.offsetHeight ?? 80;
-    const timelinePanel = this.shadowRoot?.querySelector(".movi-timeline-panel") as HTMLElement;
+    const timelinePanel = this.shadowRoot?.querySelector(
+      ".movi-timeline-panel",
+    ) as HTMLElement;
     let subtitlePadding = barHeight + 20;
 
     if (timelinePanel && timelinePanel.style.display !== "none") {
@@ -15429,7 +15825,9 @@ export class MoviElement extends HTMLElement {
 
     // Show title bar if showtitle is enabled
     if (this._showTitle && this.shadowRoot) {
-      const titleBar = this.shadowRoot.querySelector(".movi-title-bar") as HTMLElement;
+      const titleBar = this.shadowRoot.querySelector(
+        ".movi-title-bar",
+      ) as HTMLElement;
       if (titleBar && titleBar.style.display !== "none") {
         titleBar.classList.add("movi-title-visible");
       }
@@ -15557,10 +15955,7 @@ export class MoviElement extends HTMLElement {
    * it on open, run the CSS transition, and restore it once the exit
    * transition finishes.
    */
-  private setBottomMenuOpen(
-    el: HTMLElement | null,
-    open: boolean,
-  ): void {
+  private setBottomMenuOpen(el: HTMLElement | null, open: boolean): void {
     if (!el) return;
     if (open) {
       if (el.classList.contains("is-open")) return;
@@ -15727,7 +16122,8 @@ export class MoviElement extends HTMLElement {
     // so take whichever side is roomier.
     // Keep the bar clear when the menu fits beside it; otherwise let it
     // overlap, clamped into the viewport below.
-    const openBelow = below >= menuH ? true : above >= menuH ? false : below >= above;
+    const openBelow =
+      below >= menuH ? true : above >= menuH ? false : below >= above;
     let left = btnRect.right - menuW;
     left = Math.min(
       Math.max(left, EDGE),
@@ -15821,8 +16217,7 @@ export class MoviElement extends HTMLElement {
     // RAM window, so skipping stays within what's seekable.
     const now = Date.now();
     const continuing =
-      this.lastSeekSide === direction &&
-      now - this.lastSeekTime < 1000;
+      this.lastSeekSide === direction && now - this.lastSeekTime < 1000;
     const dur = this.duration;
     // Sanitise the dur cap. Infinity (live) and NaN/0 (not yet loaded)
     // both leave Math.min producing values that bypass clamping; pin
@@ -15844,18 +16239,16 @@ export class MoviElement extends HTMLElement {
       0,
       Math.min(safeDur, Number.isFinite(rawBefore) ? rawBefore : 0),
     );
-    const target = direction === "left"
-      ? Math.max(0, before - step)
-      : Math.min(safeDur, before + step);
+    const target =
+      direction === "left"
+        ? Math.max(0, before - step)
+        : Math.min(safeDur, before + step);
     this.currentTime = target;
     this._seekChainTarget = target;
-    const delta =
-      direction === "left" ? before - target : target - before;
+    const delta = direction === "left" ? before - target : target - before;
 
     const nextCum =
-      continuing && delta > 0
-        ? this.cumulativeSeekAmount + delta
-        : delta;
+      continuing && delta > 0 ? this.cumulativeSeekAmount + delta : delta;
     // cum should be ≥ 0 by construction, but Math.max guards against
     // any weird state (NaN, transient float negatives) leaking into
     // the display.
@@ -15928,9 +16321,11 @@ export class MoviElement extends HTMLElement {
    * browser that wouldn't expose the capability regardless.
    */
   private featureAllowed(feature: string): boolean {
-    const fp = (document as unknown as {
-      featurePolicy?: { allowsFeature?: (f: string) => boolean };
-    }).featurePolicy;
+    const fp = (
+      document as unknown as {
+        featurePolicy?: { allowsFeature?: (f: string) => boolean };
+      }
+    ).featurePolicy;
     if (fp && typeof fp.allowsFeature === "function") {
       try {
         return fp.allowsFeature(feature);
@@ -16099,7 +16494,8 @@ export class MoviElement extends HTMLElement {
     // so gate on the Permissions Policy.
     const speakerAllowed = this.featureAllowed("speaker-selection");
     const canUnlock =
-      !!navigator.mediaDevices?.getUserMedia && this.featureAllowed("microphone");
+      !!navigator.mediaDevices?.getUserMedia &&
+      this.featureAllowed("microphone");
     if (
       !MoviElement.audioSinkSupported() ||
       !speakerAllowed ||
@@ -16277,14 +16673,18 @@ export class MoviElement extends HTMLElement {
     const upper = label.toUpperCase();
     let name = "";
     try {
-      name =
-        new Intl.DisplayNames(["en"], { type: "language" }).of(lang) || "";
+      name = new Intl.DisplayNames(["en"], { type: "language" }).of(lang) || "";
     } catch {
       name = "";
     }
     const names = [name, lang].filter(Boolean).map((n) => n.toUpperCase());
     for (const n of names) {
-      if (n && new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(upper)) {
+      if (
+        n &&
+        new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(
+          upper,
+        )
+      ) {
         return label;
       }
     }
@@ -16312,8 +16712,9 @@ export class MoviElement extends HTMLElement {
     switch (key) {
       case "quality":
         return (
-          activeText(".movi-quality-item.movi-quality-active .movi-quality-label") ||
-          "Auto"
+          activeText(
+            ".movi-quality-item.movi-quality-active .movi-quality-label",
+          ) || "Auto"
         );
       case "speed": {
         const rate = this.playbackRate || 1;
@@ -16378,14 +16779,17 @@ export class MoviElement extends HTMLElement {
   /** Resolution of the only rung there is, e.g. "1080p" - shown as a dead row
    *  when there is nothing to choose between. */
   private singleQualityLabel(): string {
-    const only = this._videoQualities.length === 1 ? this._videoQualities[0] : null;
+    const only =
+      this._videoQualities.length === 1 ? this._videoQualities[0] : null;
     if (only?.label) {
       const fps = Math.round(only.fps || 0);
       return fps > 30 && !new RegExp(`${fps}$`).test(only.label)
         ? `${only.label}@${fps}`
         : only.label;
     }
-    const v = this.player?.getMediaInfo?.()?.tracks?.find((t) => t.type === "video");
+    const v = this.player
+      ?.getMediaInfo?.()
+      ?.tracks?.find((t) => t.type === "video");
     if (!v?.height) return "";
     // Same suffix the ladder uses: "2160p@60". A high frame rate is as much a
     // part of "what am I watching" as the resolution is, and this row was
@@ -16399,7 +16803,8 @@ export class MoviElement extends HTMLElement {
    *  text says "Fill" and the mark shows what that looks like, so the row
    *  answers "what is it set to" without opening anything. */
   private aspectRowIcon(): string {
-    const fit = this._objectFit === "control" ? this._currentFit : this._objectFit;
+    const fit =
+      this._objectFit === "control" ? this._currentFit : this._objectFit;
     return symbolSvg(
       MoviElement.aspectSymbol(fit as string),
       "movi-settings-icon",
@@ -16515,16 +16920,21 @@ export class MoviElement extends HTMLElement {
     const liveNow = (actionKey: string) =>
       !initial || this.getInitialEnabledControls().includes(actionKey);
     const offered = (
-      a: "snapshot" | "rotate" | "aspect" | "hdr" | "ambient" | "timeline" | "stableaudio",
+      a:
+        | "snapshot"
+        | "rotate"
+        | "aspect"
+        | "hdr"
+        | "ambient"
+        | "timeline"
+        | "stableaudio",
     ) => (initial ? !this.isControlDisabled(a) : this.isControlAvailable(a));
     // A row the host took off the initial list is shown and dimmed, not
     // removed — an absent row reads as "this player cannot do that", which is
     // the thing this panel was getting wrong in the first place.
     const deadIf = (actionKey: string) =>
       liveNow(actionKey) ? "" : ' disabled aria-disabled="true"';
-    rows.push(
-      `<div class="movi-settings-section-label">Playback</div>`,
-    );
+    rows.push(`<div class="movi-settings-section-label">Playback</div>`);
     // Every row here is a remembered preference, and all of them can be set
     // before there is anything to apply them to — the same list
     // worksBeforePlayback keeps live in the context menu.
@@ -16541,7 +16951,12 @@ export class MoviElement extends HTMLElement {
       !off("quality") &&
       this.settingsRowAvailable(".movi-quality-container", ".movi-quality-item")
     ) {
-      page("quality", "Quality", ".movi-quality-container", ".movi-quality-item");
+      page(
+        "quality",
+        "Quality",
+        ".movi-quality-container",
+        ".movi-quality-item",
+      );
     } else if (!audioOnly && !off("quality")) {
       // One rung only (a plain file, a single <source>). The row still belongs:
       // "what am I watching" is the question people open this panel with, and
@@ -16582,7 +16997,7 @@ export class MoviElement extends HTMLElement {
     // button is already absent there; this row was the one that wasn't.
     if (!audioOnly && offered("aspect")) {
       rows.push(
-      `<button type="button"${deadIf("aspect")} class="movi-settings-row" data-page="aspect">${this.aspectRowIcon()}<span class="movi-settings-row-label">Aspect</span><span class="movi-settings-row-value">${MoviElement.escapeSettingsText(this.settingsRowValue("aspect"))}</span>${chevron}</button>`,
+        `<button type="button"${deadIf("aspect")} class="movi-settings-row" data-page="aspect">${this.aspectRowIcon()}<span class="movi-settings-row-label">Aspect</span><span class="movi-settings-row-value">${MoviElement.escapeSettingsText(this.settingsRowValue("aspect"))}</span>${chevron}</button>`,
       );
     }
 
@@ -16610,7 +17025,11 @@ export class MoviElement extends HTMLElement {
     const hdrEl = this.shadowRoot?.querySelector(
       ".movi-hdr-container",
     ) as HTMLElement | null;
-    if (!audioOnly && hdrEl?.style.display === "flex" && this.isControlAvailable("hdr")) {
+    if (
+      !audioOnly &&
+      hdrEl?.style.display === "flex" &&
+      this.isControlAvailable("hdr")
+    ) {
       rows.push(toggle("hdr", "HDR", this._hdr));
     }
     // Ambient mode, on the same availability test its context-menu row uses:
@@ -16699,9 +17118,10 @@ export class MoviElement extends HTMLElement {
     view: HTMLElement,
     direction: "forward" | "back",
   ): void {
-    const cls = direction === "forward"
-      ? "movi-settings-view-forward"
-      : "movi-settings-view-back";
+    const cls =
+      direction === "forward"
+        ? "movi-settings-view-forward"
+        : "movi-settings-view-back";
     view.classList.remove(
       "movi-settings-view-forward",
       "movi-settings-view-back",
@@ -16771,7 +17191,10 @@ export class MoviElement extends HTMLElement {
       // Each fit already HAS a drawing — the bar button cycled through exactly
       // these to show which was active. Reuse them here: for a spatial setting,
       // the picture of the crop says more than the word for it.
-      const icon = symbolSvg(MoviElement.aspectSymbol(fit), "movi-settings-icon");
+      const icon = symbolSvg(
+        MoviElement.aspectSymbol(fit),
+        "movi-settings-icon",
+      );
       return `<button type="button" class="movi-settings-choice ${fit === current ? "is-active" : ""}" data-fit="${fit}"><span class="movi-settings-choice-main">${icon}<span>${label}</span></span>${fit === current ? check : ""}</button>`;
     }).join("");
   }
@@ -16802,7 +17225,10 @@ export class MoviElement extends HTMLElement {
    * nothing to listen to. Fired on real changes only, so a host echoing the
    * value back cannot feed itself.
    */
-  private emitSettingChange(name: string, detail: Record<string, unknown>): void {
+  private emitSettingChange(
+    name: string,
+    detail: Record<string, unknown>,
+  ): void {
     this.dispatchEvent(
       new CustomEvent(name, { detail, bubbles: true, composed: true }),
     );
@@ -16899,8 +17325,10 @@ export class MoviElement extends HTMLElement {
       .closest(".movi-controls-bar")
       ?.querySelector(".movi-progress-container") as HTMLElement | null;
     if (row && progress) {
-      const gap = row.getBoundingClientRect().bottom -
-        progress.getBoundingClientRect().top + 6;
+      const gap =
+        row.getBoundingClientRect().bottom -
+        progress.getBoundingClientRect().top +
+        6;
       menu.style.bottom = `${Math.round(gap)}px`;
     }
 
@@ -16934,7 +17362,10 @@ export class MoviElement extends HTMLElement {
     ) as HTMLElement | null;
     if (container) {
       const sync = () =>
-        container.classList.toggle("is-open", menu.classList.contains("is-open"));
+        container.classList.toggle(
+          "is-open",
+          menu.classList.contains("is-open"),
+        );
       new MutationObserver(sync).observe(menu, {
         attributes: true,
         attributeFilter: ["class"],
@@ -17000,7 +17431,11 @@ export class MoviElement extends HTMLElement {
       if (path.includes(this)) return;
       this.closeSettingsMenu();
     };
-    document.addEventListener("pointerdown", this._settingsOutsideHandler, true);
+    document.addEventListener(
+      "pointerdown",
+      this._settingsOutsideHandler,
+      true,
+    );
 
     // Swipe down to dismiss, on a touch popup (the panel on a small player).
     //
@@ -17142,11 +17577,13 @@ export class MoviElement extends HTMLElement {
       this.clampSettingsPanel(menu);
     });
 
-    container?.querySelector(".movi-settings-close")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.closeSettingsMenu();
-      this.focus();
-    });
+    container
+      ?.querySelector(".movi-settings-close")
+      ?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.closeSettingsMenu();
+        this.focus();
+      });
 
     menu.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
@@ -17270,15 +17707,27 @@ export class MoviElement extends HTMLElement {
   private isAnyMenuOpen(): boolean {
     if (!this.shadowRoot) return false;
 
-    const speedMenu = this.shadowRoot.querySelector(".movi-speed-menu") as HTMLElement;
-    const audioMenu = this.shadowRoot.querySelector(".movi-audio-track-menu") as HTMLElement;
-    const subtitleMenu = this.shadowRoot.querySelector(".movi-subtitle-track-menu") as HTMLElement;
-    const qualityMenu = this.shadowRoot.querySelector(".movi-quality-menu") as HTMLElement;
-    const settingsMenu = this.shadowRoot.querySelector(".movi-settings-menu") as HTMLElement;
+    const speedMenu = this.shadowRoot.querySelector(
+      ".movi-speed-menu",
+    ) as HTMLElement;
+    const audioMenu = this.shadowRoot.querySelector(
+      ".movi-audio-track-menu",
+    ) as HTMLElement;
+    const subtitleMenu = this.shadowRoot.querySelector(
+      ".movi-subtitle-track-menu",
+    ) as HTMLElement;
+    const qualityMenu = this.shadowRoot.querySelector(
+      ".movi-quality-menu",
+    ) as HTMLElement;
+    const settingsMenu = this.shadowRoot.querySelector(
+      ".movi-settings-menu",
+    ) as HTMLElement;
     // contextMenuRoot(): the desktop context menu moves to the body portal while
     // open, so this.shadowRoot wouldn't find it and auto-hide would think no menu
     // is open (hiding the controls out from under an open menu).
-    const contextMenu = this.contextMenuRoot().querySelector(".movi-context-menu") as HTMLElement;
+    const contextMenu = this.contextMenuRoot().querySelector(
+      ".movi-context-menu",
+    ) as HTMLElement;
     // The timeline counts as open chrome too. It is anchored to the bar — the
     // stylesheet moves it when the bar goes — so auto-hiding underneath it slid
     // the panel down while someone was reading it.
@@ -17287,13 +17736,15 @@ export class MoviElement extends HTMLElement {
     ) as HTMLElement | null;
 
     return (
-      (timeline?.style.display === "flex") ||
+      timeline?.style.display === "flex" ||
       this.isBottomMenuOpen(settingsMenu) ||
       this.isBottomMenuOpen(speedMenu) ||
       this.isBottomMenuOpen(audioMenu) ||
       this.isBottomMenuOpen(subtitleMenu) ||
       this.isBottomMenuOpen(qualityMenu) ||
-      (contextMenu && (contextMenu.style.display === "block" || contextMenu.style.display === "flex"))
+      (contextMenu &&
+        (contextMenu.style.display === "block" ||
+          contextMenu.style.display === "flex"))
     );
   }
 
@@ -17382,7 +17833,9 @@ export class MoviElement extends HTMLElement {
     this.classList.remove("movi-bar-visible");
 
     // Shift timeline panel down when controls hide
-    const timelinePanel = this.shadowRoot?.querySelector(".movi-timeline-panel") as HTMLElement;
+    const timelinePanel = this.shadowRoot?.querySelector(
+      ".movi-timeline-panel",
+    ) as HTMLElement;
     if (timelinePanel) {
       timelinePanel.style.bottom = "12px";
     }
@@ -17401,7 +17854,9 @@ export class MoviElement extends HTMLElement {
 
     // Hide title bar when controls are hidden
     if (this.shadowRoot) {
-      const titleBar = this.shadowRoot.querySelector(".movi-title-bar") as HTMLElement;
+      const titleBar = this.shadowRoot.querySelector(
+        ".movi-title-bar",
+      ) as HTMLElement;
       if (titleBar) {
         titleBar.classList.remove("movi-title-visible");
       }
@@ -17594,8 +18049,14 @@ export class MoviElement extends HTMLElement {
     // The action glyph belongs to the pop alone — see _centerFlashOwnsGlyph.
     this._centerFlashOwnsGlyph = !persistent;
     if (!persistent) {
-      playIcon?.style.setProperty("display", kind === "play" ? "block" : "none");
-      pauseIcon?.style.setProperty("display", kind === "play" ? "none" : "block");
+      playIcon?.style.setProperty(
+        "display",
+        kind === "play" ? "block" : "none",
+      );
+      pauseIcon?.style.setProperty(
+        "display",
+        kind === "play" ? "none" : "block",
+      );
     }
 
     // A repeated toggle restarts cleanly — cancel() drops the old one outright
@@ -17817,8 +18278,9 @@ export class MoviElement extends HTMLElement {
     const root = sr.querySelector(".movi-settings-root") as HTMLElement | null;
     if (!root) return;
 
-    root.querySelectorAll<HTMLElement>(".movi-settings-row[data-page]").forEach(
-      (row) => {
+    root
+      .querySelectorAll<HTMLElement>(".movi-settings-row[data-page]")
+      .forEach((row) => {
         const key = row.dataset.page;
         if (!key) return;
         const value = row.querySelector(".movi-settings-row-value");
@@ -17829,11 +18291,12 @@ export class MoviElement extends HTMLElement {
               : this.settingsRowValue(key);
         }
         if (key === "aspect") {
-          const icon = row.querySelector(".movi-settings-icon") as HTMLElement | null;
+          const icon = row.querySelector(
+            ".movi-settings-icon",
+          ) as HTMLElement | null;
           if (icon) icon.outerHTML = this.aspectRowIcon();
         }
-      },
-    );
+      });
 
     const toggleState: Record<string, boolean> = {
       hdr: this._hdr,
@@ -17843,15 +18306,17 @@ export class MoviElement extends HTMLElement {
       loop: this._loop,
       shuffle: this._shuffle,
     };
-    root.querySelectorAll<HTMLElement>(".movi-settings-row[data-toggle]").forEach(
-      (row) => {
+    root
+      .querySelectorAll<HTMLElement>(".movi-settings-row[data-toggle]")
+      .forEach((row) => {
         const key = row.dataset.toggle;
         if (!key || !(key in toggleState)) return;
         const on = toggleState[key];
         row.setAttribute("aria-pressed", String(on));
-        row.querySelector(".movi-settings-switch")?.classList.toggle("is-on", on);
-      },
-    );
+        row
+          .querySelector(".movi-settings-switch")
+          ?.classList.toggle("is-on", on);
+      });
   }
 
   private refreshOpenSettingsSurfaces(): void {
@@ -17890,7 +18355,9 @@ export class MoviElement extends HTMLElement {
     }
     if (this._contextMenuVisible) {
       const root = this.contextMenuRoot();
-      const ctx = root.querySelector(".movi-context-menu") as HTMLElement | null;
+      const ctx = root.querySelector(
+        ".movi-context-menu",
+      ) as HTMLElement | null;
       if (ctx) this.updateContextMenuContent(ctx);
       // The static submenus (fit, speed) are moved OUT of the menu to escape
       // its overflow, so updateContextMenuContent's own sweep can't reach them
@@ -17950,9 +18417,8 @@ export class MoviElement extends HTMLElement {
     // text, a border or a focus ring — and the color-mix() shades derived off
     // it — gets the gradient's first colour instead. Handing those a gradient
     // makes the whole declaration invalid and the accent silently disappears.
-    const gradient = /(^|\s)(repeating-)?(linear|radial|conic)-gradient\(/i.test(
-      primary,
-    );
+    const gradient =
+      /(^|\s)(repeating-)?(linear|radial|conic)-gradient\(/i.test(primary);
     if (gradient) {
       this.style.setProperty("--movi-brand-fill", primary);
       const solid = MoviElement.firstColorOf(primary);
@@ -18117,7 +18583,8 @@ export class MoviElement extends HTMLElement {
         ?.classList.toggle("movi-gear-visible", strip && this.hasMediaSource());
     } else {
       container.style.display = "none";
-      if (centerPlayPause) centerPlayPause.classList.remove("movi-center-visible");
+      if (centerPlayPause)
+        centerPlayPause.classList.remove("movi-center-visible");
     }
     this.syncBarCollapsedClass();
   }
@@ -18158,136 +18625,136 @@ export class MoviElement extends HTMLElement {
    */
   private runUiTick(timestamp: number): boolean {
     this.notePlayed(this.currentTime);
-      if (!this.player) {
-        this._uiUpdatesRunning = false;
-        return false;
+    if (!this.player) {
+      this._uiUpdatesRunning = false;
+      return false;
+    }
+
+    // Fold the live download speed into the ABR estimate on every UI tick —
+    // the ABR's own 4s cadence misses a small file that caches in under a
+    // second, which left Auto stuck at a low rung on a fast link. NOT
+    // persisted across videos: a carried-over estimate goes stale when the
+    // network changes and made Auto open a too-high rung — each video now
+    // measures its own sustained rate fresh (see the start-low note).
+    this.player.sampleThroughput?.();
+
+    if (timestamp - this._lastUiTickAt >= MoviElement.UI_UPDATE_MIN_MS) {
+      this._lastUiTickAt = timestamp;
+      // tracksChange can land BEFORE the renderer's configure() has applied the
+      // new rung's colour metadata, so the read there can still be the old
+      // value. Watch the flag instead and re-sync whenever it actually flips —
+      // self-correcting whenever detection settles, and free until it does.
+      const hdrSupported = !!this.player.isHDRSupported?.();
+      if (hdrSupported !== this._lastHdrSupported) {
+        this._lastHdrSupported = hdrSupported;
+        this.updateHDRVisibility();
+      }
+      // Standard `progress`: fetching advanced the buffered end. A <video>
+      // gives hosts this for free; ours only drew its own bar, so anyone
+      // rendering custom chrome had to poll getBufferEndTime() themselves.
+      // Throttled by a real threshold rather than the tick so a stalled
+      // download stays quiet instead of firing 4x/sec forever.
+      const bufEnd = this.player.getBufferEndTime?.() ?? 0;
+      if (bufEnd > this._lastProgressBufferEnd + 0.25) {
+        this._lastProgressBufferEnd = bufEnd;
+        this.dispatchEvent(new CustomEvent("progress", { detail: bufEnd }));
       }
 
-      // Fold the live download speed into the ABR estimate on every UI tick —
-      // the ABR's own 4s cadence misses a small file that caches in under a
-      // second, which left Auto stuck at a low rung on a fast link. NOT
-      // persisted across videos: a carried-over estimate goes stale when the
-      // network changes and made Auto open a too-high rung — each video now
-      // measures its own sustained rate fresh (see the start-low note).
-      this.player.sampleThroughput?.();
+      // `canplaythrough` only once the buffer genuinely reaches the end. A
+      // <video> fires it on an ESTIMATE; we would rather stay silent than
+      // promise a stall-free run we can't back — hosts that gate their UI on
+      // it must not be lied to. Fires at most once per source.
+      const dur = this.player.getDuration?.() ?? 0;
+      if (!this._canPlayThroughFired && dur > 0 && bufEnd >= dur - 0.5) {
+        this._canPlayThroughFired = true;
+        this.dispatchEvent(new Event("canplaythrough"));
+      }
 
-      if (timestamp - this._lastUiTickAt >= MoviElement.UI_UPDATE_MIN_MS) {
-        this._lastUiTickAt = timestamp;
-        // tracksChange can land BEFORE the renderer's configure() has applied the
-        // new rung's colour metadata, so the read there can still be the old
-        // value. Watch the flag instead and re-sync whenever it actually flips —
-        // self-correcting whenever detection settles, and free until it does.
-        const hdrSupported = !!this.player.isHDRSupported?.();
-        if (hdrSupported !== this._lastHdrSupported) {
-          this._lastHdrSupported = hdrSupported;
-          this.updateHDRVisibility();
-        }
-        // Standard `progress`: fetching advanced the buffered end. A <video>
-        // gives hosts this for free; ours only drew its own bar, so anyone
-        // rendering custom chrome had to poll getBufferEndTime() themselves.
-        // Throttled by a real threshold rather than the tick so a stalled
-        // download stays quiet instead of firing 4x/sec forever.
-        const bufEnd = this.player.getBufferEndTime?.() ?? 0;
-        if (bufEnd > this._lastProgressBufferEnd + 0.25) {
-          this._lastProgressBufferEnd = bufEnd;
-          this.dispatchEvent(new CustomEvent("progress", { detail: bufEnd }));
-        }
-
-        // `canplaythrough` only once the buffer genuinely reaches the end. A
-        // <video> fires it on an ESTIMATE; we would rather stay silent than
-        // promise a stall-free run we can't back — hosts that gate their UI on
-        // it must not be lied to. Fires at most once per source.
-        const dur = this.player.getDuration?.() ?? 0;
-        if (!this._canPlayThroughFired && dur > 0 && bufEnd >= dur - 0.5) {
-          this._canPlayThroughFired = true;
-          this.dispatchEvent(new Event("canplaythrough"));
-        }
-
-        // `stalled`: the browser tried to fetch and got nothing. Native uses a
-        // ~3s no-data window; mirror that against the real byte cursor, which
-        // (unlike the time-based buffer) doesn't go flat merely because the
-        // playhead is parked during a seek.
-        const bytes = this.player.getBufferEndBytes?.() ?? -1;
-        if (bytes >= 0 && bytes === this._lastStalledBytes) {
-          if (
-            this._stalledSince &&
-            timestamp - this._stalledSince >= 3000 &&
-            !this._stalledFired
-          ) {
-            this._stalledFired = true;
-            // Bytes stopped arriving — but if there are none left to ask for,
-            // that is the download FINISHING, which a media element reports as
-            // `suspend`. Calling it `stalled` told a page its network had died
-            // every time a short file finished buffering.
-            const buffered = this.player?.getBufferedTime?.() ?? 0;
-            const whole = this.duration || 0;
-            const complete = whole > 0 && buffered >= whole - 0.5;
-            this.dispatchEvent(new Event(complete ? "suspend" : "stalled"));
-          } else if (!this._stalledSince) {
-            this._stalledSince = timestamp;
-          }
-        } else {
-          this._lastStalledBytes = bytes;
-          this._stalledSince = 0;
-          this._stalledFired = false;
-        }
-        // When the controls *bar* is auto-hidden, progress bar / time /
-        // volume icon are invisible — skip those DOM writes. Play/pause
-        // icon stays out of the gate because its update ALSO drives the
-        // centred big play/pause button overlay, which sits separately
-        // from the controls bar and is visible even when the bar is
-        // hidden — without this update the centre button gets stuck on
-        // its initial "pause" SVG. Loading indicator + title overlay
-        // also stay live; they aren't part of the bar.
-        // In strip mode, controls are permanently visible (the bar IS
-        // the player), so the auto-hide optimisation below would freeze
-        // the time / progress / volume icon updates against an empty
-        // class on the controls-container. Force the updates through.
-        const inStripMode = this.classList.contains("movi-audio-strip");
-        // …and never while the picture is in a PiP window. The skip below
-        // exists because a hidden bar is a bar nobody can see, so writing to it
-        // is waste — but in PiP the page has no picture, the bar IS what is on
-        // screen, and whether it happens to carry the hidden class at this
-        // instant is not something the clock should depend on. Left gated, the
-        // page sat at 0:00 through an entire video while the player's own clock
-        // ran past forty seconds; one showControls() and it caught up
-        // immediately, which is what took so long to see.
-        const controlsHidden =
-          !inStripMode &&
-          !this._pipWindow &&
-          this.controlsContainer?.classList.contains("movi-controls-hidden");
-        // While PiP is open the bar is the only thing on this surface, and it
-        // must not be allowed to stay hidden — hideControls() already stands
-        // down for PiP, but a source change hides it by another route and
-        // nothing was putting it back, leaving the placeholder alone on screen
-        // with a running video no one could scrub. Self-healing here rather
-        // than hunting that route: the tick already runs, and asking is free.
+      // `stalled`: the browser tried to fetch and got nothing. Native uses a
+      // ~3s no-data window; mirror that against the real byte cursor, which
+      // (unlike the time-based buffer) doesn't go flat merely because the
+      // playhead is parked during a seek.
+      const bytes = this.player.getBufferEndBytes?.() ?? -1;
+      if (bytes >= 0 && bytes === this._lastStalledBytes) {
         if (
-          this._pipWindow &&
-          this.controlsContainer?.classList.contains("movi-controls-hidden")
+          this._stalledSince &&
+          timestamp - this._stalledSince >= 3000 &&
+          !this._stalledFired
         ) {
-          this.showControls();
+          this._stalledFired = true;
+          // Bytes stopped arriving — but if there are none left to ask for,
+          // that is the download FINISHING, which a media element reports as
+          // `suspend`. Calling it `stalled` told a page its network had died
+          // every time a short file finished buffering.
+          const buffered = this.player?.getBufferedTime?.() ?? 0;
+          const whole = this.duration || 0;
+          const complete = whole > 0 && buffered >= whole - 0.5;
+          this.dispatchEvent(new Event(complete ? "suspend" : "stalled"));
+        } else if (!this._stalledSince) {
+          this._stalledSince = timestamp;
         }
-        // Spinner first, icon second. The centre button's own rule is "not
-        // while something is loading", and it reads that off the spinner's
-        // display — so running it first meant one tick where it read the
-        // previous frame's answer and put the button back up over a spinner
-        // that was about to appear. Ordering is the whole fix: nothing here
-        // needs to know about the other.
-        this.updateLoadingIndicator();
-        this.updatePlayPauseIcon();
-        this.updateTitle();
-        if (!controlsHidden) {
-          this.updateTimeDisplay();
-          this.updateChapterPill();
-          this.updateTimelineCurrent();
-          this.updateProgressBar();
-          this.updateVolumeIcon();
-        }
-        this._checkFrozenVideo(timestamp);
-        this._checkStuckPlayback(timestamp);
-        this._checkRungRestore(timestamp);
+      } else {
+        this._lastStalledBytes = bytes;
+        this._stalledSince = 0;
+        this._stalledFired = false;
       }
+      // When the controls *bar* is auto-hidden, progress bar / time /
+      // volume icon are invisible — skip those DOM writes. Play/pause
+      // icon stays out of the gate because its update ALSO drives the
+      // centred big play/pause button overlay, which sits separately
+      // from the controls bar and is visible even when the bar is
+      // hidden — without this update the centre button gets stuck on
+      // its initial "pause" SVG. Loading indicator + title overlay
+      // also stay live; they aren't part of the bar.
+      // In strip mode, controls are permanently visible (the bar IS
+      // the player), so the auto-hide optimisation below would freeze
+      // the time / progress / volume icon updates against an empty
+      // class on the controls-container. Force the updates through.
+      const inStripMode = this.classList.contains("movi-audio-strip");
+      // …and never while the picture is in a PiP window. The skip below
+      // exists because a hidden bar is a bar nobody can see, so writing to it
+      // is waste — but in PiP the page has no picture, the bar IS what is on
+      // screen, and whether it happens to carry the hidden class at this
+      // instant is not something the clock should depend on. Left gated, the
+      // page sat at 0:00 through an entire video while the player's own clock
+      // ran past forty seconds; one showControls() and it caught up
+      // immediately, which is what took so long to see.
+      const controlsHidden =
+        !inStripMode &&
+        !this._pipWindow &&
+        this.controlsContainer?.classList.contains("movi-controls-hidden");
+      // While PiP is open the bar is the only thing on this surface, and it
+      // must not be allowed to stay hidden — hideControls() already stands
+      // down for PiP, but a source change hides it by another route and
+      // nothing was putting it back, leaving the placeholder alone on screen
+      // with a running video no one could scrub. Self-healing here rather
+      // than hunting that route: the tick already runs, and asking is free.
+      if (
+        this._pipWindow &&
+        this.controlsContainer?.classList.contains("movi-controls-hidden")
+      ) {
+        this.showControls();
+      }
+      // Spinner first, icon second. The centre button's own rule is "not
+      // while something is loading", and it reads that off the spinner's
+      // display — so running it first meant one tick where it read the
+      // previous frame's answer and put the button back up over a spinner
+      // that was about to appear. Ordering is the whole fix: nothing here
+      // needs to know about the other.
+      this.updateLoadingIndicator();
+      this.updatePlayPauseIcon();
+      this.updateTitle();
+      if (!controlsHidden) {
+        this.updateTimeDisplay();
+        this.updateChapterPill();
+        this.updateTimelineCurrent();
+        this.updateProgressBar();
+        this.updateVolumeIcon();
+      }
+      this._checkFrozenVideo(timestamp);
+      this._checkStuckPlayback(timestamp);
+      this._checkRungRestore(timestamp);
+    }
 
     return true;
   }
@@ -18328,7 +18795,7 @@ export class MoviElement extends HTMLElement {
       !p ||
       p.getState?.() !== "playing" ||
       this._audioOnly ||
-      !(p.getVideoTracks?.().length)
+      !p.getVideoTracks?.().length
     ) {
       this._frozenSince = 0;
       return;
@@ -18350,8 +18817,9 @@ export class MoviElement extends HTMLElement {
     // is how one downshift became four: each new rung rescued off the rung
     // before it had filled a single second.
     const sinceSwitch =
-      (p as { msSinceRenditionSwitch?: () => number }).msSinceRenditionSwitch?.() ??
-      Infinity;
+      (
+        p as { msSinceRenditionSwitch?: () => number }
+      ).msSinceRenditionSwitch?.() ?? Infinity;
     if (sinceSwitch < MoviElement.SWITCH_SETTLE_MS) {
       this._frozenSince = 0;
       this._starvedSince = 0;
@@ -18386,8 +18854,9 @@ export class MoviElement extends HTMLElement {
       // link measuring 14–150 Mbps, with not one stall in between. Nothing
       // queued to show is what starving looks like from the screen.
       const pictureShort =
-        ((p as { pictureRunwaySeconds?: () => number }).pictureRunwaySeconds?.() ??
-          0) < 0.05;
+        ((
+          p as { pictureRunwaySeconds?: () => number }
+        ).pictureRunwaySeconds?.() ?? 0) < 0.05;
       const starving = pictureShort && t > this._starvedLastTime + 0.05;
       this._starvedLastTime = t;
       if (!starving) {
@@ -18397,7 +18866,9 @@ export class MoviElement extends HTMLElement {
       if (this._starvedSince === 0) this._starvedSince = now;
       if (now - this._starvedSince > MoviElement.STARVED_RESCUE_MS) {
         this._starvedSince = 0;
-        this._rescueRung(`starved ${(bufferedAhead).toFixed(1)}s at ${t.toFixed(1)}s`);
+        this._rescueRung(
+          `starved ${bufferedAhead.toFixed(1)}s at ${t.toFixed(1)}s`,
+        );
       }
       return;
     }
@@ -18417,7 +18888,8 @@ export class MoviElement extends HTMLElement {
       return;
     }
     const frames = p.getRenderHealth?.()?.framesPresented ?? 0;
-    const clockAdvancing = this._frozenLastTime >= 0 && t > this._frozenLastTime + 0.05;
+    const clockAdvancing =
+      this._frozenLastTime >= 0 && t > this._frozenLastTime + 0.05;
     const framesAdvancing = frames > this._frozenLastFrames;
     this._frozenLastTime = t;
     this._frozenLastFrames = frames;
@@ -18586,7 +19058,8 @@ export class MoviElement extends HTMLElement {
     const progressing =
       (this._stuckRecoveryLastTime >= 0 &&
         t > this._stuckRecoveryLastTime + 0.05) ||
-      (this._stuckLastBuffered >= 0 && buffered > this._stuckLastBuffered + 0.05) ||
+      (this._stuckLastBuffered >= 0 &&
+        buffered > this._stuckLastBuffered + 0.05) ||
       // Real bytes landing. Right after a seek the TIME-based signals are both
       // flat by construction — the playhead is parked and the buffered END is
       // computed as (currentTime + forward), so a trickle of arriving data
@@ -28657,7 +29130,9 @@ export class MoviElement extends HTMLElement {
     this.classList.toggle("movi-no-controls", !this._controls);
     this.applyLoop(this.getAttribute("loop"));
     this._shuffle = this.hasAttribute("shuffle");
-    this._smoothWarning = this.isSmoothWarningOn(this.getAttribute("smoothwarning"));
+    this._smoothWarning = this.isSmoothWarningOn(
+      this.getAttribute("smoothwarning"),
+    );
     this._noLinkWarning = this.hasAttribute("nolinkwarning");
     this._muted = this.hasAttribute("muted");
     this._playsinline = this.hasAttribute("playsinline");
@@ -28690,21 +29165,13 @@ export class MoviElement extends HTMLElement {
     const objectFitAttr = this.getAttribute("objectfit");
     if (objectFitAttr) {
       const validFitModes: (
-        | "contain"
-        | "cover"
-        | "fill"
-        | "zoom"
-        | "control"
+        "contain" | "cover" | "fill" | "zoom" | "control"
       )[] = ["contain", "cover", "fill", "zoom", "control"];
       this._objectFit = validFitModes.includes(
         objectFitAttr.toLowerCase() as any,
       )
         ? (objectFitAttr.toLowerCase() as
-            | "contain"
-            | "cover"
-            | "fill"
-            | "zoom"
-            | "control")
+            "contain" | "cover" | "fill" | "zoom" | "control")
         : "contain";
     }
 
@@ -28813,7 +29280,8 @@ export class MoviElement extends HTMLElement {
       // two and a half rows showing. The class tightens its spacing instead —
       // a height the @container query on this host cannot see, being
       // inline-size only.
-      if (h > 0) this.classList.toggle("movi-short", h < MoviElement.SHORT_PLAYER_PX);
+      if (h > 0)
+        this.classList.toggle("movi-short", h < MoviElement.SHORT_PLAYER_PX);
       this.syncPictureRounding();
     };
     publishPlayerWidth();
@@ -28976,7 +29444,11 @@ export class MoviElement extends HTMLElement {
 
         if (settings.playbackRate !== undefined) {
           this._playbackRate = settings.playbackRate;
-          this.noteStoredChoice("playbackrate", true, String(settings.playbackRate));
+          this.noteStoredChoice(
+            "playbackrate",
+            true,
+            String(settings.playbackRate),
+          );
           this.updatePlaybackRate();
           changed = true;
         }
@@ -29106,7 +29578,11 @@ export class MoviElement extends HTMLElement {
     document.removeEventListener("freeze", this._onPageLeaving);
     window.removeEventListener("pagehide", this._onPageLeaving);
     if (this._outsideTapHandler) {
-      document.removeEventListener("pointerdown", this._outsideTapHandler, true);
+      document.removeEventListener(
+        "pointerdown",
+        this._outsideTapHandler,
+        true,
+      );
       this._outsideTapHandler = null;
     }
     if (this._settingsOutsideHandler) {
@@ -29340,7 +29816,8 @@ export class MoviElement extends HTMLElement {
         this.applyAutoAdvance(newValue);
         break;
       case "shuffle": {
-        const on = newValue !== null && newValue !== "false" && newValue !== "off";
+        const on =
+          newValue !== null && newValue !== "false" && newValue !== "off";
         if (on !== this._shuffle) {
           this._shuffle = on;
           this.rebuildPlayOrder();
@@ -29372,7 +29849,10 @@ export class MoviElement extends HTMLElement {
         WasmBindings.probeBytes = parseByteSize(newValue);
         break;
       case "probeduration":
-        WasmBindings.probeAnalyzeMs = Math.max(0, parseInt(newValue || "0", 10) || 0);
+        WasmBindings.probeAnalyzeMs = Math.max(
+          0,
+          parseInt(newValue || "0", 10) || 0,
+        );
         break;
       case "cropbars":
         // The same guard its neighbours have — see the setter.
@@ -29578,8 +30058,9 @@ export class MoviElement extends HTMLElement {
       case "disableremoteplayback":
         this._disableRemote = newValue !== null;
         if (this.video) {
-          (this.video as unknown as { disableRemotePlayback?: boolean }).disableRemotePlayback =
-            newValue !== null;
+          (
+            this.video as unknown as { disableRemotePlayback?: boolean }
+          ).disableRemotePlayback = newValue !== null;
         }
         break;
       case "loop":
@@ -29654,6 +30135,11 @@ export class MoviElement extends HTMLElement {
         // localStorage values for the lifetime of this element.
         this.applySubtitleAttribute(name, newValue);
         this.applySubtitleSettings();
+        break;
+      case "subtitlefallbackfont":
+        // Read when the ASS renderer is created (the first ASS track shown), so
+        // there is nothing to apply here; observed so the attribute is part of
+        // the element's declared surface.
         break;
       case "postertime":
         this._posterTime = newValue;
@@ -29805,20 +30291,12 @@ export class MoviElement extends HTMLElement {
         break;
       case "objectfit":
         const validFitModes: (
-          | "contain"
-          | "cover"
-          | "fill"
-          | "zoom"
-          | "control"
+          "contain" | "cover" | "fill" | "zoom" | "control"
         )[] = ["contain", "cover", "fill", "zoom", "control"];
         const newFitMode =
           newValue && validFitModes.includes(newValue.toLowerCase() as any)
             ? (newValue.toLowerCase() as
-                | "contain"
-                | "cover"
-                | "fill"
-                | "zoom"
-                | "control")
+                "contain" | "cover" | "fill" | "zoom" | "control")
             : "contain";
         if (this._objectFit !== newFitMode) {
           this._objectFit = newFitMode;
@@ -29836,7 +30314,7 @@ export class MoviElement extends HTMLElement {
         // Declarative rotation in degrees, snapped to 0 / 90 / 180 / 270. Applied
         // live and re-applied on load (see initializePlayer). Rotates on top of
         // any rotation the container metadata already carries.
-        const raw = ((parseInt(newValue || "0", 10) || 0) % 360 + 360) % 360;
+        const raw = (((parseInt(newValue || "0", 10) || 0) % 360) + 360) % 360;
         const snapped = (Math.round(raw / 90) * 90) % 360;
         if (this._rotate !== snapped) {
           this._rotate = snapped;
@@ -30064,18 +30542,23 @@ export class MoviElement extends HTMLElement {
         .sort((x, y) => x.r.left - y.r.left);
       const at = items.findIndex(({ n }) => n === d);
       const side = (i: number) =>
-        i >= 0 && i < items.length &&
+        i >= 0 &&
+        i < items.length &&
         !items[i].n.classList.contains("movi-controls-divider");
-      d.classList.toggle("movi-divider-stranded", !(side(at - 1) && side(at + 1)));
+      d.classList.toggle(
+        "movi-divider-stranded",
+        !(side(at - 1) && side(at + 1)),
+      );
     }
   }
-
 
   private fitControlsRow(): void {
     const sr = this.shadowRoot;
     if (!sr) return;
     const left = sr.querySelector(".movi-controls-left") as HTMLElement | null;
-    const right = sr.querySelector(".movi-controls-right") as HTMLElement | null;
+    const right = sr.querySelector(
+      ".movi-controls-right",
+    ) as HTMLElement | null;
     if (!left || !right) return;
     const centre = sr.querySelector(
       ".movi-controls-center",
@@ -30100,7 +30583,10 @@ export class MoviElement extends HTMLElement {
       let contentRight = 0;
       for (const kid of Array.from(left.children)) {
         const el = kid as HTMLElement;
-        if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") {
+        if (
+          el.offsetParent === null &&
+          getComputedStyle(el).position !== "fixed"
+        ) {
           continue;
         }
         contentRight = Math.max(contentRight, el.getBoundingClientRect().right);
@@ -30260,7 +30746,9 @@ export class MoviElement extends HTMLElement {
     if (!url) {
       // No longer applicable — drop any loaded poster-cover bitmap.
       if (this._posterCoverBitmap) {
-        try { this._posterCoverBitmap.close(); } catch {}
+        try {
+          this._posterCoverBitmap.close();
+        } catch {}
         this._posterCoverBitmap = null;
       }
       this._posterCoverUrl = "";
@@ -30281,8 +30769,17 @@ export class MoviElement extends HTMLElement {
       if (this._posterCoverUrl !== url) return; // superseded mid-load
       createImageBitmap(img)
         .then((bmp) => {
-          if (this._posterCoverUrl !== url) { try { bmp.close(); } catch {}; return; }
-          if (this._posterCoverBitmap) { try { this._posterCoverBitmap.close(); } catch {} }
+          if (this._posterCoverUrl !== url) {
+            try {
+              bmp.close();
+            } catch {}
+            return;
+          }
+          if (this._posterCoverBitmap) {
+            try {
+              this._posterCoverBitmap.close();
+            } catch {}
+          }
           this._posterCoverBitmap = bmp;
           this._posterCoverLoading = false;
           this.updateCoverArtOverlay();
@@ -30383,7 +30880,8 @@ export class MoviElement extends HTMLElement {
     let frameMax = 0;
     for (let i = 0; i < count; i++) {
       const target = levels ? levels[i] : 0;
-      smoothed[i] += (target - smoothed[i]) * (target > smoothed[i] ? 0.5 : 0.12);
+      smoothed[i] +=
+        (target - smoothed[i]) * (target > smoothed[i] ? 0.5 : 0.12);
       if (smoothed[i] > frameMax) frameMax = smoothed[i];
     }
     // Scale the row against its own loudest band, and let that reference fall
@@ -30488,9 +30986,7 @@ export class MoviElement extends HTMLElement {
   /** Pull two restrained ambient colours from opposite halves of a sleeve.
    *  Using a tiny downsample keeps this off the hot path; weighting colourful
    *  midtones prevents a white title block or black border dominating it. */
-  private applyCoverArtPalette(
-    bitmap: ImageBitmap,
-  ): {
+  private applyCoverArtPalette(bitmap: ImageBitmap): {
     accent: [number, number, number];
     secondary: [number, number, number];
   } {
@@ -30511,7 +31007,10 @@ export class MoviElement extends HTMLElement {
       if (!sampleCtx) throw new Error("2D canvas unavailable");
       sampleCtx.drawImage(bitmap, 0, 0, size, size);
       const pixels = sampleCtx.getImageData(0, 0, size, size).data;
-      const collect = (fromX: number, toX: number): [number, number, number] => {
+      const collect = (
+        fromX: number,
+        toX: number,
+      ): [number, number, number] => {
         let red = 0;
         let green = 0;
         let blue = 0;
@@ -30637,8 +31136,7 @@ export class MoviElement extends HTMLElement {
     // itself: real video dimensions (or a non-audio src before metadata loads)
     // keep the full video surface; a genuine audio-only source still strips.
     const nativeFallbackIsVideo =
-      this._nativeFallbackActive &&
-      (this.video.videoWidth > 0 || !srcIsAudio);
+      this._nativeFallbackActive && (this.video.videoWidth > 0 || !srcIsAudio);
     const audioMode =
       !nativeFallbackIsVideo &&
       (this._audioOnly ||
@@ -30659,11 +31157,14 @@ export class MoviElement extends HTMLElement {
     const hasArtTrack =
       (this.player?.trackManager?.getAttachedPicTracks?.()?.length ?? 0) > 0;
     const coverArtPending =
-      audioMode && !bitmap && this._thumb && hasArtTrack && !this._coverArtResolved;
+      audioMode &&
+      !bitmap &&
+      this._thumb &&
+      hasArtTrack &&
+      !this._coverArtResolved;
     // Same idea for a poster acting as album art: while its bitmap is still
     // loading, hold the strip off so we don't flash strip → album-art.
-    const posterCoverPending =
-      audioMode && !bitmap && this._posterCoverLoading;
+    const posterCoverPending = audioMode && !bitmap && this._posterCoverLoading;
     // What the WINDOWED player is: the page-facing decision, and the one the
     // audiostripchange event reports. Fullscreen only changes what is drawn
     // while it lasts — telling the page would reflow its wrapper out from
@@ -30748,7 +31249,9 @@ export class MoviElement extends HTMLElement {
     // src swaps and doesn't thrash the DOM on resize.
     const loopBtn = this.shadowRoot?.querySelector(".movi-loop-btn");
     const moreBtn = this.shadowRoot?.querySelector(".movi-more-btn");
-    const expandable = this.shadowRoot?.querySelector(".movi-mobile-expandable");
+    const expandable = this.shadowRoot?.querySelector(
+      ".movi-mobile-expandable",
+    );
     if (loopBtn && moreBtn && expandable) {
       if (audioMode && loopBtn.previousElementSibling !== moreBtn) {
         moreBtn.after(loopBtn);
@@ -30810,12 +31313,18 @@ export class MoviElement extends HTMLElement {
     // text empty until the first fullscreen trip, so the audio view had no
     // title beside its art until the viewer had been fullscreen once.
     const trackTitle = readMeta("title") || (this._title || "").trim();
-    const artistName = readMeta("artist", "album_artist", "performer", "author");
+    const artistName = readMeta(
+      "artist",
+      "album_artist",
+      "performer",
+      "author",
+    );
     const albumName = readMeta("album");
     const releaseDate = readMeta("date", "year", "originaldate");
     const releaseYear = releaseDate.match(/\b(?:19|20)\d{2}\b/)?.[0] ?? "";
     const eyebrow = [
-      albumName && albumName.toLocaleLowerCase() !== trackTitle.toLocaleLowerCase()
+      albumName &&
+      albumName.toLocaleLowerCase() !== trackTitle.toLocaleLowerCase()
         ? albumName
         : "",
       releaseYear,
@@ -30844,7 +31353,9 @@ export class MoviElement extends HTMLElement {
         );
     if (this._coverArtBgEl) {
       if (bitmap) {
-        const bgUrl = this.coverArtBitmap ? this._coverArtBgUrl : this._posterCoverUrl;
+        const bgUrl = this.coverArtBitmap
+          ? this._coverArtBgUrl
+          : this._posterCoverUrl;
         this._coverArtBgEl.style.backgroundImage = bgUrl
           ? `url("${bgUrl.replace(/"/g, '\\"')}")`
           : "none";
@@ -30866,7 +31377,11 @@ export class MoviElement extends HTMLElement {
     // player (a Shorts card) carries its own title chrome and would show the
     // title twice, and a short windowed box has no room below the art.
     const stacked =
-      !!words && !sideBySide && fullscreen && cssH >= 360 && cssH / cssW >= 1.05;
+      !!words &&
+      !sideBySide &&
+      fullscreen &&
+      cssH >= 360 &&
+      cssH / cssW >= 1.05;
 
     let frameSize = sideBySide
       ? Math.min(cssH * 0.43, cssW * 0.24)
@@ -30902,10 +31417,7 @@ export class MoviElement extends HTMLElement {
     // edge and made the layout feel like a settings screen rather than a cover.
     const sidePad = Math.max(24, Math.round(cssW * 0.04));
     const textW = sideBySide
-      ? Math.min(
-          Math.max(220, cssW * 0.39),
-          cssW - artW - gap - sidePad * 2,
-        )
+      ? Math.min(Math.max(220, cssW * 0.39), cssW - artW - gap - sidePad * 2)
       : stacked
         ? Math.min(cssW - sidePad * 2, 640)
         : 0;
@@ -30915,7 +31427,12 @@ export class MoviElement extends HTMLElement {
     };
     // Titles are long ("… feat. …", a remix note, the year) and a single
     // line of them is mostly ellipsis. Wrap to two, then give up.
-    const wrap = (text: string, size: number, weight: string, maxLines: number): string[] => {
+    const wrap = (
+      text: string,
+      size: number,
+      weight: string,
+      maxLines: number,
+    ): string[] => {
       setFont(size, weight);
       if (ctx.measureText(text).width <= textW) return [text];
       const words = text.split(/\s+/);
@@ -30945,8 +31462,10 @@ export class MoviElement extends HTMLElement {
       return lines;
     };
     const showWords = sideBySide || stacked;
-    const titleLines = showWords && trackTitle ? wrap(trackTitle, titleSize, "400", 2) : [];
-    const artistLines = showWords && artistName ? wrap(artistName, artistSize, "400", 1) : [];
+    const titleLines =
+      showWords && trackTitle ? wrap(trackTitle, titleSize, "400", 2) : [];
+    const artistLines =
+      showWords && artistName ? wrap(artistName, artistSize, "400", 1) : [];
     const eyebrowSize = Math.max(10, Math.round(titleSize * 0.29));
     const eyebrowGap = eyebrow ? Math.round(titleSize * 0.48) : 0;
     const lineGap = Math.round(titleSize * 0.42);
@@ -31088,7 +31607,11 @@ export class MoviElement extends HTMLElement {
         }
         ctx.fillStyle = "rgba(255,255,255,0.56)";
         ctx.textAlign = "left";
-        ctx.fillText(fittedEyebrow, markerX + markerW + markerGap, y + eyebrowSize / 2);
+        ctx.fillText(
+          fittedEyebrow,
+          markerX + markerW + markerGap,
+          y + eyebrowSize / 2,
+        );
         ctx.textAlign = sideBySide ? "left" : "center";
         y += eyebrowSize + eyebrowGap;
       }
@@ -31131,7 +31654,9 @@ export class MoviElement extends HTMLElement {
       const k = (n: number) => (n + h / 30) % 12;
       const a = s * Math.min(l, 1 - l);
       const f = (n: number) =>
-        Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
+        Math.round(
+          255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))),
+        );
       return [f(0), f(8), f(4)];
     };
     // Muted rather than saturated: this sits where artwork would, and a
@@ -31177,7 +31702,14 @@ export class MoviElement extends HTMLElement {
     // flat swatch of colour.
     const lightX = x + w * 0.26;
     const lightY = y + h * 0.2;
-    const light = ctx.createRadialGradient(lightX, lightY, 0, lightX, lightY, w * 0.95);
+    const light = ctx.createRadialGradient(
+      lightX,
+      lightY,
+      0,
+      lightX,
+      lightY,
+      w * 0.95,
+    );
     light.addColorStop(0, "rgba(255,255,255,0.2)");
     light.addColorStop(1, "rgba(255,255,255,0)");
     ctx.fillStyle = light;
@@ -31284,14 +31816,18 @@ export class MoviElement extends HTMLElement {
           ? 6 // ~100ms
           : 24; // ~400ms
       if (attempt < graceFrames) {
-        requestAnimationFrame(() => this.maybeFallbackToMutedAutoplay(attempt + 1));
+        requestAnimationFrame(() =>
+          this.maybeFallbackToMutedAutoplay(attempt + 1),
+        );
         return;
       }
     } else {
       // Not blocked (running, or mid-wakeup). Re-check across a few frames in
       // case the block surfaces late, then conclude audio is fine.
       if (attempt < 5) {
-        requestAnimationFrame(() => this.maybeFallbackToMutedAutoplay(attempt + 1));
+        requestAnimationFrame(() =>
+          this.maybeFallbackToMutedAutoplay(attempt + 1),
+        );
       }
       return;
     }
@@ -31488,16 +32024,15 @@ export class MoviElement extends HTMLElement {
       // nobody touching anything, and no log said what re-applied the rate.
       Logger.info(
         TAG,
-        `Speed OSD ${this._playbackRate}x (last shown ${previousOsdRate}x) via ${(new Error().stack || "")
+        `Speed OSD ${this._playbackRate}x (last shown ${previousOsdRate}x) via ${(
+          new Error().stack || ""
+        )
           .split("\n")
           .slice(2, 5)
           .map((l) => l.trim().replace(/^at /, "").split(" (")[0])
           .join(" < ")}`,
       );
-      this.showOSD(
-        `${symbolSvg("stopwatch")}`,
-        `${this._playbackRate}x`,
-      );
+      this.showOSD(`${symbolSvg("stopwatch")}`, `${this._playbackRate}x`);
     }
   }
 
@@ -31554,7 +32089,8 @@ export class MoviElement extends HTMLElement {
     if (/^(contain|cover|fill|none|scale-down)$/.test(this._posterFit)) {
       return this._posterFit;
     }
-    const fit = this._objectFit === "control" ? this._currentFit : this._objectFit;
+    const fit =
+      this._objectFit === "control" ? this._currentFit : this._objectFit;
     if (fit === "zoom") return "cover";
     if (fit === "fill") return "fill";
     if (fit === "cover") return "cover";
@@ -31614,7 +32150,13 @@ export class MoviElement extends HTMLElement {
     if (this._isUnsupported) return;
 
     // If encrypted mode, use loadEncrypted instead
-    if (this._encrypted && this._tokenUrl && this._videoUrl && !this.isLoading && !this.player) {
+    if (
+      this._encrypted &&
+      this._tokenUrl &&
+      this._videoUrl &&
+      !this.isLoading &&
+      !this.player
+    ) {
       // Native raises `encrypted` when it meets initialisation data it cannot
       // decode without a key. The equivalent here is the load that is about to
       // go and ask for one — which is also the only moment a listener could
@@ -31626,7 +32168,11 @@ export class MoviElement extends HTMLElement {
       // event fires from the handshake rather than from the declaration.
       this.dispatchEvent(
         new CustomEvent("encrypted", {
-          detail: { initDataType: "token", tokenUrl: this._tokenUrl, videoUrl: this._videoUrl },
+          detail: {
+            initDataType: "token",
+            tokenUrl: this._tokenUrl,
+            videoUrl: this._videoUrl,
+          },
         }),
       );
       // …and playback is held until that token lands, which is exactly what
@@ -31647,7 +32193,12 @@ export class MoviElement extends HTMLElement {
       return;
     }
 
-    if ((!this._src && !this._sourceAdapter) || this.isLoading || this.player || this._isUnsupported) {
+    if (
+      (!this._src && !this._sourceAdapter) ||
+      this.isLoading ||
+      this.player ||
+      this._isUnsupported
+    ) {
       return;
     }
 
@@ -31780,7 +32331,10 @@ export class MoviElement extends HTMLElement {
           label: t.label,
         }));
       } else if (this._audioSrc) {
-        playerConfig.audioSource = { type: "url", url: this._audioSrc } as SourceConfig;
+        playerConfig.audioSource = {
+          type: "url",
+          url: this._audioSrc,
+        } as SourceConfig;
       }
 
       // External subtitle tracks
@@ -31789,7 +32343,7 @@ export class MoviElement extends HTMLElement {
           url: t.src,
           lang: t.lang,
           label: t.label,
-          format: (t.format as "vtt" | "srt" | undefined),
+          format: t.format as "vtt" | "srt" | undefined,
         }));
       }
 
@@ -31799,7 +32353,8 @@ export class MoviElement extends HTMLElement {
       // is enough to enable it; the bare `drm` boolean attribute still works.
       const licenseUrl = this.getAttribute("licenseurl") || "";
       const isDrm = this.hasAttribute("drm") || licenseUrl.length > 0;
-      const isAdaptiveStream = typeof this._src === "string" &&
+      const isAdaptiveStream =
+        typeof this._src === "string" &&
         (this._src.toLowerCase().includes(".m3u8") ||
           this._src.toLowerCase().includes(".mpd") ||
           this._src.toLowerCase().includes(".ism"));
@@ -31845,9 +32400,12 @@ export class MoviElement extends HTMLElement {
         // no way to read a progressive file, let alone pair a video-only file
         // with a separate audio one. Asking for one on a plain URL would
         // otherwise silently play through the WASM pipeline instead.
-        const srcL = typeof this._src === "string" ? this._src.toLowerCase() : "";
+        const srcL =
+          typeof this._src === "string" ? this._src.toLowerCase() : "";
         const isManifest =
-          srcL.includes(".m3u8") || srcL.includes(".mpd") || srcL.includes(".ism");
+          srcL.includes(".m3u8") ||
+          srcL.includes(".mpd") ||
+          srcL.includes(".ism");
         if (leadEngine !== "wasm" && !isManifest) {
           Logger.warn(
             TAG,
@@ -31905,6 +32463,19 @@ export class MoviElement extends HTMLElement {
       this.player = created;
       this.warmStoryboardSheets();
 
+      // With a JASSUB host registered, ASS/SSA gets libass unless the page chose
+      // a renderer of its own. Nothing of JASSUB is loaded here: the renderer
+      // only fetches it when an ASS track is shown.
+      if (
+        !this._subtitleRenderer &&
+        !this._subtitleRendererChosen &&
+        MoviElement._jassubHost
+      ) {
+        this._subtitleRenderer = new JassubRenderer(
+          MoviElement._jassubHost,
+          this._subtitleFallbackFont(),
+        );
+      }
       // Re-apply a host subtitle renderer to the fresh player (it's registered on
       // the element, which outlives per-source player recreates).
       if (this._subtitleRenderer) {
@@ -31913,14 +32484,13 @@ export class MoviElement extends HTMLElement {
       // Same for host-supplied chapters: the element outlives the player, and a
       // fresh one only knows about the container's own.
       if (this._chapters) this.player.setChapters(this._chapters);
-    // The renderer is new, and the crop setting lives on it — an attribute set
-    // before the player existed would otherwise never reach anything.
-    if (this._cropBars) this.applyBarCrop();
+      // The renderer is new, and the crop setting lives on it — an attribute set
+      // before the player existed would otherwise never reach anything.
+      if (this._cropBars) this.applyBarCrop();
       // …and the corner rounding, which a fresh renderer does not inherit —
       // see scheduleRoundingReapply.
       this.syncPictureRounding(true);
       this.scheduleRoundingReapply();
-
 
       // …and for Document PiP. The window belongs to the ELEMENT and survives a
       // source change, but `isPiPActive` lives on the player and a fresh one
@@ -31985,10 +32555,10 @@ export class MoviElement extends HTMLElement {
       // Load the video
       if (this.player) {
         this.attachFrameCallbackBridge();
-      await this.player.load();
-      // Again after the load: a rebuilt renderer is a new object, and the hook
-      // lives on the object.
-      this.attachFrameCallbackBridge();
+        await this.player.load();
+        // Again after the load: a rebuilt renderer is a new object, and the hook
+        // lives on the object.
+        this.attachFrameCallbackBridge();
         // The element can be removed while that load is in flight (a host that
         // swaps videos on navigation). disconnectedCallback has already torn
         // down whatever it found, so anything from here on would run — and
@@ -32128,7 +32698,11 @@ export class MoviElement extends HTMLElement {
       const discarded = this.takeDiscardState();
       if (discarded && this.player) {
         await this.player.seek(discarded.t).catch((e: unknown) => {
-          Logger.warn(TAG, "Failed to restore the position of a discarded tab", e);
+          Logger.warn(
+            TAG,
+            "Failed to restore the position of a discarded tab",
+            e,
+          );
         });
         // Already there — a "Resume from X?" prompt at X is noise.
         this._resumeDialogPending = false;
@@ -32240,7 +32814,10 @@ export class MoviElement extends HTMLElement {
       if (startArmed && this.player) {
         if (hiddenAndNotInPip) {
           this._autoplayPendingVisible = true;
-          Logger.info(TAG, "Autoplay deferred — tab hidden; will start when visible");
+          Logger.info(
+            TAG,
+            "Autoplay deferred — tab hidden; will start when visible",
+          );
         } else {
           await this._startAutoplay();
         }
@@ -32294,7 +32871,9 @@ export class MoviElement extends HTMLElement {
           // resolves earlier, before paint) — snapshot it there for artwork.
           // `seekcomplete`, not `seeked`: this seek is the player's own and
           // says nothing to the page.
-          this.player.once("seekcomplete", () => this.captureMediaSessionArtwork());
+          this.player.once("seekcomplete", () =>
+            this.captureMediaSessionArtwork(),
+          );
           this.player
             .seek(0, { suppressSpinner: true, internal: true })
             .catch(() => {});
@@ -32426,18 +33005,23 @@ export class MoviElement extends HTMLElement {
             "Couldn't load it from where it's hosted. Check your connection, then try again.";
         } else if (raw.includes("fetch")) {
           title = "Can't Load This";
-          message =
-            "Couldn't load it. Check your connection, then try again.";
-        // Unanchored for the same reason as the http match in the runtime error
-        // handler: the status can be wrapped ("Failed to open media: HTTP 403").
-        } else if (/\bHTTP (401|403)\b/.test(raw) || /Access denied|Authentication required/i.test(raw)) {
+          message = "Couldn't load it. Check your connection, then try again.";
+          // Unanchored for the same reason as the http match in the runtime error
+          // handler: the status can be wrapped ("Failed to open media: HTTP 403").
+        } else if (
+          /\bHTTP (401|403)\b/.test(raw) ||
+          /Access denied|Authentication required/i.test(raw)
+        ) {
           // Most often a signed URL whose signature has run out — which is why
           // this can arrive in the middle of a video that had been playing
           // perfectly well. Saying "can't play this file" there is both untrue
           // and unhelpful: the file was playing, and reloading usually fixes it.
           title = "Access Expired";
           message = "The link to it is no longer valid.";
-        } else if (/\bHTTP (404|410)\b/.test(raw) || /Video not found/i.test(raw)) {
+        } else if (
+          /\bHTTP (404|410)\b/.test(raw) ||
+          /Video not found/i.test(raw)
+        ) {
           title = "Not Found";
           message = "It isn't at that address any more.";
         } else if (/\bHTTP 5\d\d\b/.test(raw)) {
@@ -32449,7 +33033,9 @@ export class MoviElement extends HTMLElement {
           message =
             "This is hosted in a way the player can't stream from. Try a different source.";
         } else if (
-          /out of bounds memory access|memory access out of bounds|RuntimeError|Aborted\(\)/i.test(raw)
+          /out of bounds memory access|memory access out of bounds|RuntimeError|Aborted\(\)/i.test(
+            raw,
+          )
         ) {
           // Emscripten WASM crash (FFmpeg ran out of memory or hit an
           // OOB in a codec path). The "Try Software Decoding" button on
@@ -32477,7 +33063,9 @@ export class MoviElement extends HTMLElement {
           title = "Playback Error";
           message =
             "This couldn't be decoded. It may use a format this browser can't play.";
-        } else if (/\(HTTP \d|was denied|could not be found|video server/i.test(raw)) {
+        } else if (
+          /\(HTTP \d|was denied|could not be found|video server/i.test(raw)
+        ) {
           // The one case where the raw text IS the user-facing text: the stream
           // wrapper writes these as plain sentences ("the video server denied
           // the request (HTTP 403)"), so they carry the useful specifics.
@@ -32693,7 +33281,11 @@ export class MoviElement extends HTMLElement {
       const vt = this.player?.trackManager?.getActiveVideoTrack?.();
       const vw = vt?.width || 0;
       const vhh = vt?.height || 0;
-      if (vw > 0 && vhh > 0 && (vw !== this._lastVideoWidth || vhh !== this._lastVideoHeight)) {
+      if (
+        vw > 0 &&
+        vhh > 0 &&
+        (vw !== this._lastVideoWidth || vhh !== this._lastVideoHeight)
+      ) {
         this._lastVideoWidth = vw;
         this._lastVideoHeight = vhh;
         // The box the picture is drawn into follows the picture's own shape
@@ -32730,19 +33322,23 @@ export class MoviElement extends HTMLElement {
         if (notify) {
           this._lastNotifiedQualityHeight = vh;
           this.dispatchEvent(
-            new CustomEvent("qualitychange", { detail: { height: vh, auto: isAuto } }),
+            new CustomEvent("qualitychange", {
+              detail: { height: vh, auto: isAuto },
+            }),
           );
         }
         this._qualityHighWater = Math.max(this._qualityHighWater, vh);
       }
-      this.dispatchEvent(new CustomEvent("trackschange", {
-        detail: {
-          audio: this.player?.getAudioTracks() || [],
-          video: this.player?.getVideoTracks() || [],
-          subtitle: this.player?.getSubtitleTracks() || [],
-          chapters: this.player?.getChapters() || [],
-        },
-      }));
+      this.dispatchEvent(
+        new CustomEvent("trackschange", {
+          detail: {
+            audio: this.player?.getAudioTracks() || [],
+            video: this.player?.getVideoTracks() || [],
+            subtitle: this.player?.getSubtitleTracks() || [],
+            chapters: this.player?.getChapters() || [],
+          },
+        }),
+      );
     } finally {
       this._inTracksChange = false;
     }
@@ -32792,7 +33388,8 @@ export class MoviElement extends HTMLElement {
         if (this._autoplay && !this._muted && !this._userHasUnmuted) {
           this.maybeFallbackToMutedAutoplay();
         }
-      } else if (state === "buffering") this.dispatchEvent(new Event("waiting"));
+      } else if (state === "buffering")
+        this.dispatchEvent(new Event("waiting"));
       // The glyph must not blink across a seek. Arm on the way in — only from
       // a state that says playback is meant to continue — and let go once it
       // genuinely has, or once the video has stopped for a reason of its own.
@@ -32861,8 +33458,7 @@ export class MoviElement extends HTMLElement {
         const starved = !!this.player?.deliveryStarved?.();
         if (starved) this._deliveryStalls++;
         if (starved || !this.player?.deviceIsBottleneck?.()) this._linkStalls++;
-      }
-      else this._qoe.bufferingEndNow();
+      } else this._qoe.bufferingEndNow();
       // A seek requested before the player was ready was held — apply it now
       // that we've reached a seekable state (fixes e.g. a PiP/handoff seek that
       // arrives while the source is still loading).
@@ -32900,7 +33496,10 @@ export class MoviElement extends HTMLElement {
             this._startAt = this._startAtBeforeSwitch;
             this.hidePoster();
           }
-        } else if (this._snapshotPosterActive && this._recoveryResumeTime >= 0) {
+        } else if (
+          this._snapshotPosterActive &&
+          this._recoveryResumeTime >= 0
+        ) {
           // Recovery recreate: same as a quality switch — hold the last-frame
           // cover until the resume-seek has actually moved the playhead, so it
           // doesn't flash the poster + 00:00 for a frame at playback start.
@@ -33048,7 +33647,8 @@ export class MoviElement extends HTMLElement {
           // which a media element never reports: it fires seeking and seeked
           // and stays "playing" throughout. Held for a moment so a resume can
           // cancel it, which is what a seek's resume does.
-          if (this._pauseAnnounceTimer !== null) clearTimeout(this._pauseAnnounceTimer);
+          if (this._pauseAnnounceTimer !== null)
+            clearTimeout(this._pauseAnnounceTimer);
           this._pauseAnnounceTimer = window.setTimeout(() => {
             this._pauseAnnounceTimer = null;
             if (!this._playFired) return; // already answered
@@ -33205,7 +33805,10 @@ export class MoviElement extends HTMLElement {
     // genuinely new destination still announces itself, so a scrub's stream of
     // targets is reported the way an element reports it.
     const seekingHandler = (time: number) => {
-      if (this._seekAnnouncedFor !== null && Math.abs(this._seekAnnouncedFor - time) < 0.01) {
+      if (
+        this._seekAnnouncedFor !== null &&
+        Math.abs(this._seekAnnouncedFor - time) < 0.01
+      ) {
         return;
       }
       this._seekAnnouncedFor = time;
@@ -33247,7 +33850,9 @@ export class MoviElement extends HTMLElement {
     );
 
     const durationChangeHandler = (duration: number) =>
-      this.dispatchEvent(new CustomEvent("durationchange", { detail: duration }));
+      this.dispatchEvent(
+        new CustomEvent("durationchange", { detail: duration }),
+      );
     this.player.on("durationChange", durationChangeHandler);
     this.eventHandlers.set("durationChange", () =>
       this.player?.off("durationChange", durationChangeHandler),
@@ -33294,8 +33899,18 @@ export class MoviElement extends HTMLElement {
       this.player?.off("timeUpdate", timeUpdateHandler),
     );
 
-    const fileRevokedHandler = (info: { offset: number; length: number; reason: string }) => {
-      this.dispatchEvent(new CustomEvent("filerevoked", { detail: info, bubbles: true, composed: true }));
+    const fileRevokedHandler = (info: {
+      offset: number;
+      length: number;
+      reason: string;
+    }) => {
+      this.dispatchEvent(
+        new CustomEvent("filerevoked", {
+          detail: info,
+          bubbles: true,
+          composed: true,
+        }),
+      );
     };
     this.player.on("filerevoked", fileRevokedHandler);
     this.eventHandlers.set("filerevoked", () =>
@@ -33354,7 +33969,11 @@ export class MoviElement extends HTMLElement {
       // connection — the two things every branch below would otherwise blame.
       // The player has already phrased it for a viewer, so pass it through
       // rather than mapping it again.
-      if (/protected|licen[cs]e|key[ _-]?system|\bdrm\b|widevine|playready|fairplay/i.test(raw)) {
+      if (
+        /protected|licen[cs]e|key[ _-]?system|\bdrm\b|widevine|playready|fairplay/i.test(
+          raw,
+        )
+      ) {
         title = "Protected Video";
         message = this.hasAttribute("licenseurl")
           ? "This video is protected and the licence was refused. It may have expired, or it isn't available in your region."
@@ -33391,7 +34010,8 @@ export class MoviElement extends HTMLElement {
           message = "You don't have permission to open this.";
         else if (code.startsWith("5"))
           message = "The server isn't responding. Try again in a bit.";
-        else message = "Couldn't load it. Check your connection, then try again.";
+        else
+          message = "Couldn't load it. Check your connection, then try again.";
       } else if (/file handle|FileSource read timeout|revoked/i.test(raw)) {
         title = "Can't Read This";
         message =
@@ -33402,7 +34022,8 @@ export class MoviElement extends HTMLElement {
           "This is taking too long to load. Check your connection, then try again.";
       } else if (raw.includes("Stream failed after")) {
         title = "Connection Lost";
-        message = "The connection dropped while playing. Check your network, then try again.";
+        message =
+          "The connection dropped while playing. Check your network, then try again.";
       } else if (raw.includes("the decoder produced no frames")) {
         // The stuck watchdog gave up having never seen a frame presented, with
         // the source reporting no fault — so the bytes were arriving and the
@@ -33422,14 +34043,14 @@ export class MoviElement extends HTMLElement {
         // through to the generic branch: that one offers "Try Software
         // Decoding", which cannot help a pipeline that is receiving no bytes.
         title = "Playback Stopped";
-        message = "The video stopped loading. Check your connection, then try again.";
+        message =
+          "The video stopped loading. Check your connection, then try again.";
       } else if (
         raw.toLowerCase().includes("cors") ||
         raw.includes("Failed to fetch video resource")
       ) {
         title = "Can't Load This";
-        message =
-          "Couldn't load it. Check your connection, then try again.";
+        message = "Couldn't load it. Check your connection, then try again.";
       } else if (raw.includes("does not support range requests")) {
         title = "Can't Play This";
         message =
@@ -33441,7 +34062,9 @@ export class MoviElement extends HTMLElement {
         // emscripten/JS-engine text with something useful and steer the
         // user to the software-decode fallback that already handles the
         // codec variants where the hardware path explodes.
-        /out of bounds memory access|memory access out of bounds|RuntimeError|Aborted\(\)/i.test(raw)
+        /out of bounds memory access|memory access out of bounds|RuntimeError|Aborted\(\)/i.test(
+          raw,
+        )
       ) {
         title = "Playback Error";
         message =
@@ -33592,7 +34215,11 @@ export class MoviElement extends HTMLElement {
     this._coverArtBgUrl = "";
     this._coverArtResolved = false;
     // Drop the poster-as-album-art bitmap too — we own it, so close to free it.
-    if (this._posterCoverBitmap) { try { this._posterCoverBitmap.close(); } catch {} }
+    if (this._posterCoverBitmap) {
+      try {
+        this._posterCoverBitmap.close();
+      } catch {}
+    }
     this._posterCoverBitmap = null;
     this._posterCoverUrl = "";
     this._posterCoverLoading = false;
@@ -33605,7 +34232,9 @@ export class MoviElement extends HTMLElement {
 
     // Clear chapter markers
     if (this.shadowRoot) {
-      const markers = this.shadowRoot.querySelector(".movi-chapter-markers") as HTMLElement;
+      const markers = this.shadowRoot.querySelector(
+        ".movi-chapter-markers",
+      ) as HTMLElement;
       if (markers) markers.innerHTML = "";
     }
 
@@ -33914,7 +34543,9 @@ export class MoviElement extends HTMLElement {
     // genuinely dark/audio-only canvas can't spin forever; "playing" re-arms it.
     if (this.isCanvasBlank()) {
       if (attempt < 30) {
-        requestAnimationFrame(() => this.captureMediaSessionArtwork(attempt + 1));
+        requestAnimationFrame(() =>
+          this.captureMediaSessionArtwork(attempt + 1),
+        );
       }
       return;
     }
@@ -34230,7 +34861,11 @@ export class MoviElement extends HTMLElement {
     this.coverArtBitmap = null;
     this._coverArtBgUrl = "";
     this._coverArtResolved = false;
-    if (this._posterCoverBitmap) { try { this._posterCoverBitmap.close(); } catch {} }
+    if (this._posterCoverBitmap) {
+      try {
+        this._posterCoverBitmap.close();
+      } catch {}
+    }
     this._posterCoverBitmap = null;
     this._posterCoverUrl = "";
     this._posterCoverLoading = false;
@@ -34268,7 +34903,9 @@ export class MoviElement extends HTMLElement {
       // Hide any resume dialog left over from the previous source — the next
       // source re-shows it only if it has its own saved position, otherwise
       // the stale "Resume from X?" prompt would linger.
-      const resumeDialog = sr.querySelector(".movi-resume-dialog") as HTMLElement | null;
+      const resumeDialog = sr.querySelector(
+        ".movi-resume-dialog",
+      ) as HTMLElement | null;
       if (resumeDialog) {
         resumeDialog.style.display = "none";
         resumeDialog.style.animation = "";
@@ -34277,10 +34914,14 @@ export class MoviElement extends HTMLElement {
       this.hideSmoothWarning();
       this._smoothWarnKey = null;
       if (!this._title) {
-        const titleText = sr.querySelector(".movi-title-text") as HTMLElement | null;
+        const titleText = sr.querySelector(
+          ".movi-title-text",
+        ) as HTMLElement | null;
         if (titleText) titleText.textContent = "";
       }
-      const rotateStatus = sr.querySelector(".movi-rotate-status") as HTMLElement | null;
+      const rotateStatus = sr.querySelector(
+        ".movi-rotate-status",
+      ) as HTMLElement | null;
       if (rotateStatus) rotateStatus.textContent = "0°";
     }
 
@@ -34384,7 +35025,8 @@ export class MoviElement extends HTMLElement {
     // fading, which is not the receipt every other pause draws. The flag the
     // flash already sets says what the display cannot.
     const isLoading =
-      loadingIndicator?.style.display === "flex" || this._spinnerDeferredByFlash;
+      loadingIndicator?.style.display === "flex" ||
+      this._spinnerDeferredByFlash;
 
     // Through contextMenuRoot(): this runs on the UI tick, and the desktop
     // menu spends its whole visible life in the body portal — which is exactly
@@ -34859,9 +35501,7 @@ export class MoviElement extends HTMLElement {
         };
       } | null
     )?.videoRenderer;
-    return (
-      renderer?.getBarCrop?.() ?? { top: 0, bottom: 0, left: 0, right: 0 }
-    );
+    return renderer?.getBarCrop?.() ?? { top: 0, bottom: 0, left: 0, right: 0 };
   }
 
   private updateChapterPill(): void {
@@ -34953,13 +35593,22 @@ export class MoviElement extends HTMLElement {
    */
   private updateTimelineArrows(): void {
     const sr = this.shadowRoot;
-    const strip = sr?.querySelector(".movi-timeline-strip") as HTMLElement | null;
+    const strip = sr?.querySelector(
+      ".movi-timeline-strip",
+    ) as HTMLElement | null;
     if (!strip) return;
-    const left = sr?.querySelector(".movi-timeline-arrow-left") as HTMLElement | null;
-    const right = sr?.querySelector(".movi-timeline-arrow-right") as HTMLElement | null;
+    const left = sr?.querySelector(
+      ".movi-timeline-arrow-left",
+    ) as HTMLElement | null;
+    const right = sr?.querySelector(
+      ".movi-timeline-arrow-right",
+    ) as HTMLElement | null;
     const max = strip.scrollWidth - strip.clientWidth;
     left?.classList.toggle("movi-timeline-arrow-on", strip.scrollLeft > 2);
-    right?.classList.toggle("movi-timeline-arrow-on", strip.scrollLeft < max - 2);
+    right?.classList.toggle(
+      "movi-timeline-arrow-on",
+      strip.scrollLeft < max - 2,
+    );
   }
 
   /**
@@ -34989,7 +35638,9 @@ export class MoviElement extends HTMLElement {
 
   private updateTimelineCurrent(): void {
     const sr = this.shadowRoot;
-    const panel = sr?.querySelector(".movi-timeline-panel") as HTMLElement | null;
+    const panel = sr?.querySelector(
+      ".movi-timeline-panel",
+    ) as HTMLElement | null;
     if (!sr || !panel || panel.style.display === "none") return;
     const items = Array.from(
       sr.querySelectorAll(".movi-timeline-item"),
@@ -35000,7 +35651,11 @@ export class MoviElement extends HTMLElement {
     for (let i = 0; i < items.length; i++) {
       const start = Number(items[i].dataset.start);
       const end = Number(items[i].dataset.end);
-      if (!Number.isNaN(start) && t >= start && (Number.isNaN(end) || t < end)) {
+      if (
+        !Number.isNaN(start) &&
+        t >= start &&
+        (Number.isNaN(end) || t < end)
+      ) {
         current = i;
       }
     }
@@ -35172,8 +35827,7 @@ export class MoviElement extends HTMLElement {
     this._qoeHeartbeat = window.setInterval(() => {
       if (this.player?.getState?.() !== "playing") return;
       const stats = this.player?.getStats?.() as
-        | Record<string, unknown>
-        | undefined;
+        Record<string, unknown> | undefined;
       const decoder = String(stats?.["Video Decoder"] ?? "unknown");
       // No dropped-frame counter is exposed yet; rebufferRatio carries the
       // stall cost. Report 0 so the schema stays stable for consumers.
@@ -35362,7 +36016,9 @@ export class MoviElement extends HTMLElement {
     const shadowRoot = this.shadowRoot;
     if (!shadowRoot || !this.player) return;
 
-    const container = shadowRoot.querySelector(".movi-chapter-markers") as HTMLElement;
+    const container = shadowRoot.querySelector(
+      ".movi-chapter-markers",
+    ) as HTMLElement;
     if (!container) return;
 
     container.innerHTML = "";
@@ -35412,9 +36068,10 @@ export class MoviElement extends HTMLElement {
     for (let i = 0; i < chapters.length; i++) {
       const ch = chapters[i];
       const startPct = (ch.start / duration) * 100;
-      const endPct = i < chapters.length - 1
-        ? (chapters[i + 1].start / duration) * 100
-        : 100;
+      const endPct =
+        i < chapters.length - 1
+          ? (chapters[i + 1].start / duration) * 100
+          : 100;
 
       const segment = document.createElement("div");
       segment.className = "movi-chapter-segment";
@@ -35478,7 +36135,10 @@ export class MoviElement extends HTMLElement {
       // Never behind the playhead: the buffer bar is drawn from where the
       // current run began, and a buffered edge to the LEFT of the played one
       // would invert the gradient's stops and paint the section solid.
-      seg.style.setProperty("--movi-seg-buffered", pct(Math.max(played, buffered)));
+      seg.style.setProperty(
+        "--movi-seg-buffered",
+        pct(Math.max(played, buffered)),
+      );
       // The hover range, clipped to this section. The thin bar's own band is
       // masked out under a raised section (the track is CUT there — see
       // applyChapterGaps), so without this the band stopped dead at the edge
@@ -35709,7 +36369,10 @@ export class MoviElement extends HTMLElement {
           // between them. Clamping keeps the join seamless: the segment either
           // starts under the played bar or exactly at its edge.
           const bufferStart = Math.min(rawBufferStart, ct);
-          const startPercent = Math.min(100, (bufferStart / this.duration) * 100);
+          const startPercent = Math.min(
+            100,
+            (bufferStart / this.duration) * 100,
+          );
           const endPercent = Math.min(100, (bufferEnd / this.duration) * 100);
           progressBuffer.style.left = `${startPercent}%`;
           progressBuffer.style.width = `${Math.max(0, endPercent - startPercent)}%`;
@@ -36197,7 +36860,9 @@ export class MoviElement extends HTMLElement {
     // wasn't. Hold it back for the first moment and let it through only if the
     // catch-up is genuinely taking time.
     const catchUpMs = (
-      this.player as unknown as { videoCatchUpElapsedMs?: () => number | null } | null
+      this.player as unknown as {
+        videoCatchUpElapsedMs?: () => number | null;
+      } | null
     )?.videoCatchUpElapsedMs?.();
     if (
       shouldShow &&
@@ -36234,8 +36899,7 @@ export class MoviElement extends HTMLElement {
       shouldShow &&
       this._seekRunSince &&
       (liveState === "seeking" || liveState === "buffering") &&
-      performance.now() - this._seekRunSince <
-        MoviElement.SEEK_SPINNER_GRACE_MS
+      performance.now() - this._seekRunSince < MoviElement.SEEK_SPINNER_GRACE_MS
     ) {
       shouldShow = false;
     }
@@ -36361,7 +37025,8 @@ export class MoviElement extends HTMLElement {
     // No native `controls` attribute: Movi's bar is the UI.
     if (this.canvas) this.canvas.style.display = "none";
     if (this.brokenIndicator) this.brokenIndicator.style.display = "none";
-    if (this.emptyStateIndicator) this.emptyStateIndicator.style.display = "none";
+    if (this.emptyStateIndicator)
+      this.emptyStateIndicator.style.display = "none";
     if (this.posterElement) this.posterElement.style.display = "none";
     this.setSpinnerVisible(false);
     v.controls = false;
@@ -36501,10 +37166,12 @@ export class MoviElement extends HTMLElement {
       // trying again will change either half of the problem: we can't read the
       // file, and the browser can't play it. Say that instead, so the viewer
       // stops retrying something that cannot work.
-      const fetchFailed = [origMessage, (held as { message?: string } | undefined)
-        ?.message].some((m) =>
-          /cors|failed to fetch|fetch video resource/i.test(String(m ?? "")),
-        );
+      const fetchFailed = [
+        origMessage,
+        (held as { message?: string } | undefined)?.message,
+      ].some((m) =>
+        /cors|failed to fetch|fetch video resource/i.test(String(m ?? "")),
+      );
       if (!fetchFailed) {
         this.handleUnsupportedVideo(origTitle, origMessage);
         return;
@@ -36587,7 +37254,8 @@ export class MoviElement extends HTMLElement {
         url,
       );
     }
-    if (this._videoQualities.length > 1) this.classList.add("movi-native-quality");
+    if (this._videoQualities.length > 1)
+      this.classList.add("movi-native-quality");
     if (this._subtitleTracks.length > 0) this.classList.add("movi-native-subs");
 
     // Bring Movi's own chrome to life against the wrapper.
@@ -36613,7 +37281,9 @@ export class MoviElement extends HTMLElement {
     this.updateVolumeCap();
     this.isLoading = wasLoading;
 
-    this.dispatchEvent(new CustomEvent("nativefallback", { detail: { src: url } }));
+    this.dispatchEvent(
+      new CustomEvent("nativefallback", { detail: { src: url } }),
+    );
 
     // A host learns a source loaded from `durationchange` → `loadedmetadata` →
     // `loadeddata` → `canplay`, the way a <video> announces itself. This path
@@ -36677,7 +37347,8 @@ export class MoviElement extends HTMLElement {
    * hasn't finished failing yet.
    */
   private willHandOffToNative(): boolean {
-    if (typeof this._src !== "string" || this._nativeFallbackActive) return false;
+    if (typeof this._src !== "string" || this._nativeFallbackActive)
+      return false;
     if (this._fallbackMode() === "native" && !this._nativeFallbackAttempted) {
       return true;
     }
@@ -36750,16 +37421,21 @@ export class MoviElement extends HTMLElement {
     // "Network Error" for fetch-fail / CORS, whose MESSAGE ("Failed to fetch
     // video resource…") carries none of the keyword hints below — so keying on
     // the message alone missed the most common network error (no Retry button).
-    const isNetworkError = title === "Network Error" ||
-      msgLower.includes("http 4") || msgLower.includes("http 5") ||
-      msgLower.includes("stream unavailable") || msgLower.includes("network error") ||
-      msgLower.includes("hls error") || msgLower.includes("failed to fetch");
-    const isDecoderError = !isNetworkError && (
-      title === "Format Unsupported" ||
-      title === "Codec Unsupported" ||
-      title === "Playback Error" ||
-      msgLower.includes("decoder") ||
-      msgLower.includes("codec"));
+    const isNetworkError =
+      title === "Network Error" ||
+      msgLower.includes("http 4") ||
+      msgLower.includes("http 5") ||
+      msgLower.includes("stream unavailable") ||
+      msgLower.includes("network error") ||
+      msgLower.includes("hls error") ||
+      msgLower.includes("failed to fetch");
+    const isDecoderError =
+      !isNetworkError &&
+      (title === "Format Unsupported" ||
+        title === "Codec Unsupported" ||
+        title === "Playback Error" ||
+        msgLower.includes("decoder") ||
+        msgLower.includes("codec"));
 
     // An explicit `engine` list owns the escalation: walk to the next engine the
     // author named that hasn't been tried for this source. Only when the list is
@@ -36914,7 +37590,11 @@ export class MoviElement extends HTMLElement {
     // opted into auto fallback (sw="auto"), or the user already accepted
     // software once for this video, so a later quality that also can't
     // hardware-decode applies it automatically. Skipped if already in software.
-    if (isDecoderError && this._sw !== "software" && softwareFallbackAvailable) {
+    if (
+      isDecoderError &&
+      this._sw !== "software" &&
+      softwareFallbackAvailable
+    ) {
       Logger.info(
         TAG,
         this._userAcceptedSoftwareFallback
@@ -37071,10 +37751,12 @@ export class MoviElement extends HTMLElement {
     // provide it — surface a clear "unsupported browser" message rather than a
     // cryptic decode failure, and skip player init.
     if (typeof WebAssembly === "undefined") {
-      Logger.warn(TAG, "WebAssembly unavailable — this browser can't run the player");
+      Logger.warn(
+        TAG,
+        "WebAssembly unavailable — this browser can't run the player",
+      );
       if (this.brokenIndicator) {
-        const wasmScreenWasUp =
-          this.brokenIndicator.style.display === "flex";
+        const wasmScreenWasUp = this.brokenIndicator.style.display === "flex";
         this.brokenIndicator.style.display = "flex";
         if (this.emptyStateIndicator) {
           this.emptyStateIndicator.style.display = "none";
@@ -37318,8 +38000,7 @@ export class MoviElement extends HTMLElement {
       // "Nothing to Play" screen — an invitation to fullscreen an empty player.
       if (
         el.classList.contains("movi-fullscreen-btn") &&
-        (this.isFullscreenActive() ||
-          (!isUnsupported && this.hasMediaSource()))
+        (this.isFullscreenActive() || (!isUnsupported && this.hasMediaSource()))
       ) {
         el.style.opacity = "1";
         el.style.pointerEvents = "auto";
@@ -37341,7 +38022,12 @@ export class MoviElement extends HTMLElement {
       const isPlayControl =
         el.classList.contains("movi-play-pause") ||
         el.classList.contains("movi-center-play-pause");
-      if (isInitial && !isUnsupported && this.hasMediaSource() && isPlayControl) {
+      if (
+        isInitial &&
+        !isUnsupported &&
+        this.hasMediaSource() &&
+        isPlayControl
+      ) {
         if (el.classList.contains("movi-center-play-pause")) {
           // Whether it is ON SCREEN stays the classes' business — poster, first
           // play, ended, touch-with-chrome-up. All this does is stop the
@@ -37420,7 +38106,7 @@ export class MoviElement extends HTMLElement {
       el.style.opacity = enabled ? "1" : "0.4";
       el.style.pointerEvents = enabled ? "auto" : "none";
     });
-      // Cheap, and self-correcting: the tray's contents depend on per-control
+    // Cheap, and self-correcting: the tray's contents depend on per-control
     // visibility that settles at different times (tracks resolve late, HDR
     // later still), so re-deciding on every state change beats trying to
     // catch the last of them.
@@ -37471,7 +38157,10 @@ export class MoviElement extends HTMLElement {
     this._restoreRungSrc = null;
     this._restoreHealthySince = 0;
     const label = this._videoQualities.find((q) => q.src === target)?.label;
-    Logger.info(TAG, `Restoring the rung a recovery dropped: ${label || target}`);
+    Logger.info(
+      TAG,
+      `Restoring the rung a recovery dropped: ${label || target}`,
+    );
     // Same as the rescue: the player moved this, not the viewer, so a host that
     // persists the picked quality must not record it.
     this._involuntaryQualityUntil = now + 30000;
@@ -37569,7 +38258,10 @@ export class MoviElement extends HTMLElement {
   /** The action keys that are ENABLED before playback — see
    *  setInitialEnabledControls for what that governs. */
   getInitialEnabledControls(): string[] {
-    return [...(this._initialEnabledControls ?? MoviElement.DEFAULT_INITIAL_ENABLED_CONTROLS)];
+    return [
+      ...(this._initialEnabledControls ??
+        MoviElement.DEFAULT_INITIAL_ENABLED_CONTROLS),
+    ];
   }
 
   /**
@@ -37582,7 +38274,9 @@ export class MoviElement extends HTMLElement {
    * nothing to go fullscreen with.
    */
   setInitialEnabledControls(keys: string[] | null): void {
-    this._initialEnabledControls = keys ? keys.map((k) => k.toLowerCase()) : null;
+    this._initialEnabledControls = keys
+      ? keys.map((k) => k.toLowerCase())
+      : null;
     this.updateControlsState();
     this.buildSettingsRoot();
   }
@@ -37590,7 +38284,9 @@ export class MoviElement extends HTMLElement {
   private worksBeforePlayback(el: HTMLElement): boolean {
     // Inside a submenu, the parent action decides: the entries there are the
     // values of that one setting (and its Back row), not actions of their own.
-    const submenu = el.closest(".movi-context-menu-submenu") as HTMLElement | null;
+    const submenu = el.closest(
+      ".movi-context-menu-submenu",
+    ) as HTMLElement | null;
     const key = submenu?.dataset.submenu || el.dataset.action || "";
     // Crop is a preference too, and a remembered one: asking for it before a
     // source arrives means "crop when there is something to crop". It was the
@@ -37627,7 +38323,10 @@ export class MoviElement extends HTMLElement {
    */
   /** The canvas renderer, when there is one — it owns the shader-side cut. */
   private pictureRenderer():
-    | { setCornerRadius?: (px: number | number[]) => void; presentFpsCap?: number }
+    | {
+        setCornerRadius?: (px: number | number[]) => void;
+        presentFpsCap?: number;
+      }
     | undefined {
     return (
       this.player as unknown as {
@@ -37810,7 +38509,8 @@ export class MoviElement extends HTMLElement {
       // Also skip during seek/buffering — the renderer is recovering and any
       // canvas readback contends with frame presentation, magnifying stutter.
       const playerState = this.player?.getState();
-      const isRecovering = playerState === "seeking" || playerState === "buffering";
+      const isRecovering =
+        playerState === "seeking" || playerState === "buffering";
       // Skip for a short window after a playback-rate change so audio refill
       // isn't fighting the GPU readback for main-thread time.
       const sinceRateChange = timestamp - this._lastRateChangeTime;
@@ -37890,12 +38590,12 @@ export class MoviElement extends HTMLElement {
 
   private stopAmbientColorSampling(): void {
     (
-      (this.player as unknown as {
+      this.player as unknown as {
         videoRenderer?: {
           setAmbientWash?: (rgb: [number, number, number] | null) => void;
         };
-      } | null)?.videoRenderer
-    )?.setAmbientWash?.(null);
+      } | null
+    )?.videoRenderer?.setAmbientWash?.(null);
     if (this._ambientRafId !== null) {
       cancelAnimationFrame(this._ambientRafId);
       this._ambientRafId = null;
@@ -37989,7 +38689,13 @@ export class MoviElement extends HTMLElement {
       // meant to read as a colour in the room, not as a lighter black.
       const grey = lum * level;
       const sat = (v: number) =>
-        Math.max(0, Math.min(AMBIENT_MAX_CHANNEL, Math.round(grey + (v * level - grey) * 1.25)));
+        Math.max(
+          0,
+          Math.min(
+            AMBIENT_MAX_CHANNEL,
+            Math.round(grey + (v * level - grey) * 1.25),
+          ),
+        );
       const wr = sat(r);
       const wg = sat(g);
       const wb = sat(b);
@@ -38034,7 +38740,9 @@ export class MoviElement extends HTMLElement {
         // defaults suit a wrapper that fills the space around the player; one
         // that only shows a rim past a framed player needs more to be seen.
         const strength =
-          parseFloat(getComputedStyle(w).getPropertyValue("--movi-ambient-strength")) || 1;
+          parseFloat(
+            getComputedStyle(w).getPropertyValue("--movi-ambient-strength"),
+          ) || 1;
         const alpha = (
           this._theme === "light"
             ? [0.66, 0.4, 0.2, 0.07]
@@ -38053,12 +38761,12 @@ export class MoviElement extends HTMLElement {
         // again but nothing was clearing it, so the colour stayed painted
         // inside the canvas and the bars never went back to black.
         (
-          (this.player as unknown as {
+          this.player as unknown as {
             videoRenderer?: {
               setAmbientWash?: (rgb: [number, number, number] | null) => void;
             };
-          } | null)?.videoRenderer
-        )?.setAmbientWash?.(null);
+          } | null
+        )?.videoRenderer?.setAmbientWash?.(null);
 
         if (this._theme === "light") {
           this.ambientWrapperElement.style.filter =
@@ -38081,12 +38789,12 @@ export class MoviElement extends HTMLElement {
         // way underneath.
         this.player?.setLetterboxColor(0, 0, 0);
         (
-          (this.player as unknown as {
+          this.player as unknown as {
             videoRenderer?: {
               setAmbientWash?: (rgb: [number, number, number] | null) => void;
             };
-          } | null)?.videoRenderer
-        )?.setAmbientWash?.([wr, wg, wb]);
+          } | null
+        )?.videoRenderer?.setAmbientWash?.([wr, wg, wb]);
       }
     }
   }
@@ -38104,8 +38812,9 @@ export class MoviElement extends HTMLElement {
   /** The URL actually being read, which on a quality ladder is the rung in
    *  play rather than the `src` that was declared. */
   get currentSrc(): string {
-    const rung = (this.player as unknown as { getActiveRenditionUrl?: () => string })
-      ?.getActiveRenditionUrl?.();
+    const rung = (
+      this.player as unknown as { getActiveRenditionUrl?: () => string }
+    )?.getActiveRenditionUrl?.();
     if (rung) return rung;
     if (typeof this._src === "string") return this._src;
     return this._videoUrl || "";
@@ -38195,7 +38904,8 @@ export class MoviElement extends HTMLElement {
   }
   set defaultMuted(v: boolean) {
     this._defaultMuted = !!v;
-    if (v) this.setAttribute("muted", ""); else this.removeAttribute("muted");
+    if (v) this.setAttribute("muted", "");
+    else this.removeAttribute("muted");
   }
 
   private _defaultPlaybackRate = 1;
@@ -38248,7 +38958,10 @@ export class MoviElement extends HTMLElement {
     this.removeAttribute("src");
     if (this.video) {
       this.video.srcObject = stream;
-      this.engageNativeFallback("Live stream", "Playing a MediaStream natively");
+      this.engageNativeFallback(
+        "Live stream",
+        "Playing a MediaStream natively",
+      );
     }
   }
 
@@ -38277,8 +38990,9 @@ export class MoviElement extends HTMLElement {
     if (!v) return;
     const lang = (this._carrySubtitleLang || "").toLowerCase();
     const track =
-      Array.from(v.textTracks).find((t) => (t.language || "").toLowerCase() === lang) ??
-      v.textTracks[0];
+      Array.from(v.textTracks).find(
+        (t) => (t.language || "").toLowerCase() === lang,
+      ) ?? v.textTracks[0];
     if (!track) return;
     try {
       const t = this.currentTime;
@@ -38300,13 +39014,15 @@ export class MoviElement extends HTMLElement {
     if (!v) return;
     const declared = this._subtitleTracks || [];
     const signature = declared.map((t) => `${t.lang}|${t.label}`);
-    if (signature.join("\u0000") === this._mirroredTextTracks.join("\u0000")) return;
+    if (signature.join("\u0000") === this._mirroredTextTracks.join("\u0000"))
+      return;
     this._mirroredTextTracks = signature;
     for (const t of declared) {
       const already = Array.from(v.textTracks).some(
         (tt) => tt.language === (t.lang || "") && tt.label === (t.label || ""),
       );
-      if (!already) v.addTextTrack("subtitles", t.label || t.lang || "", t.lang || "");
+      if (!already)
+        v.addTextTrack("subtitles", t.label || t.lang || "", t.lang || "");
     }
   }
 
@@ -38410,7 +39126,11 @@ export class MoviElement extends HTMLElement {
 
   /** Creates a real TextTrack on the element's own <video>, exactly as native
    *  does, so cues added to it behave and fire `cuechange`. */
-  addTextTrack(kind: TextTrackKind, label?: string, language?: string): TextTrack | null {
+  addTextTrack(
+    kind: TextTrackKind,
+    label?: string,
+    language?: string,
+  ): TextTrack | null {
     return this.video?.addTextTrack?.(kind, label, language) ?? null;
   }
 
@@ -38418,10 +39138,13 @@ export class MoviElement extends HTMLElement {
    *  mixed in WebAudio and is not part of this stream. */
   captureStream(frameRate?: number): MediaStream | null {
     const canvas = this.getCanvas?.();
-    const grab = (canvas as unknown as { captureStream?: (f?: number) => MediaStream })
-      ?.captureStream;
+    const grab = (
+      canvas as unknown as { captureStream?: (f?: number) => MediaStream }
+    )?.captureStream;
     if (!canvas || typeof grab !== "function") return null;
-    return frameRate !== undefined ? grab.call(canvas, frameRate) : grab.call(canvas);
+    return frameRate !== undefined
+      ? grab.call(canvas, frameRate)
+      : grab.call(canvas);
   }
 
   /** Frame counts from the canvas renderer, which is what presents here. */
@@ -38444,13 +39167,18 @@ export class MoviElement extends HTMLElement {
     };
   }
 
-  private _vfcHandlers = new Map<number, (now: number, meta: unknown) => void>();
+  private _vfcHandlers = new Map<
+    number,
+    (now: number, meta: unknown) => void
+  >();
   private _vfcNextId = 1;
 
   /** Called once per presented frame, with the metadata object native supplies.
    *  Registered with the renderer's presentation loop rather than rAF, so it
    *  reports frames rather than repaints. */
-  requestVideoFrameCallback(cb: (now: number, metadata: unknown) => void): number {
+  requestVideoFrameCallback(
+    cb: (now: number, metadata: unknown) => void,
+  ): number {
     const id = this._vfcNextId++;
     this._vfcHandlers.set(id, cb);
     return id;
@@ -38502,13 +39230,19 @@ export class MoviElement extends HTMLElement {
   requestPictureInPicture(): Promise<unknown> {
     if (this.isControlDisabled?.("pip") || this._disablePip) {
       return Promise.reject(
-        new DOMException("Picture-in-Picture is disabled on this element", "InvalidStateError"),
+        new DOMException(
+          "Picture-in-Picture is disabled on this element",
+          "InvalidStateError",
+        ),
       );
     }
-    const enter = (this as unknown as { togglePictureInPicture?: () => Promise<unknown> })
-      .togglePictureInPicture;
+    const enter = (
+      this as unknown as { togglePictureInPicture?: () => Promise<unknown> }
+    ).togglePictureInPicture;
     if (typeof enter === "function") return enter.call(this);
-    return Promise.reject(new DOMException("Picture-in-Picture unavailable", "NotSupportedError"));
+    return Promise.reject(
+      new DOMException("Picture-in-Picture unavailable", "NotSupportedError"),
+    );
   }
 
   /** The same routing `setAudioOutput` does, under the name native uses. */
@@ -38582,7 +39316,9 @@ export class MoviElement extends HTMLElement {
     if (v) this.setAttribute("disableremoteplayback", "");
     else this.removeAttribute("disableremoteplayback");
     if (this.video) {
-      (this.video as unknown as { disableRemotePlayback?: boolean }).disableRemotePlayback = !!v;
+      (
+        this.video as unknown as { disableRemotePlayback?: boolean }
+      ).disableRemotePlayback = !!v;
     }
   }
 
@@ -38627,7 +39363,12 @@ export class MoviElement extends HTMLElement {
   /**
    * Get available external subtitle tracks
    */
-  getSubtitleLangs(): { lang: string; label: string; active: boolean; pending?: boolean }[] {
+  getSubtitleLangs(): {
+    lang: string;
+    label: string;
+    active: boolean;
+    pending?: boolean;
+  }[] {
     if (this.player) return this.player.getSubtitleLangs();
     return this._subtitleTracks.map((t) => ({
       lang: t.lang,
@@ -38753,7 +39494,9 @@ export class MoviElement extends HTMLElement {
     this.dispose();
 
     this.dispatchEvent(
-      new CustomEvent("loadstart", { detail: { src: adapter ? adapter.getKey() : null } }),
+      new CustomEvent("loadstart", {
+        detail: { src: adapter ? adapter.getKey() : null },
+      }),
     );
 
     this._sourceAdapter = adapter;
@@ -38915,15 +39658,33 @@ export class MoviElement extends HTMLElement {
           audio?:
             | { src: string; type?: string }
             | { src: string; type?: string; lang: string; label: string }[];
-          subtitles?: { src: string; lang: string; label: string; format?: string }[];
-        }
-  ): { src: string | File | null; type: string; audioSrc?: string | null } | void {
+          subtitles?: {
+            src: string;
+            lang: string;
+            label: string;
+            format?: string;
+          }[];
+        },
+  ): {
+    src: string | File | null;
+    type: string;
+    audioSrc?: string | null;
+  } | void {
     // Getter
     if (value === undefined) {
       const currentSrc = this._src;
       if (!currentSrc) return { src: null, type: "", audioSrc: this._audioSrc };
-      if (currentSrc instanceof File) return { src: currentSrc, type: currentSrc.type, audioSrc: this._audioSrc };
-      return { src: currentSrc, type: this.guessMediaType(currentSrc), audioSrc: this._audioSrc };
+      if (currentSrc instanceof File)
+        return {
+          src: currentSrc,
+          type: currentSrc.type,
+          audioSrc: this._audioSrc,
+        };
+      return {
+        src: currentSrc,
+        type: this.guessMediaType(currentSrc),
+        audioSrc: this._audioSrc,
+      };
     }
 
     // Setter — string
@@ -38974,7 +39735,7 @@ export class MoviElement extends HTMLElement {
    * Falls back to null if none are supported.
    */
   private pickSource(
-    sources: { src: string; type?: string }[]
+    sources: { src: string; type?: string }[],
   ): { src: string; type?: string } | null {
     const testVideo = document.createElement("video");
     for (const s of sources) {
@@ -39086,9 +39847,9 @@ export class MoviElement extends HTMLElement {
       this.warmStoryboardSheets();
 
       if (this._chapters) this.player.setChapters(this._chapters);
-    // The renderer is new, and the crop setting lives on it — an attribute set
-    // before the player existed would otherwise never reach anything.
-    if (this._cropBars) this.applyBarCrop();
+      // The renderer is new, and the crop setting lives on it — an attribute set
+      // before the player existed would otherwise never reach anything.
+      if (this._cropBars) this.applyBarCrop();
 
       // Bind device enumeration + apply any pending `audiooutput` selection.
       this.setupAudioOutputs();
@@ -39338,8 +40099,12 @@ export class MoviElement extends HTMLElement {
     const loopStatus = menuRoot.querySelector(".movi-loop-status");
 
     // Context menu icons
-    const ctxOutline = menuRoot.querySelector(".movi-context-menu-loop-outline") as HTMLElement;
-    const ctxFilled = menuRoot.querySelector(".movi-context-menu-loop-filled") as HTMLElement;
+    const ctxOutline = menuRoot.querySelector(
+      ".movi-context-menu-loop-outline",
+    ) as HTMLElement;
+    const ctxFilled = menuRoot.querySelector(
+      ".movi-context-menu-loop-filled",
+    ) as HTMLElement;
 
     if (this._loop) {
       loopBtn?.classList.add("active");
@@ -39354,7 +40119,7 @@ export class MoviElement extends HTMLElement {
       if (ctxOutline) ctxOutline.style.display = "block";
       if (ctxFilled) ctxFilled.style.display = "none";
     }
-      // Keep an open panel / context menu in step - see the method's note.
+    // Keep an open panel / context menu in step - see the method's note.
     this.refreshOpenSettingsSurfaces();
   }
 
@@ -39385,8 +40150,12 @@ export class MoviElement extends HTMLElement {
       '.movi-context-menu-item[data-action="ambient-toggle"]',
     ) as HTMLElement | null;
     const status = menuRoot.querySelector(".movi-ambient-status");
-    const ctxOutline = menuRoot.querySelector(".movi-context-menu-ambient-outline") as HTMLElement;
-    const ctxFilled = menuRoot.querySelector(".movi-context-menu-ambient-filled") as HTMLElement;
+    const ctxOutline = menuRoot.querySelector(
+      ".movi-context-menu-ambient-outline",
+    ) as HTMLElement;
+    const ctxFilled = menuRoot.querySelector(
+      ".movi-context-menu-ambient-filled",
+    ) as HTMLElement;
 
     // The ambient glow samples the WASM renderer's 16x16 mirror. Adaptive
     // streams (HLS/DASH/Shaka) draw via a separate stream-side renderer that
@@ -39628,7 +40397,11 @@ export class MoviElement extends HTMLElement {
     const legacy = this.legacySettingsEnabled();
     if (legacy && !this._legacySettingsLoaded) return;
     const wantAudio = MoviElement.usableLang(
-      names.has("audiolang") ? this._prefRead("audiolang") : legacy ? this._legacyAudioLang : null,
+      names.has("audiolang")
+        ? this._prefRead("audiolang")
+        : legacy
+          ? this._legacyAudioLang
+          : null,
     );
     const storedSubs = names.has("subtitlelang")
       ? this._prefRead("subtitlelang")
@@ -39733,8 +40506,9 @@ export class MoviElement extends HTMLElement {
 
   private pickAudioTrack(id: number) {
     const out = this.player!.selectAudioTrack(id);
-    const lang = this.player?.getAudioTracks?.()?.find((t) => t.id === id)
-      ?.language;
+    const lang = this.player
+      ?.getAudioTracks?.()
+      ?.find((t) => t.id === id)?.language;
     this.noteTrackChoice("audiolang", lang ?? null);
     return out;
   }
@@ -39750,8 +40524,9 @@ export class MoviElement extends HTMLElement {
     if (id === null) {
       this.noteTrackChoice("subtitlelang", null);
     } else {
-      const lang = this.player?.getSubtitleTracks?.()?.find((t) => t.id === id)
-        ?.language;
+      const lang = this.player
+        ?.getSubtitleTracks?.()
+        ?.find((t) => t.id === id)?.language;
       this.noteTrackChoice("subtitlelang", lang ?? null);
     }
     return out;
@@ -39818,7 +40593,8 @@ export class MoviElement extends HTMLElement {
         // restore does — it is what stops a host re-declaring the attribute
         // from taking the decision back. See hostOverridingStoredChoice.
         if (def.boolean) this.noteStoredChoice(def.attr, stored === "1");
-        else if (name !== "aspect") this.noteStoredChoice(def.attr, true, stored);
+        else if (name !== "aspect")
+          this.noteStoredChoice(def.attr, true, stored);
         if (def.boolean) {
           if (stored === "1") this.setAttribute(def.attr, "");
           else this.removeAttribute(def.attr);
@@ -39889,13 +40665,20 @@ export class MoviElement extends HTMLElement {
    * through the setters below, which update the record first, so those agree
    * and pass straight through.
    */
-  private hostOverridingStoredChoice(attr: string, newValue: string | null): boolean {
+  private hostOverridingStoredChoice(
+    attr: string,
+    newValue: string | null,
+  ): boolean {
     if (this._applyingPersisted) return false;
     if (!this._storedChoice.has(attr)) return false;
     const stored = this._storedChoice.get(attr) ?? null;
     if (stored === newValue) return false;
     // Boolean attributes: only presence carries meaning, so "" and "1" agree.
-    if (stored !== null && newValue !== null && (stored === "" || newValue === "")) {
+    if (
+      stored !== null &&
+      newValue !== null &&
+      (stored === "" || newValue === "")
+    ) {
       return false;
     }
     this._applyingPersisted = true;
@@ -39921,10 +40704,51 @@ export class MoviElement extends HTMLElement {
    *  checked after them, so one of these can only ever be dead — said out loud
    *  at registration rather than left to be discovered. */
   private static readonly RESERVED_HOTKEYS = new Set([
-    " ", "k", "j", "l", "f", "m", "c", "v", "b", "u", "z", "x",
-    "a", "p", "r", "g", "s", "t", "h", "i", "?", "+", "-", "=",
-    "arrowleft", "arrowright", "arrowup", "arrowdown", "escape", "home", "end",
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ",", ".", "<", ">",
+    " ",
+    "k",
+    "j",
+    "l",
+    "f",
+    "m",
+    "c",
+    "v",
+    "b",
+    "u",
+    "z",
+    "x",
+    "a",
+    "p",
+    "r",
+    "g",
+    "s",
+    "t",
+    "h",
+    "i",
+    "?",
+    "+",
+    "-",
+    "=",
+    "arrowleft",
+    "arrowright",
+    "arrowup",
+    "arrowdown",
+    "escape",
+    "home",
+    "end",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    ",",
+    ".",
+    "<",
+    ">",
   ]);
 
   /** Built-in controls a custom one can be positioned against. */
@@ -40030,7 +40854,10 @@ export class MoviElement extends HTMLElement {
     }
     const existing = this._customControls.get(spec.id);
     this.teardownCustomControl(spec.id);
-    if (spec.hotkey && MoviElement.RESERVED_HOTKEYS.has(spec.hotkey.trim().toLowerCase())) {
+    if (
+      spec.hotkey &&
+      MoviElement.RESERVED_HOTKEYS.has(spec.hotkey.trim().toLowerCase())
+    ) {
       Logger.warn(
         TAG,
         `addControl("${spec.id}"): the player already uses "${spec.hotkey}" — the built-in shortcut wins and this hotkey will never fire`,
@@ -40043,7 +40870,10 @@ export class MoviElement extends HTMLElement {
       const mine = this.normaliseHotkey(spec.hotkey);
       for (const [otherId, other] of this._customControls) {
         if (otherId === spec.id) continue;
-        if (other.spec.hotkey && this.normaliseHotkey(other.spec.hotkey) === mine) {
+        if (
+          other.spec.hotkey &&
+          this.normaliseHotkey(other.spec.hotkey) === mine
+        ) {
           Logger.warn(
             TAG,
             `addControl("${spec.id}"): "${spec.hotkey}" is already taken by "${otherId}", which keeps it`,
@@ -40202,9 +41032,9 @@ export class MoviElement extends HTMLElement {
     const panel = this.shadowRoot?.querySelector(".movi-shortcuts-panel");
     const body = panel?.querySelector(".movi-shortcuts-body");
     if (!body) return;
-    body.querySelectorAll(".movi-shortcut-row.movi-custom-shortcut").forEach((n) =>
-      n.remove(),
-    );
+    body
+      .querySelectorAll(".movi-shortcut-row.movi-custom-shortcut")
+      .forEach((n) => n.remove());
     const cols = body.querySelectorAll(".movi-shortcuts-col");
     const target = (cols[cols.length - 1] ?? body) as HTMLElement;
     for (const [id, entry] of this._customControls) {
@@ -40255,7 +41085,8 @@ export class MoviElement extends HTMLElement {
     this.addEventListener("play", () => this.dismissOverlaysOn("play"));
     this.addEventListener("seeking", () => this.dismissOverlaysOn("seek"));
     this.addEventListener("keydown", (e) => {
-      if ((e as KeyboardEvent).key === "Escape") this.dismissOverlaysOn("escape");
+      if ((e as KeyboardEvent).key === "Escape")
+        this.dismissOverlaysOn("escape");
     });
     // Picture-in-picture is a window the browser draws, not this tree — an
     // overlay cannot appear in it. Hidden rather than removed, so it is still
@@ -40348,7 +41179,8 @@ export class MoviElement extends HTMLElement {
       this.syncFillOverlayClass();
     }
     if (patch.interactive !== undefined) {
-      entry.el.style.pointerEvents = patch.interactive === false ? "none" : "auto";
+      entry.el.style.pointerEvents =
+        patch.interactive === false ? "none" : "auto";
     }
   }
 
@@ -40615,7 +41447,8 @@ export class MoviElement extends HTMLElement {
       // its key should be as absent as its button — otherwise "Cast to TV"
       // still fires on a podcast, invisibly.
       const scope = entry.spec.media ?? "both";
-      if ((scope === "video" && audio) || (scope === "audio" && !audio)) continue;
+      if ((scope === "video" && audio) || (scope === "audio" && !audio))
+        continue;
       // Same for a control that only exists on one side of fullscreen.
       const screen = entry.spec.screen ?? "both";
       if ((screen === "fullscreen" && !fs) || (screen === "windowed" && fs)) {
@@ -40919,7 +41752,12 @@ export class MoviElement extends HTMLElement {
     const wantsCenter = on.has("center");
 
     if ((spec as unknown as MoviDividerSpec).divider === true) {
-      this.renderCustomDivider(id, spec, { wantsBar, wantsMenu, wantsTop, wantsCenter });
+      this.renderCustomDivider(id, spec, {
+        wantsBar,
+        wantsMenu,
+        wantsTop,
+        wantsCenter,
+      });
       return;
     }
 
@@ -41068,7 +41906,12 @@ export class MoviElement extends HTMLElement {
   private renderCustomDivider(
     id: string,
     spec: MoviControlSpec,
-    where: { wantsBar: boolean; wantsMenu: boolean; wantsTop: boolean; wantsCenter: boolean },
+    where: {
+      wantsBar: boolean;
+      wantsMenu: boolean;
+      wantsTop: boolean;
+      wantsCenter: boolean;
+    },
   ): void {
     const sr = this.shadowRoot;
     if (!sr) return;
@@ -41135,8 +41978,10 @@ export class MoviElement extends HTMLElement {
   private markCustomScopes(node: HTMLElement, spec: MoviControlSpec): void {
     if (spec.media === "video") node.setAttribute("data-video-only", "");
     else if (spec.media === "audio") node.setAttribute("data-audio-only", "");
-    if (spec.screen === "fullscreen") node.setAttribute("data-fullscreen-only", "");
-    else if (spec.screen === "windowed") node.setAttribute("data-windowed-only", "");
+    if (spec.screen === "fullscreen")
+      node.setAttribute("data-fullscreen-only", "");
+    else if (spec.screen === "windowed")
+      node.setAttribute("data-windowed-only", "");
   }
 
   /** Place a node before/after a named built-in, or at the end of the row. */
@@ -41162,9 +42007,7 @@ export class MoviElement extends HTMLElement {
     // controls never land in the same capsule.
     const name = group === "none" ? `solo:${id}` : group;
 
-    const existing = (
-      group === "none" ? row : this.shadowRoot
-    )?.querySelector(
+    const existing = (group === "none" ? row : this.shadowRoot)?.querySelector(
       `.movi-control-group[data-group="${CSS.escape(name)}"]`,
     );
     if (existing) return existing;
@@ -41250,8 +42093,11 @@ export class MoviElement extends HTMLElement {
         // "custom:<id>", so a built-in and a custom control cannot collide
         // even when they share a name — and the built-in is looked up first
         // either way.
-        return built ?? parent.querySelector(
-          `.movi-context-menu-item[data-action="custom:${this.escapeSel(name)}"]`,
+        return (
+          built ??
+          parent.querySelector(
+            `.movi-context-menu-item[data-action="custom:${this.escapeSel(name)}"]`,
+          )
         );
       }
       const sel = MoviElement.CONTROL_ANCHORS[name];
@@ -41406,7 +42252,7 @@ export class MoviElement extends HTMLElement {
 
     const sub = document.createElement("div");
     sub.className = "movi-context-menu-submenu";
-    sub.dataset.submenu = `custom:${controlId}:${depth}:${(parentRow.dataset.action ?? "")}`;
+    sub.dataset.submenu = `custom:${controlId}:${depth}:${parentRow.dataset.action ?? ""}`;
     sub.dataset.customControl = controlId;
 
     const back = document.createElement("div");
@@ -41627,7 +42473,9 @@ export class MoviElement extends HTMLElement {
     return true;
   }
 
-  private updateStableAudioUI(shadowRoot: ShadowRoot | null = this.shadowRoot): void {
+  private updateStableAudioUI(
+    shadowRoot: ShadowRoot | null = this.shadowRoot,
+  ): void {
     if (!shadowRoot) return;
     const menuRoot = this.contextMenuRoot();
     const stableMenuItem = menuRoot.querySelector(
@@ -41644,8 +42492,10 @@ export class MoviElement extends HTMLElement {
     const stableContainer = shadowRoot.querySelector(
       ".movi-stable-audio-container",
     ) as HTMLElement | null;
-    if (stableContainer) stableContainer.style.display = nativeAudio ? "none" : "";
-    if (stableMenuItem) stableMenuItem.style.display = nativeAudio ? "none" : "";
+    if (stableContainer)
+      stableContainer.style.display = nativeAudio ? "none" : "";
+    if (stableMenuItem)
+      stableMenuItem.style.display = nativeAudio ? "none" : "";
     if (nativeAudio) return;
 
     const isEnabled = this.player?.getStableAudio() ?? true;
@@ -41653,8 +42503,12 @@ export class MoviElement extends HTMLElement {
     const stableStatus = menuRoot.querySelector(".movi-stable-audio-status");
 
     // Context menu icons
-    const ctxOutline = menuRoot.querySelector(".movi-context-menu-stable-outline") as HTMLElement;
-    const ctxFilled = menuRoot.querySelector(".movi-context-menu-stable-filled") as HTMLElement;
+    const ctxOutline = menuRoot.querySelector(
+      ".movi-context-menu-stable-outline",
+    ) as HTMLElement;
+    const ctxFilled = menuRoot.querySelector(
+      ".movi-context-menu-stable-filled",
+    ) as HTMLElement;
 
     if (isEnabled) {
       stableBtn?.classList.add("active");
@@ -41669,7 +42523,7 @@ export class MoviElement extends HTMLElement {
       if (ctxOutline) ctxOutline.style.display = "block";
       if (ctxFilled) ctxFilled.style.display = "none";
     }
-      // Keep an open panel / context menu in step - see the method's note.
+    // Keep an open panel / context menu in step - see the method's note.
     this.refreshOpenSettingsSurfaces();
   }
 
@@ -41695,16 +42549,16 @@ export class MoviElement extends HTMLElement {
     // Asking only the track manager meant the band never appeared for the
     // commonest way anyone adds subtitles to a song.
     const embedded = !!this.player?.trackManager?.getActiveSubtitleTrack?.();
-    const external = !!this.player
-      ?.getSubtitleLangs?.()
-      ?.some((t) => t.active);
+    const external = !!this.player?.getSubtitleLangs?.()?.some((t) => t.active);
     this.classList.toggle("movi-has-caption", embedded || external);
   }
 
   /**
    * Toggle nerd stats overlay
    */
-  private toggleNerdStats(shadowRoot: ShadowRoot | null = this.shadowRoot): void {
+  private toggleNerdStats(
+    shadowRoot: ShadowRoot | null = this.shadowRoot,
+  ): void {
     if (!shadowRoot) return;
     const overlay = shadowRoot.querySelector(".movi-nerd-stats") as HTMLElement;
     if (!overlay) return;
@@ -41760,7 +42614,10 @@ export class MoviElement extends HTMLElement {
     if (!body || !overlay) return;
 
     // Recalculate max-height every update (fullscreen/resize)
-    const hostHeight = (this as HTMLElement).offsetHeight || (this as HTMLElement).clientHeight || 400;
+    const hostHeight =
+      (this as HTMLElement).offsetHeight ||
+      (this as HTMLElement).clientHeight ||
+      400;
     const bar = shadowRoot.querySelector(".movi-controls-bar") as HTMLElement;
     const controlsHeight = (bar?.offsetHeight ?? 60) + 8;
     const topGap = hostHeight < 400 ? 4 : 12;
@@ -41780,12 +42637,15 @@ export class MoviElement extends HTMLElement {
       this.networkSpeedHistory.shift();
     }
 
-    const graphLabel = this.player.isFileSource() ? "Disk Activity" : "Network Activity";
-    const speedText = speed > 1048576
-      ? `${(speed / 1048576).toFixed(1)} MB/s`
-      : speed > 0
-        ? `${(speed / 1024).toFixed(0)} KB/s`
-        : "—";
+    const graphLabel = this.player.isFileSource()
+      ? "Disk Activity"
+      : "Network Activity";
+    const speedText =
+      speed > 1048576
+        ? `${(speed / 1048576).toFixed(1)} MB/s`
+        : speed > 0
+          ? `${(speed / 1024).toFixed(0)} KB/s`
+          : "—";
 
     body.innerHTML = renderStatsPanel(stats, {
       label: graphLabel,
@@ -41801,7 +42661,9 @@ export class MoviElement extends HTMLElement {
    */
   private drawNetworkGraph(shadowRoot: ShadowRoot): void {
     const body = shadowRoot.querySelector(".movi-nerd-stats-body");
-    const canvas = body?.querySelector(".movi-nerd-stats-graph") as HTMLCanvasElement;
+    const canvas = body?.querySelector(
+      ".movi-nerd-stats-graph",
+    ) as HTMLCanvasElement;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -41963,7 +42825,10 @@ export class MoviElement extends HTMLElement {
   private previewCaps(): { w: number; h: number } {
     if (this._previewCapsCache) return this._previewCapsCache;
     const w = Math.round(
-      Math.min(300, Math.max(MoviElement.PREVIEW_MAX_W, this.clientWidth * 0.21)),
+      Math.min(
+        300,
+        Math.max(MoviElement.PREVIEW_MAX_W, this.clientWidth * 0.21),
+      ),
     );
     // Keep the box's own proportions, so a portrait source is capped by height
     // in the same ratio it always was…
@@ -42174,7 +43039,9 @@ export class MoviElement extends HTMLElement {
     // the branch below paints. Only a missing board is a reason to stand down.
     if (!sr || !tile) return false;
 
-    const layer = sr.querySelector(".movi-thumbnail-tile") as HTMLElement | null;
+    const layer = sr.querySelector(
+      ".movi-thumbnail-tile",
+    ) as HTMLElement | null;
     if (!layer) return false;
 
     // Not here yet — hold what is on the card and let the crop path answer,
@@ -42240,9 +43107,12 @@ export class MoviElement extends HTMLElement {
     // Hold this mosaic, and the one after it: a scrub crosses a sheet boundary
     // at some point, and the sheet it crosses into is a fetch the pointer
     // should not have to wait through.
-    const sheets = (
-      this.player as unknown as { getStoryboardSheets?: () => string[] } | null
-    )?.getStoryboardSheets?.() ?? [];
+    const sheets =
+      (
+        this.player as unknown as {
+          getStoryboardSheets?: () => string[];
+        } | null
+      )?.getStoryboardSheets?.() ?? [];
     const at = sheets.indexOf(tile.url);
     this.warmSheet(tile.url);
     if (at >= 0) {
@@ -42282,8 +43152,7 @@ export class MoviElement extends HTMLElement {
 
   private updatePreviewBox(): void {
     const track = this.player?.trackManager?.getActiveVideoTrack?.() as
-      | { width?: number; height?: number; rotation?: number }
-      | undefined;
+      { width?: number; height?: number; rotation?: number } | undefined;
     let w = track?.width || this.video?.videoWidth || 0;
     let h = track?.height || this.video?.videoHeight || 0;
     if (w <= 0 || h <= 0) return; // nothing known yet — the 16:9 fallback stands
@@ -42297,7 +43166,8 @@ export class MoviElement extends HTMLElement {
     // empty space above and below. Netting them also gets the case where the
     // viewer rotates a rotated source back to where it started.
     const netRotation =
-      (((track?.rotation ?? 0) + this._currentManualRotation) % 360 + 360) % 360;
+      ((((track?.rotation ?? 0) + this._currentManualRotation) % 360) + 360) %
+      360;
     if (netRotation % 180 !== 0) [w, h] = [h, w];
     const caps = this.previewCaps();
     const scale = Math.min(caps.w / w, caps.h / h);
@@ -42351,14 +43221,16 @@ export class MoviElement extends HTMLElement {
     // matrix is a landscape picture. See updatePreviewBox.
     const videoTrack = this.player?.getVideoTracks()?.[0];
     const storedPortrait = !!videoTrack && videoTrack.height > videoTrack.width;
-    const metaRotated = ((videoTrack?.rotation ?? 0) % 180) !== 0;
+    const metaRotated = (videoTrack?.rotation ?? 0) % 180 !== 0;
     const isPortraitVideo = metaRotated ? !storedPortrait : storedPortrait;
     const is90 = deg % 180 !== 0;
     // After 90° rotation: portrait becomes landscape, landscape becomes portrait
     const resultIsPortrait = is90 ? !isPortraitVideo : isPortraitVideo;
 
     // Seek thumbnail
-    const thumbImg = this.shadowRoot.querySelector(".movi-thumbnail-img") as HTMLImageElement;
+    const thumbImg = this.shadowRoot.querySelector(
+      ".movi-thumbnail-img",
+    ) as HTMLImageElement;
     if (thumbImg) {
       this.applyThumbnailRotation(thumbImg);
     }
@@ -42374,7 +43246,9 @@ export class MoviElement extends HTMLElement {
     }
 
     // Timeline items — apply rotation + margin fix
-    const timelineImgs = this.shadowRoot.querySelectorAll(".movi-timeline-item img") as NodeListOf<HTMLImageElement>;
+    const timelineImgs = this.shadowRoot.querySelectorAll(
+      ".movi-timeline-item img",
+    ) as NodeListOf<HTMLImageElement>;
     timelineImgs.forEach((el) => {
       if (deg === 0) {
         el.style.transform = "none";
@@ -42445,7 +43319,9 @@ export class MoviElement extends HTMLElement {
     const currentTime = this.player ? this.player.getCurrentTime() : 0;
     if (Math.abs(savedTime - currentTime) < 3) return;
 
-    const dialog = shadowRoot.querySelector(".movi-resume-dialog") as HTMLElement;
+    const dialog = shadowRoot.querySelector(
+      ".movi-resume-dialog",
+    ) as HTMLElement;
     if (!dialog) return;
 
     const timeEl = dialog.querySelector(".movi-resume-time");
@@ -42454,7 +43330,9 @@ export class MoviElement extends HTMLElement {
     dialog.style.display = "flex";
 
     // Highlight Resume button for keyboard navigation
-    dialog.querySelectorAll(".movi-resume-btn").forEach(b => b.classList.remove("movi-resume-focused"));
+    dialog
+      .querySelectorAll(".movi-resume-btn")
+      .forEach((b) => b.classList.remove("movi-resume-focused"));
     const yesBtn = dialog.querySelector(".movi-resume-yes") as HTMLElement;
     yesBtn?.classList.add("movi-resume-focused");
 
@@ -42562,7 +43440,11 @@ export class MoviElement extends HTMLElement {
     try {
       const raw = sessionStorage.getItem(key);
       if (!raw) return null;
-      const v = JSON.parse(raw) as { t?: unknown; playing?: unknown; rate?: unknown };
+      const v = JSON.parse(raw) as {
+        t?: unknown;
+        playing?: unknown;
+        rate?: unknown;
+      };
       const t = typeof v.t === "number" ? v.t : NaN;
       if (!(t > 2)) return null;
       const d = this.duration;
@@ -42674,9 +43556,15 @@ export class MoviElement extends HTMLElement {
     this._timelineCancelled = true;
     this._timelineComplete = false;
     this._timelineNextIndex = 0;
-    const strip = this.shadowRoot.querySelector(".movi-timeline-strip") as HTMLElement;
-    const status = this.shadowRoot.querySelector(".movi-timeline-status") as HTMLElement;
-    const panel = this.shadowRoot.querySelector(".movi-timeline-panel") as HTMLElement;
+    const strip = this.shadowRoot.querySelector(
+      ".movi-timeline-strip",
+    ) as HTMLElement;
+    const status = this.shadowRoot.querySelector(
+      ".movi-timeline-status",
+    ) as HTMLElement;
+    const panel = this.shadowRoot.querySelector(
+      ".movi-timeline-panel",
+    ) as HTMLElement;
     if (strip) strip.innerHTML = "";
     if (status) status.textContent = "";
     if (panel) panel.style.display = "none";
@@ -42691,11 +43579,14 @@ export class MoviElement extends HTMLElement {
     if (this._linearMode) return;
     const shadowRoot = this.shadowRoot;
     if (!shadowRoot) return;
-    const panel = shadowRoot.querySelector(".movi-timeline-panel") as HTMLElement;
+    const panel = shadowRoot.querySelector(
+      ".movi-timeline-panel",
+    ) as HTMLElement;
     if (!panel) return;
     // `notimeline`: the T key checked, but the menu row and the chapter pill
     // came straight here. Opening is refused; closing never is.
-    if (panel.style.display === "none" && this.isControlDisabled("timeline")) return;
+    if (panel.style.display === "none" && this.isControlDisabled("timeline"))
+      return;
 
     if (panel.style.display === "none") {
       panel.style.display = "flex";
@@ -42708,8 +43599,12 @@ export class MoviElement extends HTMLElement {
       this.showControls();
       // Auto-generate if strip is empty, previous attempt failed, or generation
       // was paused mid-way (resumes from _timelineNextIndex)
-      const strip = shadowRoot.querySelector(".movi-timeline-strip") as HTMLElement;
-      const status = shadowRoot.querySelector(".movi-timeline-status") as HTMLElement;
+      const strip = shadowRoot.querySelector(
+        ".movi-timeline-strip",
+      ) as HTMLElement;
+      const status = shadowRoot.querySelector(
+        ".movi-timeline-status",
+      ) as HTMLElement;
       const failed = status?.textContent?.includes("Failed");
       if (failed) {
         this._timelineNextIndex = 0;
@@ -42767,9 +43662,15 @@ export class MoviElement extends HTMLElement {
     // is off; turning it on here never triggers seek-bar previews on its own.
     this.player.setPreviewsEnabled(true);
 
-    const strip = shadowRoot.querySelector(".movi-timeline-strip") as HTMLElement;
-    const status = shadowRoot.querySelector(".movi-timeline-status") as HTMLElement;
-    const titleEl = shadowRoot.querySelector(".movi-timeline-title") as HTMLElement;
+    const strip = shadowRoot.querySelector(
+      ".movi-timeline-strip",
+    ) as HTMLElement;
+    const status = shadowRoot.querySelector(
+      ".movi-timeline-status",
+    ) as HTMLElement;
+    const titleEl = shadowRoot.querySelector(
+      ".movi-timeline-title",
+    ) as HTMLElement;
     if (!strip || !status) return;
 
     // Only clear when starting fresh; on resume we keep already-generated items
@@ -42790,7 +43691,9 @@ export class MoviElement extends HTMLElement {
     const metaIs90 = metadataRotation % 180 !== 0;
     // After metadata rotation, is the video portrait?
     const isPortraitAfterMeta = videoTrack
-      ? (metaIs90 ? videoTrack.width > videoTrack.height : videoTrack.height > videoTrack.width)
+      ? metaIs90
+        ? videoTrack.width > videoTrack.height
+        : videoTrack.height > videoTrack.width
       : false;
     const deg = this._currentManualRotation;
     const is90 = deg % 180 !== 0;
@@ -42863,7 +43766,9 @@ export class MoviElement extends HTMLElement {
           // to mark the one the playhead is inside.
           item.dataset.start = String(ch.start);
           item.dataset.end = String(
-            i < chapters.length - 1 ? chapters[i + 1].start : this.player.getDuration(),
+            i < chapters.length - 1
+              ? chapters[i + 1].start
+              : this.player.getDuration(),
           );
 
           if (ch.image || blob) {
@@ -43006,15 +43911,15 @@ export class MoviElement extends HTMLElement {
           status.textContent = `${strip.children.length} / ${count}`;
         }
 
-        status.textContent = strip.children.length > 0
-          ? `${strip.children.length} thumbnails`
-          : "Failed to generate — try again";
+        status.textContent =
+          strip.children.length > 0
+            ? `${strip.children.length} thumbnails`
+            : "Failed to generate — try again";
         if (strip.children.length > 0) this._timelineComplete = true;
       }
     } finally {
       this._timelineGenerating = false;
     }
-
   }
 
   get muted(): boolean {
@@ -43050,8 +43955,13 @@ export class MoviElement extends HTMLElement {
       this.removeAttribute("muted");
     }
     this.updateMuted();
-    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ muted: this._muted });
-    this.dispatchEvent(new CustomEvent("volumechange", { detail: { volume: this._volume, muted: this._muted } }));
+    if (this.legacySettingsEnabled())
+      SettingsStorage.getInstance().save({ muted: this._muted });
+    this.dispatchEvent(
+      new CustomEvent("volumechange", {
+        detail: { volume: this._volume, muted: this._muted },
+      }),
+    );
   }
 
   get playsInline(): boolean {
@@ -43114,10 +44024,17 @@ export class MoviElement extends HTMLElement {
     // ends unmuted-via-slider reloads as muted because OPFS still
     // holds the last muted=true write from whenever the user first
     // muted via M-key or the volume button.
-    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save(
-      autoUnmuted ? { volume: this._volume, muted: false } : { volume: this._volume },
+    if (this.legacySettingsEnabled())
+      SettingsStorage.getInstance().save(
+        autoUnmuted
+          ? { volume: this._volume, muted: false }
+          : { volume: this._volume },
+      );
+    this.dispatchEvent(
+      new CustomEvent("volumechange", {
+        detail: { volume: this._volume, muted: this._muted },
+      }),
     );
-    this.dispatchEvent(new CustomEvent("volumechange", { detail: { volume: this._volume, muted: this._muted } }));
   }
 
   get playbackRate(): number {
@@ -43134,8 +44051,13 @@ export class MoviElement extends HTMLElement {
     this.noteStoredChoice("playbackrate", true, this._playbackRate.toString());
     this.setAttribute("playbackrate", this._playbackRate.toString());
     this.updatePlaybackRate();
-    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ playbackRate: this._playbackRate });
-    this.dispatchEvent(new CustomEvent("ratechange", { detail: { playbackRate: this._playbackRate } }));
+    if (this.legacySettingsEnabled())
+      SettingsStorage.getInstance().save({ playbackRate: this._playbackRate });
+    this.dispatchEvent(
+      new CustomEvent("ratechange", {
+        detail: { playbackRate: this._playbackRate },
+      }),
+    );
     // Keep the OS lock-screen scrubber's speed indicator in sync.
     this.updateMediaSessionPosition();
     // Each new speed gets a fresh stutter warning if it can't keep up.
@@ -43196,6 +44118,8 @@ export class MoviElement extends HTMLElement {
    * SubtitleRenderer.
    */
   setSubtitleRenderer(renderer: SubtitleRenderer | null): void {
+    // An explicit choice, `null` included, outranks the JASSUB host's default.
+    this._subtitleRendererChosen = true;
     if (this._subtitleRenderer === renderer) return;
     const prev = this._subtitleRenderer;
     this._subtitleRenderer = renderer;
@@ -43243,7 +44167,8 @@ export class MoviElement extends HTMLElement {
     // call this itself after the setter, so a host's own toggle (or the
     // property) left an open menu showing the old state.
     this.updateAmbientUI();
-    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ ambientMode: this._ambientMode });
+    if (this.legacySettingsEnabled())
+      SettingsStorage.getInstance().save({ ambientMode: this._ambientMode });
     if (changed) {
       this.emitSettingChange("ambientchange", { enabled: !!this._ambientMode });
     }
@@ -43268,9 +44193,12 @@ export class MoviElement extends HTMLElement {
       this.player.setStableAudio(this._stableVolume);
       this.updateStableAudioUI();
     }
-    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ stableVolume: this._stableVolume });
+    if (this.legacySettingsEnabled())
+      SettingsStorage.getInstance().save({ stableVolume: this._stableVolume });
     if (changed) {
-      this.emitSettingChange("stablevolumechange", { enabled: this._stableVolume });
+      this.emitSettingChange("stablevolumechange", {
+        enabled: this._stableVolume,
+      });
     }
   }
 
@@ -43303,7 +44231,10 @@ export class MoviElement extends HTMLElement {
     // jumping somewhere that was discarded / not yet downloaded.
     value = this.clampToBufferedWindow(value);
     const state = this.player.getState();
-    Logger.info(TAG, `currentTime setter: value=${value.toFixed(2)}, state=${state}, isSeeking=${this.isSeeking}`);
+    Logger.info(
+      TAG,
+      `currentTime setter: value=${value.toFixed(2)}, state=${state}, isSeeking=${this.isSeeking}`,
+    );
     if (
       state !== "ready" &&
       state !== "playing" &&
@@ -43335,7 +44266,10 @@ export class MoviElement extends HTMLElement {
     this.player
       .seek(value)
       .then(() => {
-        Logger.info(TAG, `Seek resolved: value=${value.toFixed(2)}, newState=${this.player?.getState()}`);
+        Logger.info(
+          TAG,
+          `Seek resolved: value=${value.toFixed(2)}, newState=${this.player?.getState()}`,
+        );
       })
       .catch((error) => {
         Logger.error(TAG, `Seek error: value=${value.toFixed(2)}`, error);
@@ -43703,9 +44637,7 @@ export class MoviElement extends HTMLElement {
   /** CORS mode for cross-origin media (mirrors `HTMLMediaElement.crossOrigin`). */
   get crossOrigin(): "anonymous" | "use-credentials" | null {
     return this.getAttribute("crossorigin") as
-      | "anonymous"
-      | "use-credentials"
-      | null;
+      "anonymous" | "use-credentials" | null;
   }
   set crossOrigin(value: "anonymous" | "use-credentials" | null) {
     this._reflectStr("crossorigin", value);
@@ -43738,11 +44670,7 @@ export class MoviElement extends HTMLElement {
   /** Subtitle edge style. */
   get subtitleEdge(): "none" | "shadow" | "outline" | "raised" | null {
     return this.getAttribute("subtitleedge") as
-      | "none"
-      | "shadow"
-      | "outline"
-      | "raised"
-      | null;
+      "none" | "shadow" | "outline" | "raised" | null;
   }
   set subtitleEdge(value: "none" | "shadow" | "outline" | "raised" | null) {
     this._reflectStr("subtitleedge", value);
@@ -43926,7 +44854,8 @@ export class MoviElement extends HTMLElement {
       if (parts.some((p) => !isFinite(p))) return null;
       let seconds = 0;
       if (parts.length === 2) seconds = parts[0] * 60 + parts[1];
-      else if (parts.length === 3) seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+      else if (parts.length === 3)
+        seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
       else return null;
       return Math.max(0, Math.min(duration, seconds));
     }
@@ -43936,7 +44865,6 @@ export class MoviElement extends HTMLElement {
     if (!isFinite(num)) return null;
     return Math.max(0, Math.min(duration, num));
   }
-
 
   get doubletap(): boolean {
     return this._doubleTap;
@@ -44323,7 +45251,9 @@ export class MoviElement extends HTMLElement {
     // A number here is the gap between items — the thing autoadvance was the
     // only way to say. `loop="all 5"`, or just `loop="5"`: asking a loop to
     // space things out can only mean the queue, so the number implies it.
-    const gap = tokens.map((t) => parseFloat(t)).find((n) => Number.isFinite(n));
+    const gap = tokens
+      .map((t) => parseFloat(t))
+      .find((n) => Number.isFinite(n));
     const saysItem = tokens.some(
       (t) => t === "one" || t === "item" || t === "single",
     );
@@ -44771,8 +45701,12 @@ export class MoviElement extends HTMLElement {
     this.classList.toggle("movi-has-playlist", this._playlist.length > 1);
     this.updateShuffleUI();
     const sr = this.shadowRoot;
-    const prev = sr?.querySelector(".movi-prev-btn") as HTMLButtonElement | null;
-    const next = sr?.querySelector(".movi-next-btn") as HTMLButtonElement | null;
+    const prev = sr?.querySelector(
+      ".movi-prev-btn",
+    ) as HTMLButtonElement | null;
+    const next = sr?.querySelector(
+      ".movi-next-btn",
+    ) as HTMLButtonElement | null;
     if (prev) prev.disabled = !this.hasPrevious;
     if (next) next.disabled = !this.hasNext;
     // A tooltip naming the item it was about to play, still open across the
@@ -44826,9 +45760,11 @@ export class MoviElement extends HTMLElement {
   /** Chapters given by the host, kept so a source/player rebuild can re-apply
    *  them — the player instance is recreated on quality switches and recovery,
    *  and a fresh one only knows about the container's own chapters. */
-  private _chapters:
-    | Array<{ title: string; start: number; end?: number }>
-    | null = null;
+  private _chapters: Array<{
+    title: string;
+    start: number;
+    end?: number;
+  }> | null = null;
 
   /**
    * Chapters from outside the media file.
@@ -45012,7 +45948,11 @@ export class MoviElement extends HTMLElement {
 
   private handleBackClick(): void {
     this.dispatchEvent(
-      new CustomEvent("back", { cancelable: true, bubbles: true, composed: true }),
+      new CustomEvent("back", {
+        cancelable: true,
+        bubbles: true,
+        composed: true,
+      }),
     );
   }
 
@@ -45049,7 +45989,8 @@ export class MoviElement extends HTMLElement {
       ".pip-title",
     ) as HTMLElement | null;
     if (!el) return;
-    const text = this._showTitle && this.titleAllowedHere() ? this._title || "" : "";
+    const text =
+      this._showTitle && this.titleAllowedHere() ? this._title || "" : "";
     if (el.textContent !== text) el.textContent = text;
     el.style.display = text ? "" : "none";
   }
@@ -45080,8 +46021,7 @@ export class MoviElement extends HTMLElement {
       // Encrypted mode doesn't set `_src` (URL lives in `videoid`), so
       // allow the block to run there too.
       const haveTitleSource =
-        !!this._src ||
-        (this._encrypted && !!this._videoId);
+        !!this._src || (this._encrypted && !!this._videoId);
       if (haveTitleSource) {
         let filename = "";
 
@@ -45123,7 +46063,10 @@ export class MoviElement extends HTMLElement {
           } else if (typeof srcForTitle === "string") {
             try {
               let srcUrl = new URL(srcForTitle, window.location.href);
-              if (srcUrl.pathname === "/proxy" && srcUrl.searchParams.get("url")) {
+              if (
+                srcUrl.pathname === "/proxy" &&
+                srcUrl.searchParams.get("url")
+              ) {
                 srcUrl = new URL(srcUrl.searchParams.get("url")!);
               }
               const pathname = srcUrl.pathname;
@@ -45141,14 +46084,25 @@ export class MoviElement extends HTMLElement {
         if (filename) {
           filename = filename.replace(/\.[^.\/]+$/, "");
           // If filename is empty or non-descriptive, try parent path segment
-          if (!filename || filename === "index" || filename === "master" || filename === "playlist") {
+          if (
+            !filename ||
+            filename === "index" ||
+            filename === "master" ||
+            filename === "playlist"
+          ) {
             try {
               const url = new URL(this._src as string, window.location.href);
-              const segments = url.pathname.split("/").filter(s => s && !s.includes("."));
+              const segments = url.pathname
+                .split("/")
+                .filter((s) => s && !s.includes("."));
               if (segments.length > 0) {
-                filename = decodeURIComponent(segments[segments.length - 1]).replace(/[-_]/g, " ");
+                filename = decodeURIComponent(
+                  segments[segments.length - 1],
+                ).replace(/[-_]/g, " ");
               }
-            } catch { /* ignore */ }
+            } catch {
+              /* ignore */
+            }
           }
           if (filename) {
             this._title = this.cleanVideoTitle(filename);
@@ -45156,7 +46110,9 @@ export class MoviElement extends HTMLElement {
         }
         this._titleAutoLoaded = true;
         if (this._title) {
-          this.dispatchEvent(new CustomEvent("titlechange", { detail: { title: this._title } }));
+          this.dispatchEvent(
+            new CustomEvent("titlechange", { detail: { title: this._title } }),
+          );
           // Re-check resume now that title is available (resume key depends on _title)
           // Only when the title is what the key is made of. A host that named
           // the key had its position looked up at the ordinary time, and this
@@ -45247,7 +46203,8 @@ export class MoviElement extends HTMLElement {
     // the host setting it late) needs a repaint to appear there.
     if (this._title !== this._coverTitlePainted) {
       this._coverTitlePainted = this._title;
-      if (this.classList.contains("movi-audio-mode")) this.updateCoverArtOverlay();
+      if (this.classList.contains("movi-audio-mode"))
+        this.updateCoverArtOverlay();
     }
   }
   private _coverTitlePainted: string | null = null;
@@ -45290,17 +46247,25 @@ export class MoviElement extends HTMLElement {
 
     // Remove common release group / site suffixes (e.g., "-4kHdHub Com", "-YIFY", "-HDHub4u Ms")
     // Only strip if the part after dash looks like a release group (contains digits, dots, or known groups)
-    title = title.replace(/\s*-\s*(?:\w*\d\w*[\w ]*|YIFY|RARBG|YTS|ETRG|SPARKS|GECKOS|EVO|FGT|CMRG|NTb|SiGMA|FLUX|ION10|PECULATE|PSA|QxR|TiGOLE|MeGusta|PAHE|HDHub\w*)\s*$/i, "");
+    title = title.replace(
+      /\s*-\s*(?:\w*\d\w*[\w ]*|YIFY|RARBG|YTS|ETRG|SPARKS|GECKOS|EVO|FGT|CMRG|NTb|SiGMA|FLUX|ION10|PECULATE|PSA|QxR|TiGOLE|MeGusta|PAHE|HDHub\w*)\s*$/i,
+      "",
+    );
 
     // Truncate at quality/codec markers
-    const cutPatterns = /\b(2160p|1080p|720p|480p|4K|UHD|HD|HQ|WEB[ -]?DL|WEB[ -]?Rip|BluRay|BDRip|BRRip|HDRip|DVDRip|HDTV|AMZN|NF|DSNP|HMAX|ATVP|PCOK|PMTP|MA |DDP?\d|AAC|AC3|FLAC|Atmos|TrueHD|DTS|HEVC|H[ .]?26[45]|x26[45]|AV1|VP9|HDR|HDR10|DV|DoVi|Dolby|REMUX|PROPER|REPACK|iNTERNAL|EXTENDED|UNRATED|DC |10bit|8bit)\b/i;
+    const cutPatterns =
+      /\b(2160p|1080p|720p|480p|4K|UHD|HD|HQ|WEB[ -]?DL|WEB[ -]?Rip|BluRay|BDRip|BRRip|HDRip|DVDRip|HDTV|AMZN|NF|DSNP|HMAX|ATVP|PCOK|PMTP|MA |DDP?\d|AAC|AC3|FLAC|Atmos|TrueHD|DTS|HEVC|H[ .]?26[45]|x26[45]|AV1|VP9|HDR|HDR10|DV|DoVi|Dolby|REMUX|PROPER|REPACK|iNTERNAL|EXTENDED|UNRATED|DC |10bit|8bit)\b/i;
     const match = title.match(cutPatterns);
     if (match && match.index && match.index > 5) {
       title = title.substring(0, match.index);
     }
 
     // Clean up orphan trailing brackets, hyphens, and extra spaces
-    title = title.replace(/\s*[\(\[]\s*$/, "").replace(/\s*[-–—]\s*$/, "").replace(/\s+/g, " ").trim();
+    title = title
+      .replace(/\s*[\(\[]\s*$/, "")
+      .replace(/\s*[-–—]\s*$/, "")
+      .replace(/\s+/g, " ")
+      .trim();
 
     // Convert any remaining internal hyphens into spaces. Done AFTER the
     // release-group strip above (which keys off `-` as the separator
@@ -45310,13 +46275,19 @@ export class MoviElement extends HTMLElement {
     // (`Sintel.2010.1080p.mkv` → "Sintel 2010") that picker-dropped
     // files produce. Normalising both styles keeps the overlay
     // consistent regardless of how the source was named.
-    title = title.replace(/[-–—]+/g, " ").replace(/\s+/g, " ").trim();
+    title = title
+      .replace(/[-–—]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
     // Title-case words that arrived all-lowercase (e.g. URL filenames
     // are usually `sintel`, not `Sintel`). Mixed-case tokens like
     // `iPhone` or `MoviePlayer` are intentional capitalisation — the
     // `\b[a-z]+\b` guard skips them. Numbers and ALLCAPS stay as-is.
-    title = title.replace(/\b[a-z]+\b/g, (w) => w.charAt(0).toUpperCase() + w.slice(1));
+    title = title.replace(
+      /\b[a-z]+\b/g,
+      (w) => w.charAt(0).toUpperCase() + w.slice(1),
+    );
 
     return title || filename;
   }
@@ -45445,7 +46416,8 @@ export class MoviElement extends HTMLElement {
   }
 
   set rotate(deg: number) {
-    const snapped = (Math.round(((((deg || 0) % 360) + 360) % 360) / 90) * 90) % 360;
+    const snapped =
+      (Math.round(((((deg || 0) % 360) + 360) % 360) / 90) * 90) % 360;
     const changed = snapped !== this._rotate;
     if (snapped) this.setAttribute("rotate", String(snapped));
     else this.removeAttribute("rotate");
@@ -45486,7 +46458,8 @@ export class MoviElement extends HTMLElement {
     // attribute — and `persist`, which listens to the attribute, never heard
     // the choice. Written here as well; the attribute path writes the same.
     if (this._persistNames().has("hdr")) this._prefWrite("hdr", v ? "1" : "0");
-    if (this.legacySettingsEnabled()) SettingsStorage.getInstance().save({ hdr: this._hdr });
+    if (this.legacySettingsEnabled())
+      SettingsStorage.getInstance().save({ hdr: this._hdr });
     this.emitSettingChange("hdrchange", { enabled: this._hdr });
   }
 
@@ -45532,7 +46505,7 @@ export class MoviElement extends HTMLElement {
       hdrMenuItem?.classList.remove("movi-context-menu-active");
       if (hdrStatus) hdrStatus.textContent = "Off";
     }
-      // Keep an open panel / context menu in step - see the method's note.
+    // Keep an open panel / context menu in step - see the method's note.
     this.refreshOpenSettingsSurfaces();
   }
 
@@ -45569,7 +46542,10 @@ export class MoviElement extends HTMLElement {
               if (ctx) {
                 ctx.drawImage(frame, 0, 0);
                 dataUrl = c.toDataURL("image/png");
-                Logger.info(TAG, "Snapshot: WebGL readback was blank, used decoded VideoFrame");
+                Logger.info(
+                  TAG,
+                  "Snapshot: WebGL readback was blank, used decoded VideoFrame",
+                );
               }
             } catch (e) {
               Logger.warn(TAG, "VideoFrame snapshot fallback failed", e);
@@ -45827,7 +46803,8 @@ export class MoviElement extends HTMLElement {
     // to. Sweeping the portal costs one query and cannot miss.
     const subs = new Set<Element>(this._portaledSubs);
     for (const sub of Array.from(
-      this._menuPortalRoot?.querySelectorAll(MoviElement.SUBMENU_SELECTOR) || [],
+      this._menuPortalRoot?.querySelectorAll(MoviElement.SUBMENU_SELECTOR) ||
+        [],
     )) {
       subs.add(sub);
     }
@@ -45863,7 +46840,8 @@ export class MoviElement extends HTMLElement {
     let dy = 0;
     if (r.right > window.innerWidth - m) dx = window.innerWidth - m - r.right;
     if (r.left + dx < m) dx = m - r.left;
-    if (r.bottom > window.innerHeight - m) dy = window.innerHeight - m - r.bottom;
+    if (r.bottom > window.innerHeight - m)
+      dy = window.innerHeight - m - r.bottom;
     if (r.top + dy < m) dy = m - r.top;
     if (dx) menu.style.left = `${curLeft + dx}px`;
     if (dy) menu.style.top = `${curTop + dy}px`;

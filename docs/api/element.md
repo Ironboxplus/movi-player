@@ -1483,6 +1483,24 @@ Shifts subtitle timing relative to video, in seconds. Sign matches VLC and mpv: 
 
 ---
 
+#### `subtitlefallbackfont`
+
+The font ASS/SSA subtitles fall back to when no font they name is embedded in the file or installed — give it a font that covers your viewers' scripts, or Chinese, Japanese and Korean text renders as boxes.
+
+```html
+<movi-player
+  src="video.mkv"
+  subtitlefallbackfont="Source Han Sans CN|/static/fonts/SourceHanSansCN-Bold.woff2"
+  controls
+></movi-player>
+```
+
+The value is `Family Name|url`. The font is fetched only when a subtitle needs it, never at load. Without the attribute, JASSUB's own default font is used.
+
+ASS/SSA rendering itself is enabled by the host with `MoviElement.setJassubHost()` (see [ASS subtitles and embedded fonts](#ass-subtitles-and-embedded-fonts)); this attribute does nothing without it.
+
+---
+
 #### `subtitlesize` / `subtitlecolor` / `subtitlebg` / `subtitleedge`
 
 Customize subtitle rendering. All four are also exposed in the in-player customize panel under the subtitle menu and persist to localStorage when changed there.
@@ -4213,3 +4231,25 @@ observer.observe(player);
 ---
 
 **Last Updated:** June 10, 2026
+
+## ASS subtitles and embedded fonts
+
+ASS/SSA — embedded tracks and external `.ass` files declared with `<track data-format="ass">` — is drawn by libass through [JASSUB](https://github.com/ThaUnknown/jassub), which movi drives but does not bundle: its library, worker and two WebAssembly builds are assets that have to go through your bundler. Hand them over once, before the first player is created:
+
+```js
+import JASSUB from "jassub";
+import workerUrl from "jassub/dist/worker/worker.js?worker&url";
+import wasmUrl from "jassub/dist/wasm/jassub-worker.wasm?url";
+import modernWasmUrl from "jassub/dist/wasm/jassub-worker-modern.wasm?url";
+
+customElements.get("movi-player").setJassubHost({
+  load: async () => JASSUB,
+  workerUrl,
+  wasmUrl,
+  modernWasmUrl,
+});
+```
+
+Without a host, ASS tracks are shown by the built-in text path (override tags dropped, no styling) as before. SRT, VTT and the other plain-text formats never go through libass.
+
+**Fonts follow mpv and libass.** A script's style `Fontname` (and any `\fn`) is looked up among the fonts attached to the file — in Matroska, the attachments with a font MIME type, or a `.ttf/.ttc/.otf/.otc` name when the muxer got the type wrong — by family name, before the fallback font is used. The attachments are not downloaded to find out what they are: opening a file does not read them at all, each font's `name` table is read with two small ranged requests, and only the fonts a script uses are fetched in full. A font named later by a `\fn` is fetched when the event that names it arrives. Fonts in an ASS file's own `[Fonts]` section are libass's to handle.

@@ -43,7 +43,7 @@ export type {
   PlaybackQuery,
   DecodeAudioOptions,
   DecodedAudioChunk,
-} from './types';
+} from "./types";
 
 // Utilities
 export {
@@ -51,84 +51,96 @@ export {
   playerFor,
   type UpgradeOptions,
   type UpgradedVideo,
-} from './upgrade';
-export { Logger, LogLevel } from './utils/Logger';
-export { Time, TIME_BASE } from './utils/Time';
+} from "./upgrade";
+export { Logger, LogLevel } from "./utils/Logger";
+export { Time, TIME_BASE } from "./utils/Time";
 
 // Events
-export { EventEmitter } from './events/EventEmitter';
+export { EventEmitter } from "./events/EventEmitter";
 
 // WASM bindings (singleton pattern)
-export { WasmBindings, ThumbnailBindings, type DataSource } from './wasm/bindings';
-export { loadWasmModule, loadWasmModuleNew, getWasmModule, isWasmModuleLoaded } from './wasm/FFmpegLoader';
-export type { MoviWasmModule, StreamInfo, PacketInfo } from './wasm/types';
+export {
+  WasmBindings,
+  ThumbnailBindings,
+  type DataSource,
+} from "./wasm/bindings";
+export {
+  loadWasmModule,
+  loadWasmModuleNew,
+  getWasmModule,
+  isWasmModuleLoaded,
+} from "./wasm/FFmpegLoader";
+export type { MoviWasmModule, StreamInfo, PacketInfo } from "./wasm/types";
 
 // Source adapters
-export type { SourceAdapter } from './source/SourceAdapter';
-export { HttpSource, createHttpSource } from './source/HttpSource';
-export { FileSource, createFileSource } from './source/FileSource';
-export { ThumbnailHttpSource, createThumbnailHttpSource } from './source/ThumbnailHttpSource';
-export { EncryptedHttpSource } from './source/EncryptedHttpSource';
-export type { EncryptedSourceConfig } from './source/EncryptedHttpSource';
+export type { SourceAdapter } from "./source/SourceAdapter";
+export { HttpSource, createHttpSource } from "./source/HttpSource";
+export { FileSource, createFileSource } from "./source/FileSource";
+export {
+  ThumbnailHttpSource,
+  createThumbnailHttpSource,
+} from "./source/ThumbnailHttpSource";
+export { EncryptedHttpSource } from "./source/EncryptedHttpSource";
+export type { EncryptedSourceConfig } from "./source/EncryptedHttpSource";
 export {
   registerSourceAdapter,
   unregisterSourceAdapter,
   getRegisteredSchemes,
-} from './source/adapterRegistry';
+} from "./source/adapterRegistry";
 export type {
   SourceAdapterFactory,
   SourceAdapterFactoryConfig,
-} from './source/adapterRegistry';
-export { generateFingerprint } from './utils/Fingerprint';
+} from "./source/adapterRegistry";
+export { generateFingerprint } from "./utils/Fingerprint";
 
 // Cache
-export { LRUCache } from './cache/LRUCache';
+export { LRUCache } from "./cache/LRUCache";
 
 // Demuxer
-export { Demuxer } from './demux/Demuxer';
+export { Demuxer } from "./demux/Demuxer";
 
 // Decoders
-export { MoviVideoDecoder } from './decode/VideoDecoder';
-export { MoviAudioDecoder } from './decode/AudioDecoder';
-export { SubtitleDecoder } from './decode/SubtitleDecoder';
+export { MoviVideoDecoder } from "./decode/VideoDecoder";
+export { MoviAudioDecoder } from "./decode/AudioDecoder";
+export { SubtitleDecoder } from "./decode/SubtitleDecoder";
 
 // Renderers
-export { CanvasRenderer } from './render/CanvasRenderer';
-export { AudioRenderer } from './render/AudioRenderer';
+export { CanvasRenderer } from "./render/CanvasRenderer";
+export { AudioRenderer } from "./render/AudioRenderer";
 
 // Core components
-export { TrackManager } from './core/TrackManager';
-export { Clock } from './core/Clock';
-export { PlayerStateManager } from './core/PlayerState';
-export { PlaybackController } from './core/PlaybackController';
+export { TrackManager } from "./core/TrackManager";
+export { Clock } from "./core/Clock";
+export { PlayerStateManager } from "./core/PlayerState";
+export { PlaybackController } from "./core/PlaybackController";
 
 // Player
-export { MoviPlayer } from './core/MoviPlayer';
+export { MoviPlayer } from "./core/MoviPlayer";
 
 // Main export: MoviElement (custom HTML element)
-export { MoviElement } from './render/MoviElement';
+export { MoviElement } from "./render/MoviElement";
 // Host-supplied bar buttons / context-menu rows — see MoviElement.addControl.
-export type { MoviControlSpec, MoviControlItem, MoviDividerSpec } from './render/MoviElement';
+export type {
+  MoviControlSpec,
+  MoviControlItem,
+  MoviDividerSpec,
+} from "./render/MoviElement";
 // One entry in the queue — see MoviElement.playlist.
-export type { MoviPlaylistItem } from './render/MoviElement';
-import type { MoviElement as MoviElementType } from './render/MoviElement';
+export type { MoviPlaylistItem } from "./render/MoviElement";
+import type { MoviElement as MoviElementType } from "./render/MoviElement";
 
 // Package version, baked in at build time. `import { VERSION } from
 // "movi-player/element"`, or read MoviElement.version / element.version.
-export { VERSION } from './version';
+export { VERSION } from "./version";
 
 // Which bundle this is — "slim" (separate movi.wasm) or "full" (embedded).
 // Separate from VERSION, which is identical across both. Also readable as
 // MoviElement.build / element.build.
-export { BUILD } from './build-flags';
+export { BUILD } from "./build-flags";
 
 // QoE analytics — versioned event stream + pluggable sinks.
-export {
-  QoECollector,
-  beaconSink,
-  QOE_SCHEMA_VERSION,
-} from './utils/QoE';
-export type { QoEEvent, QoESink, QoESession } from './utils/QoE';
+export { QoECollector, beaconSink, QOE_SCHEMA_VERSION } from "./utils/QoE";
+export type { QoEEvent, QoESink, QoESession } from "./utils/QoE";
 
 /**
  * The documented `<movi-player>` attribute surface. Kept as a flat string/
@@ -336,6 +348,8 @@ export interface MoviPlayerAttributes {
   subtitlebg?: number | string;
   /** Subtitle edge style. */
   subtitleedge?: "none" | "shadow" | "outline" | "raised";
+  /** Font for ASS/SSA text no embedded font covers: `Family Name|font-url`. */
+  subtitlefallbackfont?: string;
 
   /** CSS selector for an external element to receive the ambient glow. */
   ambientwrapper?: string;

@@ -117,8 +117,8 @@ export interface SourceConfig {
 export interface AudioSourceEntry {
   url: string;
   type?: string;
-  lang: string;       // BCP 47 language code (e.g., "en", "hi", "ja")
-  label: string;      // Display name (e.g., "English", "Hindi")
+  lang: string; // BCP 47 language code (e.g., "en", "hi", "ja")
+  label: string; // Display name (e.g., "English", "Hindi")
   /**
    * Pre-built adapter for this track (e.g. an HLS audio rendition presented as
    * a concatenated segment stream). Opened directly instead of `url` when set;
@@ -130,9 +130,9 @@ export interface AudioSourceEntry {
 /** External subtitle source (VTT/SRT) with language metadata */
 export interface SubtitleSourceEntry {
   url: string;
-  lang: string;       // BCP 47 language code
-  label: string;      // Display name
-  format?: "vtt" | "srt" | "ttml"; // Auto-detected from URL extension if omitted
+  lang: string; // BCP 47 language code
+  label: string; // Display name
+  format?: "vtt" | "srt" | "ttml" | "ass"; // Auto-detected from URL extension if omitted
 }
 
 export interface CacheConfig {
@@ -221,7 +221,7 @@ export interface PlayerConfig {
 export interface Chapter {
   title: string;
   start: number; // seconds
-  end: number;   // seconds
+  end: number; // seconds
   /**
    * Optional artwork for the chapter, supplied by the host alongside the list.
    * Where it is set the timeline tile shows it instead of decoding a frame at
@@ -348,7 +348,8 @@ export interface VideoDecoderConfig {
     matrix?: VideoMatrixCoefficients | null;
     fullRange?: boolean | null;
   };
-  hardwareAcceleration?: "no-preference" | "prefer-hardware" | "prefer-software";
+  hardwareAcceleration?:
+    "no-preference" | "prefer-hardware" | "prefer-software";
 }
 
 export interface AudioDecoderConfig {
@@ -420,6 +421,24 @@ export interface SubtitleRenderer {
     videoWidth: number,
     videoHeight: number,
   ): Promise<void> | void;
+  /** Optional: whether this renderer takes the given embedded track. When it is
+   *  present and says no, the track stays with the built-in decoder, so a
+   *  renderer that only does ASS does not swallow the SRT tracks of the same
+   *  file. Absent means "every track". */
+  accepts?(track: SubtitleTrack): boolean;
+  /** Optional: where the fonts attached to the open file can be fetched from,
+   *  by family name (null when the source changes). Called before `configure`. */
+  setFontSource?(
+    source: {
+      fontsFor(names: readonly string[]): Promise<Uint8Array[]>;
+    } | null,
+  ): void;
+  /** Optional: show a whole external script (an .ass file the host declared).
+   *  Without it, an external ASS file goes through the plain-text path. */
+  loadExternal?(content: string, fonts?: Uint8Array[]): Promise<void> | void;
+  /** Optional: what this renderer was showing is no longer its — a different
+   *  track, or none. Stop drawing it. */
+  release?(): void;
   /** Optional: receive the player's subtitle overlay element (absolutely
    *  positioned over the visible video) to append a canvas/DOM into. */
   mount?(container: HTMLElement): void;
