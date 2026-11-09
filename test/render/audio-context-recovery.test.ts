@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AvSim, halfFrame, VSYNC_MS, type SimOptions } from "../helpers/av-sim";
 
+vi.mock("../../dist/wasm/movi.js", () => ({ default: vi.fn(async () => ({})) }));
+
 /**
  * AudioContext recovery after the audio device fails.
  *
