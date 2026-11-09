@@ -45,6 +45,20 @@ import { setWasmUrl } from "../wasm/FFmpegLoader";
 import { probeLinkBandwidth } from "../utils/bandwidthProbe";
 import { childAbort } from "../utils/abort";
 import {
+  activeIdentity,
+  autoQualityAllowed,
+  buildSubtitleMenu,
+  chooseOpeningSource,
+  hiddenExternalLangs,
+  identityOfExternal,
+  isHlsSource,
+  qualityMenuMode,
+  resolveIdentity,
+  type ExternalSubtitle,
+  type InbandSlot,
+  type InbandTrack,
+} from "./SourceSelection";
+import {
   linkSeedBps,
   loadPersistedLinkBps,
   persistLinkBps,
@@ -1097,7 +1111,17 @@ export class MoviElement extends HTMLElement {
   // persisting host's remembered quality.
   private _qualityHighWater: number = 0;
   private _audioTracks: { src: string; type?: string; lang: string; label: string }[] = []; // Multi-language audio
-  private _subtitleTracks: { src: string; lang: string; label: string; format?: string }[] = []; // External subtitles
+  // External subtitles. `inbandTitle` / `inbandOrder` (from `data-inband-*` on
+  // the <track>) say the file is the extracted twin of an in-band track of
+  // another source — see SourceSelection.ts.
+  private _subtitleTracks: {
+    src: string;
+    lang: string;
+    label: string;
+    format?: string;
+    inbandTitle?: string;
+    inbandOrder?: number;
+  }[] = [];
   private _autoplay: boolean = false;
   // True from the moment an autoplay attempt is kicked off until playback
   // actually reaches "playing" or the browser blocks it. While set, the
@@ -6975,7 +6999,7 @@ export class MoviElement extends HTMLElement {
           if (this.isControlDisabled("cc")) break;
           e.preventDefault();
           if (this.player) {
-            const extSubs = this.player.getSubtitleLangs();
+            const extSubs = this._visibleSubtitleLangs();
             const muxedSubs = this.player.getSubtitleTracks();
             const subOsdOn = OSD.subOn;
             const subOsdOff = OSD.subOff;
@@ -8422,7 +8446,7 @@ export class MoviElement extends HTMLElement {
     const subtitleTracks = this.player.getSubtitleTracks();
     const activeSubtitleTrack =
       this.player.trackManager.getActiveSubtitleTrack();
-    const ctxExternalSubs = this.player.getSubtitleLangs();
+    const ctxExternalSubs = this._visibleSubtitleLangs();
     const ctxAnyExternalSubActive = ctxExternalSubs.some((t) => t.active);
     const subtitleDivider = contextMenu.querySelector(
       ".movi-context-menu-divider-subtitle",
@@ -9934,31 +9958,24 @@ export class MoviElement extends HTMLElement {
 
     if (!qualityList || !qualityBtn || !qualityContainer) return;
 
-    // Only show the quality menu for adaptive streams (HLS .m3u8 / DASH .mpd).
-    // Local files or single-file URLs should not show quality selection.
-    const isAdaptive =
-      typeof this._src === "string" &&
-      (this._src.toLowerCase().includes(".m3u8") ||
-        this._src.toLowerCase().includes(".mpd"));
-
-    // DASH force-demux mode: the .mpd is playing through the demuxer, so the
-    // adaptive getVideoTracks() only has the one decoded track. Offer the
-    // manifest's Representations instead — picking one re-loads at that quality.
     const dashRenditions =
       (this.player as any)?.getDashRenditions?.() as
         | { url: string; label: string; id: string }[]
         | undefined;
-    // Only for the demuxer fallback (adaptive .m3u8/.mpd src). The premuxed
-    // path also populates the player's renditions (for the ABR) but keeps its
-    // own menu below, so gate this on isAdaptive to avoid stealing it.
-    if (isAdaptive && dashRenditions && dashRenditions.length > 1) {
-      this.renderDashQualityMenu(qualityList, qualityContainer, dashRenditions);
-      return;
-    }
+    // A declared <source> list is the menu, whatever is playing: it used to
+    // vanish the moment the current source was HLS, which left no way back to
+    // an entry that was not (see qualityMenuMode). Without a list, the quality
+    // menu is only for adaptive streams (HLS .m3u8 / DASH .mpd); local files
+    // and single-file URLs get no quality selection.
+    const mode = qualityMenuMode({
+      currentSrc: this._src,
+      ladder: this._videoQualities,
+      dashRenditionCount: dashRenditions?.length ?? 0,
+    });
 
     // Pre-muxed multi-quality path: build a virtual track list from the
     // declarative <source> tags so the picker works without an adaptive stream.
-    if (!isAdaptive && this._videoQualities.length > 1) {
+    if (mode === "sources") {
       this.renderPremuxedQualityMenu(
         qualityList,
         qualityContainer,
@@ -9966,7 +9983,15 @@ export class MoviElement extends HTMLElement {
       return;
     }
 
-    if (!isAdaptive) {
+    // DASH force-demux mode: the .mpd is playing through the demuxer, so the
+    // adaptive getVideoTracks() only has the one decoded track. Offer the
+    // manifest's Representations instead — picking one re-loads at that quality.
+    if (mode === "dash" && dashRenditions) {
+      this.renderDashQualityMenu(qualityList, qualityContainer, dashRenditions);
+      return;
+    }
+
+    if (mode === "none") {
       qualityContainer.style.display = "none";
       return;
     }
@@ -10179,6 +10204,14 @@ export class MoviElement extends HTMLElement {
    *  rebuild (localStorage), so once the user picks Auto it stays Auto on the
    *  next video instead of falling back to a fixed height. */
   private _readQualityAutoPref(): boolean {
+    // A list with an HLS entry is not a ladder Auto can walk (see
+    // autoQualityAllowed); the stored preference is left alone, not cleared.
+    if (
+      this._videoQualities.length > 1 &&
+      !autoQualityAllowed(this._videoQualities)
+    ) {
+      return false;
+    }
     try {
       return localStorage.getItem("movi:quality-auto") === "1";
     } catch {
@@ -10537,6 +10570,13 @@ export class MoviElement extends HTMLElement {
           el.getAttribute("label") || el.getAttribute("srclang") || "Subtitle",
         format:
           (el.getAttribute("data-format") as "vtt" | "srt" | undefined) || "vtt",
+        inbandTitle: el.getAttribute("data-inband-title") || undefined,
+        inbandOrder: (() => {
+          const raw = el.getAttribute("data-inband-order");
+          return raw !== null && /^\d+$/.test(raw.trim())
+            ? parseInt(raw, 10)
+            : undefined;
+        })(),
       }))
       .filter((t) => t.src);
     if (replace || parsed.length > 0) this._subtitleTracks = parsed;
@@ -10676,12 +10716,10 @@ export class MoviElement extends HTMLElement {
 
           // Prefer explicit data-default, otherwise pickSource heuristic
           const defaultSource = videoSources.find((s) => s.isDefault);
-          if (defaultSource) {
-            this._src = defaultSource.src;
-          } else {
-            const picked = this.pickSource(videoSources);
-            this._src = picked ? picked.src : videoSources[0].src;
-          }
+          const fallbackSrc = defaultSource
+            ? defaultSource.src
+            : (this.pickSource(videoSources)?.src ?? videoSources[0].src);
+          this._src = fallbackSrc;
           this._childSourceIndex = this._childSourceUrls.indexOf(this._src);
 
           // Under Auto, ALWAYS open on the SMALLEST rung, not the consumer's
@@ -10701,14 +10739,27 @@ export class MoviElement extends HTMLElement {
           // bursts seen in the logs), not the link's, so it over-measures just
           // as badly. Starting low + measuring sustained playback is the only
           // reading that's honest on every link.
-          if (this._videoQualities.length > 1 && this._readQualityAutoPref()) {
-            const smallest = [...this._videoQualities].sort(
-              (a, b) =>
-                (a.bandwidth || this._estimateBitrate(a.height)) -
-                (b.bandwidth || this._estimateBitrate(b.height)),
-            )[0];
-            if (smallest) this._src = smallest.src;
-          }
+          //
+          // Not for a list with an HLS entry: there the smallest entry is the
+          // 360P transcode, and the host's data-default (the original file)
+          // is the answer. _readQualityAutoPref already says no for it, and
+          // chooseOpeningSource keeps that decision in one tested place.
+          const smallest =
+            this._videoQualities.length > 1
+              ? [...this._videoQualities].sort(
+                  (a, b) =>
+                    (a.bandwidth || this._estimateBitrate(a.height)) -
+                    (b.bandwidth || this._estimateBitrate(b.height)),
+                )[0]
+              : undefined;
+          this._src = chooseOpeningSource({
+            ladder: this._videoQualities,
+            declaredDefault: defaultSource?.src,
+            fallback: fallbackSrc,
+            autoPref: this._readQualityAutoPref(),
+            smallest: smallest?.src,
+          });
+          this._childSourceIndex = this._childSourceUrls.indexOf(this._src);
         }
 
         // Multi-language audio: when more than one <source kind="audio"> is
@@ -10843,10 +10894,7 @@ export class MoviElement extends HTMLElement {
     // A REPEAT failure is different: whatever is wrong survived a clean
     // restart, so take the lowest rung, whose small file is the likeliest to
     // load on a link that keeps failing.
-    const active =
-      ((this.player as { getActiveDashRendition?: () => string } | null)
-        ?.getActiveDashRendition?.() as string) ||
-      (typeof this._src === "string" ? this._src : "");
+    const active = this._activeRungSrc();
     const keepRung =
       this._fullRecreates === 1 &&
       !!active &&
@@ -10900,10 +10948,7 @@ export class MoviElement extends HTMLElement {
     if (this.hasAttribute("src")) this.removeAttribute("src");
     // Which rung is on screen right now — remembered before _parseChildSources
     // resets the ladder, so the restore below knows what to climb back to.
-    const rungBefore =
-      ((this.player as { getActiveDashRendition?: () => string } | null)
-        ?.getActiveDashRendition?.() as string) ||
-      (typeof this._src === "string" ? this._src : "");
+    const rungBefore = this._activeRungSrc();
     this._src = null;
     this._suppressSwReload = true;
     this._parseChildSources();
@@ -10976,10 +11021,89 @@ export class MoviElement extends HTMLElement {
   private _carrySubtitleTrackId: number | null = null;
   private _carryAudioLang: string | null = null;
 
+  // In-band subtitle lists of non-HLS sources that have been open, so a source
+  // with no in-band tracks (an HLS transcode) can still show which ones exist
+  // only in the original. Keyed by `resumekey` when the host gave one (a
+  // signed URL changes, the media does not) and by URL otherwise.
+  private _inbandMemory = new Map<string, InbandSlot[]>();
+  // The logical subtitle showing when a source switch began — an in-band
+  // index or an external file, not a menu label (see SourceSelection.ts).
+  private _carrySubtitleIdentity: string | null = null;
+
+  private _noteInband(inband: readonly InbandTrack[]): void {
+    const own = this._activeRungSrc();
+    if (inband.length === 0 || isHlsSource(own)) return;
+    const slots = inband.map((t, order) => ({ order, title: t.title }));
+    if (own) this._inbandMemory.set(`src:${own}`, slots);
+    if (this._resumeKey) this._inbandMemory.set(`key:${this._resumeKey}`, slots);
+  }
+
+  private _rememberedInband(): InbandSlot[] | undefined {
+    if (this._resumeKey) {
+      const byKey = this._inbandMemory.get(`key:${this._resumeKey}`);
+      if (byKey) return byKey;
+    }
+    for (const q of this._videoQualities) {
+      if (isHlsSource(q.src)) continue;
+      const bySrc = this._inbandMemory.get(`src:${q.src}`);
+      if (bySrc) return bySrc;
+    }
+    return undefined;
+  }
+
+  /** What the viewer calls the source the greyed subtitles live in. */
+  private _originalSourceLabel(): string {
+    return (
+      this._videoQualities.find((q) => !isHlsSource(q.src))?.label ||
+      "the original"
+    );
+  }
+
+  /** Everything buildSubtitleMenu needs, read from the player and from the
+   *  declared <track>s (the player does not carry the alias attributes). */
+  private _subtitleMenuInput(note = false) {
+    const p = this.player;
+    const inband: InbandTrack[] = (p?.getSubtitleTracks() ?? []).map((t) => ({
+      id: t.id,
+      title: t.label || `Subtitle ${t.id}`,
+    }));
+    const external: ExternalSubtitle[] = (p?.getSubtitleLangs() ?? []).map((t) => {
+      const meta = this._subtitleTracks.find((m) => m.lang === t.lang);
+      return {
+        ...t,
+        inbandTitle: meta?.inbandTitle,
+        inbandOrder: meta?.inbandOrder,
+      };
+    });
+    // Only the menu may record: it runs against the source that is really
+    // open, whereas a rebuild captures while `_src` already names the next one.
+    if (note) this._noteInband(inband);
+    return {
+      inband,
+      external,
+      remembered: this._rememberedInband(),
+      activeMuxedId: p?.trackManager.getActiveSubtitleTrack()?.id ?? null,
+    };
+  }
+
+  /** External subtitle tracks the viewer may be offered: all of them, minus
+   *  the extracted twins of in-band tracks the open source has itself. */
+  private _visibleSubtitleLangs() {
+    const all = this.player?.getSubtitleLangs() ?? [];
+    const input = this._subtitleMenuInput();
+    const hidden = hiddenExternalLangs(input);
+    return hidden.size ? all.filter((t) => !hidden.has(t.lang)) : all;
+  }
+
   /** Snapshot the active subtitle/audio choices before a player rebuild. */
   private _captureTrackSelection(): void {
     const p = this.player as any;
     if (!p) return;
+    try {
+      this._carrySubtitleIdentity = activeIdentity(this._subtitleMenuInput());
+    } catch {
+      this._carrySubtitleIdentity = null;
+    }
     try {
       this._carrySubtitleLang =
         (p.getSubtitleLangs?.() as { lang: string; active: boolean }[] | undefined)
@@ -11005,16 +11129,31 @@ export class MoviElement extends HTMLElement {
     const subLang = this._carrySubtitleLang;
     const subId = this._carrySubtitleTrackId;
     const audioLang = this._carryAudioLang;
+    const subIdentity = this._carrySubtitleIdentity;
     this._carrySubtitleLang = null;
     this._carrySubtitleTrackId = null;
     this._carryAudioLang = null;
+    this._carrySubtitleIdentity = null;
     try {
       if (audioLang && p.getAudioLangs?.()?.some((t: any) => t.lang === audioLang)) {
         void p.selectAudioLang?.(audioLang);
       }
-      if (subLang && p.getSubtitleLangs?.()?.some((t: any) => t.lang === subLang)) {
-        void p.selectSubtitleLang?.(subLang);
-      } else if (subId !== null) {
+      // The logical subtitle first: it lands on the in-band track when this
+      // source has it and on the extracted file when it does not, which a
+      // language or a track id of the OLD source cannot say. A bare language
+      // (a <track default>) goes through the same door, so it cannot select
+      // the hidden twin of an in-band track the source has itself.
+      const input = this._subtitleMenuInput();
+      const wanted =
+        subIdentity ?? (subLang ? identityOfExternal(input, subLang) : null);
+      const target = wanted
+        ? resolveIdentity(buildSubtitleMenu(input), wanted)
+        : null;
+      if (target?.kind === "external") {
+        void p.selectSubtitleLang?.(target.lang);
+      } else if (target?.kind === "muxed") {
+        void p.selectSubtitleTrack?.(target.id)?.catch?.(() => {});
+      } else if (!wanted && subId !== null) {
         void p.selectSubtitleTrack?.(subId)?.catch?.(() => {});
       }
     } catch {
@@ -11909,10 +12048,11 @@ export class MoviElement extends HTMLElement {
     // is unchanged (no reload), so the player tracks it via its active-rendition
     // url; on the first render that's "" and we fall back to the element's chosen
     // (default) src.
-    const activeSrc = this.effectiveQualityKey(
-      (player?.getActiveDashRendition?.() as string) ||
-        (typeof this._src === "string" ? this._src : ""),
-    );
+    const activeSrc = this.effectiveQualityKey(this._activeRungSrc());
+    // A list with an HLS entry has no Auto and no in-place swaps (see
+    // autoQualityAllowed), so nothing below may touch the player's ABR or the
+    // stored Auto preference on its behalf.
+    const mixedList = !autoQualityAllowed(this._videoQualities);
 
     // Feed the qualities (with bitrate) to the player's ABR so "Auto" can size
     // and switch them; needs 2+ with a (real or estimated) bitrate. Pass the
@@ -11923,6 +12063,7 @@ export class MoviElement extends HTMLElement {
     // throughput to size them by and doesn't implement setDashRenditions. Its
     // menu therefore lists the fixed rungs only, with no dead "Auto" row.
     const abrCapable =
+      !mixedList &&
       this._videoQualities.filter((q) => (q.bandwidth || 0) > 0).length >= 2 &&
       typeof player?.setDashRenditions === "function";
     if (abrCapable) {
@@ -11955,7 +12096,7 @@ export class MoviElement extends HTMLElement {
         player?.setAutoQuality?.(true);
       }
     }
-    const isAuto = !!player?.isAutoQuality?.();
+    const isAuto = !mixedList && !!player?.isAutoQuality?.();
 
     const activeQuality = this._videoQualities.find((q) => q.src === activeSrc);
     this._updateQualityBtnBadge(
@@ -12020,9 +12161,13 @@ export class MoviElement extends HTMLElement {
           closeMenu();
           return;
         }
-        // A specific pick leaves Auto.
-        player?.setAutoQuality?.(false);
-        this._writeQualityAutoPref(false);
+        // A specific pick leaves Auto — except in a list that never had it,
+        // where writing "off" would clobber the viewer's preference for the
+        // ladders that do.
+        if (!mixedList) {
+          player?.setAutoQuality?.(false);
+          this._writeQualityAutoPref(false);
+        }
         // Confirm it like every other setting does - from inside the panel the
         // list closes immediately, so the toast is the only feedback.
         const picked = this._videoQualities.find((q) => q.src === newSrc);
@@ -12181,6 +12326,24 @@ export class MoviElement extends HTMLElement {
    * bails — a rung that could not be prepared must not stay ticked.
    */
   private _pendingQualityKey: string | null = null;
+
+  /**
+   * The `<source>` entry that is on screen.
+   *
+   * Usually the player's active rendition, which an in-place swap moves without
+   * touching `src`. But for an HLS source routed through the demuxer the player
+   * reports the variant playlist it picked, which is no entry of the list, and
+   * a list with an HLS entry never swaps in place — so there `src` is the
+   * answer.
+   */
+  private _activeRungSrc(): string {
+    const own = typeof this._src === "string" ? this._src : "";
+    if (!autoQualityAllowed(this._videoQualities)) return own;
+    return (
+      ((this.player as { getActiveDashRendition?: () => string } | null)
+        ?.getActiveDashRendition?.() as string) || own
+    );
+  }
 
   /** Read by every quality renderer instead of the player's active rendition,
    *  so the chosen rung is the one shown from the moment it is chosen. */
@@ -12355,7 +12518,13 @@ export class MoviElement extends HTMLElement {
     // Setups like movi-tube (a video-only file per quality + a separate audio
     // file) hit this fast path.
     const p = this.player as any;
-    if (p && typeof p.switchVideoRenditionInPlace === "function") {
+    // An HLS source on either side of the swap cannot be exchanged in place —
+    // the in-place path re-opens a byte-range file against the running clock —
+    // so those go straight to the reload, which keeps position, paused state
+    // and (via _captureTrackSelection) the viewer's subtitle choice.
+    const crossesHls =
+      isHlsSource(newSrc) || isHlsSource(this._activeRungSrc());
+    if (!crossesHls && p && typeof p.switchVideoRenditionInPlace === "function") {
       this._suppressSwReload = true;
       p.switchVideoRenditionInPlace(newSrc)
         .then((ok: boolean) => {
@@ -14539,13 +14708,17 @@ export class MoviElement extends HTMLElement {
 
     const subtitleTracks = this.player.getSubtitleTracks();
     const activeTrack = this.player.trackManager.getActiveSubtitleTrack();
-    const externalSubs = this.player.getSubtitleLangs();
-    const hasExternalSubs = externalSubs.length > 0;
+    // One logical list, whichever source is playing: in-band tracks, the
+    // extracted twins of the ones this source lacks, and files of its own.
+    const menuInput = this._subtitleMenuInput(true);
+    const entries = buildSubtitleMenu(menuInput);
+    // Whether anything is showing counts the hidden twins too.
+    const anyExternalActive = menuInput.external.some((t) => t.active);
 
     // Hide container if no subtitle tracks (muxed or external). Not when the
     // picker is on: a file the viewer is about to add is exactly the case
     // where the menu is empty, and hiding the button hides the way to add it.
-    if (subtitleTracks.length === 0 && !hasExternalSubs && !this._subtitlePicker) {
+    if (entries.length === 0 && !this._subtitlePicker) {
       subtitleTrackContainer.style.display = "none";
       return;
     }
@@ -14601,7 +14774,6 @@ export class MoviElement extends HTMLElement {
       return;
     }
 
-    const anyExternalActive = externalSubs.some((t) => t.active);
     const offActive = activeTrack === null && !anyExternalActive;
 
     // Toggle icons based on active state
@@ -14635,36 +14807,46 @@ export class MoviElement extends HTMLElement {
       </div>
     `;
 
-    // Add muxed subtitle tracks
-    menuHTML += subtitleTracks
-      .map((track) => {
-        const isActive = activeTrack?.id === track.id;
-        const label = track.label || `Subtitle ${track.id}`;
-        const badge = this.formatSubtitleBadge(track);
-
-        return `
-        <div class="movi-subtitle-track-item ${isActive ? "movi-subtitle-track-active" : ""}"
-             data-track-id="${track.id}">
+    // The rest of the list, in the order buildSubtitleMenu decided.
+    const originalLabel = this._originalSourceLabel();
+    menuHTML += entries
+      .map((e) => {
+        if (e.kind === "muxed") {
+          const track = subtitleTracks.find((t) => t.id === e.id);
+          const badge = track ? this.formatSubtitleBadge(track) : "";
+          return `
+        <div class="movi-subtitle-track-item ${e.active ? "movi-subtitle-track-active" : ""}"
+             data-track-id="${e.id}">
           ${ICON}
-          <span class="movi-subtitle-track-label">${label}</span>
+          <span class="movi-subtitle-track-label">${e.label}</span>
           ${badge ? `<span class="movi-subtitle-track-info">${badge}</span>` : ""}
           ${CHECK}
         </div>
       `;
-      })
-      .join("");
-
-    // Add external subtitle tracks
-    menuHTML += externalSubs
-      .map((t) => `
-        <div class="movi-subtitle-track-item ${t.active ? "movi-subtitle-track-active" : ""}"
-             data-subtitle-lang="${t.lang}">
+        }
+        if (e.kind === "original-only") {
+          return `
+        <div class="movi-subtitle-track-item movi-subtitle-track-disabled"
+             data-original-only="1" aria-disabled="true">
           ${ICON}
-          <span class="movi-subtitle-track-label">${t.label}</span>
-          ${t.pending ? MoviElement.SUBTITLE_PENDING : `<span class="movi-subtitle-track-info">${t.lang.toUpperCase()}</span>`}
+          <span class="movi-subtitle-track-label">${MoviElement.escapeSettingsText(e.label)}</span>
+          <span class="movi-subtitle-track-info">${MoviElement.escapeSettingsText(originalLabel)}</span>
+        </div>
+      `;
+        }
+        // The extracted twin of an in-band track is named for that track and
+        // has no language of its own worth printing.
+        const twin = e.identity.startsWith("inband:");
+        return `
+        <div class="movi-subtitle-track-item ${e.active ? "movi-subtitle-track-active" : ""}"
+             data-subtitle-lang="${e.lang}">
+          ${ICON}
+          <span class="movi-subtitle-track-label">${twin ? MoviElement.escapeSettingsText(e.label) : e.label}</span>
+          ${e.pending ? MoviElement.SUBTITLE_PENDING : twin ? "" : `<span class="movi-subtitle-track-info">${e.lang.toUpperCase()}</span>`}
           ${CHECK}
         </div>
-      `)
+      `;
+      })
       .join("");
 
     // "Add subtitle…" — last, under the tracks it will join.
@@ -14685,7 +14867,7 @@ export class MoviElement extends HTMLElement {
       ".movi-subtitle-track-footer",
     ) as HTMLElement | null;
     if (subtitleFooter) {
-      const count = subtitleTracks.length + externalSubs.length;
+      const count = entries.length;
       subtitleFooter.textContent =
         count === 0
           ? "SRT, VTT or TTML"
@@ -14704,6 +14886,12 @@ export class MoviElement extends HTMLElement {
           // track — it opens the file dialog and nothing else.
           if ((item as HTMLElement).dataset.subtitlePick) {
             this.openSubtitleFilePicker();
+            return;
+          }
+          // Present so the viewer knows it exists; nothing in the source
+          // that is playing can show it.
+          if ((item as HTMLElement).dataset.originalOnly) {
+            this.showOSD(OSD.subOff, `Only in ${originalLabel} — switch source to use it`);
             return;
           }
           const trackIdStr = (item as HTMLElement).dataset.trackId;
@@ -21215,6 +21403,16 @@ export class MoviElement extends HTMLElement {
       .movi-audio-track-item:hover,
       .movi-subtitle-track-item:hover {
         background: color-mix(in srgb, var(--movi-primary) 0.12, transparent);
+      }
+
+      /* A subtitle only the original source carries, listed while another
+         source plays so the viewer can see it exists. */
+      .movi-subtitle-track-item.movi-subtitle-track-disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .movi-subtitle-track-item.movi-subtitle-track-disabled:hover {
+        background: none;
       }
 
       .movi-audio-track-item.movi-audio-track-active,
@@ -32629,6 +32827,7 @@ export class MoviElement extends HTMLElement {
       if (
         (this._carrySubtitleLang !== null ||
           this._carrySubtitleTrackId !== null ||
+          this._carrySubtitleIdentity !== null ||
           this._carryAudioLang !== null) &&
         (state === "ready" || state === "paused" || state === "playing")
       ) {
@@ -39482,9 +39681,9 @@ export class MoviElement extends HTMLElement {
             this.player.selectSubtitleLang(null);
             this._subsRestored = true;
           } else {
-            const byLang = this.player
-              .getSubtitleLangs?.()
-              ?.find((t) => MoviElement.langMatches(t.lang, wantSubs, loose));
+            const byLang = this._visibleSubtitleLangs().find((t) =>
+              MoviElement.langMatches(t.lang, wantSubs, loose),
+            );
             if (byLang) {
               this.player.selectSubtitleLang(byLang.lang);
               this._subsRestored = true;

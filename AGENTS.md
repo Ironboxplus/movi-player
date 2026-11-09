@@ -241,6 +241,17 @@ Dispatched on the `<movi-player>` element. Names follow `HTMLMediaElement` conve
 
 Children of `<movi-player>` render as fallback while loading or if JS fails. Useful for SSR-friendly placeholders (the existing `index.html` uses a shimmer div).
 
+### 4.5 A source list that mixes originals and HLS, and subtitle aliases
+
+The decisions live in [src/render/SourceSelection.ts](src/render/SourceSelection.ts) (pure, tested in `test/render/source-selection.test.ts`); `MoviElement` only wires them.
+
+- **The `<source>` menu does not depend on what is playing.** With more than one `<source>` the quality menu is that list, also while an HLS entry plays (it used to vanish, leaving no way back). Switching to or from an HLS entry always takes the reload path (position, paused state and subtitle choice carry over), never the in-place swap.
+- **A list with an HLS entry has no Auto** and opens on `data-default`, not on the smallest entry. The stored Auto preference is left untouched.
+- **`<track data-inband-title data-inband-order>`** marks a subtitle file as the extracted twin of an in-band track of another source (an HLS transcode has no in-band subtitles). Open source has that track (index, then title must agree): the `<track>` is not offered, the in-band track is. Open source has none: the `<track>` is offered under the in-band track's name. Disagreement means it is treated as a plain external file — a duplicate is a smaller mistake than the wrong subtitle.
+- The in-band list of a non-HLS source is remembered (by `resumekey`, else URL); while an HLS entry plays, in-band tracks with no twin are listed greyed out.
+- A source switch carries the subtitle by logical identity (`inband:<index>` or `ext:<lang>`), not by menu text.
+- External subtitles are VTT/SRT/TTML only. ASS/SSA and PGS/SUP render only as in-band tracks (`SubtitleDecoder`); an external ASS/SUP file needs host-side rendering.
+
 ---
 
 ## 5. The programmatic core — `MoviPlayer`
