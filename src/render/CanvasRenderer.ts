@@ -4013,6 +4013,16 @@ export class CanvasRenderer {
   }
 
   /**
+   * Re-match the cues against the clock and repaint. The presentation loop
+   * does this every frame; a surface without that loop (a stream engine's
+   * element) calls it on its own tick, or a cue that has run out stays up.
+   */
+  refreshSubtitles(): void {
+    this.updateActiveSubtitle();
+    this.renderSubtitles();
+  }
+
+  /**
    * Set subtitle delay in seconds (VLC/mpv convention).
    * Positive value: subtitles appear later than their original timing.
    * Negative value: subtitles appear earlier.

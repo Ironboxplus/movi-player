@@ -13680,6 +13680,8 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
           sink.setSubtitleCues([]);
         }
       }
+      // No presentation loop behind a stream engine to expire the cue.
+      if (this.streamWrapper) sink.refreshSubtitles();
     }, 100); // 10Hz check — enough for subtitle timing
   }
 
