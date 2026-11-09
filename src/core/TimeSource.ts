@@ -125,3 +125,23 @@ export class PlaybackTimeSource {
  * not glitch a sound that is fine.
  */
 export const VIDEO_UNDERFLOW_THRESHOLD_MS = 3000;
+
+/**
+ * The time source of a surface that plays through a <video>/<audio> element
+ * (the stream engines): the element's own playhead is the clock, and there is
+ * no audio side of ours to be driven by. Lets that surface's CanvasRenderer
+ * time subtitle cues it is handed.
+ */
+export class MediaElementTimeSource extends PlaybackTimeSource {
+  constructor(private readonly element: HTMLMediaElement) {
+    super();
+  }
+
+  override now(): number {
+    return this.element.currentTime;
+  }
+
+  override isAudioDriven(): boolean {
+    return false;
+  }
+}

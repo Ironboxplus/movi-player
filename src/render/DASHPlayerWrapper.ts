@@ -11,6 +11,7 @@ import {
   SubtitleTrack,
 } from "../types";
 import { CanvasRenderer } from "./CanvasRenderer";
+import { MediaElementTimeSource } from "../core/TimeSource";
 import { TrackManager } from "../core/TrackManager";
 import { Logger } from "../utils/Logger";
 import { sanitizeVttHtml } from "./sanitizeVttHtml";
@@ -73,6 +74,9 @@ export class DASHPlayerWrapper extends EventEmitter<PlayerEventMap> {
     // access DRM-protected frames (browser blocks VideoFrame copy).
     if (!config.drm && config.renderer === "canvas" && config.canvas) {
       this.canvasRenderer = new CanvasRenderer(config.canvas);
+      this.canvasRenderer.setTimeSource(
+        new MediaElementTimeSource(this.videoElement),
+      );
       this.createTextContainer();
     }
 

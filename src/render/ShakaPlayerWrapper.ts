@@ -10,6 +10,7 @@ import {
   SubtitleTrack,
 } from "../types";
 import { CanvasRenderer } from "./CanvasRenderer";
+import { MediaElementTimeSource } from "../core/TimeSource";
 import { TrackManager } from "../core/TrackManager";
 import { Logger } from "../utils/Logger";
 import { loadPersistedLinkBps, raiseLinkBps } from "../utils/LinkRate";
@@ -92,6 +93,9 @@ export class ShakaPlayerWrapper extends EventEmitter<PlayerEventMap> {
     // (via attachCanvas), so our rVFC→CanvasRenderer path stays out of the way.
     if (!config.drm && !config.lcevc && config.renderer === "canvas" && config.canvas) {
       this.canvasRenderer = new CanvasRenderer(config.canvas);
+      this.canvasRenderer.setTimeSource(
+        new MediaElementTimeSource(this.videoElement),
+      );
     }
 
     this.setupEventHandlers();
