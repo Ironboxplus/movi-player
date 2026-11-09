@@ -42,8 +42,7 @@ ASS
 # film still has cues ahead of it. (The player reads the packets of a track
 # only once it is picked, so a single 30 s cue read before that would be gone.)
 for t in $(seq 0 29); do
-  printf 'Dialogue: 0,0:00:%02d.00,0:00:%02d.00,Default,,0,0,0,,iiiiiiiiii
-' "$t" "$((t + 1))" >> sub.ass
+  printf 'Dialogue: 0,0:00:%02d.00,0:00:%02d.00,Default,,0,0,0,,iiiiiiiiii\n' "$t" "$((t + 1))" >> sub.ass
 done
 
 ATTACH=()
