@@ -9041,15 +9041,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
   private dispatchSubtitlePacket(packet: Packet): void {
     // Check for subtitle track
     const activeSubtitle = this.trackManager.getActiveSubtitleTrack();
-    if (
-      activeSubtitle &&
-      activeSubtitle.id === packet.streamIndex &&
-      this._customRendererFor(activeSubtitle)
-    ) {
+    const custom =
+      activeSubtitle && activeSubtitle.id === packet.streamIndex
+        ? this._customRendererFor(activeSubtitle)
+        : null;
+    if (custom) {
       // A host renderer (e.g. jassub/libass) owns this track — hand it the
       // raw packet and skip the internal decoder entirely.
       try {
-        void this._customSubtitleRenderer.pushPacket(packet);
+        void custom.pushPacket(packet);
       } catch (e) {
         Logger.error(TAG, "Custom subtitle renderer pushPacket failed", e);
       }
