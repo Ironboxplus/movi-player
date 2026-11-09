@@ -16,10 +16,13 @@
 //      about twice as wide as when the same script is drawn in the fallback
 //      (DejaVu Sans), which is what plain.mkv, with no attachments, shows.
 //
-// The HTTP log can only say what was REQUESTED, and the player's first range is
-// 4 MB (FIRST_RANGE_CHUNK_SIZE in HttpSource). That is why the file is padded:
-// with 11 MB of bodies, 4 MB is a minority of them, and the two fonts that
-// matter sit past the 4 MB mark where only a deliberate read can touch them.
+// What is counted is the player's own reads of the file (its source's read()
+// calls, the same ones the demuxer and the font catalog make), not HTTP
+// requests: HttpSource streams the file, so a request for "4 MB onwards" says
+// nothing about which of those bytes anything looked at (the first run of this
+// scenario showed three requests covering the whole file). The file is padded
+// so that a demuxer that does read the bodies is unmistakable: 11 MB of them
+// against a 512 KB read buffer.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { chromium } from "@playwright/test";
@@ -108,13 +111,12 @@ all.push(sans, mono);
 const total = all.reduce((n, b) => n + b.size, 0);
 console.log("attachment bodies:", JSON.stringify(all.map((b) => [b.file, b.offset, b.size])));
 
-// Bytes of one body that requests in log[from..to) asked for.
-const requested = (a, b, body) => {
+// Bytes of one body that the reads in reads[a..b) covered.
+const covered = (reads, a, b, body) => {
   let n = 0;
-  for (const r of server.log.slice(a, b)) {
-    if (r.path !== "/media/fonts.mkv") continue;
-    const lo = Math.max(r.start, body.offset);
-    const hi = Math.min(r.end + 1, body.offset + body.size);
+  for (const [offset, length] of reads.slice(a, b)) {
+    const lo = Math.max(offset, body.offset);
+    const hi = Math.min(offset + length, body.offset + body.size);
     if (hi > lo) n += hi - lo;
   }
   return n;
@@ -154,16 +156,53 @@ async function play(file) {
   const page = await context.newPage();
   page.on("console", (m) => consoleLog.push(`[${file}] [${m.type()}] ${m.text()}`));
   page.on("pageerror", (e) => consoleLog.push(`[${file}] [pageerror] ${e.message}`));
+  page.on("response", (r) => {
+    if (r.status() >= 400) consoleLog.push(`[${file}] [http ${r.status()}] ${r.url()}`);
+  });
+  page.on("worker", (w) => {
+    consoleLog.push(`[${file}] [worker] ${w.url()}`);
+    w.on("console", (m) => consoleLog.push(`[${file}] [worker ${m.type()}] ${m.text()}`));
+  });
   await page.goto(`${server.url}/page.html`);
   await waitFor(
     () => page.evaluate(() => window.__hostReady === true),
     30_000,
     "the page to load the player and JASSUB",
   );
-  const t0 = server.log.length;
   await page.evaluate(
     ({ file, fallback }) => {
       const el = document.createElement("movi-player");
+      // Count what the player reads of the file. The player and its source are
+      // made after this point, so catch them as they are assigned.
+      window.__reads = [];
+      let player = null;
+      Object.defineProperty(el, "player", {
+        configurable: true,
+        get: () => player,
+        set(p) {
+          player = p;
+          if (!p) return;
+          let source = p.source;
+          const wrap = (s) => {
+            if (!s || s.__counted) return;
+            const read = s.read.bind(s);
+            s.read = (offset, length) => {
+              window.__reads.push([offset, length]);
+              return read(offset, length);
+            };
+            s.__counted = true;
+          };
+          wrap(source);
+          Object.defineProperty(p, "source", {
+            configurable: true,
+            get: () => source,
+            set(s) {
+              source = s;
+              wrap(s);
+            },
+          });
+        },
+      });
       el.setAttribute("autoplay", "");
       el.setAttribute("muted", "");
       el.setAttribute("subtitlefallbackfont", fallback);
@@ -183,41 +222,61 @@ async function play(file) {
     `${file} to open with its subtitle track`,
   );
   await sleep(2000);
-  const opened = server.log.length;
+  const opened = await page.evaluate(() => window.__reads.length);
   await page.evaluate(async () => {
     const p = document.querySelector("movi-player").player;
     await p.selectSubtitleTrack(p.getSubtitleTracks()[0].id);
   });
-  await waitFor(async () => (await ink(page)).count > 50, 60_000, "the cue to be drawn");
+  try {
+    await waitFor(async () => (await ink(page)).count > 50, 60_000, "the cue to be drawn");
+  } catch (e) {
+    const state = await page.evaluate(() => {
+      const p = document.querySelector("movi-player").player;
+      return {
+        tracks: p.getSubtitleTracks().map((t) => [t.id, t.codec, t.label]),
+        active: p.trackManager.getActiveSubtitleTrack()?.id ?? null,
+        renderer: !!p._customSubtitleRenderer,
+        time: p.getCurrentTime(),
+        shadowCanvases: [...document.querySelector("movi-player").shadowRoot.querySelectorAll("canvas")].map((c) => c.getAttribute("part")),
+      };
+    });
+    console.log("cue not drawn; player state:", JSON.stringify(state));
+    await page.screenshot({ path: resolve(outDir, `${file}-undrawn.png`) }).catch(() => {});
+    throw e;
+  }
   await sleep(1500);
   const seen = await ink(page);
-  const done = server.log.length;
+  const done = await page.evaluate(() => window.__reads.length);
+  const reads = await page.evaluate(() => window.__reads);
   await page.screenshot({ path: resolve(outDir, `${file}.png`) }).catch(() => {});
   await context.close();
-  return { t0, opened, done, ink: seen };
+  return { reads, opened, done, ink: seen };
 }
 
 try {
   const real = await play("fonts.mkv");
   console.log("fonts.mkv ink:", JSON.stringify(real.ink));
 
-  const touchedOnOpen = all.reduce((n, b) => n + requested(real.t0, real.opened, b), 0);
-  const monoOnOpen = requested(real.t0, real.opened, mono);
-  const sansOnOpen = requested(real.t0, real.opened, sans);
+  const cov = (a, b, body) => covered(real.reads, a, b, body);
+  const touchedOnOpen = all.reduce((n, b) => n + cov(0, real.opened, b), 0);
+  const monoOnOpen = cov(0, real.opened, mono);
+  const sansOnOpen = cov(0, real.opened, sans);
   note(
-    "a. opening the file asks for a minority of the attachment bodies",
-    touchedOnOpen < total * 0.5 && monoOnOpen < mono.size * 0.1 && sansOnOpen < sans.size * 0.1,
-    `asked for ${touchedOnOpen} of ${total} bytes of bodies (the player's first range is 4 MB); Mono ${monoOnOpen}/${mono.size}, Sans ${sansOnOpen}/${sans.size}`,
+    "a. opening the file does not read the attachment bodies",
+    // The first buffer (512 KB) runs into the first body before anything can be
+    // skipped; every other body is read in full by an unpatched demuxer.
+    touchedOnOpen < total * 0.1 && monoOnOpen < mono.size * 0.1 && sansOnOpen < sans.size * 0.1,
+    `read ${touchedOnOpen} of ${total} bytes of bodies; Mono ${monoOnOpen}/${mono.size}, Sans ${sansOnOpen}/${sans.size}`,
   );
 
-  const monoLater = requested(real.opened, real.done, mono);
+  const monoLater = cov(real.opened, real.done, mono);
   note(
     "b1. selecting the ASS track downloads the Mono font the style names",
     monoLater + monoOnOpen >= mono.size,
     `Mono ${monoLater + monoOnOpen}/${mono.size} bytes`,
   );
   const others = all.filter((b) => b !== mono);
-  const rows = others.map((b) => [b.file, requested(real.opened, real.done, b), b.size]);
+  const rows = others.map((b) => [b.file, cov(real.opened, real.done, b), b.size]);
   const worst = rows.reduce((w, r) => (r[1] / r[2] > w[1] / w[2] ? r : w), rows[0]);
   note(
     "b2. no other attachment is downloaded, only probed (under a quarter of any body)",
