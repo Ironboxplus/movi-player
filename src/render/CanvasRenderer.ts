@@ -3121,7 +3121,7 @@ export class CanvasRenderer {
     const source = this.timeSource;
     // A stream engine's element plays on its own; there is no presentation
     // loop here whose last frame could stand in for the time.
-    if (source?.isElementPlayhead()) return source.now();
+    if (source?.isElementPlayhead?.()) return source.now();
     // No picture at all: the sound IS the clock, and the captions follow it.
     if (!this.isVideoConfigured || this.subtitleClockTimer !== null) {
       return source ? source.now() : -1;
