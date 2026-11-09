@@ -69,6 +69,15 @@ const activeBindings = new Set<WasmBindings>();
 // ArrayBuffer value must not be resizable" on a view of one. Copying into a
 // fresh, fixed-size buffer sidesteps it. Single helper so every heap-string read
 // gets the fix (newer Emscripten toolchains hit this; issue #11).
+export interface AttachmentInfo {
+  streamIndex: number;
+  filename: string;
+  mimeType: string;
+  /** Byte offset of the body in the source, or -1 when it was read at open. */
+  offset: number;
+  size: number;
+}
+
 export function decodeUtf8(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes.slice());
 }
@@ -819,6 +828,47 @@ export class WasmBindings {
       }
     }
     return null;
+  }
+
+  /**
+   * The container's file attachments (Matroska fonts, mostly) and where each
+   * body sits in the file. The bodies are NOT read at open: an attachment of
+   * 50+ MB used to be pulled in ahead of the first frame. `offset` is the
+   * body's byte position in the source (-1 when the demuxer had to read it
+   * anyway, which only happens on non-seekable input), `size` its length.
+   * Empty on a WASM that predates the export.
+   */
+  getAttachments(): AttachmentInfo[] {
+    if (!this.contextPtr || !this.module._movi_get_attachment_info) return [];
+    const out: AttachmentInfo[] = [];
+    const BUF = 1024;
+    const bufferPtr = this.module._malloc(BUF);
+    try {
+      const count = this.getStreamCount();
+      for (let i = 0; i < count; i++) {
+        const n = this.module._movi_get_attachment_info(
+          this.contextPtr,
+          i,
+          bufferPtr,
+          BUF,
+        );
+        if (n < 0) continue;
+        const [filename, mimeType, offset, size] = decodeUtf8(
+          this.module.HEAPU8.slice(bufferPtr, bufferPtr + n),
+        ).split("
+");
+        out.push({
+          streamIndex: i,
+          filename: filename ?? "",
+          mimeType: mimeType ?? "",
+          offset: Number(offset),
+          size: Number(size),
+        });
+      }
+    } finally {
+      this.module._free(bufferPtr);
+    }
+    return out;
   }
 
   /**

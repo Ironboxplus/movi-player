@@ -58,6 +58,13 @@ export interface MoviWasmModule {
     buffer: number,
     bufferSize: number,
   ) => number;
+  /** Absent on a WASM built before attachments became on-demand. */
+  _movi_get_attachment_info?: (
+    ctx: number,
+    streamIndex: number,
+    buffer: number,
+    bufferSize: number,
+  ) => number;
   _movi_get_attached_pic_data: (
     ctx: number,
     streamIndex: number,

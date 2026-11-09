@@ -25,6 +25,7 @@ import {
   type MoviWasmModule,
   type StreamInfo,
   type DataSource,
+  type AttachmentInfo,
 } from "../wasm";
 import { CodecParser } from "../decode/CodecParser";
 import { Logger } from "../utils/Logger";
@@ -691,6 +692,15 @@ export class Demuxer {
    */
   getExtradata(trackId: number): Uint8Array | null {
     return this.bindings?.getExtradata(trackId) ?? null;
+  }
+
+  /**
+   * File attachments of the container (fonts, mostly) and where their bodies
+   * are; see WasmBindings.getAttachments. The bytes are read from the source on
+   * demand, not at open.
+   */
+  getAttachments(): AttachmentInfo[] {
+    return this.bindings?.getAttachments() ?? [];
   }
 
   /**
