@@ -2727,6 +2727,7 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
     // Initialize components
     this.audioDecoder = new MoviAudioDecoder();
     this.audioRenderer = new AudioRenderer();
+    this.audioRenderer.setOnContextRecovered(() => this.onAudioContextRecovered());
     this.subtitleDecoder = new SubtitleDecoder();
 
     // Initialize video renderer with canvas (WebCodecs)
@@ -7292,6 +7293,26 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
         bindings.setStreamDiscard(t.id, t.id !== activeAudioId);
       }
     }
+  }
+
+  /**
+   * The audio device failed or was taken away and the sound is back (see
+   * AudioRenderer.setupContextStateMonitoring). The renderer has dropped what
+   * the dead context held; the picture carried on against the wall clock, so
+   * the sound has to be rebuilt at the playhead. A seek to the playhead is the
+   * existing way to do that (it flushes both pipelines and restarts both
+   * decoders there, the same thing the desync net below does), and the
+   * cooldown it shares keeps that net from firing a second one on top.
+   *
+   * Only while playing: paused, buffering or seeking already have their own
+   * restart at the playhead.
+   */
+  private onAudioContextRecovered(): void {
+    if (this.disableAudio || this.stateManager.getState() !== "playing") return;
+    const at = this.clock.getTime();
+    Logger.warn(TAG, `Audio device recovered, restarting sound at ${at.toFixed(2)}s`);
+    this._lastDesyncSeekTime = performance.now();
+    this.seek(at).catch(() => {});
   }
 
   /**
