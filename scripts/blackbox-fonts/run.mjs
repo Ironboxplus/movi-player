@@ -156,7 +156,7 @@ async function play(file) {
   const page = await context.newPage();
   page.on("console", (m) => consoleLog.push(`[${file}] [${m.type()}] ${m.text()}`));
   page.on("pageerror", (e) => consoleLog.push(`[${file}] [pageerror] ${e.message}`));
-  page.on("response", (r) => {
+  context.on("response", (r) => {
     if (r.status() >= 400) consoleLog.push(`[${file}] [http ${r.status()}] ${r.url()}`);
   });
   page.on("worker", (w) => {
@@ -237,7 +237,19 @@ async function play(file) {
         active: p.trackManager.getActiveSubtitleTrack()?.id ?? null,
         renderer: !!p._customSubtitleRenderer,
         time: p.getCurrentTime(),
-        shadowCanvases: [...document.querySelector("movi-player").shadowRoot.querySelectorAll("canvas")].map((c) => c.getAttribute("part")),
+        canvases: [...document.querySelector("movi-player").shadowRoot.querySelectorAll("canvas")].map((c) => [c.getAttribute("part"), c.width, c.height, c.clientWidth, c.clientHeight]),
+        jassub: (() => {
+          const r = p._customSubtitleRenderer;
+          return {
+            active: r?.active,
+            destroyed: r?.destroyed,
+            instance: !!r?.instance,
+            creating: !!r?.creating,
+            asked: r?.asked ? [...r.asked] : null,
+            fontSource: !!r?.fontSource,
+            timeOffset: r?.instance?.timeOffset,
+          };
+        })(),
       };
     });
     console.log("cue not drawn; player state:", JSON.stringify(state));
