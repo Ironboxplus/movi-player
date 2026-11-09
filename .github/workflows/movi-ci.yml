@@ -72,7 +72,7 @@ jobs:
           path: |
             dist/ffmpeg
             dist/dav1d
-          key: wasm-libs-${{ steps.emsdk.outputs.digest }}-${{ hashFiles('docker/Dockerfile', 'docker/build-ffmpeg.sh') }}
+          key: wasm-libs-${{ steps.emsdk.outputs.digest }}-${{ hashFiles('docker/Dockerfile', 'docker/build-ffmpeg.sh', 'docker/patches/*') }}
       - run: npm run build:wasm
       - run: npm run build:ts
       # The unit job has no WASM, so the tests that drive the real FFmpeg build

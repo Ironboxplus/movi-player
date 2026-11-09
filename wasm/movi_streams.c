@@ -1,4 +1,5 @@
 #include "movi.h"
+#include <stdio.h>
 
 EMSCRIPTEN_KEEPALIVE
 double movi_get_duration(MoviContext *ctx) {
@@ -22,6 +23,50 @@ double movi_get_start_time(MoviContext *ctx) {
 EMSCRIPTEN_KEEPALIVE
 int movi_get_stream_count(MoviContext *ctx) {
   return (ctx && ctx->fmt_ctx) ? ctx->fmt_ctx->nb_streams : 0;
+}
+
+// Describe a Matroska attachment stream (a font, usually) as four lines:
+// file name, MIME type, byte offset in the file, byte size. The patched
+// matroskadec (docker/patches) leaves an attachment's body in the file and puts
+// where it is in the stream's "attachment_offset"/"attachment_size" metadata; a
+// body that had to be read anyway (non-seekable input) has no offset and is
+// reported as -1 with its size, and is in the stream's extradata.
+// Returns the length written (no NUL counted), or -1 when the stream is not an
+// attachment or the buffer is too small.
+EMSCRIPTEN_KEEPALIVE
+int movi_get_attachment_info(MoviContext *ctx, int stream_index, char *buf,
+                             int buf_size) {
+  if (!ctx || !ctx->fmt_ctx || !buf || buf_size <= 0 || stream_index < 0 ||
+      stream_index >= (int)ctx->fmt_ctx->nb_streams)
+    return -1;
+  AVStream *stream = ctx->fmt_ctx->streams[stream_index];
+  if (stream->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT)
+    return -1;
+
+  const AVDictionaryEntry *fn = av_dict_get(stream->metadata, "filename", NULL, 0);
+  const AVDictionaryEntry *mt = av_dict_get(stream->metadata, "mimetype", NULL, 0);
+  const AVDictionaryEntry *off =
+      av_dict_get(stream->metadata, "attachment_offset", NULL, 0);
+  const AVDictionaryEntry *sz =
+      av_dict_get(stream->metadata, "attachment_size", NULL, 0);
+
+  char name[512];
+  snprintf(name, sizeof(name), "%s", fn && fn->value ? fn->value : "");
+  // The fields are newline-separated; a name cannot carry one.
+  for (char *c = name; *c; c++)
+    if (*c == '
+' || *c == '')
+      *c = ' ';
+
+  long long offset = off && off->value ? atoll(off->value) : -1;
+  long long size = sz && sz->value ? atoll(sz->value)
+                                   : (long long)stream->codecpar->extradata_size;
+  int n = snprintf(buf, buf_size, "%s
+%s
+%lld
+%lld", name,
+                   mt && mt->value ? mt->value : "", offset, size);
+  return (n < 0 || n >= buf_size) ? -1 : n;
 }
 
 EMSCRIPTEN_KEEPALIVE

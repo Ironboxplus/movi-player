@@ -30,6 +30,13 @@ RUN git clone --depth 1 --branch ${DAV1D_VERSION} https://code.videolan.org/vide
 ARG FFMPEG_VERSION=n9.0.2
 RUN git clone --depth 1 --branch ${FFMPEG_VERSION} https://github.com/FFmpeg/FFmpeg.git /opt/FFmpeg
 
+# Local FFmpeg patches (docker/patches/*.patch). git apply, not patch: git is
+# already here, and it fails the build loudly when upstream moves a hunk.
+#   ffmpeg-matroska-lazy-attachments.patch  matroskadec records where an
+#   attachment's body is instead of reading it at open; see the patch header.
+COPY patches /opt/patches
+RUN cd /opt/FFmpeg && for p in /opt/patches/*.patch; do echo "applying $p"; git apply --verbose "$p"; done
+
 # Build script
 COPY build-ffmpeg.sh /opt/build-ffmpeg.sh
 RUN chmod +x /opt/build-ffmpeg.sh

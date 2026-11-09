@@ -1,0 +1,130 @@
+matroskadec: leave attachment bodies in the file
+
+FFmpeg n9.0.2 reads every attachment body into memory when it parses the
+header, before the first cluster. A release carrying 50+ MB of fonts spends
+most of its time to first frame on that. With this change the FileData
+element is skipped (avio_skip) and only its position and size are recorded;
+the attachment stream carries them as "attachment_offset"/"attachment_size"
+metadata and a caller reads the bytes from the source when it wants them.
+Attached pictures (cover art) are still loaded, from the recorded position,
+because the demuxer itself turns them into a packet. Non-seekable input keeps
+the old behaviour.
+
+--- a/libavformat/matroskadec.c
++++ b/libavformat/matroskadec.c
+@@ -1108,6 +1108,59 @@
+ }
+ 
+ /*
++ * Attachment bodies (fonts, mostly) are not read when the header is parsed.
++ * Opening a file used to pull every attachment into memory, ahead of the first
++ * cluster, which for a release with 50+ MB of fonts is most of the time to
++ * first frame over a network source. Only where the element sits and how long
++ * it is get recorded (EbmlBin.pos / .size, with .data left NULL); a caller that
++ * wants the bytes reads them from the source at that offset.
++ * Seekable input only: without a seek the bytes have to be consumed anyway.
++ * 0 is success, < 0 is failure.
++ */
++static int ebml_skip_binary(AVIOContext *pb, int length,
++                            int64_t pos, EbmlBin *bin)
++{
++    int64_t ret = avio_skip(pb, length);
++    if (ret < 0)
++        return ret;
++
++    bin->buf  = NULL;
++    bin->data = NULL;
++    bin->size = length;
++    bin->pos  = pos;
++    return 0;
++}
++
++/*
++ * Read an attachment's body that was skipped at header time, leaving the
++ * read position where it was. For attachments the demuxer itself needs
++ * (cover art becomes an attached picture packet); fonts are never loaded here.
++ */
++static int matroska_load_skipped_binary(AVIOContext *pb, EbmlBin *bin)
++{
++    int64_t back = avio_tell(pb);
++    int ret;
++
++    if (back < 0)
++        return back;
++    if ((ret = avio_seek(pb, bin->pos, SEEK_SET)) < 0)
++        return ret;
++    ret = av_buffer_realloc(&bin->buf, bin->size + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (ret < 0)
++        return ret;
++    memset(bin->buf->data + bin->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++    bin->data = bin->buf->data;
++    if ((ret = avio_read(pb, bin->data, bin->size)) != bin->size) {
++        av_buffer_unref(&bin->buf);
++        bin->data = NULL;
++        return ret < 0 ? ret : AVERROR_INVALIDDATA;
++    }
++    if ((ret = avio_seek(pb, back, SEEK_SET)) < 0)
++        return ret;
++    return 0;
++}
++
++/*
+  * Read the next element, but only the header. The contents
+  * are supposed to be sub-elements which can be read separately.
+  * 0 is success, < 0 is failure.
+@@ -1493,7 +1546,11 @@
+         res = ebml_read_ascii(pb, length, syntax->def.s, data);
+         break;
+     case EBML_BIN:
+-        res = ebml_read_binary(pb, length, pos_alt, data);
++        if (id == MATROSKA_ID_FILEDATA && length != EBML_UNKNOWN_LENGTH &&
++            length <= INT_MAX && (pb->seekable & AVIO_SEEKABLE_NORMAL))
++            res = ebml_skip_binary(pb, length, pos_alt, data);
++        else
++            res = ebml_read_binary(pb, length, pos_alt, data);
+         break;
+     case EBML_LEVEL1:
+     case EBML_NEST:
+@@ -3508,7 +3565,8 @@
+     attachments = attachments_list->elem;
+     for (j = 0; j < attachments_list->nb_elem; j++) {
+         if (!(attachments[j].filename && attachments[j].mime &&
+-              attachments[j].bin.data && attachments[j].bin.size > 0)) {
++              (attachments[j].bin.data || attachments[j].bin.pos > 0) &&
++              attachments[j].bin.size > 0)) {
+             av_log(matroska->ctx, AV_LOG_ERROR, "incomplete attachment\n");
+         } else {
+             AVStream *st = avformat_new_stream(s, NULL);
+@@ -3530,15 +3588,28 @@
+             attachments[j].stream = st;
+ 
+             if (st->codecpar->codec_id != AV_CODEC_ID_NONE) {
++                if (!attachments[j].bin.data) {
++                    res = matroska_load_skipped_binary(s->pb, &attachments[j].bin);
++                    if (res < 0)
++                        return res;
++                }
+                 res = ff_add_attached_pic(s, st, NULL, &attachments[j].bin.buf, 0);
+                 if (res < 0)
+                     return res;
+             } else {
+                 st->codecpar->codec_type = AVMEDIA_TYPE_ATTACHMENT;
+-                if (ff_alloc_extradata(st->codecpar, attachments[j].bin.size))
+-                    break;
+-                memcpy(st->codecpar->extradata, attachments[j].bin.data,
+-                       attachments[j].bin.size);
++                if (attachments[j].bin.data) {
++                    if (ff_alloc_extradata(st->codecpar, attachments[j].bin.size))
++                        break;
++                    memcpy(st->codecpar->extradata, attachments[j].bin.data,
++                           attachments[j].bin.size);
++                } else {
++                    /* Body left in the file: say where, so it can be read on demand. */
++                    av_dict_set_int(&st->metadata, "attachment_offset",
++                                    attachments[j].bin.pos, 0);
++                    av_dict_set_int(&st->metadata, "attachment_size",
++                                    attachments[j].bin.size, 0);
++                }
+ 
+                 for (i = 0; mkv_mime_tags[i].id != AV_CODEC_ID_NONE; i++) {
+                     if (av_strstart(attachments[j].mime, mkv_mime_tags[i].str, NULL)) {
