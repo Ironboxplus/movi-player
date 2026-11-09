@@ -199,6 +199,30 @@ const subtitleInternals = () =>
       overlay: r?.subtitleOverlay ? r.subtitleOverlay.outerHTML.slice(0, 400) : null,
     };
   });
+// Seek to 1 s and sample the player every 250 ms for 6 s.
+const replayProbe = () =>
+  page.evaluate(async () => {
+    const el = document.querySelector("movi-player");
+    const p = el.player;
+    const w = p?.streamWrapper;
+    const r = w?.getCanvasRenderer?.();
+    el.currentTime = 1;
+    await el.play().catch(() => {});
+    const rows = [];
+    for (let i = 0; i < 24; i++) {
+      await new Promise((x) => setTimeout(x, 250));
+      rows.push([
+        +(w?.getCurrentTime?.() ?? -1).toFixed(2),
+        !!p?._externalSubTimer,
+        p?._externalSubCues?.length,
+        r?.subtitleCues?.length,
+        r?.activeSubtitleCue?.text ?? null,
+        r?.subtitleOverlay?.style.display,
+        +(r?.timeSource?.now?.() ?? -1).toFixed(2),
+      ]);
+    }
+    return rows;
+  });
 const shot = (name) => page.screenshot({ path: resolve(outDir, `${name}.png`) }).catch(() => {});
 
 const cueAt = async (label, cue, start, expectOn, expectOff) => {
@@ -312,7 +336,10 @@ try {
 
   await check("5c. on the rendition the cue is the right one at the right time", async () => {
     const r = await cueAt("hls", "SUB-1-A", 1, 2, 6);
-    if (!r.ok) console.log("5c internals:", JSON.stringify(await subtitleInternals()));
+    if (!r.ok) {
+      console.log("5c internals:", JSON.stringify(await subtitleInternals()));
+      console.log("5c replay:", JSON.stringify(await replayProbe()));
+    }
     return r;
   });
 
