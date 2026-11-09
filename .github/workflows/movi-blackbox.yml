@@ -1,0 +1,104 @@
+name: movi-blackbox
+
+# Real-browser black-box runs against a built movi-player package: media is
+# generated with ffmpeg, served with Range support, and played in the runner's
+# Chrome. No mocks. Two ways to point it at a package:
+#
+#   release  a published GitHub release (e.g. the previous version, as the
+#            control that must FAIL the source/subtitle assertions)
+#   artifact the package artifact of a movi-player-ci run (build_package)
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Where the package comes from"
+        type: choice
+        options: ["release", "artifact"]
+        default: "release"
+      release_tag:
+        description: "release: tag whose .tgz to test"
+        default: "v0.4.1-openlist.2"
+      artifact_run_id:
+        description: "artifact: movi-player-ci run id holding movi-player-package-<sha>"
+        default: ""
+      scenario:
+        description: "Scenario script"
+        type: choice
+        options: ["sources", "fonts"]
+        default: "sources"
+  workflow_call:
+    inputs:
+      source:
+        type: string
+        default: "artifact"
+      release_tag:
+        type: string
+        default: ""
+      artifact_run_id:
+        type: string
+        default: ""
+      scenario:
+        type: string
+        default: "sources"
+      expect_failure:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  blackbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          ffmpeg -hide_banner -version | head -1
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -c libx264
+      - name: Package under test (release)
+        if: inputs.source == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p pkg && cd pkg
+          gh release download "${{ inputs.release_tag }}" -R "${{ github.repository }}" -p '*.tgz'
+          tar xzf *.tgz
+          ls package/dist | head
+      - name: Package under test (artifact)
+        if: inputs.source == 'artifact'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN="${{ inputs.artifact_run_id }}"
+          if [ -z "$RUN" ]; then RUN="${{ github.run_id }}"; fi
+          mkdir -p pkg/dl && cd pkg
+          gh run download "$RUN" -R "${{ github.repository }}" -p 'movi-player-package-*' -D dl
+          tar xzf dl/*/*.tgz
+          ls package/dist | head
+      - name: Generate the media
+        run: bash scripts/blackbox-sources/make-fixtures.sh "$PWD/fixtures"
+      - name: Run the scenario
+        id: run
+        continue-on-error: ${{ inputs.expect_failure == true }}
+        env:
+          MOVI_CHROME_EXECUTABLE: /usr/bin/google-chrome
+        run: |
+          google-chrome --version
+          node scripts/blackbox-sources/run.mjs --dist "$PWD/pkg/package/dist" --media "$PWD/fixtures" --out "$PWD/results"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blackbox-${{ inputs.scenario }}-${{ github.run_id }}-${{ inputs.source }}
+          path: results
+          if-no-files-found: warn
+          retention-days: 7
