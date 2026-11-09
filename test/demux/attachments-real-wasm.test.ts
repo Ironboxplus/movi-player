@@ -1,7 +1,9 @@
 /**
  * Matroska font attachments against the REAL WASM build, on a real MKV made by
- * ffmpeg at test time: H.264 + AAC + one ASS track + two font attachments
- * (DejaVu Sans, about 750 KB, and DejaVu Sans Mono, about 340 KB).
+ * ffmpeg at test time: H.264 + AAC + one ASS track + eight font attachments
+ * (DejaVu Sans, about 750 KB, six copies of it under other names, and DejaVu
+ * Sans Mono, about 340 KB): over six megabytes of bodies, so that one buffer of
+ * read-ahead is a small part of them.
  *
  * What it pins is the patched matroskadec (docker/patches): opening the file
  * must not read the attachment bodies, the demuxer must say where each body
@@ -86,6 +88,12 @@ describe.skipIf(!runnable)("Matroska attachments against real WASM", () => {
   beforeAll(async () => {
     dir = mkdtempSync(join(tmpdir(), "movi-att-"));
     writeFileSync(join(dir, "sub.ass"), ASS);
+    const copies = [1, 2, 3, 4, 5, 6].map((n) => {
+      const path = join(dir, `DejaVuSansCopy${n}.ttf`);
+      writeFileSync(path, readFileSync(FONT_SANS));
+      return path;
+    });
+    const fonts = [FONT_SANS, ...copies, FONT_MONO];
     const r = spawnSync(
       "ffmpeg",
       [
@@ -95,8 +103,9 @@ describe.skipIf(!runnable)("Matroska attachments against real WASM", () => {
         "-i", join(dir, "sub.ass"),
         "-map", "0:v", "-map", "1:a", "-map", "2",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-c:s", "ass",
-        "-attach", FONT_SANS, "-metadata:s:t:0", "mimetype=application/x-truetype-font",
-        "-attach", FONT_MONO, "-metadata:s:t:1", "mimetype=application/x-truetype-font",
+        ...fonts.flatMap((f, i) => [
+          "-attach", f, `-metadata:s:t:${i}`, "mimetype=application/x-truetype-font",
+        ]),
         join(dir, "fonts.mkv"),
       ],
       { encoding: "utf8" },
@@ -117,26 +126,34 @@ describe.skipIf(!runnable)("Matroska attachments against real WASM", () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  it("lists both fonts with their MIME type and name", () => {
+  it("lists the fonts with their MIME type and name", () => {
     const att = demuxer.getAttachments();
-    expect(att.map((a) => a.filename).sort()).toEqual(["DejaVuSans.ttf", "DejaVuSansMono.ttf"]);
+    expect(att.map((a) => a.filename).sort()).toEqual([
+      "DejaVuSans.ttf",
+      "DejaVuSansCopy1.ttf",
+      "DejaVuSansCopy2.ttf",
+      "DejaVuSansCopy3.ttf",
+      "DejaVuSansCopy4.ttf",
+      "DejaVuSansCopy5.ttf",
+      "DejaVuSansCopy6.ttf",
+      "DejaVuSansMono.ttf",
+    ]);
     for (const a of att) expect(a.mimeType).toBe("application/x-truetype-font");
   });
 
   it("does not read the attachment bodies when it opens the file", () => {
     const att = demuxer.getAttachments();
     const fontBytes = att.reduce((n, a) => n + a.size, 0);
-    expect(fontBytes).toBeGreaterThan(900_000);
+    expect(fontBytes).toBeGreaterThan(5_000_000);
     const touched = att.reduce((n, a) => n + overlap(source.reads, a.offset, a.size), 0);
-    // A read that starts just before a body may run into it by one buffer; the
-    // bodies themselves (over a megabyte between them) were read in full
-    // before the patch.
-    expect(touched).toBeLessThan(fontBytes * 0.1);
+    // The first buffer (512 KB) runs into the first body before anything can
+    // be skipped; every other body was read in full before the patch.
+    expect(touched).toBeLessThan(700_000);
   });
 
   it("reports offsets and sizes that read back the exact font files", () => {
     for (const a of demuxer.getAttachments()) {
-      const original = readFileSync(a.filename === "DejaVuSans.ttf" ? FONT_SANS : FONT_MONO);
+      const original = readFileSync(a.filename === "DejaVuSansMono.ttf" ? FONT_MONO : FONT_SANS);
       expect(a.size).toBe(original.length);
       expect(sha256(mkv.subarray(a.offset, a.offset + a.size))).toBe(sha256(original));
     }

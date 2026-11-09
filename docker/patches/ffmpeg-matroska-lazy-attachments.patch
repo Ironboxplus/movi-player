@@ -12,9 +12,20 @@ the old behaviour.
 
 --- a/libavformat/matroskadec.c
 +++ b/libavformat/matroskadec.c
-@@ -1108,6 +1108,59 @@
+@@ -1108,6 +1108,81 @@
  }
  
++/* The buffer size ebml_skip_binary shrank pb to; 0 when it did not. */
++static int skipped_buffer_size;
++
++static void matroska_restore_buffer_size(AVIOContext *pb)
++{
++    if (skipped_buffer_size) {
++        pb->buffer_size     = skipped_buffer_size;
++        skipped_buffer_size = 0;
++    }
++}
++
  /*
 + * Attachment bodies (fonts, mostly) are not read when the header is parsed.
 + * Opening a file used to pull every attachment into memory, ahead of the first
@@ -31,6 +42,18 @@ the old behaviour.
 +    int64_t ret = avio_skip(pb, length);
 +    if (ret < 0)
 +        return ret;
++
++    /*
++     * The skip left the buffer empty. Refilling it would read a whole buffer
++     * (512 KB in movi) from the middle of the next attachment just to find
++     * its few header bytes, for every font. Read small until the header is
++     * parsed; matroska_read_header puts the size back.
++     */
++    if (pb->buffer_size > 4096) {
++        if (!skipped_buffer_size)
++            skipped_buffer_size = pb->buffer_size;
++        pb->buffer_size = 4096;
++    }
 +
 +    bin->buf  = NULL;
 +    bin->data = NULL;
@@ -72,7 +95,7 @@ the old behaviour.
   * Read the next element, but only the header. The contents
   * are supposed to be sub-elements which can be read separately.
   * 0 is success, < 0 is failure.
-@@ -1493,7 +1546,11 @@
+@@ -1493,7 +1568,11 @@
          res = ebml_read_ascii(pb, length, syntax->def.s, data);
          break;
      case EBML_BIN:
@@ -85,8 +108,9 @@ the old behaviour.
          break;
      case EBML_LEVEL1:
      case EBML_NEST:
-@@ -3508,7 +3565,8 @@
+@@ -3508,7 +3587,9 @@
      attachments = attachments_list->elem;
++    matroska_restore_buffer_size(s->pb);
      for (j = 0; j < attachments_list->nb_elem; j++) {
          if (!(attachments[j].filename && attachments[j].mime &&
 -              attachments[j].bin.data && attachments[j].bin.size > 0)) {
@@ -95,7 +119,7 @@ the old behaviour.
              av_log(matroska->ctx, AV_LOG_ERROR, "incomplete attachment\n");
          } else {
              AVStream *st = avformat_new_stream(s, NULL);
-@@ -3530,15 +3588,28 @@
+@@ -3530,15 +3612,28 @@
              attachments[j].stream = st;
  
              if (st->codecpar->codec_id != AV_CODEC_ID_NONE) {
