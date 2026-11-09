@@ -10,9 +10,12 @@ Attached pictures (cover art) are still loaded, from the recorded position,
 because the demuxer itself turns them into a packet. Non-seekable input keeps
 the old behaviour.
 
+diff --git a/libavformat/matroskadec.c b/libavformat/matroskadec.c
+index 18849af..269ccb3 100644
 --- a/libavformat/matroskadec.c
 +++ b/libavformat/matroskadec.c
-@@ -1108,6 +1108,81 @@
+@@ -1107,6 +1107,82 @@ static int ebml_read_binary(AVIOContext *pb, int length,
+     return 0;
  }
  
 +/* The buffer size ebml_skip_binary shrank pb to; 0 when it did not. */
@@ -26,7 +29,7 @@ the old behaviour.
 +    }
 +}
 +
- /*
++/*
 + * Attachment bodies (fonts, mostly) are not read when the header is parsed.
 + * Opening a file used to pull every attachment into memory, ahead of the first
 + * cluster, which for a release with 50+ MB of fonts is most of the time to
@@ -91,11 +94,10 @@ the old behaviour.
 +    return 0;
 +}
 +
-+/*
+ /*
   * Read the next element, but only the header. The contents
   * are supposed to be sub-elements which can be read separately.
-  * 0 is success, < 0 is failure.
-@@ -1493,7 +1568,11 @@
+@@ -1493,7 +1569,11 @@ static int ebml_parse(MatroskaDemuxContext *matroska,
          res = ebml_read_ascii(pb, length, syntax->def.s, data);
          break;
      case EBML_BIN:
@@ -108,7 +110,9 @@ the old behaviour.
          break;
      case EBML_LEVEL1:
      case EBML_NEST:
-@@ -3508,7 +3587,9 @@
+@@ -3506,9 +3586,11 @@ static int matroska_read_header(AVFormatContext *s)
+         return res;
+ 
      attachments = attachments_list->elem;
 +    matroska_restore_buffer_size(s->pb);
      for (j = 0; j < attachments_list->nb_elem; j++) {
@@ -119,7 +123,7 @@ the old behaviour.
              av_log(matroska->ctx, AV_LOG_ERROR, "incomplete attachment\n");
          } else {
              AVStream *st = avformat_new_stream(s, NULL);
-@@ -3530,15 +3612,28 @@
+@@ -3530,15 +3612,28 @@ static int matroska_read_header(AVFormatContext *s)
              attachments[j].stream = st;
  
              if (st->codecpar->codec_id != AV_CODEC_ID_NONE) {
