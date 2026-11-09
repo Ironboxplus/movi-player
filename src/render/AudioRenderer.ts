@@ -346,17 +346,44 @@ export class AudioRenderer {
   private static readonly PCM_COALESCE_MAX_DELAY_MS = 25;
   private static readonly PCM_COALESCE_GAP_TOLERANCE_US = 20000;
 
-  // Stable audio: AudioContext state monitoring & auto-recovery
+  // AudioContext state monitoring & device-failure recovery
   private contextStateHandler: (() => void) | null = null;
+  private contextErrorHandler: (() => void) | null = null;
   /**
    * Latches sharedContextActivated the moment the context reaches "running".
-   * Separate from contextStateHandler on purpose: that one is stable audio's
-   * recovery monitor and is only wired when stable audio is on, while "audio
-   * got unlocked this session" is a fact every path needs — see init().
+   * Separate from contextStateHandler on purpose: that one is the recovery
+   * monitor and is torn down and rebuilt with the context, while "audio got
+   * unlocked this session" is a fact every path needs — see init().
    */
   private contextActivationHandler: (() => void) | null = null;
-  private recoveryAttempts: number = 0;
-  private static readonly MAX_RECOVERY_ATTEMPTS = 3;
+  /**
+   * Set from the moment the context is found suspended or interrupted that
+   * nobody asked for until it is heard running again. What it guards is the
+   * audio still queued on the context: it describes a moment that never played
+   * (see settleRecovery).
+   */
+  private _deviceFault = false;
+  private recoveryActive = false;
+  private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Resumes in a row that did not leave the context running. */
+  private recoveryFailures = 0;
+  /** Bumped whenever the recovery loop is cancelled, so a resume() still in
+   *  flight knows its answer is no longer wanted. */
+  private recoveryEpoch = 0;
+  private onContextRecovered: (() => void) | null = null;
+  /**
+   * How long one resume() gets before it is called failed. A resume the
+   * browser will not grant does not always reject — see play().
+   */
+  private static readonly RECOVERY_RESUME_TIMEOUT_MS = 1500;
+  private static readonly RECOVERY_BACKOFF_BASE_MS = 500;
+  private static readonly RECOVERY_BACKOFF_MAX_MS = 5000;
+  /**
+   * Failed resumes on one context before it is replaced. Backoff 0.5, 1, 2, 4s:
+   * about eight seconds of trying the device we have, then a fresh context —
+   * which is what a reload does and what the field report's tab needed.
+   */
+  private static readonly RECOVERY_REBUILD_AFTER = 5;
 
   // Stable audio: starvation detection
   private starvationStartTime: number = 0;
@@ -481,33 +508,7 @@ export class AudioRenderer {
       const remintForRate = inheritedRateWrong && sharedContextActivated;
       const retiringContext = remintForRate ? sharedAudioContext : null;
       if (!sharedAudioContext || sharedAudioContext.state === "closed" || remintForRate) {
-        // Open at the SOURCE's sample rate when we know it. Every decoded
-        // packet becomes its own AudioBufferSourceNode, and a buffer whose rate
-        // differs from the context's is resampled PER NODE — each one resampled
-        // in isolation, so every buffer boundary carries a small discontinuity.
-        // At 1024 frames / 44.1kHz that is a click roughly 43 times a second:
-        // the "pit pit" heard on a Chrome/Android whose output runs at 48kHz,
-        // and silent on devices that happen to run at 44.1kHz, where no
-        // resampling took place. Matching the rate here moves the conversion to
-        // the output mix, where it is one continuous stream.
-        const opts: AudioContextOptions = {
-          // "interactive" gives Chromium's audio thread a shorter read-ahead
-          // (~30–50ms vs ~150ms with "playback"). Without this, Chromium starves
-          // when setPlaybackRate stops active sources and resets scheduledTime
-          // to `now` — Safari/Firefox tolerate it because their read-ahead is
-          // already short. Trade-off is a smaller output buffer cushion against
-          // main-thread spikes; the audio decoder + Stable Audio gap-fill
-          // already handle that case.
-          latencyHint: "interactive",
-        };
-        if (this._sourceSampleRate > 0) opts.sampleRate = this._sourceSampleRate;
-        try {
-          sharedAudioContext = new AudioContext(opts);
-        } catch {
-          // Some devices refuse a rate outright — the browser's own is fine,
-          // it just costs the per-buffer resampling described above.
-          sharedAudioContext = new AudioContext({ latencyHint: "interactive" });
-        }
+        sharedAudioContext = this.mintContext();
       }
       this.audioContext = sharedAudioContext;
       if (retiringContext && retiringContext !== sharedAudioContext) {
@@ -548,63 +549,17 @@ export class AudioRenderer {
       if (sharedContextActivated && this.audioContext.state === "suspended") {
         this.audioContext.resume().catch(() => {});
       }
-      this.inputNode = this.audioContext.createGain();
-      // Volume / mute / makeup gain — ALWAYS the last node before destination.
-      // A >100% boost lives here, applied AFTER the limiter, so stable audio's
-      // compressor can't cancel it (a gain *before* the limiter would be
-      // crushed straight back down — ~+6dB becomes ~+0.6dB).
-      this.gainNode = this.audioContext.createGain();
-
-      // Create compressor for stable audio (loudness normalization).
-      // Tuned as a peak-limiter, not a heavy compressor: a wide soft knee
-      // + low ratio (the WebAudio default-ish) flattens the whole signal
-      // and the average RMS rises — perceptually that makes loud passages
-      // feel *louder*, not stabler. Instead we let dialogue / mid-level
-      // content pass untouched and clamp only true peaks.
-      this.compressorNode = this.audioContext.createDynamicsCompressor();
-      this.compressorNode.threshold.value = -18;  // only peaks > -18dB engage
-      // Softer than it was, and the reason is what a 1ms attack at 20:1
-      // actually does to music. That is a limiter, and it grabs every drum hit
-      // the instant it crosses the threshold — the gain steps down in a
-      // millisecond, holds, and walks back over 150ms, on every beat. The step
-      // is heard as a faint crackle riding the transients, which is what
-      // "stable volume on, very slight clicking" is.
-      //
-      // The intent stays: leave dialogue and mid-level content alone, clamp
-      // true peaks. It is reached with a wider knee (the transition is a curve
-      // rather than a corner), a firm-but-not-brickwall ratio, and an attack
-      // that lets the first few milliseconds of a transient through — the part
-      // that carries the punch and none of the level — before clamping the
-      // body behind it. A longer release then moves the gain less often.
-      this.compressorNode.knee.value = 12;
-      this.compressorNode.ratio.value = 12;
-      this.compressorNode.attack.value = 0.005;   // 5ms — the transient passes, its body does not
-      this.compressorNode.release.value = 0.25;
-
-      this.wireGraph();
-
-      // Apply muted state if set before initialization
-      this.gainNode.gain.value = this._muted ? 0 : this.perceptualGain(this.volume);
-      // A tap built before this point would have been wired to the old graph.
-      if (this._analyser) {
-        this._analyser = null;
-        this._analyserBins = null;
-      }
-
-      // Re-apply the chosen output device to the freshly-created context.
-      // Non-blocking: a stale/removed deviceId just falls back to default.
-      if (this._sinkId) {
-        this.applySinkId(this._sinkId).catch(() => {});
-      }
+      this.buildGraph();
 
       // Don't resume here — play() handles resume when user clicks play.
       // Pre-init creates AudioContext during load for fast startup;
       // resuming here would cause poster-seek audio to leak.
 
-      // Stable audio: monitor AudioContext state for auto-recovery
-      if (this._stableAudio) {
-        this.setupContextStateMonitoring();
-      }
+      // Watch for the context being taken away from us — a device error, an
+      // interruption — and bring it back. Always on: it used to be wired only
+      // under stable audio, which is off by default, so a default install had
+      // no recovery at all.
+      this.setupContextStateMonitoring();
 
       // Always watch for the context reaching "running", whatever wakes it.
       // This latch used to live ONLY inside the stable-audio recovery monitor
@@ -637,6 +592,97 @@ export class AudioRenderer {
     } catch (error) {
       Logger.error(TAG, "Failed to initialize", error);
       return false;
+    }
+  }
+
+  /**
+   * Open a new AudioContext for this source. Shared by init() and by the
+   * rebuild after a device failure (see rebuildContext), which is why it lives
+   * on its own.
+   */
+  private mintContext(): AudioContext {
+    // Open at the SOURCE's sample rate when we know it. Every decoded
+    // packet becomes its own AudioBufferSourceNode, and a buffer whose rate
+    // differs from the context's is resampled PER NODE — each one resampled
+    // in isolation, so every buffer boundary carries a small discontinuity.
+    // At 1024 frames / 44.1kHz that is a click roughly 43 times a second:
+    // the "pit pit" heard on a Chrome/Android whose output runs at 48kHz,
+    // and silent on devices that happen to run at 44.1kHz, where no
+    // resampling took place. Matching the rate here moves the conversion to
+    // the output mix, where it is one continuous stream.
+    const opts: AudioContextOptions = {
+      // "interactive" gives Chromium's audio thread a shorter read-ahead
+      // (~30–50ms vs ~150ms with "playback"). Without this, Chromium starves
+      // when setPlaybackRate stops active sources and resets scheduledTime
+      // to `now` — Safari/Firefox tolerate it because their read-ahead is
+      // already short. Trade-off is a smaller output buffer cushion against
+      // main-thread spikes; the audio decoder + Stable Audio gap-fill
+      // already handle that case.
+      latencyHint: "interactive",
+    };
+    if (this._sourceSampleRate > 0) opts.sampleRate = this._sourceSampleRate;
+    try {
+      return new AudioContext(opts);
+    } catch {
+      // Some devices refuse a rate outright — the browser's own is fine,
+      // it just costs the per-buffer resampling described above.
+      return new AudioContext({ latencyHint: "interactive" });
+    }
+  }
+
+  /**
+   * Build this renderer's nodes on the current context and wire them. Also
+   * what a rebuilt context needs, so init() and rebuildContext() share it.
+   */
+  private buildGraph(): void {
+    if (!this.audioContext) return;
+    this.inputNode = this.audioContext.createGain();
+    // Volume / mute / makeup gain — ALWAYS the last node before destination.
+    // A >100% boost lives here, applied AFTER the limiter, so stable audio's
+    // compressor can't cancel it (a gain *before* the limiter would be
+    // crushed straight back down — ~+6dB becomes ~+0.6dB).
+    this.gainNode = this.audioContext.createGain();
+
+    // Create compressor for stable audio (loudness normalization).
+    // Tuned as a peak-limiter, not a heavy compressor: a wide soft knee
+    // + low ratio (the WebAudio default-ish) flattens the whole signal
+    // and the average RMS rises — perceptually that makes loud passages
+    // feel *louder*, not stabler. Instead we let dialogue / mid-level
+    // content pass untouched and clamp only true peaks.
+    this.compressorNode = this.audioContext.createDynamicsCompressor();
+    this.compressorNode.threshold.value = -18;  // only peaks > -18dB engage
+    // Softer than it was, and the reason is what a 1ms attack at 20:1
+    // actually does to music. That is a limiter, and it grabs every drum hit
+    // the instant it crosses the threshold — the gain steps down in a
+    // millisecond, holds, and walks back over 150ms, on every beat. The step
+    // is heard as a faint crackle riding the transients, which is what
+    // "stable volume on, very slight clicking" is.
+    //
+    // The intent stays: leave dialogue and mid-level content alone, clamp
+    // true peaks. It is reached with a wider knee (the transition is a curve
+    // rather than a corner), a firm-but-not-brickwall ratio, and an attack
+    // that lets the first few milliseconds of a transient through — the part
+    // that carries the punch and none of the level — before clamping the
+    // body behind it. A longer release then moves the gain less often.
+    this.compressorNode.knee.value = 12;
+    this.compressorNode.ratio.value = 12;
+    this.compressorNode.attack.value = 0.005;   // 5ms — the transient passes, its body does not
+    this.compressorNode.release.value = 0.25;
+
+    this.wireGraph();
+
+    // Apply muted state if set before initialization
+    this.gainNode.gain.value = this._muted ? 0 : this.perceptualGain(this.volume);
+    // A tap built before this point would have been wired to the old graph.
+    if (this._analyser) {
+      this._analyser = null;
+      this._analyserBins = null;
+    }
+
+    // Re-apply the chosen output device to the freshly-created context.
+    // Non-blocking: a stale/removed deviceId just falls back to default.
+    if (this._sinkId) {
+      this.applySinkId(this._sinkId).catch(() => {});
     }
   }
 
@@ -3024,13 +3070,6 @@ export class AudioRenderer {
     // Rewire for the new state (live sources stay attached to inputNode).
     this.wireGraph();
     Logger.debug(TAG, `Audio chain rewired: compressor ${enabled ? "active" : "bypassed"}`);
-
-    if (enabled && this.audioContext) {
-      this.setupContextStateMonitoring();
-    } else if (!enabled && this.audioContext && this.contextStateHandler) {
-      this.audioContext.removeEventListener("statechange", this.contextStateHandler);
-      this.contextStateHandler = null;
-    }
   }
 
   /**
@@ -3201,27 +3240,25 @@ export class AudioRenderer {
   }
 
   /**
-   * Monitor AudioContext state changes and auto-recover from interruptions
-   * Handles cases like: phone calls, other audio sources, OS-level interruptions
+   * Watch the context for the ways the platform takes it away, and bring it
+   * back: a device or renderer error (W3C Web Audio 2.8: the user agent fires
+   * `error`, suspends the context and fires `statechange`, and never resumes it
+   * itself) and an interruption (2.7: state "interrupted"). A suspend we asked
+   * for — pause, a buffering hold, contextSuspendIntent — is none of these.
    */
   private setupContextStateMonitoring(): void {
-    if (!this.audioContext) return;
+    const ctx = this.audioContext;
+    if (!ctx) return;
 
-    // Remove old handler if any
-    if (this.contextStateHandler) {
-      this.audioContext.removeEventListener("statechange", this.contextStateHandler);
-    }
+    this.detachContextMonitor(ctx);
 
     this.contextStateHandler = () => {
-      if (!this.audioContext) return;
-      const state = this.audioContext.state;
+      const current = this.audioContext;
+      if (!current) return;
+      const state = current.state;
 
-      if (state === "interrupted" || (state === "suspended" && this.isPlaying && !this._muted && !contextSuspendIntent)) {
-        Logger.warn(TAG, `AudioContext ${state} unexpectedly during playback, attempting recovery`);
-        this.attemptContextRecovery();
-      } else if (state === "running") {
+      if (state === "running") {
         // Successfully recovered
-        this.recoveryAttempts = 0;
         // The context reaching "running" — via play(), the tap-to-unmute
         // resume(), a recovery, anything — means audio is unlocked this session.
         // Latch it so an auto-advanced / switched video's init() can wake the
@@ -3230,6 +3267,7 @@ export class AudioRenderer {
         // false and the NEXT video re-showed "tap to unmute".
         sharedContextActivated = true;
         Logger.debug(TAG, "AudioContext recovered to running state");
+        this.settleRecovery();
         // Audio frames that arrived while the context was suspended were
         // dropped, so the scheduled timeline describes a moment that never
         // played. Left alone, the audio clock would report a time pinned near
@@ -3248,37 +3286,249 @@ export class AudioRenderer {
           this.maxScheduledMediaTime = 0;
           Logger.debug(TAG, "Audio timeline reset after suspended drop");
         }
+      } else if (
+        (state === "suspended" || state === "interrupted") &&
+        this.wantsContextRunning()
+      ) {
+        Logger.warn(TAG, `AudioContext ${state} unexpectedly during playback, attempting recovery`);
+        this.beginRecovery();
       }
     };
 
-    this.audioContext.addEventListener("statechange", this.contextStateHandler);
+    // The event that names the cause. It is fired BEFORE the context is
+    // suspended (same task, 2.8 step order), so the state is not read here —
+    // the first attempt runs a tick later, when it is.
+    this.contextErrorHandler = () => {
+      Logger.warn(TAG, "AudioContext reported an error from the audio device or the renderer");
+      if (this.wantsContextRunning()) this.beginRecovery();
+    };
+
+    ctx.addEventListener("statechange", this.contextStateHandler);
+    ctx.addEventListener("error", this.contextErrorHandler);
+  }
+
+  private detachContextMonitor(ctx: AudioContext | null): void {
+    if (ctx && this.contextStateHandler) {
+      ctx.removeEventListener("statechange", this.contextStateHandler);
+    }
+    if (ctx && this.contextErrorHandler) {
+      ctx.removeEventListener("error", this.contextErrorHandler);
+    }
+    this.contextStateHandler = null;
+    this.contextErrorHandler = null;
   }
 
   /**
-   * Attempt to recover AudioContext from interrupted/suspended state
+   * Is a context that is not running a fault? Only while the player is playing
+   * unmuted and has not suspended the context itself.
    */
-  private attemptContextRecovery(): void {
-    if (!this.audioContext || !this.isPlaying) return;
-    if (this.recoveryAttempts >= AudioRenderer.MAX_RECOVERY_ATTEMPTS) {
-      Logger.error(TAG, `AudioContext recovery failed after ${AudioRenderer.MAX_RECOVERY_ATTEMPTS} attempts`);
-      this.recoveryAttempts = 0;
+  private wantsContextRunning(): boolean {
+    return !!this.audioContext && this.isPlaying && !this._muted && !contextSuspendIntent;
+  }
+
+  /**
+   * Told once, after the sound has come back from a device failure or an
+   * interruption: the audio that was queued on the context has been dropped
+   * (it belongs to a moment that was never heard) and the player has to feed
+   * audio again from the playhead.
+   */
+  setOnContextRecovered(callback: (() => void) | null): void {
+    this.onContextRecovered = callback;
+  }
+
+  /**
+   * Start getting the context back. Runs until it is running, the player stops
+   * wanting it (pause, buffering, destroy), or the renderer is gone — there is
+   * no failure count at which a viewer who is still watching is given up on,
+   * only a bounded pace (see attemptRecovery).
+   */
+  private beginRecovery(): void {
+    if (this.recoveryActive) return;
+    this.recoveryActive = true;
+    this.recoveryFailures = 0;
+    this.scheduleRecoveryAttempt(0);
+  }
+
+  private cancelRecovery(): void {
+    this.recoveryActive = false;
+    this.recoveryEpoch++;
+    if (this.recoveryTimer !== null) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = null;
+    }
+  }
+
+  private scheduleRecoveryAttempt(delayMs: number): void {
+    const epoch = this.recoveryEpoch;
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = null;
+      this.attemptRecovery(epoch).catch((err) => {
+        // Nothing here may end the loop: a viewer is still waiting for sound.
+        Logger.error(TAG, "AudioContext recovery attempt threw", err);
+        if (epoch === this.recoveryEpoch && this.recoveryActive) {
+          this.scheduleRecoveryAttempt(AudioRenderer.RECOVERY_BACKOFF_MAX_MS);
+        }
+      });
+    }, delayMs);
+  }
+
+  /**
+   * One resume(), judged by what the context says afterwards. The promise is
+   * not the answer: in the field report resume paths resolved while the context
+   * stayed suspended, and Safari leaves one pending. So the state is read after
+   * it settles or after RECOVERY_RESUME_TIMEOUT_MS, whichever is first.
+   *
+   * A failure backs off (0.5s doubling to 5s) and tries again. Every
+   * RECOVERY_REBUILD_AFTER failures the context itself is replaced: a device
+   * that errored can leave the context object unusable, and a new one binds to
+   * whatever the device is now.
+   */
+  private async attemptRecovery(epoch: number): Promise<void> {
+    const ctx = this.audioContext;
+    if (epoch !== this.recoveryEpoch || !ctx) return;
+    if (!this.wantsContextRunning()) {
+      this.cancelRecovery();
+      return;
+    }
+    if (ctx.state === "running") {
+      // An error that did not take the context down, or one already mended.
+      this.settleRecovery();
       return;
     }
 
-    this.recoveryAttempts++;
-    Logger.debug(TAG, `AudioContext recovery attempt ${this.recoveryAttempts}/${AudioRenderer.MAX_RECOVERY_ATTEMPTS}`);
-
-    this.audioContext.resume().then(() => {
-      if (this.audioContext?.state === "running") {
-        Logger.info(TAG, "AudioContext recovered successfully");
-        this.recoveryAttempts = 0;
+    this._deviceFault = true;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, AudioRenderer.RECOVERY_RESUME_TIMEOUT_MS);
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      try {
+        ctx.resume().then(done, (err) => {
+          Logger.debug(TAG, "AudioContext resume() rejected during recovery", err);
+          done();
+        });
+      } catch (err) {
+        Logger.debug(TAG, "AudioContext resume() threw during recovery", err);
+        done();
       }
-    }).catch((err) => {
-      Logger.warn(TAG, "AudioContext recovery failed", err);
-      // Retry with exponential backoff
-      const delay = Math.min(1000 * Math.pow(2, this.recoveryAttempts - 1), 5000);
-      setTimeout(() => this.attemptContextRecovery(), delay);
     });
+
+    // Cancelled while waiting (a pause, a destroy), or the running event got
+    // there first and settled it.
+    if (epoch !== this.recoveryEpoch || this.audioContext !== ctx) return;
+    if (!this.wantsContextRunning()) {
+      this.cancelRecovery();
+      return;
+    }
+    if ((ctx.state as string) === "running") {
+      this.settleRecovery();
+      return;
+    }
+
+    this.recoveryFailures++;
+    const failures = this.recoveryFailures;
+    if (failures === 1 || failures % 5 === 0) {
+      Logger.warn(
+        TAG,
+        `AudioContext still ${ctx.state} after resume (failure ${failures}), retrying`,
+      );
+    }
+    // An interruption ends when the user agent says so (2.7) and resume() is
+    // specified to reject until then; replacing the context would only open a
+    // second device stream under the call.
+    if (
+      ctx.state === "closed" ||
+      (ctx.state !== "interrupted" &&
+        failures >= AudioRenderer.RECOVERY_REBUILD_AFTER &&
+        failures % AudioRenderer.RECOVERY_REBUILD_AFTER === 0)
+    ) {
+      this.rebuildContext();
+    }
+    const backoff = Math.min(
+      AudioRenderer.RECOVERY_BACKOFF_BASE_MS * Math.pow(2, failures - 1),
+      AudioRenderer.RECOVERY_BACKOFF_MAX_MS,
+    );
+    this.scheduleRecoveryAttempt(backoff);
+  }
+
+  /**
+   * The context is running. If it got there from a fault, what it had queued
+   * is stale — dropped here — and the player is told to refill from the
+   * playhead. Until buffers from the new position play, the audio clock answers
+   * -1 and the picture runs on the wall clock (see TimeSource.ts), which is
+   * the path that carried it through the outage.
+   */
+  private settleRecovery(): void {
+    this.cancelRecovery();
+    this.recoveryFailures = 0;
+    if (!this._deviceFault) return;
+    this._deviceFault = false;
+    Logger.info(TAG, "AudioContext recovered, dropping the audio queued during the outage");
+    const ended = this._streamEnded;
+    this.reset();
+    this._streamEnded = ended;
+    this.onContextRecovered?.();
+  }
+
+  /**
+   * Replace a context that resume() cannot bring back, keeping everything the
+   * renderer owns: its nodes are rebuilt on the new one, the output device is
+   * re-applied, the timeline is emptied (the old sound is gone with the old
+   * context) and listeners move over.
+   *
+   * The context is shared by the module (see sharedAudioContext). If it is
+   * still the one that failed it is replaced for everybody; if another
+   * renderer already replaced it, that one is adopted rather than minting a
+   * third. Renderers still holding the dead one run their own recovery.
+   */
+  private rebuildContext(): void {
+    const old = this.audioContext;
+    if (!old) return;
+
+    let next: AudioContext;
+    try {
+      next =
+        sharedAudioContext &&
+        sharedAudioContext !== old &&
+        sharedAudioContext.state !== "closed"
+          ? sharedAudioContext
+          : this.mintContext();
+    } catch (err) {
+      Logger.error(TAG, "Could not create a replacement AudioContext", err);
+      return;
+    }
+    Logger.warn(TAG, "Replacing the AudioContext after repeated failed resumes");
+
+    // Everything scheduled on the old context, while it is still ours to talk to.
+    const ended = this._streamEnded;
+    this.reset();
+    this._streamEnded = ended;
+
+    this.detachContextMonitor(old);
+    if (this.contextActivationHandler) {
+      old.removeEventListener("statechange", this.contextActivationHandler);
+    }
+    for (const node of [this.inputNode, this.compressorNode, this.gainNode, this._analyser]) {
+      try {
+        node?.disconnect();
+      } catch {
+        /* the old context may refuse; it is being closed anyway */
+      }
+    }
+
+    sharedAudioContext = next;
+    this.audioContext = next;
+    this._analyser = null;
+    this._analyserBins = null;
+    this.buildGraph();
+    this.scheduledTime = next.currentTime;
+    this.setupContextStateMonitoring();
+    if (this.contextActivationHandler) {
+      next.addEventListener("statechange", this.contextActivationHandler);
+    }
+
+    old.close().catch(() => {});
   }
 
   /**
@@ -3353,11 +3603,10 @@ export class AudioRenderer {
       this.keepaliveUrl = null;
     }
 
-    // Clean up context state monitoring
-    if (this.audioContext && this.contextStateHandler) {
-      this.audioContext.removeEventListener("statechange", this.contextStateHandler);
-      this.contextStateHandler = null;
-    }
+    // Clean up context state monitoring, and any recovery still retrying.
+    this.cancelRecovery();
+    this.onContextRecovered = null;
+    this.detachContextMonitor(this.audioContext);
     // The activation latch comes off too — the context is shared and outlives
     // this renderer, so a listener left behind would accumulate one per source.
     if (this.audioContext && this.contextActivationHandler) {
@@ -3415,7 +3664,6 @@ export class AudioRenderer {
       this.signalsmith.destroy();
       this.signalsmith = null;
     }
-    this.recoveryAttempts = 0;
     Logger.debug(TAG, "Destroyed");
   }
 }

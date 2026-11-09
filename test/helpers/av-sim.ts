@@ -100,6 +100,15 @@ export class SimContext {
   private base = 0;
   private baseT: number;
   private frozen = false;
+  private listeners = new Map<string, Set<() => void>>();
+  /**
+   * What each resume() call does, in order; once the plan runs out it works.
+   * "stay" is the failure the field report showed: the promise resolves and the
+   * context is still suspended.
+   */
+  resumePlan: ("run" | "stay" | "reject")[] = [];
+  resumeCalls = 0;
+  closeCalls = 0;
 
   constructor(
     private readonly ref: SimRef,
@@ -107,6 +116,59 @@ export class SimContext {
     private readonly ppm: number,
   ) {
     this.baseT = ref.t;
+  }
+
+  addEventListener(type: string, fn: () => void): void {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type)!.add(fn);
+  }
+
+  removeEventListener(type: string, fn: () => void): void {
+    this.listeners.get(type)?.delete(fn);
+  }
+
+  listenerCount(type: string): number {
+    return this.listeners.get(type)?.size ?? 0;
+  }
+
+  private emit(type: string): void {
+    for (const fn of [...(this.listeners.get(type) ?? [])]) fn();
+  }
+
+  /**
+   * The audio device or renderer fails, as W3C Web Audio 2.8 describes it: an
+   * `error` event, then the context is suspended with a `statechange`.
+   */
+  failDevice(): void {
+    this.emit("error");
+    this.freezeClock();
+    this.state = "suspended";
+    this.emit("statechange");
+  }
+
+  private interruptedByOs = false;
+
+  /** Another application takes the output device (W3C Web Audio 2.7). */
+  interrupt(): void {
+    this.freezeClock();
+    this.interruptedByOs = true;
+    this.state = "interrupted";
+    this.emit("statechange");
+  }
+
+  /** The interruption is over: the user agent restarts the context by itself. */
+  endInterruption(): void {
+    this.interruptedByOs = false;
+    this.releaseClock();
+    this.state = "running";
+    this.emit("statechange");
+  }
+
+  close(): Promise<void> {
+    this.closeCalls++;
+    this.freezeClock();
+    this.state = "closed";
+    return Promise.resolve();
   }
 
   /** The hardware clock, unquantised. */
@@ -143,12 +205,24 @@ export class SimContext {
   suspend(): Promise<void> {
     this.freezeClock();
     this.state = "suspended";
+    this.emit("statechange");
     return Promise.resolve();
   }
 
   resume(): Promise<void> {
-    this.releaseClock();
-    this.state = "running";
+    this.resumeCalls++;
+    if (this.interruptedByOs) {
+      return Promise.reject(new DOMException("interrupted", "InvalidStateError"));
+    }
+    const action = this.resumePlan.shift() ?? "run";
+    if (action === "reject") {
+      return Promise.reject(new DOMException("device unavailable", "InvalidStateError"));
+    }
+    if (action === "run") {
+      this.releaseClock();
+      this.state = "running";
+      this.emit("statechange");
+    }
     return Promise.resolve();
   }
 
@@ -156,8 +230,14 @@ export class SimContext {
     return new SimGain();
   }
 
-  createDynamicsCompressor(): SimGain {
-    return new SimGain();
+  createDynamicsCompressor(): SimGain & Record<string, { value: number }> {
+    return Object.assign(new SimGain(), {
+      threshold: { value: 0 },
+      knee: { value: 0 },
+      ratio: { value: 0 },
+      attack: { value: 0 },
+      release: { value: 0 },
+    });
   }
 
   createBuffer(channels: number, frames: number, sampleRate: number): SimBuffer {
@@ -233,6 +313,12 @@ export interface SimOptions {
   decodeSpeed?: number;
   /** No audio track: the clock has no audio side and nothing is fed to it. */
   noAudio?: boolean;
+  /**
+   * An AudioRenderer class loaded from a fresh module registry, so the
+   * module-level shared context starts empty. Needed by anything that lets the
+   * renderer mint a context of its own.
+   */
+  rendererClass?: typeof AudioRenderer;
 }
 
 export interface Window {
@@ -253,7 +339,9 @@ export function intervalDistance(heard: number, pts: number, interval: number): 
 
 export class AvSim {
   readonly ref: SimRef = { t: 1_000_000 };
-  readonly ctx: SimContext;
+  /** Every context the renderer minted itself (see failDevice / rebuild tests). */
+  readonly minted: SimContext[] = [];
+  private readonly firstCtx: SimContext;
   readonly audio: AudioRenderer;
   readonly clock: Clock;
   readonly canvas: CanvasRenderer;
@@ -264,6 +352,8 @@ export class AvSim {
   presented: { t: number; pts: number; heard: number | null }[] = [];
 
   audioNext = 0;
+  /** How many times the renderer reported the sound back after a failure. */
+  recoveries = 0;
   private videoNext = 0;
   private videoBudget = 0;
   audioFeeding = true;
@@ -296,15 +386,36 @@ export class AvSim {
       removeEventListener: vi.fn(),
     });
 
-    this.ctx = new SimContext(this.ref, opts.outputLatency ?? 0.04, opts.ppm ?? 0);
+    const latency = opts.outputLatency ?? 0.04;
+    const ppm = opts.ppm ?? 0;
+    this.firstCtx = new SimContext(this.ref, latency, ppm);
+    // A context the renderer opens for itself starts suspended, like a real one.
+    const ref = this.ref;
+    const minted = this.minted;
+    vi.stubGlobal("AudioContext", function () {
+      const c = new SimContext(ref, latency, ppm);
+      c.state = "suspended";
+      c.freezeClock();
+      minted.push(c);
+      return c;
+    });
 
-    this.audio = new AudioRenderer();
+    this.audio = new (opts.rendererClass ?? AudioRenderer)();
     Object.assign(this.audio as unknown as object, {
-      audioContext: this.ctx,
-      gainNode: this.ctx.createGain(),
+      audioContext: this.firstCtx,
+      gainNode: this.firstCtx.createGain(),
       isPlaying: true,
     });
+    (this.audio as unknown as { setupContextStateMonitoring(): void }).setupContextStateMonitoring();
     this.audio.setPreservePitch(false);
+    // What MoviPlayer does when the sound comes back from a device failure: the
+    // sound the old context held is gone, so audio is fed again from the playhead.
+    (this.audio as unknown as { setOnContextRecovered?(cb: () => void): void }).setOnContextRecovered?.(
+      () => {
+        this.recoveries++;
+        this.restartAudioAtClock();
+      },
+    );
 
     this.clock = new Clock();
     this.canvas = new CanvasRenderer({} as HTMLCanvasElement);
@@ -357,6 +468,11 @@ export class AvSim {
     this.audio.clearEndOfStream();
     this.audioNext = Math.ceil(this.clock.getTime() / CHUNK_S) * CHUNK_S;
     this.audioFeeding = true;
+  }
+
+  /** The context the renderer is using right now (it changes if it rebuilds). */
+  get ctx(): SimContext {
+    return (this.audio as unknown as { audioContext: SimContext }).audioContext ?? this.firstCtx;
   }
 
   /** What the picture is being held to right now. */
