@@ -67,13 +67,13 @@ export class PlaybackTimeSource {
     return this.media + ((perfNowMs - this.perf) / 1000) * this.rate;
   }
 
-  /** Did the last read come from the sound rather than the wall clock? */
   /** True when the clock is a media element's own playhead, which keeps
    *  running with no presentation loop of ours behind it. */
   isElementPlayhead(): boolean {
     return false;
   }
 
+  /** Did the last read come from the sound rather than the wall clock? */
   isAudioDriven(): boolean {
     return this._fromAudio && this.audio !== null;
   }

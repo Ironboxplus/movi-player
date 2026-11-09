@@ -86,7 +86,13 @@ jobs:
           tar xzf dl/*/*.tgz
           ls package/dist | head
       - name: Generate the media
-        run: bash scripts/blackbox-sources/make-fixtures.sh "$PWD/fixtures"
+        run: bash scripts/blackbox-${{ inputs.scenario }}/make-fixtures.sh "$PWD/fixtures"
+      - name: JASSUB (fonts scenario)
+        if: inputs.scenario == 'fonts'
+        run: |
+          # The host's dependency, not this package's: installed for the run only.
+          npm install --no-save jassub@2.5.37 esbuild
+          node scripts/blackbox-fonts/build-jassub.mjs "$PWD/jassub-bundle"
       - name: Run the scenario
         id: run
         continue-on-error: ${{ inputs.expect_failure == true }}
@@ -94,7 +100,11 @@ jobs:
           MOVI_CHROME_EXECUTABLE: /usr/bin/google-chrome
         run: |
           google-chrome --version
-          node scripts/blackbox-sources/run.mjs --dist "$PWD/pkg/package/dist" --media "$PWD/fixtures" --out "$PWD/results"
+          if [ "${{ inputs.scenario }}" = "fonts" ]; then
+            node scripts/blackbox-fonts/run.mjs --dist "$PWD/pkg/package/dist" --media "$PWD/fixtures" --jassub "$PWD/jassub-bundle" --out "$PWD/results"
+          else
+            node scripts/blackbox-sources/run.mjs --dist "$PWD/pkg/package/dist" --media "$PWD/fixtures" --out "$PWD/results"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

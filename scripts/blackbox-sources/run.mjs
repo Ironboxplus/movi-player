@@ -329,9 +329,19 @@ try {
     };
   });
 
-  await check("5b. on the rendition the menu has the three files named for their tracks, none twice", async () => {
-    const labels = (await subtitleMenu()).map((e) => e.label);
-    return { ok: JSON.stringify(labels) === JSON.stringify(TITLES), detail: JSON.stringify(labels) };
+  await check("5b. on the rendition the menu has the three files named for their tracks, none twice, and each can be picked", async () => {
+    const menu = await subtitleMenu();
+    const labels = menu.map((e) => e.label);
+    // A row is pickable when it is not greyed out; only the track no file
+    // exists for (the ASS one) may be greyed. Comparing labels alone passed
+    // while every row was greyed (see the 4 rows disabled:true in run 42665032756).
+    const pickable = menu.filter((e) => !e.disabled).map((e) => e.label);
+    return {
+      ok:
+        JSON.stringify(labels) === JSON.stringify(TITLES) &&
+        JSON.stringify(pickable) === JSON.stringify(TITLES.slice(0, 3)),
+      detail: JSON.stringify(menu),
+    };
   });
 
   await check("5c. on the rendition the cue is the right one at the right time", async () => {
