@@ -8,6 +8,7 @@ import {
   identityOfExternal,
   qualityMenuMode,
   resolveIdentity,
+  retargetTrack,
   type ExternalSubtitle,
   type InbandSlot,
   type InbandTrack,
@@ -299,8 +300,11 @@ describe("a track with no name is matched by order and language", () => {
       "inband:10",
       "inband:11",
     ]);
-    // …so nothing is left greyed
-    expect(entries.some((e) => e.kind === "original-only")).toBe(false);
+    // …so neither of those two is left greyed (the ten with no file are)
+    const greyed = entries.filter((e) => e.kind === "original-only").map((e) => e.identity)
+    expect(greyed).not.toContain("inband:10")
+    expect(greyed).not.toContain("inband:11")
+    expect(greyed).toHaveLength(10);
     // and on the original the twin steps aside for the track itself
     expect(hiddenExternalLangs({ inband: unnamedInband, external })).toEqual(
       new Set(["x10", "x11"]),
