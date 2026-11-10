@@ -261,3 +261,165 @@ describe("the selection survives a source switch", () => {
     expect(resolveIdentity(menu, "inband:10")).toBeNull();
   });
 });
+
+// The twelve tracks of the file above, but the way 小城良方's 11th and 12th (and
+// every track of many fansub rips) come: the container gave them no name, so
+// the player invents "Subtitle <id>" and the host has no title to send.
+describe("a track with no name is matched by order and language", () => {
+  const LANGS = ["ind", "fre", "tha", "chi", "chi", "eng", "por", "spa", "vie", "ara", "kor", "may"];
+  const unnamedInband: InbandTrack[] = LANGS.map((lang, i) => ({
+    id: 200 + i,
+    title: `Subtitle ${200 + i}`,
+    lang,
+    untitled: true,
+  }));
+  const unnamedRemembered: InbandSlot[] = unnamedInband.map((t, order) => ({
+    order,
+    title: t.title,
+    lang: t.lang,
+    untitled: true,
+  }));
+  const unnamedTwin = (order: number, lang: string): ExternalSubtitle => ({
+    lang: `x${order}`,
+    label: `Subtitle ${order + 1}`,
+    active: false,
+    inbandOrder: order,
+    inbandLang: lang,
+  });
+
+  it("confirms an alias with no title against an unnamed original track", () => {
+    const external = [unnamedTwin(10, "kor"), unnamedTwin(11, "may")];
+    const entries = buildSubtitleMenu({
+      inband: [],
+      external,
+      remembered: unnamedRemembered,
+      activeMuxedId: null,
+    });
+    expect(entries.filter((e) => e.kind === "external").map((e) => e.identity)).toEqual([
+      "inband:10",
+      "inband:11",
+    ]);
+    // …so nothing is left greyed
+    expect(entries.some((e) => e.kind === "original-only")).toBe(false);
+    // and on the original the twin steps aside for the track itself
+    expect(hiddenExternalLangs({ inband: unnamedInband, external })).toEqual(
+      new Set(["x10", "x11"]),
+    );
+  });
+
+  it("accepts the languages 639-1 and 639-2 spell differently as one", () => {
+    const entries = buildSubtitleMenu({
+      inband: [],
+      external: [unnamedTwin(3, "zh"), unnamedTwin(10, "ko-KR")],
+      remembered: unnamedRemembered,
+      activeMuxedId: null,
+    });
+    expect(entries.filter((e) => e.kind === "external")).toHaveLength(2);
+  });
+
+  it("rejects an alias whose language is not the track's", () => {
+    const entries = buildSubtitleMenu({
+      inband: [],
+      external: [unnamedTwin(10, "jpn")],
+      remembered: unnamedRemembered,
+      activeMuxedId: null,
+    });
+    expect(entries.find((e) => e.identity === "inband:10")?.kind).toBe("original-only");
+    expect(entries.find((e) => e.identity === "ext:x10")).toMatchObject({ kind: "external" });
+  });
+
+  it("uses the language when only one side has a title", () => {
+    // The host knows the name, the container does not
+    const named: ExternalSubtitle = { ...unnamedTwin(10, "kor"), inbandTitle: "韩语" };
+    expect(
+      buildSubtitleMenu({ inband: [], external: [named], remembered: unnamedRemembered, activeMuxedId: null })
+        .find((e) => e.identity === "inband:10")?.kind,
+    ).toBe("external");
+    // …and the other way round
+    const original = [{ id: 1, title: "韩语", lang: "kor" }];
+    expect(
+      buildSubtitleMenu({ inband: original, external: [unnamedTwin(0, "kor")], activeMuxedId: null })
+        .map((e) => e.kind),
+    ).toEqual(["muxed"]);
+    expect(
+      buildSubtitleMenu({ inband: original, external: [unnamedTwin(0, "eng")], activeMuxedId: null })
+        .map((e) => e.kind),
+    ).toEqual(["muxed", "external"]);
+  });
+
+  it("does not let a code that says nothing disagree", () => {
+    const entries = buildSubtitleMenu({
+      inband: [],
+      external: [unnamedTwin(10, "")],
+      remembered: [{ order: 10, title: "Subtitle 1", lang: "und", untitled: true }],
+      activeMuxedId: null,
+    });
+    expect(entries.find((e) => e.identity === "inband:10")?.kind).toBe("external");
+  });
+
+  it("labels the row with the file's own label when the track has no name", () => {
+    const entries = buildSubtitleMenu({
+      inband: [],
+      external: [unnamedTwin(10, "kor")],
+      remembered: unnamedRemembered,
+      activeMuxedId: null,
+    });
+    expect(entries.find((e) => e.identity === "inband:10")).toMatchObject({ label: "Subtitle 11" });
+  });
+});
+
+describe("a subtitle that is still being made is a row like any other", () => {
+  const remembered2: InbandSlot[] = [{ order: 0, title: "English", lang: "eng" }];
+  const pendingTwin: ExternalSubtitle = {
+    lang: "x0",
+    label: "English",
+    active: false,
+    pending: true,
+    inbandTitle: "English",
+    inbandOrder: 0,
+  };
+
+  it("is offered with its working indicator, not greyed", () => {
+    const entries = buildSubtitleMenu({
+      inband: [],
+      external: [pendingTwin],
+      remembered: remembered2,
+      activeMuxedId: null,
+    });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ kind: "external", pending: true, identity: "inband:0" });
+  });
+
+  it("can be the target of a selection carried across a source switch", () => {
+    const entries = buildSubtitleMenu({
+      inband: [],
+      external: [pendingTwin],
+      remembered: remembered2,
+      activeMuxedId: null,
+    });
+    expect(resolveIdentity(entries, "inband:0")).toMatchObject({ kind: "external", lang: "x0" });
+  });
+});
+
+describe("a <track> whose src is rewritten loads again", () => {
+  const tracks = () => [
+    { lang: "x0", src: "/api/fs/subtitle_extract?track=0&at=10", label: "a" },
+    { lang: "x1", src: "/api/fs/subtitle_extract?track=1&at=10", label: "b" },
+  ];
+
+  it("takes the new src for the same track and says which one to reload", () => {
+    const list = tracks();
+    const hit = retargetTrack(list, "x0", "/api/fs/subtitle_extract?track=0&at=10&rev=1");
+    expect(hit).toBe(list[0]);
+    expect(list[0].src).toMatch(/rev=1$/);
+    expect(list[1].src).toMatch(/track=1&at=10$/);
+  });
+
+  it("does nothing for the same src, an empty one, or an unknown track", () => {
+    const list = tracks();
+    expect(retargetTrack(list, "x0", list[0].src)).toBeNull();
+    expect(retargetTrack(list, "x0", "")).toBeNull();
+    expect(retargetTrack(list, "nope", "/x")).toBeNull();
+    expect(list).toEqual(tracks());
+  });
+});

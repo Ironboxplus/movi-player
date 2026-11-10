@@ -90,12 +90,18 @@ export function chooseOpeningSource(args: {
 export interface InbandTrack {
   id: number;
   title: string;
+  /** The container's language code, when it has one. */
+  lang?: string;
+  /** `title` is made up (the container gave the track no name). */
+  untitled?: boolean;
 }
 
 /** An in-band track of a source that was open earlier. */
 export interface InbandSlot {
   order: number;
   title: string;
+  lang?: string;
+  untitled?: boolean;
 }
 
 export interface ExternalSubtitle {
@@ -105,6 +111,8 @@ export interface ExternalSubtitle {
   pending?: boolean;
   inbandTitle?: string;
   inbandOrder?: number;
+  /** Language of the in-band track the file stands for (`data-inband-lang`). */
+  inbandLang?: string;
 }
 
 export type SubtitleMenuEntry = (
@@ -130,20 +138,58 @@ function sameTitle(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
+/** The codes one language goes by: ISO 639-2/B, 639-2/T and 639-1. A code in no
+ *  group stands for itself. */
+const LANGUAGE_GROUPS: readonly (readonly string[])[] = [
+  ["chi", "zho", "zh", "cmn", "yue"], ["eng", "en"], ["jpn", "ja"], ["kor", "ko"],
+  ["spa", "es"], ["fre", "fra", "fr"], ["ger", "deu", "de"], ["ita", "it"],
+  ["por", "pt"], ["rus", "ru"], ["ara", "ar"], ["tha", "th"], ["vie", "vi"],
+  ["may", "msa", "ms"], ["ind", "id"], ["hin", "hi"], ["tur", "tr"], ["pol", "pl"],
+  ["dut", "nld", "nl"], ["swe", "sv"], ["dan", "da"], ["nor", "no", "nob"], ["fin", "fi"],
+  ["cze", "ces", "cs"], ["gre", "ell", "el"], ["heb", "he"], ["hun", "hu"], ["ukr", "uk"],
+];
+
+function languageKey(l: string | undefined): string {
+  let k = (l || "").trim().toLowerCase();
+  const cut = k.search(/[-_]/);
+  if (cut > 0) k = k.slice(0, cut);
+  return LANGUAGE_GROUPS.find((g) => g.includes(k))?.[0] ?? k;
+}
+
+/** Two language codes agree unless both are known and differ: a missing or
+ *  "und" code says nothing. */
+function sameLanguage(a: string | undefined, b: string | undefined): boolean {
+  const ka = languageKey(a);
+  const kb = languageKey(b);
+  return !ka || !kb || ka === "und" || kb === "und" || ka === kb;
+}
+
 /**
  * An alias is believed only when what it points at agrees. By index first, then
  * by title: a mismatch means the host's idea of the track list is not this
  * file's, and a duplicated subtitle is a smaller mistake than the wrong one.
+ * Where either side has no title (a track the container left unnamed) the
+ * languages decide instead: a title that is not there cannot disagree, and the
+ * order has already matched.
  * With nothing to check against (the original was never opened) it is trusted.
  */
-function confirms(input: SubtitleMenuInput, order: number, title: string): boolean {
+function confirms(
+  input: SubtitleMenuInput,
+  order: number,
+  title: string,
+  lang: string | undefined,
+): boolean {
+  const agrees = (t: { title: string; lang?: string; untitled?: boolean }) =>
+    title && t.title.trim() && !t.untitled
+      ? sameTitle(t.title, title)
+      : sameLanguage(t.lang, lang);
   if (input.inband.length > 0) {
     const t = input.inband[order];
-    return !!t && sameTitle(t.title, title);
+    return !!t && agrees(t);
   }
   if (input.remembered && input.remembered.length > 0) {
     const slot = input.remembered.find((s) => s.order === order);
-    return !!slot && sameTitle(slot.title, title);
+    return !!slot && agrees(slot);
   }
   return true;
 }
@@ -158,9 +204,8 @@ function classify(input: SubtitleMenuInput) {
       typeof order === "number" &&
       Number.isInteger(order) &&
       order >= 0 &&
-      title &&
       !accepted.has(order) &&
-      confirms(input, order, title)
+      confirms(input, order, title, ext.inbandLang)
     ) {
       accepted.set(order, ext);
     } else {
@@ -202,8 +247,9 @@ export function buildSubtitleMenu(
       slots.set(order, {
         kind: "external",
         lang: ext.lang,
-        // Named for the track it stands for, not for the extracted file.
-        label: (ext.inbandTitle || "").trim(),
+        // Named for the track it stands for, not for the extracted file (which
+        // names it only when the track has no name).
+        label: (ext.inbandTitle || "").trim() || ext.label,
         identity: `inband:${order}`,
         active: ext.active,
         ...(ext.pending ? { pending: true } : {}),
@@ -234,6 +280,22 @@ export function buildSubtitleMenu(
     });
   }
   return entries;
+}
+
+/**
+ * A declared `<track>` was pointed at another file. Returns the entry now
+ * holding the new `src`, or null when there is nothing to load again: no such
+ * track, an empty `src`, or the one it already had.
+ */
+export function retargetTrack<T extends { lang: string; src: string }>(
+  tracks: readonly T[],
+  lang: string,
+  src: string,
+): T | null {
+  const track = tracks.find((t) => t.lang === lang);
+  if (!track || !src || track.src === src) return null;
+  track.src = src;
+  return track;
 }
 
 export function identityOfExternal(input: SubtitleMenuInput, lang: string): string {

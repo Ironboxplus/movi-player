@@ -62,6 +62,7 @@ import {
   isHlsSource,
   qualityMenuMode,
   resolveIdentity,
+  retargetTrack,
   type ExternalSubtitle,
   type InbandSlot,
   type InbandTrack,
@@ -918,6 +919,7 @@ export class MoviElement extends HTMLElement {
   // Watches the declarative <source> children so a host can swap videos without
   // replacing the element — see _watchSourceChildren.
   private _sourceObserver: MutationObserver | null = null;
+  private _trackObserver: MutationObserver | null = null;
   private _sourceSignature = "";
   private _sourceSwapQueued = false;
   private _lastCaptionText: string = "";
@@ -1172,6 +1174,7 @@ export class MoviElement extends HTMLElement {
     format?: string;
     inbandTitle?: string;
     inbandOrder?: number;
+    inbandLang?: string;
   }[] = [];
   private _autoplay: boolean = false;
   // True from the moment an autoplay attempt is kicked off until playback
@@ -10740,6 +10743,43 @@ export class MoviElement extends HTMLElement {
       });
     });
     this._sourceObserver.observe(this, { childList: true });
+
+    // A `<track>` whose `src` is rewritten loads again, as in HTML: the host
+    // that serves a subtitle still being made (a file that grows) says so by
+    // pointing the same track at a newer URL.
+    this._trackObserver?.disconnect();
+    this._trackObserver = new MutationObserver((records) => {
+      for (const r of records) {
+        if (r.target instanceof Element && r.target.localName === "track") {
+          this._reloadTrackSrc(r.target);
+        }
+      }
+    });
+    this._trackObserver.observe(this, {
+      attributes: true,
+      attributeFilter: ["src"],
+      subtree: true,
+    });
+  }
+
+  /** A declared `<track>` got a new `src`: fetch it again, and if it is the
+   *  subtitle showing, keep showing it from the new file. */
+  private _reloadTrackSrc(el: Element): void {
+    const src = el.getAttribute("src") || "";
+    const lang = el.getAttribute("srclang") || el.getAttribute("lang") || "";
+    const meta = retargetTrack(this._subtitleTracks, lang, src);
+    if (!meta) return;
+    const p = this.player;
+    if (!p) return;
+    p.addSubtitleTrack({
+      url: src,
+      lang: meta.lang,
+      label: meta.label,
+      format: meta.format as "vtt" | "srt" | "ttml" | "ass" | undefined,
+    });
+    if (p.getSubtitleLangs().some((t) => t.active && t.lang === lang)) {
+      void p.selectSubtitleLang(lang);
+    }
   }
 
   private _reloadFromSourceChildren(): void {
@@ -10858,6 +10898,7 @@ export class MoviElement extends HTMLElement {
           (el.getAttribute("data-format") as "vtt" | "srt" | undefined) ||
           "vtt",
         inbandTitle: el.getAttribute("data-inband-title") || undefined,
+        inbandLang: el.getAttribute("data-inband-lang") || undefined,
         inbandOrder: (() => {
           const raw = el.getAttribute("data-inband-order");
           return raw !== null && /^\d+$/.test(raw.trim())
@@ -11343,7 +11384,12 @@ export class MoviElement extends HTMLElement {
   private _noteInband(inband: readonly InbandTrack[]): void {
     const own = this._activeRungSrc();
     if (inband.length === 0 || isHlsSource(own)) return;
-    const slots = inband.map((t, order) => ({ order, title: t.title }));
+    const slots = inband.map((t, order) => ({
+      order,
+      title: t.title,
+      lang: t.lang,
+      untitled: t.untitled,
+    }));
     if (own) this._inbandMemory.set(`src:${own}`, slots);
     if (this._resumeKey)
       this._inbandMemory.set(`key:${this._resumeKey}`, slots);
@@ -11377,6 +11423,8 @@ export class MoviElement extends HTMLElement {
     const inband: InbandTrack[] = (p?.getSubtitleTracks() ?? []).map((t) => ({
       id: t.id,
       title: t.label || `Subtitle ${t.id}`,
+      lang: t.language,
+      untitled: !t.label,
     }));
     const external: ExternalSubtitle[] = (p?.getSubtitleLangs() ?? []).map(
       (t) => {
@@ -11385,6 +11433,7 @@ export class MoviElement extends HTMLElement {
           ...t,
           inbandTitle: meta?.inbandTitle,
           inbandOrder: meta?.inbandOrder,
+          inbandLang: meta?.inbandLang,
         };
       },
     );
@@ -29558,6 +29607,8 @@ export class MoviElement extends HTMLElement {
     // Stop watching the <source> children; a reconnect re-observes them.
     this._sourceObserver?.disconnect();
     this._sourceObserver = null;
+    this._trackObserver?.disconnect();
+    this._trackObserver = null;
 
     // If removed while in the iOS pseudo-fullscreen fallback, restore the page
     // scroll we locked and drop the resize listeners (setPseudoFullscreen(false)
