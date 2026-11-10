@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1-openlist.4] - 2026-11-10
+
+### Changed
+- A subtitle alias whose in-band track has no name (or a file with no `data-inband-title`) is confirmed by its order and language (`data-inband-lang`, ISO 639-1/639-2 codes compared as one language) instead of being treated as a plain file.
+
+### Added
+- A declared `<track>` whose `src` changes is loaded again and stays selected if it was showing, as in HTML. A host serving a subtitle that is still being produced points the track at the newer file.
+
 ## [0.4.1-openlist.3] - 2026-11-10
 
 ### Added
