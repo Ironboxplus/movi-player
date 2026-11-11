@@ -7,8 +7,10 @@ import {
   hiddenExternalLangs,
   identityOfExternal,
   qualityMenuMode,
+  reconcileChildTracks,
   resolveIdentity,
   retargetTrack,
+  trackEvents,
   type ExternalSubtitle,
   type InbandSlot,
   type InbandTrack,
@@ -425,5 +427,116 @@ describe("a <track> whose src is rewritten loads again", () => {
     expect(retargetTrack(list, "x0", "")).toBeNull();
     expect(retargetTrack(list, "nope", "/x")).toBeNull();
     expect(list).toEqual(tracks());
+  });
+});
+
+// WHATWG HTML, "When a track element's parent element changes and the new
+// parent is a media element, then the user agent must add the track element's
+// corresponding text track ... and fire addtrack": a <track> that arrives after
+// the element was set up joins the subtitle list, and one that leaves, leaves.
+describe("a <track> added or removed after the element was set up", () => {
+  type Declared = {
+    src: string;
+    lang: string;
+    label: string;
+    inbandTitle?: string;
+    inbandOrder?: number;
+  };
+  const declared = (order: number): Declared => ({
+    src: `/api/fs/subtitle_extract?track=${order}`,
+    lang: `sub${order}`,
+    label: `[内置字幕]${TITLES[order]}`,
+    inbandTitle: TITLES[order],
+    inbandOrder: order,
+  });
+  const asExternal = (ts: Declared[]): ExternalSubtitle[] =>
+    ts.map((t) => ({ ...t, active: false }));
+  const late = [declared(10), declared(11)]; // 韩语, 马来语
+
+  it("reports the new track as added, the held ones untouched", () => {
+    const held = [declared(0)];
+    const change = reconcileChildTracks(held, ["sub0"], [declared(0), ...late]);
+    expect(change.added.map((t) => t.lang)).toEqual(["sub10", "sub11"]);
+    expect(change.removed).toEqual([]);
+  });
+
+  it("reports a track that left the children as removed", () => {
+    const held = [declared(0), ...late];
+    const change = reconcileChildTracks(
+      held,
+      ["sub0", "sub10", "sub11"],
+      [declared(0), declared(10)],
+    );
+    expect(change.added).toEqual([]);
+    expect(change.removed.map((t) => t.lang)).toEqual(["sub11"]);
+  });
+
+  it("does not touch a track the host passed in JS rather than as a child", () => {
+    const js = { src: "blob:x", lang: "file-1", label: "mine" };
+    const change = reconcileChildTracks([js], [], [declared(10)]);
+    expect(change.removed).toEqual([]);
+    expect(change.added.map((t) => t.lang)).toEqual(["sub10"]);
+  });
+
+  it("says addtrack for each track added and removetrack for each removed", () => {
+    const held = [declared(0), declared(1)];
+    const change = reconcileChildTracks(
+      held,
+      ["sub0", "sub1"],
+      [declared(0), ...late],
+    );
+    expect(trackEvents(change).map((e) => [e.type, e.track.lang])).toEqual([
+      ["removetrack", "sub1"],
+      ["addtrack", "sub10"],
+      ["addtrack", "sub11"],
+    ]);
+  });
+
+  it("reports nothing when the children are what the element already holds", () => {
+    const held = [declared(0), declared(1)];
+    expect(
+      reconcileChildTracks(held, ["sub0", "sub1"], [declared(0), declared(1)]),
+    ).toEqual({ added: [], removed: [] });
+  });
+
+  it("puts the late track in the menu: HLS shows it under the in-band name", () => {
+    const menu = buildSubtitleMenu({
+      inband: [],
+      external: asExternal(late),
+      remembered,
+      activeMuxedId: null,
+    });
+    const shown = menu.filter((e) => e.kind === "external");
+    expect(shown.map((e) => e.label)).toEqual(["韩语", "马来语"]);
+    expect(shown.map((e) => e.identity)).toEqual(["inband:10", "inband:11"]);
+    expect(menu.some((e) => e.kind === "original-only" && e.label === "韩语")).toBe(
+      false,
+    );
+  });
+
+  it("puts the late track in the menu: on the original the in-band track stands in", () => {
+    const input = {
+      inband,
+      external: asExternal(late),
+      remembered,
+      activeMuxedId: null,
+    };
+    expect([...hiddenExternalLangs(input)]).toEqual(["sub10", "sub11"]);
+    const menu = buildSubtitleMenu(input);
+    expect(menu.filter((e) => e.kind === "external")).toEqual([]);
+    expect(menu.map((e) => e.label)).toContain("韩语");
+  });
+
+  it("takes the track out of the menu again when it is removed", () => {
+    const held = [declared(10), declared(11)];
+    const change = reconcileChildTracks(held, ["sub10", "sub11"], [declared(10)]);
+    const left = held.filter((t) => !change.removed.includes(t));
+    const menu = buildSubtitleMenu({
+      inband: [],
+      external: asExternal(left),
+      remembered: undefined,
+      activeMuxedId: null,
+    });
+    expect(menu.map((e) => e.label)).toEqual(["韩语"]);
   });
 });
