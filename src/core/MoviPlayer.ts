@@ -13442,6 +13442,15 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   removeSubtitleCues(lang: string): boolean {
     if (!this._generatedSubCues.has(lang)) return false;
+    return this.removeSubtitleTrack(lang);
+  }
+
+  /**
+   * Take an external subtitle track (see addSubtitleTrack) out of the list,
+   * switching subtitles off if it was showing. False if there is none.
+   */
+  removeSubtitleTrack(lang: string): boolean {
+    if (!this._subtitleTracks.some((t) => t.lang === lang)) return false;
     if (this._activeSubtitleLang === lang) {
       this.stopExternalSubtitles();
       this._externalSubCues = [];

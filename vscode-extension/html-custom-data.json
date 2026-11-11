@@ -348,6 +348,19 @@
           ]
         },
         {
+          "name": "subtitlefallbackfont",
+          "description": {
+            "kind": "markdown",
+            "value": "The font ASS/SSA subtitles fall back to when no font they name is embedded in the file or installed — give it a font that covers your viewers' scripts, or Chinese, Japanese and Korean text renders as boxes."
+          },
+          "references": [
+            {
+              "name": "Documentation",
+              "url": "https://moviplayer.com/docs/api/element#subtitlefallbackfont"
+            }
+          ]
+        },
+        {
           "name": "ambientmode",
           "description": {
             "kind": "markdown",

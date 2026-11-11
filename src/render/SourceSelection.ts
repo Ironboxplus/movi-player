@@ -298,6 +298,45 @@ export function retargetTrack<T extends { lang: string; src: string }>(
   return track;
 }
 
+export interface ChildTrackChange<T> {
+  added: T[];
+  removed: T[];
+}
+
+/**
+ * The `<track>` children changed while the `<source>` ones did not. `held` is
+ * the element's external subtitle list, `childLangs` the part of it that came
+ * from `<track>` children (a list the host passed in JS is not the children's
+ * to take away), `declared` what the children say now. A track is known by its
+ * `lang`, the key the menu and the player use; a new `src` on a known one is
+ * `retargetTrack`'s business, not a change of the list.
+ */
+export function reconcileChildTracks<T extends { lang: string }>(
+  held: readonly T[],
+  childLangs: readonly string[],
+  declared: readonly T[],
+): ChildTrackChange<T> {
+  const have = new Set(held.map((t) => t.lang));
+  const now = new Set(declared.map((t) => t.lang));
+  const fromChildren = new Set(childLangs);
+  return {
+    added: declared.filter((t) => !have.has(t.lang)),
+    removed: held.filter((t) => fromChildren.has(t.lang) && !now.has(t.lang)),
+  };
+}
+
+/** The events a change of the list is announced with, as on a media element's
+ *  `textTracks`: `removetrack` for each track that left, `addtrack` for each
+ *  that joined. */
+export function trackEvents<T>(
+  change: ChildTrackChange<T>,
+): { type: "addtrack" | "removetrack"; track: T }[] {
+  return [
+    ...change.removed.map((track) => ({ type: "removetrack" as const, track })),
+    ...change.added.map((track) => ({ type: "addtrack" as const, track })),
+  ];
+}
+
 export function identityOfExternal(input: SubtitleMenuInput, lang: string): string {
   const { accepted } = classify(input);
   for (const [order, ext] of accepted) {

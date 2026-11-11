@@ -532,6 +532,8 @@ The custom element re-exposes player activity as DOM events so you can wire `add
 | `audiotrackchange`     | —                                    | Active audio track switched                        |
 | `subtitletrackchange`  | —                                    | Active subtitle track switched                     |
 | `trackschange`         | `Track[]`                            | Available tracks list updated                      |
+| `addtrack`             | `{ lang, label, src, inbandOrder? }` | A `<track>` child was added after the element was set up and joined the subtitle list and menu, as on a media element's `textTracks`. Fired once per track; the video does not reload |
+| `removetrack`          | `{ lang, label, src, inbandOrder? }` | A `<track>` child was removed and left the subtitle list and menu (subtitles go off if it was showing). A list passed in JS is not touched |
 | `fullscreenchange`     | `{ fullscreen: boolean }`            | Player entered/exited fullscreen                   |
 | `movi-fullscreen-request` | —                                 | **Cancelable** — fires before `requestFullscreen()`. `preventDefault()` blocks it so a host can take over via [`setHostFullscreen()`](./element.md#sethostfullscreen-active-boolean-void) |
 | `pipchange`            | `{ pip: boolean }`                   | Picture-in-Picture window opened/closed            |

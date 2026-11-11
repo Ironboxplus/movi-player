@@ -111,6 +111,10 @@
               }
             },
             {
+              "name": "subtitlefallbackfont",
+              "description": "The font ASS/SSA subtitles fall back to when no font they name is embedded in the file or installed — give it a font that covers your viewers' scripts, or Chinese, Japanese and Korean text renders as boxes."
+            },
+            {
               "name": "ambientmode",
               "description": "Enables ambient background effects."
             },
@@ -588,6 +592,20 @@
               "description": "Available tracks list updated",
               "type": {
                 "text": "CustomEvent<Track[]>"
+              }
+            },
+            {
+              "name": "addtrack",
+              "description": "A <track> child was added after the element was set up and joined the subtitle list and menu, as on a media element's textTracks. Fired once per track; the video does not reload",
+              "type": {
+                "text": "CustomEvent<{ lang, label, src, inbandOrder? }>"
+              }
+            },
+            {
+              "name": "removetrack",
+              "description": "A <track> child was removed and left the subtitle list and menu (subtitles go off if it was showing). A list passed in JS is not touched",
+              "type": {
+                "text": "CustomEvent<{ lang, label, src, inbandOrder? }>"
               }
             },
             {

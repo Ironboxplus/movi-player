@@ -61,8 +61,10 @@ import {
   identityOfExternal,
   isHlsSource,
   qualityMenuMode,
+  reconcileChildTracks,
   resolveIdentity,
   retargetTrack,
+  trackEvents,
   type ExternalSubtitle,
   type InbandSlot,
   type InbandTrack,
@@ -907,6 +909,17 @@ function moviTrackList<T extends { id: string }>(
   return list;
 }
 
+/** An external subtitle as the element holds it (a <track> child, or passed in JS). */
+interface DeclaredSubtitle {
+  src: string;
+  lang: string;
+  label: string;
+  format?: string;
+  inbandTitle?: string;
+  inbandOrder?: number;
+  inbandLang?: string;
+}
+
 export class MoviElement extends HTMLElement {
   private canvas: HTMLCanvasElement;
   private video: HTMLVideoElement;
@@ -1176,6 +1189,9 @@ export class MoviElement extends HTMLElement {
     inbandOrder?: number;
     inbandLang?: string;
   }[] = [];
+  // The langs of `_subtitleTracks` that came from <track> children, as against
+  // a list the host passed in JS: only those follow the children when they change.
+  private _childTrackLangs: string[] = [];
   private _autoplay: boolean = false;
   // True from the moment an autoplay attempt is kicked off until playback
   // actually reaches "playing" or the browser blocks it. While set, the
@@ -10737,7 +10753,11 @@ export class MoviElement extends HTMLElement {
       queueMicrotask(() => {
         this._sourceSwapQueued = false;
         const next = this._sourceChildrenSignature();
-        if (!next || next === this._sourceSignature) return;
+        if (!next || next === this._sourceSignature) {
+          // The sources stand: a <track> may still have come or gone.
+          this._syncChildTracks();
+          return;
+        }
         this._sourceSignature = next;
         this._reloadFromSourceChildren();
       });
@@ -10888,26 +10908,11 @@ export class MoviElement extends HTMLElement {
       'track[kind="subtitles"], track[kind="captions"], track:not([kind])',
     );
     if (!replace && this._subtitleTracks.length > 0) return;
-    const parsed = Array.from(trackEls)
-      .map((el) => ({
-        src: el.getAttribute("src") || "",
-        lang: el.getAttribute("srclang") || el.getAttribute("lang") || "",
-        label:
-          el.getAttribute("label") || el.getAttribute("srclang") || "Subtitle",
-        format:
-          (el.getAttribute("data-format") as "vtt" | "srt" | undefined) ||
-          "vtt",
-        inbandTitle: el.getAttribute("data-inband-title") || undefined,
-        inbandLang: el.getAttribute("data-inband-lang") || undefined,
-        inbandOrder: (() => {
-          const raw = el.getAttribute("data-inband-order");
-          return raw !== null && /^\d+$/.test(raw.trim())
-            ? parseInt(raw, 10)
-            : undefined;
-        })(),
-      }))
-      .filter((t) => t.src);
-    if (replace || parsed.length > 0) this._subtitleTracks = parsed;
+    const parsed = this._readChildTracks(trackEls);
+    if (replace || parsed.length > 0) {
+      this._subtitleTracks = parsed;
+      this._childTrackLangs = parsed.map((t) => t.lang);
+    }
 
     // `default` on a track means "show this one" — it is how every player that
     // takes <track> children says it, and markup written for one of those
@@ -10926,6 +10931,95 @@ export class MoviElement extends HTMLElement {
       const lang =
         marked.getAttribute("srclang") || marked.getAttribute("lang") || "";
       if (lang) this._carrySubtitleLang = lang;
+    }
+  }
+
+  /** What the <track> children declare, as the element holds it. */
+  private _readChildTracks(
+    trackEls: Iterable<Element>,
+  ): DeclaredSubtitle[] {
+    return Array.from(trackEls)
+      .map((el) => ({
+        src: el.getAttribute("src") || "",
+        lang: el.getAttribute("srclang") || el.getAttribute("lang") || "",
+        label:
+          el.getAttribute("label") || el.getAttribute("srclang") || "Subtitle",
+        format:
+          (el.getAttribute("data-format") as "vtt" | "srt" | undefined) ||
+          "vtt",
+        inbandTitle: el.getAttribute("data-inband-title") || undefined,
+        inbandLang: el.getAttribute("data-inband-lang") || undefined,
+        inbandOrder: (() => {
+          const raw = el.getAttribute("data-inband-order");
+          return raw !== null && /^\d+$/.test(raw.trim())
+            ? parseInt(raw, 10)
+            : undefined;
+        })(),
+      }))
+      .filter((t) => t.src);
+  }
+
+  /** The entry the player holds for a declared <track>. */
+  private _playerSubtitleEntry(t: DeclaredSubtitle) {
+    return {
+      url: t.src,
+      lang: t.lang,
+      label: t.label,
+      format: t.format as "vtt" | "srt" | "ttml" | "ass" | undefined,
+    };
+  }
+
+  /**
+   * The `<track>` children came or went while the `<source>` ones stayed. In
+   * HTML a track element added to a media element joins its text tracks and
+   * fires `addtrack` (and `removetrack` when it leaves) — the video does not
+   * reload for it, and neither does this: the list, the player and the menu
+   * follow, and the element says so with the same two events, once per track.
+   *
+   * A host whose subtitle list takes longer to make than the video takes to
+   * open declares the tracks when they are known rather than holding the video
+   * back for them.
+   */
+  private _syncChildTracks(): void {
+    const declared = this._readChildTracks(
+      this.querySelectorAll(
+        'track[kind="subtitles"], track[kind="captions"], track:not([kind])',
+      ),
+    );
+    const change = reconcileChildTracks(
+      this._subtitleTracks,
+      this._childTrackLangs,
+      declared,
+    );
+    if (!change.added.length && !change.removed.length) return;
+    const gone = new Set(change.removed.map((t) => t.lang));
+    this._subtitleTracks = [
+      ...this._subtitleTracks.filter((t) => !gone.has(t.lang)),
+      ...change.added,
+    ];
+    this._childTrackLangs = declared.map((t) => t.lang);
+    Logger.info(
+      TAG,
+      `<track> children changed: +${change.added.length} -${change.removed.length}`,
+    );
+    // Without a player yet the list is read when it is created.
+    const p = this.player;
+    if (p) {
+      for (const t of change.removed) p.removeSubtitleTrack(t.lang);
+      for (const t of change.added) p.addSubtitleTrack(this._playerSubtitleEntry(t));
+      this.updateSubtitleTrackMenu();
+    }
+    for (const e of trackEvents(change)) {
+      this.dispatchEvent(
+        new CustomEvent(e.type, {
+          detail: {
+            lang: e.track.lang,
+            label: e.track.label,
+            src: e.track.src,
+            inbandOrder: e.track.inbandOrder,
+          },
+        }),
+      );
     }
   }
 
@@ -32512,6 +32606,14 @@ export class MoviElement extends HTMLElement {
       created.setPrecisePreviews(this._thumbPrecise);
       created.setStoryboard(this._storyboard);
       this.player = created;
+      // A <track> declared while the config above was being assembled is in
+      // the element's list but not in the player's (see _syncChildTracks).
+      const known = new Set(created.getSubtitleLangs().map((t) => t.lang));
+      for (const t of this._subtitleTracks) {
+        if (!known.has(t.lang)) {
+          created.addSubtitleTrack(this._playerSubtitleEntry(t));
+        }
+      }
       this.warmStoryboardSheets();
 
       // With a JASSUB host registered, ASS/SSA gets libass unless the page chose
