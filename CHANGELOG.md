@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1-openlist.5] - 2026-11-11
+
+### Added
+- A `<track>` child added to `<movi-player>` after it was set up (or removed) joins (or leaves) the external subtitle list, the player and the subtitle menu without reloading the source, as in HTML for a media element's text tracks. The element fires `addtrack` / `removetrack`, once per track (see `docs/api/events.md`). A host whose subtitle list is slower than the video can open the video first and declare the tracks when they are known. A list passed in JS is not touched.
+- `MoviPlayer.removeSubtitleTrack(lang)`.
+
 ## [0.4.1-openlist.4] - 2026-11-10
 
 ### Changed
