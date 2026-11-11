@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1-openlist.6] - 2026-11-11
+
+### Fixed
+- The subtitle delay (settings panel and Z/X) is offered for a subtitle file (`<track>`) on any source, not only a local file. An in-band track on a network source still is not: delaying it ahead of what has been read needs the whole stream read, and `prefetchActiveSubtitleStream` no longer runs on a network source at all.
+- External subtitle cues follow the delay: the cue was picked by the unshifted time and then refused by the renderer, so nothing showed.
+- ASS through JASSUB is delayed the right way: JASSUB draws at `mediaTime + timeOffset`, so a later subtitle is a negative offset (it was shown earlier).
+- `MoviPlayer.getSubtitleDelay()` answers the delay that was set, also behind a stream engine.
+
 ## [0.4.1-openlist.5] - 2026-11-11
 
 ### Added
