@@ -80,6 +80,7 @@ import { DASHPlayerWrapper } from "../render/DASHPlayerWrapper";
 import { ThumbnailRenderer } from "../utils/ThumbnailRenderer";
 import { getDecodeMode, isSoftwareDecodePath } from "./decodeMode";
 import { PacketQueue } from "./PacketQueue";
+import { externalCueIndex } from "./SubtitleDelay";
 import { childAbort } from "../utils/abort";
 
 // Any of the three adaptive-streaming engines (Shaka primary; hls.js / dash.js
@@ -13706,9 +13707,10 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
       const time = this.streamWrapper
         ? this.streamWrapper.getCurrentTime()
         : this.clock.getTime();
-      // Find active cue
-      const idx = this._externalSubCues.findIndex(
-        (c) => time >= c.start && time <= c.end,
+      const idx = externalCueIndex(
+        this._externalSubCues,
+        time,
+        this._subtitleDelaySec,
       );
       if (idx !== lastIdx) {
         lastIdx = idx;
@@ -13778,7 +13780,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
 
   /** Get current subtitle delay in seconds. */
   getSubtitleDelay(): number {
-    return this.videoRenderer ? this.videoRenderer.getSubtitleDelay() : 0;
+    // Not the video renderer's: behind a stream engine the cues are painted
+    // on the engine's renderer, and Movi's may not exist.
+    return this._subtitleDelaySec;
   }
 
   /**
@@ -13946,6 +13950,9 @@ export class MoviPlayer extends EventEmitter<PlayerEventMap> {
    */
   private async prefetchActiveSubtitleStream(): Promise<void> {
     if (this.prefetchInFlight) return;
+    // Reading the whole stream is a read of the whole file: on a network
+    // source, the whole video (see canDelaySubtitles).
+    if (!this.isFileSource()) return;
     if (!this.demuxer || !this.videoRenderer) return;
     const subtitleTrack = this.trackManager.getActiveSubtitleTrack();
     if (!subtitleTrack) return;

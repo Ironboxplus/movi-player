@@ -52,6 +52,7 @@ import { IS_SLIM, BUILD } from "../build-flags";
 import { setWasmUrl } from "../wasm/FFmpegLoader";
 import { probeLinkBandwidth } from "../utils/bandwidthProbe";
 import { childAbort } from "../utils/abort";
+import { canDelaySubtitles } from "../core/SubtitleDelay";
 import {
   activeIdentity,
   autoQualityAllowed,
@@ -7238,14 +7239,14 @@ export class MoviElement extends HTMLElement {
         case "X": {
           // Z / X: Subtitle delay — shift subs earlier (Z) or later (X) by
           // 100ms per press. mpv convention: positive value = subs later.
-          // File-source only — streamed sources don't expose the timing
-          // controls this nudge depends on. Also require an active subtitle
-          // track: nudging a delay value that applies to nothing on screen
-          // would just surface a misleading OSD readout. The delay lives in the
-          // captions menu, so it goes with `nocc`.
+          // Only where the delay can be applied (see canDelaySubtitles). Also
+          // require an active subtitle track: nudging a delay value that
+          // applies to nothing on screen would just surface a misleading OSD
+          // readout. The delay lives in the captions menu, so it goes with
+          // `nocc`.
           if (this.isControlDisabled("cc")) break;
           e.preventDefault();
-          if (!this.player || !this.player.isFileSource()) break;
+          if (!this._canDelaySubtitles()) break;
           const hasActiveMuxed =
             !!this.player.trackManager.getActiveSubtitleTrack();
           const hasActiveExt = this.player
@@ -13874,6 +13875,17 @@ export class MoviElement extends HTMLElement {
    *               into the bitmap.
    *   - null    → no subtitle selected → no customize gear shown.
    */
+  /** A subtitle file (any source) or anything on a local file: see
+   *  canDelaySubtitles. */
+  private _canDelaySubtitles(): boolean {
+    const p = this.player;
+    if (!p) return false;
+    return canDelaySubtitles({
+      fileSource: p.isFileSource(),
+      externalActive: p.getSubtitleLangs().some((t) => t.active),
+    });
+  }
+
   private getActiveSubtitleKind(): "vtt" | "text" | "image" | null {
     if (!this.player) return null;
     // External (declared via <track> children) — has a `format` hint.
@@ -14466,9 +14478,7 @@ export class MoviElement extends HTMLElement {
     // the same slider that resizes text/vtt cues.
     const showSize = kind !== null;
     const showBackdrop = kind === "vtt"; // backdrop only paints for VTT
-    // Subtitle delay only makes sense on file sources — streamed sources
-    // don't expose the timing surface this control nudges.
-    const showShift = kind !== null && !!this.player?.isFileSource();
+    const showShift = kind !== null && this._canDelaySubtitles();
     const currentDelay = this.player ? this.player.getSubtitleDelay() : 0;
 
     const edges: {

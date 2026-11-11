@@ -162,7 +162,13 @@ export class JassubRenderer implements SubtitleRenderer {
 
   setDelay(seconds: number): void {
     this.delay = seconds;
-    if (this.instance) this.instance.timeOffset = seconds;
+    if (this.instance) this.instance.timeOffset = this.timeOffset();
+  }
+
+  // The delay is mpv's sub-delay (positive: the subtitles come later); JASSUB
+  // draws the script at mediaTime + timeOffset, so later is a negative offset.
+  private timeOffset(): number {
+    return -this.delay;
   }
 
   /**
@@ -225,7 +231,7 @@ export class JassubRenderer implements SubtitleRenderer {
       if (fonts?.length) await inst.renderer.addFonts(fonts);
       await inst.renderer.setTrack(script);
     }
-    inst.timeOffset = this.delay;
+    inst.timeOffset = this.timeOffset();
     this.active = true;
   }
 
@@ -249,7 +255,7 @@ export class JassubRenderer implements SubtitleRenderer {
           canvas,
           subContent: script,
           fonts,
-          timeOffset: this.delay,
+          timeOffset: this.timeOffset(),
           ...(this.host.workerUrl && { workerUrl: this.host.workerUrl }),
           ...(this.host.wasmUrl && { wasmUrl: this.host.wasmUrl }),
           ...(this.host.modernWasmUrl && {
