@@ -82,8 +82,17 @@ jobs:
       # fonts to it; MOVI_REQUIRE_WASM makes a missing one a failure.
       - name: ffmpeg and fonts for the attachment test
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          # Ubuntu's own archive only, from kernel.org's mirror, and none of the
+          # runner's other sources (Microsoft, PPAs on launchpad): on 2026-11-11
+          # the runners could not resolve *.ubuntu.com or launchpad for over an
+          # hour, and apt waited on each of them until the job was cancelled.
+          c=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          for p in "$c" "$c-updates" "$c-security"; do
+            echo "deb http://mirrors.edge.kernel.org/ubuntu/ $p main universe"
+          done > /tmp/apt-sources.list
+          apt_opts="-o Dir::Etc::sourcelist=/tmp/apt-sources.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0"
+          sudo apt-get $apt_opts update
+          sudo apt-get $apt_opts install -y -qq ffmpeg fonts-dejavu-core
       - name: Run the real-WASM tests against the freshly built WASM
         run: npm run test:run
         env:
