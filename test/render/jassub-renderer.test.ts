@@ -218,13 +218,16 @@ describe("JassubRenderer", () => {
     ]);
   });
 
-  it("passes the subtitle delay on, also to an instance made later", async () => {
+  // The delay is mpv's sub-delay (positive: later). JASSUB draws the script at
+  // mediaTime + timeOffset (jassub.js `_draw(mediaTime + this.timeOffset)`), so
+  // showing it later is a negative offset.
+  it("passes the subtitle delay on as JASSUB's offset, also to an instance made later", async () => {
     const { r, inst } = make();
     r.setDelay(0.7);
     await r.configure(track("ass"), HEADER, []);
-    expect(inst().timeOffset).toBe(0.7);
+    expect(inst().timeOffset).toBe(-0.7);
     r.setDelay(-0.2);
-    expect(inst().timeOffset).toBe(-0.2);
+    expect(inst().timeOffset).toBe(0.2);
   });
 
   it("keeps what libass already has on a seek", async () => {
