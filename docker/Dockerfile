@@ -10,6 +10,16 @@ FROM emscripten/emsdk:6.0.1
 LABEL maintainer="movi"
 LABEL description="FFmpeg WASM build environment for movi"
 
+# Apt reads its archive through a mirror list (apt-transport-mirror(1)): tried
+# by priority, the next one when one fails. On 2026-11-11 GitHub's runners could
+# not resolve *.ubuntu.com for over an hour and every package build failed here:
+# kernel.org's Ubuntu mirror goes first, archive.ubuntu.com after it.
+RUN printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\n' > /etc/apt/mirrors.txt \
+    && for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+         [ -f "$f" ] && sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu/?#mirror+file:/etc/apt/mirrors.txt#g' "$f"; \
+       done; \
+    grep -rqs 'mirror+file' /etc/apt/sources.list /etc/apt/sources.list.d/
+
 # Install build dependencies (including meson/ninja for dav1d)
 RUN apt-get update && apt-get install -y \
     git \
