@@ -24,7 +24,7 @@ on:
       scenario:
         description: "Scenario script"
         type: choice
-        options: ["sources", "fonts"]
+        options: ["sources", "fonts", "picture"]
         default: "sources"
   workflow_call:
     inputs:
@@ -96,8 +96,8 @@ jobs:
           ls package/dist | head
       - name: Generate the media
         run: bash scripts/blackbox-${{ inputs.scenario }}/make-fixtures.sh "$PWD/fixtures"
-      - name: JASSUB (fonts scenario)
-        if: inputs.scenario == 'fonts'
+      - name: JASSUB (fonts and picture scenarios)
+        if: inputs.scenario == 'fonts' || inputs.scenario == 'picture'
         run: |
           # The host's dependency, not this package's: installed for the run only.
           npm install --no-save jassub@2.5.37 esbuild
@@ -109,8 +109,8 @@ jobs:
           MOVI_CHROME_EXECUTABLE: /usr/bin/google-chrome
         run: |
           google-chrome --version
-          if [ "${{ inputs.scenario }}" = "fonts" ]; then
-            node scripts/blackbox-fonts/run.mjs --dist "$PWD/pkg/package/dist" --media "$PWD/fixtures" --jassub "$PWD/jassub-bundle" --out "$PWD/results"
+          if [ "${{ inputs.scenario }}" = "fonts" ] || [ "${{ inputs.scenario }}" = "picture" ]; then
+            node scripts/blackbox-${{ inputs.scenario }}/run.mjs --dist "$PWD/pkg/package/dist" --media "$PWD/fixtures" --jassub "$PWD/jassub-bundle" --out "$PWD/results"
           else
             node scripts/blackbox-sources/run.mjs --dist "$PWD/pkg/package/dist" --media "$PWD/fixtures" --out "$PWD/results"
           fi
