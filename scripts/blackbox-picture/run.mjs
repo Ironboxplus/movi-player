@@ -113,6 +113,7 @@ const state = (page) =>
       return { z: s.zIndex, bg: s.backgroundColor, op: s.opacity, vis: s.visibility, disp: s.display };
     };
     return {
+      contextsLost: window.__lost,
       time: p?.getCurrentTime?.(),
       state: p?.getState?.(),
       inband: p?.getSubtitleTracks?.().map((t) => [t.id, t.codec, t.label]),
@@ -139,9 +140,9 @@ const CASES = [
   },
 ];
 
-async function run(browser, mode, c) {
+async function run(browser, mode, c, contextOptions = {}) {
   const label = `[${mode}] ${c.name}`;
-  const context = await browser.newContext({ viewport: { width: W, height: H } });
+  const context = await browser.newContext({ viewport: { width: W, height: H }, ...contextOptions });
   const page = await context.newPage();
   page.on("console", (m) => consoleLog.push(`${label} [${m.type()}] ${m.text()}`));
   page.on("pageerror", (e) => consoleLog.push(`${label} [pageerror] ${e.message}`));
@@ -156,6 +157,16 @@ async function run(browser, mode, c) {
       wrapper.style.cssText = "position:relative;width:100%";
       wrapper.innerHTML = `<movi-player src="/media/subs.mkv" controls theme="dark" hdr fastseek autoplay subtitlefallbackfont="${fallback}" style="width:100%;max-height:80vh"></movi-player>`;
       document.getElementById("host").appendChild(wrapper);
+      // A lost WebGL context takes the picture with it: count them.
+      window.__lost = 0;
+      const seen = new WeakSet();
+      setInterval(() => {
+        for (const cv of wrapper.firstElementChild.shadowRoot?.querySelectorAll("canvas") ?? []) {
+          if (seen.has(cv)) continue;
+          seen.add(cv);
+          cv.addEventListener("webglcontextlost", () => window.__lost++);
+        }
+      }, 50);
     }, { fallback: FALLBACK });
     await waitFor(
       () => page.evaluate(() => {
@@ -215,17 +226,27 @@ async function run(browser, mode, c) {
   await context.close();
 }
 
-const MODES = {
-  default: [],
-  webgpu: ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-angle=swiftshader", "--use-webgpu-adapter=swiftshader"],
+// A phone as the player sees one: its user agent, touch and pixel ratio, which
+// is what movi's mobile paths are chosen by (MoviPlayer._isMobileDevice).
+const PHONE = {
+  userAgent:
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+  isMobile: true,
+  hasTouch: true,
+  deviceScaleFactor: 2.625,
 };
-for (const [mode, extra] of Object.entries(MODES)) {
+const MODES = {
+  default: { args: [] },
+  webgpu: { args: ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-angle=swiftshader", "--use-webgpu-adapter=swiftshader"] },
+  phone: { args: [], context: PHONE },
+};
+for (const [mode, { args, context }] of Object.entries(MODES)) {
   const browser = await chromium.launch({
     executablePath: process.env.MOVI_CHROME_EXECUTABLE || undefined,
     headless: true,
-    args: ["--autoplay-policy=no-user-gesture-required", "--no-sandbox", ...extra],
+    args: ["--autoplay-policy=no-user-gesture-required", "--no-sandbox", ...args],
   });
-  for (const c of CASES) await run(browser, mode, c);
+  for (const c of CASES) await run(browser, mode, c, context);
   await browser.close();
 }
 
